@@ -1,0 +1,157 @@
+# Third-party notices
+
+MoEspresso incorporates or adapts the third-party material listed below. Each
+entry identifies an immutable upstream revision and the affected MoEspresso
+files or code regions. The complete license terms are shipped in
+`LICENSE-MIT` and `LICENSE-APACHE-2.0`.
+
+Only attribution and copyright text present in the pinned upstream material is
+reproduced here. A package or repository license declaration is identified as
+metadata when the upstream revision does not contain a license or notice file.
+
+## JANG
+
+Source: [jjang-ai/jangq at
+`e0c5a81fb34a63f1547030902044a4b99d3f2345`](https://github.com/jjang-ai/jangq/tree/e0c5a81fb34a63f1547030902044a4b99d3f2345)
+(tag `v2.5.29`).
+
+The pinned `jang-tools/pyproject.toml` declares `Apache-2.0` and identifies
+Jinho Jang as the author. The pinned revision contains no `LICENSE` or `NOTICE`
+file. The applicable Apache License 2.0 terms are in
+`LICENSE-APACHE-2.0`.
+
+The gather, fused gate/up, and Hadamard kernel sources contain this attribution:
+
+> Created by Jinho Jang (eric@jangq.ai)
+
+Mapped material:
+
+- `src/moespresso/runtime/gather_tq_split_norms.py` adapts
+  `jang-tools/jang_tools/turboquant/gather_tq_kernel.py::_GATHER_TQ_SOURCE`
+  and its gather dispatch wrapper.
+- `src/moespresso/runtime/deepseek_v4/hc_kernel.py` adapts the embedded Metal
+  source produced by
+  `jang-tools/jang_tools/dsv4/mlx_model.py::_make_hc_split_sinkhorn_kernel`,
+  exposed upstream through `hc_split_sinkhorn`.
+- `src/moespresso/runtime/routed_decode_kernel.py` adapts
+  `gather_tq_kernel.py::_GATHER_TQ_SOURCE`,
+  `fused_gate_up_kernel.py::_FUSED_SWIGLU_SOURCE`, and
+  `hadamard_kernel.py::_HADAMARD_BUTTERFLY_SOURCE` together with
+  `hadamard_rotate_metal`.
+- `src/moespresso/correctness/tq_reference.py::_beta_pdf` and
+  `compute_codebook` adapt the same symbols from
+  `jang-tools/jang_tools/turboquant/codebook.py`.
+
+Each modified Apache-derived file carries a local modification notice that
+describes the MoEspresso changes.
+
+## ds4
+
+Source: [antirez/ds4 at
+`80ebbc396aee40eedc1d829222f3362d10fa4c6c`](https://github.com/antirez/ds4/tree/80ebbc396aee40eedc1d829222f3362d10fa4c6c).
+
+License: MIT. The complete terms are in `LICENSE-MIT`. The upstream copyright
+notice is:
+
+> Copyright (c) 2026 The ds4.c authors  
+> Copyright (c) 2023-2026 The ggml authors
+
+Mapped material:
+
+- `src/moespresso/correctness/deepseek_v4/q3.py` and
+  `src/moespresso/correctness/fixtures/deepseek_v4/q3_long_context/answers.json`
+  adapt the DS4 long-context story fixture and
+  `tests/generate_long_context_story_prompt.py`.
+- `src/moespresso/correctness/fixtures/deepseek_v4/test_vectors/` contains the
+  published DS4 test-vector prompts, manifests, selected-token vectors, and
+  official records from `tests/test-vectors/`.
+- `src/moespresso/correctness/fixtures/deepseek_v4/q2_official_continuations/prompts.jsonl`
+  copies the public prompt data from
+  `gguf-tools/quality-testing/prompts.jsonl`.
+- `src/moespresso/runtime/deepseek_v4/indexed_attention_kernel.py` adapts
+  attention, indexer-score, and QAT kernel material from
+  `metal/dsv4_misc.metal` and `metal/dsv4_kv.metal`.
+- The QAT helper in
+  `src/moespresso/runtime/deepseek_v4/indexer_score_kernel.py` adapts
+  `metal/dsv4_kv.metal::kernel_dsv4_indexer_hadamard_fp4_f32`.
+- The FP8 helpers in
+  `src/moespresso/runtime/deepseek_v4/decode_attention_kernel.py` adapt
+  `metal/dsv4_kv.metal::dsv4_e4m3fn_dequant`,
+  `kernel_dsv4_fp8_kv_quantize_f32`, and
+  `kernel_dsv4_kv_fp8_store_f32`.
+
+The mappings for `indexer_score_kernel.py` and `decode_attention_kernel.py`
+apply only to the named helpers.
+
+## DeepSeek-V4-Flash
+
+Source: [deepseek-ai/DeepSeek-V4-Flash at
+`a7aaed80dd2df27620eb534454253ea25eb11c7a`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/a7aaed80dd2df27620eb534454253ea25eb11c7a).
+
+License: MIT. The complete terms are in `LICENSE-MIT`. The upstream copyright
+notice is:
+
+> Copyright (c) 2023 DeepSeek
+
+`src/moespresso/runtime/deepseek_v4/renderer.py` adapts the prompt construction
+implemented by `encoding/encoding_dsv4.py`.
+
+## Apple MLX and MLX LM
+
+Sources:
+
+- [ml-explore/mlx at
+  `39886de461d4f014cd60a3a68ad42fd8d776754a`](https://github.com/ml-explore/mlx/tree/39886de461d4f014cd60a3a68ad42fd8d776754a)
+- [ml-explore/mlx at
+  `68cf2fddd8de5edd8ab3d926391772b2e2cedad8`](https://github.com/ml-explore/mlx/tree/68cf2fddd8de5edd8ab3d926391772b2e2cedad8)
+  (tag `v0.31.2`; router GEMV source)
+- [ml-explore/mlx-lm at
+  `2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5`](https://github.com/ml-explore/mlx-lm/tree/2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5)
+- [ml-explore/mlx-lm at
+  `ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd`](https://github.com/ml-explore/mlx-lm/tree/ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd)
+  (tag `v0.31.3`; raw-greedy generation source)
+
+License: MIT. The complete terms are in `LICENSE-MIT`. The mapped sources carry
+these copyright notices:
+
+> Copyright © 2023 Apple Inc.
+
+> Copyright © 2023-2024 Apple Inc.
+
+> Copyright © 2026 Apple Inc.
+
+Mapped material:
+
+- `src/moespresso/runtime/deepseek_v4/router_kernel.py::_LOG1P_HEADER` adapts
+  the float `log1p` helper from `mlx/backend/metal/kernels/utils.h`. This
+  mapping applies only to `_LOG1P_HEADER` and its
+  `moespresso_dsv4_log1p` function.
+- `src/moespresso/runtime/owned_switchglu.py::OwnedSwitchGLU.__call__` adapts
+  `mlx_lm/models/switch_layers.py::SwitchGLU.__call__`.
+- `src/moespresso/runtime/qwen/gdn_decode.py::_FUSED_SOURCE` adapts
+  `mlx/backend/metal/kernels/conv.metal::depthwise_conv_1d`.
+- `src/moespresso/runtime/qwen/gdn_decode.py::FusedDecodeGatedDeltaNet.__call__`
+  adapts `mlx_lm/models/qwen3_5.py::GatedDeltaNet.__call__`.
+- `src/moespresso/runtime/qwen/router_gemv.py::_SOURCE` adapts
+  `mlx/backend/metal/kernels/gemv.metal::GEMVKernel::run` and its
+  `gemv_float32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` specialization. The fixed
+  launch geometry derives from
+  `mlx/backend/metal/matmul.cpp::gemv_axbpy`.
+- `src/moespresso/runtime/raw_greedy.py::raw_greedy_generate_step` and
+  `src/moespresso/runtime/raw_greedy.py::stream_raw_greedy` adapt
+  `mlx_lm/generate.py::generate_step` and `mlx_lm/generate.py::stream_generate`.
+
+## froggeric Qwen-Fixed-Chat-Templates
+
+Source: [froggeric/Qwen-Fixed-Chat-Templates at
+`c31fd393e531dbacd92b6deb99a2037cc949f950`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/tree/c31fd393e531dbacd92b6deb99a2037cc949f950)
+(version `v19`).
+
+The pinned repository metadata declares `Apache-2.0`. No copyright or
+`NOTICE` text was present in the audited material. The applicable Apache
+License 2.0 terms are in `LICENSE-APACHE-2.0`.
+
+`src/moespresso/package/templates/qwen3_5_moe.chat_template.jinja` adapts the
+root `chat_template.jinja`. MoEspresso changes the thinking-disabled replay and
+generation prefixes so they emit an empty thinking scaffold and preserve token
+prefix identity.

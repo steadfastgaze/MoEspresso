@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200"
+     height="460"
+     viewBox="0 0 1200 460"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">Ornith decode throughput and perplexity comparisons</title>
+  <desc id="desc">
+    At 37,000 tokens with Q8 KV, MoEspresso decodes at 67.31 tokens per second,
+    mlx-lm at 48.09, and llama.cpp at 43.52. For the compared Q4 and oQ weight
+    artifacts, perplexity is 6.2442 for llama.cpp, 6.2661 for MoEspresso, and
+    6.2897 for mlx-lm; lower is better.
+  </desc>
+
+  <!--
+    Hand-editing map:
+      Decode plot: x = 210 + value / 75 * 300; bar width = value / 75 * 300.
+      Perplexity plot: x = 820 + (value - 6.24) / 0.06 * 300.
+      Geometry and printed values are both tagged with data-value attributes.
+  -->
+  <style>
+    text {
+      fill: #1f2328;
+      font-family: Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    .panel-title {
+      font-size: 25px;
+      font-weight: 500;
+    }
+    .subtitle {
+      fill: #57606a;
+      font-size: 17px;
+    }
+    .tick {
+      fill: #57606a;
+      font-size: 17px;
+    }
+    .label {
+      font-size: 18px;
+    }
+    .value {
+      font-size: 19px;
+      font-weight: 500;
+      text-anchor: end;
+    }
+    .grid {
+      stroke: #d0d7de;
+      stroke-width: 1;
+      vector-effect: non-scaling-stroke;
+    }
+    .axis {
+      stroke: #8c959f;
+      stroke-width: 1.5;
+      vector-effect: non-scaling-stroke;
+    }
+    .row-guide {
+      stroke: #d0d7de;
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
+    }
+    .bar-peer {
+      fill: #6e7781;
+    }
+    .bar-accent {
+      fill: #0969da;
+    }
+    .dot-accent {
+      fill: #0969da;
+    }
+    .dot-peer {
+      fill: #6e7781;
+    }
+    @media (prefers-color-scheme: dark) {
+      text {
+        fill: #f0f6fc;
+      }
+      .subtitle {
+        fill: #8c959f;
+      }
+      .tick {
+        fill: #8c959f;
+      }
+      .grid {
+        stroke: #30363d;
+      }
+      .row-guide {
+        stroke: #30363d;
+      }
+      .axis {
+        stroke: #6e7681;
+      }
+      .bar-accent {
+        fill: #58a6ff;
+      }
+      .dot-accent {
+        fill: #58a6ff;
+      }
+      .bar-peer {
+        fill: #8b949e;
+      }
+      .dot-peer {
+        fill: #8b949e;
+      }
+    }
+  </style>
+
+  <!-- Left panel: decode throughput. -->
+  <g id="decode-throughput">
+    <text class="panel-title" x="24" y="40">Decode throughput at 37,000 tokens</text>
+    <text class="subtitle" x="24" y="68">Q8 KV · tokens/s · higher is better</text>
+
+    <!-- Vertical grid and zero-based axis: 0 to 75 tok/s. -->
+    <line class="grid" x1="210" y1="104" x2="210" y2="370" />
+    <line class="grid" x1="270" y1="104" x2="270" y2="370" />
+    <line class="grid" x1="330" y1="104" x2="330" y2="370" />
+    <line class="grid" x1="390" y1="104" x2="390" y2="370" />
+    <line class="grid" x1="450" y1="104" x2="450" y2="370" />
+    <line class="grid" x1="510" y1="104" x2="510" y2="370" />
+    <line class="axis" x1="210" y1="370" x2="510" y2="370" />
+
+    <!-- MoEspresso: 67.31 / 75 * 300 = 269.24. -->
+    <g id="ornith-decode-moespresso" data-value="67.31">
+      <text class="label" x="24" y="139">MoEspresso Q4_K_M</text>
+      <rect class="bar-accent" x="210" y="114" width="269.24" height="34" rx="4" />
+      <text class="value" x="570" y="139">67.31</text>
+    </g>
+
+    <!-- mlx-lm: 48.09 / 75 * 300 = 192.36. -->
+    <g id="ornith-decode-mlx-lm" data-value="48.09">
+      <text class="label" x="24" y="227">mlx-lm oQ4e</text>
+      <rect class="bar-peer" x="210" y="202" width="192.36" height="34" rx="4" />
+      <text class="value" x="570" y="227">48.09</text>
+    </g>
+
+    <!-- llama.cpp: 43.52 / 75 * 300 = 174.08. -->
+    <g id="ornith-decode-llama-cpp" data-value="43.52">
+      <text class="label" x="24" y="315">llama.cpp Q4_K_M</text>
+      <rect class="bar-peer" x="210" y="290" width="174.08" height="34" rx="4" />
+      <text class="value" x="570" y="315">43.52</text>
+    </g>
+
+    <text class="tick" x="210" y="401" text-anchor="middle">0</text>
+    <text class="tick" x="270" y="401" text-anchor="middle">15</text>
+    <text class="tick" x="330" y="401" text-anchor="middle">30</text>
+    <text class="tick" x="390" y="401" text-anchor="middle">45</text>
+    <text class="tick" x="450" y="401" text-anchor="middle">60</text>
+    <text class="tick" x="510" y="401" text-anchor="middle">75</text>
+  </g>
+
+  <line class="grid" x1="600" y1="20" x2="600" y2="430" />
+
+  <!-- Right panel: position marks avoid a misleading non-zero bar baseline. -->
+  <g id="perplexity">
+    <text class="panel-title" x="624" y="40">Perplexity</text>
+    <text class="subtitle" x="624" y="68">Q4_K_M and oQ4e · 6,132 target tokens · lower is better</text>
+
+    <!-- Axis range: 6.24 to 6.30. -->
+    <line class="grid" x1="820" y1="104" x2="820" y2="370" />
+    <line class="grid" x1="920" y1="104" x2="920" y2="370" />
+    <line class="grid" x1="1020" y1="104" x2="1020" y2="370" />
+    <line class="grid" x1="1120" y1="104" x2="1120" y2="370" />
+    <line class="axis" x1="820" y1="370" x2="1120" y2="370" />
+
+    <!-- llama.cpp: 820 + (6.2442 - 6.24) / 0.06 * 300 = 841. -->
+    <g id="ornith-ppl-llama-cpp" data-value="6.2442">
+      <text class="label" x="624" y="139">llama.cpp Q4_K_M</text>
+      <line class="row-guide" x1="820" y1="132" x2="1120" y2="132" />
+      <circle class="dot-peer" cx="841" cy="132" r="8" />
+      <text class="value" x="1180" y="139">6.2442</text>
+    </g>
+
+    <!-- MoEspresso: 820 + (6.2661 - 6.24) / 0.06 * 300 = 950.5. -->
+    <g id="ornith-ppl-moespresso" data-value="6.2661">
+      <text class="label" x="624" y="227">MoEspresso Q4_K_M</text>
+      <line class="row-guide" x1="820" y1="220" x2="1120" y2="220" />
+      <circle class="dot-accent" cx="950.5" cy="220" r="8" />
+      <text class="value" x="1180" y="227">6.2661</text>
+    </g>
+
+    <!-- mlx-lm: 820 + (6.2897 - 6.24) / 0.06 * 300 = 1068.5. -->
+    <g id="ornith-ppl-mlx-lm" data-value="6.2897">
+      <text class="label" x="624" y="315">mlx-lm oQ4e</text>
+      <line class="row-guide" x1="820" y1="308" x2="1120" y2="308" />
+      <circle class="dot-peer" cx="1068.5" cy="308" r="8" />
+      <text class="value" x="1180" y="315">6.2897</text>
+    </g>
+
+    <text class="tick" x="820" y="401" text-anchor="middle">6.24</text>
+    <text class="tick" x="920" y="401" text-anchor="middle">6.26</text>
+    <text class="tick" x="1020" y="401" text-anchor="middle">6.28</text>
+    <text class="tick" x="1120" y="401" text-anchor="middle">6.30</text>
+  </g>
+</svg>

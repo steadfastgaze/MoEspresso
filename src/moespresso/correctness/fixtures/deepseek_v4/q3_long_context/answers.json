@@ -1,0 +1,21 @@
+{
+  "schema": "ds4-q3-long-context-answers-v1",
+  "facts": [
+    {"name": "Bob", "word": "thirty-four", "number": 34},
+    {"name": "Alice", "word": "fifty-two", "number": 52},
+    {"name": "Clara", "word": "seventy-one", "number": 71},
+    {"name": "Diego", "word": "ninety-three", "number": 93},
+    {"name": "Elena", "word": "sixteen", "number": 16},
+    {"name": "Felix", "word": "eighty-eight", "number": 88},
+    {"name": "Greta", "word": "forty-seven", "number": 47},
+    {"name": "Hugo", "word": "twenty-nine", "number": 29},
+    {"name": "Iris", "word": "sixty-four", "number": 64},
+    {"name": "Jonas", "word": "twelve", "number": 12},
+    {"name": "Kira", "word": "eighty-one", "number": 81},
+    {"name": "Leo", "word": "thirty-nine", "number": 39},
+    {"name": "Marta", "word": "seventy-six", "number": 76},
+    {"name": "Nadia", "word": "twenty-three", "number": 23},
+    {"name": "Owen", "word": "fifty-eight", "number": 58},
+    {"name": "Priya", "word": "ninety-seven", "number": 97}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "schema": "ds4-q3-long-context-manifest-v1",
+  "source": "https://github.com/antirez/ds4/blob/0cba357ca1bc0e7510421cc26888e420ea942123/tests/generate_long_context_story_prompt.py",
+  "generator_seed": 20260513,
+  "prompt_id": "long_context_story_fact_recall",
+  "task": "extract name-to-number assignment facts from a long deterministic story",
+  "answers_file": "answers.json"
+}

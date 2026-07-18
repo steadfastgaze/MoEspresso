@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200"
+     height="500"
+     viewBox="0 0 1200 500"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">DeepSeek decode throughput and perplexity comparisons</title>
+  <desc id="desc">
+    At 15,406 tokens, MoEspresso decodes at 23.17 tokens per second, oMLX at
+    21.56, DwarfStar at 20.70, and llama.cpp at 5.67. On 2,290 official API
+    continuation tokens, perplexity is 1.4597 for DwarfStar, 1.4598 for
+    MoEspresso, and 1.4723 for oMLX; lower is better.
+  </desc>
+
+  <!--
+    Hand-editing map:
+      Decode plot: x = 210 + value / 25 * 300; bar width = value / 25 * 300.
+      Perplexity plot: x = 820 + (value - 1.458) / 0.016 * 300.
+      Geometry and printed values are both tagged with data-value attributes.
+  -->
+  <style>
+    text {
+      fill: #1f2328;
+      font-family: Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    .panel-title {
+      font-size: 25px;
+      font-weight: 500;
+    }
+    .subtitle {
+      fill: #57606a;
+      font-size: 17px;
+    }
+    .tick {
+      fill: #57606a;
+      font-size: 17px;
+    }
+    .label {
+      font-size: 18px;
+    }
+    .value {
+      font-size: 19px;
+      font-weight: 500;
+      text-anchor: end;
+    }
+    .grid {
+      stroke: #d0d7de;
+      stroke-width: 1;
+      vector-effect: non-scaling-stroke;
+    }
+    .axis {
+      stroke: #8c959f;
+      stroke-width: 1.5;
+      vector-effect: non-scaling-stroke;
+    }
+    .row-guide {
+      stroke: #d0d7de;
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
+    }
+    .bar-peer {
+      fill: #6e7781;
+    }
+    .bar-accent {
+      fill: #0969da;
+    }
+    .dot-accent {
+      fill: #0969da;
+    }
+    .dot-peer {
+      fill: #6e7781;
+    }
+    @media (prefers-color-scheme: dark) {
+      text {
+        fill: #f0f6fc;
+      }
+      .subtitle {
+        fill: #8c959f;
+      }
+      .tick {
+        fill: #8c959f;
+      }
+      .grid {
+        stroke: #30363d;
+      }
+      .row-guide {
+        stroke: #30363d;
+      }
+      .axis {
+        stroke: #6e7681;
+      }
+      .bar-accent {
+        fill: #58a6ff;
+      }
+      .dot-accent {
+        fill: #58a6ff;
+      }
+      .bar-peer {
+        fill: #8b949e;
+      }
+      .dot-peer {
+        fill: #8b949e;
+      }
+    }
+  </style>
+
+  <!-- Left panel: decode throughput. -->
+  <g id="decode-throughput">
+    <text class="panel-title" x="24" y="40">Decode throughput at 15,406 tokens</text>
+    <text class="subtitle" x="24" y="68">tokens/s · higher is better</text>
+
+    <!-- Vertical grid and zero-based axis: 0 to 25 tok/s. -->
+    <line class="grid" x1="210" y1="100" x2="210" y2="410" />
+    <line class="grid" x1="270" y1="100" x2="270" y2="410" />
+    <line class="grid" x1="330" y1="100" x2="330" y2="410" />
+    <line class="grid" x1="390" y1="100" x2="390" y2="410" />
+    <line class="grid" x1="450" y1="100" x2="450" y2="410" />
+    <line class="grid" x1="510" y1="100" x2="510" y2="410" />
+    <line class="axis" x1="210" y1="410" x2="510" y2="410" />
+
+    <!-- MoEspresso: 23.17 / 25 * 300 = 278.04. -->
+    <g id="deepseek-decode-moespresso" data-value="23.17">
+      <text class="label" x="24" y="127">MoEspresso IQ2_XXS</text>
+      <rect class="bar-accent" x="210" y="106" width="278.04" height="30" rx="4" />
+      <text class="value" x="570" y="127">23.17</text>
+    </g>
+
+    <!-- oMLX: 21.56 / 25 * 300 = 258.72. -->
+    <g id="deepseek-decode-omlx" data-value="21.56">
+      <text class="label" x="24" y="201">oMLX oQ2.5e</text>
+      <rect class="bar-peer" x="210" y="180" width="258.72" height="30" rx="4" />
+      <text class="value" x="570" y="201">21.56</text>
+    </g>
+
+    <!-- DwarfStar: 20.70 / 25 * 300 = 248.4. -->
+    <g id="deepseek-decode-dwarfstar" data-value="20.70">
+      <text class="label" x="24" y="275">DwarfStar IQ2_XXS</text>
+      <rect class="bar-peer" x="210" y="254" width="248.4" height="30" rx="4" />
+      <text class="value" x="570" y="275">20.70</text>
+    </g>
+
+    <!-- llama.cpp: 5.67 / 25 * 300 = 68.04. -->
+    <g id="deepseek-decode-llama-cpp" data-value="5.67">
+      <text class="label" x="24" y="349">llama.cpp IQ2_XXS</text>
+      <rect class="bar-peer" x="210" y="328" width="68.04" height="30" rx="4" />
+      <text class="value" x="570" y="349">5.67</text>
+    </g>
+
+    <text class="tick" x="210" y="441" text-anchor="middle">0</text>
+    <text class="tick" x="270" y="441" text-anchor="middle">5</text>
+    <text class="tick" x="330" y="441" text-anchor="middle">10</text>
+    <text class="tick" x="390" y="441" text-anchor="middle">15</text>
+    <text class="tick" x="450" y="441" text-anchor="middle">20</text>
+    <text class="tick" x="510" y="441" text-anchor="middle">25</text>
+  </g>
+
+  <line class="grid" x1="600" y1="20" x2="600" y2="470" />
+
+  <!-- Right panel: position marks avoid a misleading non-zero bar baseline. -->
+  <g id="perplexity">
+    <text class="panel-title" x="624" y="40">Perplexity</text>
+    <text class="subtitle" x="624" y="68">2,290 official continuation tokens · lower is better</text>
+
+    <!-- Axis range: 1.458 to 1.474. -->
+    <line class="grid" x1="820" y1="100" x2="820" y2="410" />
+    <line class="grid" x1="895" y1="100" x2="895" y2="410" />
+    <line class="grid" x1="970" y1="100" x2="970" y2="410" />
+    <line class="grid" x1="1045" y1="100" x2="1045" y2="410" />
+    <line class="grid" x1="1120" y1="100" x2="1120" y2="410" />
+    <line class="axis" x1="820" y1="410" x2="1120" y2="410" />
+
+    <!-- DwarfStar: 820 + (1.4597 - 1.458) / 0.016 * 300 = 851.875. -->
+    <g id="deepseek-ppl-dwarfstar" data-value="1.4597">
+      <text class="label" x="624" y="147">DwarfStar IQ2_XXS</text>
+      <line class="row-guide" x1="820" y1="140" x2="1120" y2="140" />
+      <circle class="dot-peer" cx="851.875" cy="140" r="8" />
+      <text class="value" x="1180" y="147">1.4597</text>
+    </g>
+
+    <!-- MoEspresso: 820 + (1.4598 - 1.458) / 0.016 * 300 = 853.75. -->
+    <g id="deepseek-ppl-moespresso" data-value="1.4598">
+      <text class="label" x="624" y="237">MoEspresso IQ2_XXS</text>
+      <line class="row-guide" x1="820" y1="230" x2="1120" y2="230" />
+      <circle class="dot-accent" cx="853.75" cy="230" r="8" />
+      <text class="value" x="1180" y="237">1.4598</text>
+    </g>
+
+    <!-- oMLX: 820 + (1.4723 - 1.458) / 0.016 * 300 = 1088.125. -->
+    <g id="deepseek-ppl-omlx" data-value="1.4723">
+      <text class="label" x="624" y="327">oMLX oQ2.5e</text>
+      <line class="row-guide" x1="820" y1="320" x2="1120" y2="320" />
+      <circle class="dot-peer" cx="1088.125" cy="320" r="8" />
+      <text class="value" x="1180" y="327">1.4723</text>
+    </g>
+
+    <text class="tick" x="820" y="441" text-anchor="middle">1.458</text>
+    <text class="tick" x="895" y="441" text-anchor="middle">1.462</text>
+    <text class="tick" x="970" y="441" text-anchor="middle">1.466</text>
+    <text class="tick" x="1045" y="441" text-anchor="middle">1.470</text>
+    <text class="tick" x="1120" y="441" text-anchor="middle">1.474</text>
+  </g>
+</svg>

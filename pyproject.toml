@@ -1,0 +1,124 @@
+[project]
+name = "moespresso"
+version = "1.0.0"
+description = "Run large Mixture-of-Experts language models well on the memory you have."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE-2.0", "THIRD-PARTY-NOTICES"]
+requires-python = ">=3.11"
+dependencies = [
+    "jang>=2.5.29",
+    "mlx>=0.31.2",
+    "mlx-kquant @ git+https://github.com/steadfastgaze/mlx-kquant.git@e165cafafa149493d298871c610e29e95ffa8f10",
+    "mlx-lm==0.31.3",
+    "numpy>=1.26",
+    "psutil>=7.0.0",
+]
+
+[project.optional-dependencies]
+# Optional build/conversion helper dependency. This is intentionally not part of
+# the runtime installation: serving does not need torch, but source/package
+# tooling may need safetensors' torch path for BF16 and other non-NumPy-friendly
+# dtypes.
+build = [
+    "torch>=2.0.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+# Streamed end-to-end conversion: inventory->probe->optimize->package -> SSD.
+moespresso-convert = "moespresso.package.convert:main"
+# Verify a package against its manifest, then one-shot generate (prompt in, text out).
+moespresso-generate = "moespresso.runtime.serve:main"
+# Same seam, exposed as a long-running OpenAI-compatible HTTP server.
+moespresso-serve = "moespresso.runtime.http:main"
+# On-demand integrity gate (sha256)
+moespresso-verify = "moespresso.runtime.serve:verify_main"
+# Remote Hugging Face model/header inspection without downloading full weights.
+moespresso-hf-inspect = "moespresso.inventory.hf_inspect:main"
+# Alias for the short standalone inspector command.
+hf-model-inspect = "moespresso.inventory.hf_inspect:main"
+# Validate external DeepSeek-V4 Q1 parity evidence.
+moespresso-ds4-q1-validate = "moespresso.correctness.deepseek_v4.parity:main"
+# Manual-only DeepSeek-V4 quality gates. Never called by make test or CI.
+moespresso-ds4-quality = "moespresso.correctness.deepseek_v4.quality:main"
+# Manual DeepSeek-V4 package builder from a GGUF K-quant recipe.
+moespresso-ds4-kquant-package = "moespresso.package.deepseek_v4.kquant_package:main"
+# Manual Qwen package builder from a GGUF K-quant recipe.
+moespresso-qwen-kquant-package = "moespresso.package.qwen.kquant_package:main"
+# Manual Qwen 35B exact-answer package comparison harness.
+moespresso-qwen35-hard-questions = "moespresso.correctness.qwen35.hard_questions:main"
+# Manual Ornith quality gate v2: reasoning, agentic coding, long-context recall.
+moespresso-ornith-gate = "moespresso.correctness.ornith.gate:main"
+# Manual DeepSeek-V4 speed snapshot: generation plus SSD structural counters.
+moespresso-ds4-speed-stats = "moespresso.runtime.deepseek_v4.speed_stats:main"
+# Manual DeepSeek-V4 synthetic primitive-count screen for speed ideas.
+moespresso-ds4-speed-primitives = "moespresso.runtime.deepseek_v4.speed_primitives:main"
+# Manual DeepSeek-V4 one-layer ratio-4 compressed-attention replay.
+moespresso-ds4-ratio4-attention-replay = "moespresso.runtime.deepseek_v4.ratio4_attention_replay:main"
+# Manual DeepSeek-V4 decoder-layer stage replay for speed attribution.
+moespresso-ds4-layer-stage-replay = "moespresso.runtime.deepseek_v4.layer_stage_replay:main"
+# Manual DeepSeek-V4 indexed mixed-attention kernel probe.
+moespresso-ds4-indexed-attention-probe = "moespresso.runtime.deepseek_v4.indexed_attention_kernel:main"
+# Manual DeepSeek-V4 MoE layer replay for speed-scheduler value checks.
+moespresso-ds4-moe-block-replay = "moespresso.correctness.deepseek_v4.moe_block_replay:main"
+# Manual DeepSeek-V4 full-graph replay for direct-vs-wrapped scheduler diffs.
+moespresso-ds4-moe-graph-replay = "moespresso.correctness.deepseek_v4.moe_graph_replay:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+native = [
+    # Must match MLX's nanobind pin for shared mlx.core mx.array casters.
+    "nanobind==2.12.0",
+]
+
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+    "/specs_archive",
+    "/specs_archive/**",
+    "/native/gate/build",
+    "/native/gate/build/**",
+    "/native/ds4_moe/build",
+    "/native/ds4_moe/build/**",
+    "**/private",
+    "**/private/**",
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/*.pyo",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moespresso"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/moespresso" = "moespresso"
+
+[tool.ruff]
+line-length = 100
+# Private oracle fixtures live outside the committed tree (they are gitignored)
+# and are not maintained to the project's lint standard; exclude them so an
+# explicit `ruff check src tests` does not fail on files that never ship.
+extend-exclude = ["src/moespresso/correctness/fixtures/*/private/"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_model: opt-in tests that convert/load locally downloaded full model artifacts",
+]
+# sentencepiece 0.2.1 (transitive via mlx-lm) ships SWIG C types that lack __module__;
+# Python 3.13 raises a DeprecationWarning for those (SwigPyObject/SwigPyPacked at type
+# creation, swigvarlink at shutdown). Default Python hides DeprecationWarnings, so serve/
+# convert/CLI never showed it, only pytest surfaces it (pytest enables deprecations for
+# the session). The upstream issue remains unresolved. Filter only that exact message
+# so real deprecations still surface; `-X dev` still shows everything.
+filterwarnings = [
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]
