@@ -67,9 +67,7 @@ GGUF recipe import -------------/
   and the role of family-specific served gates.
 - [`optimization_methodology.md`](optimization_methodology.md): measurement,
   attribution, A/B discipline, and acceptance rules for runtime work.
-- [`mlx_limitations.md`](mlx_limitations.md): measured MLX strengths,
-  quantization limits, kernel coverage, and platform boundaries.
 
 Start with the top-level [`README.md`](../README.md) to install and serve.
 Contributors should then read [`DEVGUIDE.md`](../DEVGUIDE.md) and
-[`AGENT.md`](../AGENT.md) before changing the implementation.
+[`AGENTS.md`](../AGENTS.md) before changing the implementation.

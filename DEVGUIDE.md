@@ -1,6 +1,6 @@
 # Developer guide
 
-This is the map from the source tree to the design. See also `AGENT.md`.
+This is the map from the source tree to the design. See also `AGENTS.md`.
 For each subsystem in depth, see the matching file in `docs/`.
 
 Public product support covers DeepSeek-V4-Flash and Ornith. Modules and entry
@@ -58,9 +58,8 @@ decode gate, `ds4_moe/` for the DeepSeek-V4 MoE kernels) and are built
 separately via `native/build.sh`; the runtime loads them if present and falls
 back transparently if not.
 
-`docs/mlx_limitations.md` records the measured limits and strengths of the MLX
-platform this runtime is built on. `docs/optimization_methodology.md` records
-the measurement discipline for serving-optimization work.
+`docs/optimization_methodology.md` records the measurement discipline for
+serving-optimization work.
 
 ## The package format
 
