@@ -32,7 +32,10 @@ higher-quality weight mix, more usable context, or expert residency. They
 remain possible future options when they demonstrate a measured net benefit
 without weakening those priorities.
 
-## Performance TLDR
+## In numbers
+
+The charts show full-resident runs on an M3 Max with 40 GPU cores and 128 GB
+unified memory. See [accuracy](#accuracy-focus) and [performance](#performance-focus).
 
 **DeepSeek-V4-Flash**
 
@@ -46,32 +49,27 @@ without weakening those priorities.
 
 | Model | Public package | Current boundary |
 |---|---|---|
-| DeepSeek-V4-Flash | [IQ2_XXS MoEspresso package](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso), about 80.0 GiB | Verified resident and bounded-expert execution are recorded. The 64 GB-class result used a capacity cap on a 128 GB host; validation on physical 64 GB hardware remains open. |
-| Ornith 1.0 35B | [Q4_K_M MoEspresso package](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso), about 19.91 GiB | Verified resident and bounded-expert execution are recorded. The 32 GB operating point was reproduced on a 128 GB host; physical 32 GB validation remains separate. |
+| DeepSeek-V4-Flash | [IQ2_XXS MoEspresso package](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso) | Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 64 GB memory configuration on a 128 GB host. |
+| Ornith 1.0 35B | [Q4_K_M MoEspresso package](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso) | Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 32 GB memory configuration on a 128 GB host. |
 
 ## Install
 
-MoEspresso 1.0.0 targets arm64 Apple Silicon Macs and Python 3.11 or newer.
-The packages need roughly 80 GiB for DeepSeek and 20 GiB for Ornith, before
-cache and working-space requirements.
+MoEspresso 1.0.0 requires an arm64 Apple Silicon Mac running macOS 26.2
+(Tahoe) or later.
 
-Install MoEspresso as an isolated `uv` tool:
+Install MoEspresso with Homebrew. The formula installs its required Python
+runtime and native dependencies:
 
 ```bash
-uv tool install \
-  'moespresso @ git+https://github.com/steadfastgaze/moespresso.git@v1.0.0'
+brew install steadfastgaze/tap/moespresso
 ```
 
 ## Download and verify a package
 
-Install the Hugging Face CLI with either Homebrew or `uv`:
+Install the Hugging Face CLI with Homebrew:
 
 ```bash
 brew install hf
-```
-
-```bash
-uv tool install hf
 ```
 
 Then download one of the public packages into an explicit directory:
