@@ -58,14 +58,28 @@ be overridden through environment variables read once at startup.
   region, and is reported in that request's usage block. Decode never
   writes. A smaller stride shortens the re-prefilled tail after a restore
   (at most one stride) at the cost of more first-time writes.
-- `MOESPRESSO_DISK_KV_BYTES`: the total byte budget for stored payloads per
-  root. Default 8 GiB when serving (a checkpoint set covering one long
-  agent prompt runs to a few GiB, so the default holds a handful of hot
-  prefix regions); the literal `unlimited` disables eviction. A positive value caps the payload bytes on disk and evicts
-  least-recently-used checkpoints before a write that would exceed it. A
-  value of `0` refuses startup with a message pointing at
-  `MOESPRESSO_DISK_KV=off`, because a zero budget cannot hold any
-  checkpoint. A negative value refuses startup as a misconfiguration.
+- `MOESPRESSO_DISK_KV_BYTES`: the byte budget for stored payloads, per
+  root, not machine-wide: every package fingerprint has its own root and
+  its own budget, and quarantined payloads sit outside it. Default 8 GiB
+  when serving (a checkpoint set covering one long agent prompt runs to a
+  few GiB, so the default holds a handful of hot prefix regions); the
+  literal `unlimited` disables eviction. A positive value caps the
+  payload bytes on disk and evicts least-recently-used checkpoints; the
+  payload is written before eviction runs so its exact size is known,
+  which means the store can briefly exceed the budget by one payload
+  during a write. The budget bounds retention, not write traffic; the
+  write-depth cap bounds that. A value of `0` refuses startup with a
+  message pointing at `MOESPRESSO_DISK_KV=off`, because a zero budget
+  cannot hold any checkpoint. A negative value refuses startup as a
+  misconfiguration.
+- `MOESPRESSO_DISK_KV_WRITE_DEPTH`: the checkpoint write-depth cap in
+  tokens. Default 16384 when serving; the literal `unlimited` writes
+  frontiers at any depth. Each checkpoint is a complete snapshot, so
+  written bytes grow quadratically with region depth, while cross-session
+  restores land in the shallow shared-prefix region (an agent client's
+  system prompt and tools). The cap keeps the whole shared-prefix benefit
+  and drops the deep-tail write traffic of a long conversation. Restores
+  are unaffected: the read path serves whatever checkpoints exist.
 
 Startup failure policy: with `MOESPRESSO_DISK_KV=frontier` set, a root that
 cannot open (already locked, unwritable) refuses startup, as does any
@@ -176,8 +190,13 @@ cold prefill because only the suffix is prefilled.
   and orphan payloads (payload files no index entry references) left by a crashed
   previous owner. The quarantine directory holds payloads that failed a load check;
   its aging is left to the operator.
+- Write faults disable the writer for the request. A hard failure during a
+  checkpoint write (a full or failing disk) logs one line and stops further
+  write attempts for that request, because each later frontier would
+  serialize an even larger snapshot into the same fault. The request itself
+  completes normally; the next request tries again.
 - Visibility. One operator log line prints on the serve stderr for each checkpoint
-  decision (write, skip with reason, restore, quarantine). The `/health` endpoint's
+  decision (write, skip with reason, write failure, restore, quarantine). The `/health` endpoint's
   `prompt_cache` block carries a `disk` sub-block with the store's counters since
   startup: enabled, root, stride, entries, payload and budget bytes, and the restore,
   write, eviction, and quarantine counts. A request that restored from disk reports the

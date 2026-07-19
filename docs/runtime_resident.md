@@ -370,10 +370,11 @@ the safety key, so it can never authorize a load, and a request without it
 behaves exactly as before.
 
 `cache_stats()` exposes a small snapshot (default/supported live-KV formats,
-entry count, byte count) for `/health`, plus a `disk` sub-block when the opt-in
-disk KV cache is enabled (`docs/disk_kv.md`). Prefix reuse is in-memory by
-default; the disk KV cache is the one durable prompt-cache tier and is off
-unless turned on. The only durable artifact otherwise is the package itself.
+entry count, byte count) for `/health`, plus a `disk` sub-block when the
+disk KV cache is enabled (`docs/disk_kv.md`). Prefix reuse is in-memory
+first; the disk KV cache is the one durable prompt-cache tier, on by
+default when serving (`MOESPRESSO_DISK_KV=off` disables it). The only
+durable artifact otherwise is the package itself.
 
 ---
 

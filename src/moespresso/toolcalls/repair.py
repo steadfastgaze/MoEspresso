@@ -108,10 +108,11 @@ def _coerce_qwenxml_values(text: str, parameter_schemas: dict[str, dict]) -> str
 
         def fix_parameter(pmatch: re.Match) -> str:
             key, raw = pmatch.group(1), pmatch.group(2)
-            declared = (properties.get(key) or {}).get("type")
-            if declared in (None, "string"):
+            primary, _nullable = qwenxml.declared_type_of(
+                qwenxml.declared_type_for(properties, key))
+            if primary in (None, "string"):
                 return pmatch.group(0)
-            fixed = _lenient_scalar(raw.strip(), declared)
+            fixed = _lenient_scalar(raw.strip(), primary)
             if fixed is None:
                 return pmatch.group(0)
             return f"<parameter={key}>\n{fixed}\n</parameter>"
@@ -158,7 +159,7 @@ def _lenient_scalar(value: str, declared: str) -> str | None:
     return None
 
 
-def coerce_arguments(arguments: dict, schema: dict) -> dict:
+def coerce_arguments(arguments: dict, schema: dict) -> tuple[dict, int]:
     """Best-effort typing of parsed argument values against a tool schema.
 
     The Qwen XML parser types values at parse time from the same schemas.
@@ -166,30 +167,44 @@ def coerce_arguments(arguments: dict, schema: dict) -> dict:
     DSML ``string`` attribute) when the emission's typing disagrees with
     the declared schema: a string value declared as a non-string type
     decodes through the lenient scalar rules, and a non-string value
-    declared string becomes its JSON text. A value that cannot coerce
-    keeps its parsed form; this never raises.
+    declared string becomes its JSON text. Coercion is deliberately
+    fail-open: a value that cannot coerce keeps its parsed form and the
+    call still ships, because the client's own argument validation is the
+    final gate and its tool-error result feeds the model's retry, while
+    dropping the call to prose would end the turn. Returns the coerced
+    arguments and the count of values that stayed schema-mismatched, so a
+    caller can surface the misses; this never raises.
     """
     properties = (schema or {}).get("properties") or {}
+    if not isinstance(properties, dict):
+        return dict(arguments), 0
     out = dict(arguments)
+    misses = 0
     for key, value in arguments.items():
-        declared = (properties.get(key) or {}).get("type")
-        if declared is None:
+        primary, nullable = qwenxml.declared_type_of(
+            qwenxml.declared_type_for(properties, key))
+        if nullable and value is None:
             continue
-        if declared == "string":
+        if primary is None:
+            continue
+        if primary == "string":
             if not isinstance(value, str):
                 out[key] = json.dumps(value, ensure_ascii=False)
             continue
-        expected = qwenxml._JSON_TYPES.get(declared)
+        expected = qwenxml._JSON_TYPES.get(primary)
         if expected is None:
             continue
         if isinstance(value, expected) and not (
-                isinstance(value, bool) and declared != "boolean"):
+                isinstance(value, bool) and primary != "boolean"):
             continue
-        if isinstance(value, str):
-            fixed = _lenient_scalar(value.strip(), declared)
-            if fixed is not None:
-                out[key] = json.loads(fixed)
-    return out
+        fixed = (
+            _lenient_scalar(value.strip(), primary)
+            if isinstance(value, str) else None)
+        if fixed is not None:
+            out[key] = json.loads(fixed)
+        else:
+            misses += 1
+    return out, misses
 
 
 def repair_qwenxml_tool_calls(

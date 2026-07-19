@@ -149,9 +149,11 @@ holds.
   recorded safety evidence that aligned saves round-trip bit-identically
   on hybrid (KV + recurrent-state) caches. Serving enables the store by
   default under a per-package root in the user cache directory with an
-  LRU byte budget; `MOESPRESSO_DISK_KV=off` is the kill switch, and a
-  default-enabled store that cannot open degrades to memory-only serving
-  while an explicitly requested one refuses startup. Checkpoint
+  LRU byte budget and a write-depth cap (checkpoints cover the shallow
+  shared-prefix region; deep cumulative snapshots are write traffic with
+  no cross-session value); `MOESPRESSO_DISK_KV=off` is the kill switch,
+  and a default-enabled store that cannot open degrades to memory-only
+  serving while an explicitly requested one refuses startup. Checkpoint
   writes happen only at proven live frontiers during prefill: token
   accounting proposes, and every positional cache must independently
   report exactly the frontier offset before a write, so an unaligned

@@ -269,6 +269,29 @@ def _request_tools(request: dict) -> list[dict] | None:
                     400,
                     f"tools[{index}] function.parameters must be a JSON "
                     f"schema object")
+            properties = (parameters or {}).get("properties")
+            if properties is None:
+                continue
+            if not isinstance(properties, dict):
+                raise RequestError(
+                    400,
+                    f"tools[{index}] parameters.properties must be an object")
+            for property_name, prop in properties.items():
+                if not isinstance(prop, dict):
+                    raise RequestError(
+                        400,
+                        f"tools[{index}] property {property_name!r} must be "
+                        f"a schema object")
+                declared = prop.get("type")
+                if declared is None or isinstance(declared, str):
+                    continue
+                if (isinstance(declared, list)
+                        and all(isinstance(t, str) for t in declared)):
+                    continue
+                raise RequestError(
+                    400,
+                    f"tools[{index}] property {property_name!r} type must "
+                    f"be a string or a list of strings")
     choice = request.get("tool_choice")
     if choice in (None, "auto"):
         return tools
@@ -962,11 +985,17 @@ def chat_completion(
                 "generation_tps": tps,
             }
     # Repair activity is the adoption evidence for a repair-dependent
-    # dialect, so a request that fired the repair layer reports its counters.
+    # dialect, so a request that fired the repair layer reports its counters,
+    # and argument values that stayed schema-mismatched after coercion are
+    # counted so the fail-open path is observable.
     if (streamer is not None and streamer.telemetry.fires
             and "usage" in response):
         response["usage"].setdefault("moespresso", {})["tool_call_repair"] = (
             streamer.telemetry.as_dict())
+    if (streamer is not None and streamer.coercion_misses
+            and "usage" in response):
+        response["usage"].setdefault("moespresso", {})[
+            "tool_call_coercion_misses"] = streamer.coercion_misses
     return response
 
 
@@ -1364,9 +1393,12 @@ def serve(
         budget = disk_kv_config.budget_bytes
         budget_label = (
             "unlimited" if budget is None else f"{budget / 1024**3:.0f}GiB")
+        depth = disk_kv_config.write_depth_tokens
+        depth_label = "unlimited" if depth is None else str(depth)
         print(
             f"[serve] disk_kv=frontier root={disk_kv_config.root} "
-            f"stride={disk_kv_config.stride} budget={budget_label}",
+            f"stride={disk_kv_config.stride} budget={budget_label} "
+            f"write_depth={depth_label}",
             flush=True,
         )
     elif disk_kv_config is not None and not disk_kv_config.enabled:

@@ -123,6 +123,7 @@ class ToolCallStreamer:
         self.make_call_id = make_call_id or _default_call_id
         self.calls: list[dict] = []
         self.telemetry = RepairTelemetry()
+        self.coercion_misses = 0
         self.content_parts: list[str] = []
         self.buffer = ""
         # While buffering a block: the owning dialect and the close marker
@@ -163,8 +164,9 @@ class ToolCallStreamer:
     def _emit_calls(self, parsed: list[ToolCall]) -> None:
         for call in parsed:
             index = len(self.calls)
-            arguments = coerce_arguments(
+            arguments, misses = coerce_arguments(
                 call.arguments, self.schemas.get(call.name) or {})
+            self.coercion_misses += misses
             entry = {
                 "id": self.make_call_id(index),
                 "type": "function",

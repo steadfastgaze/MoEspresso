@@ -336,7 +336,7 @@ def test_coerce_arguments_types_values_against_the_schema():
         "force": {"type": "boolean"},
         "tags": {"type": "array"},
     }}
-    coerced = coerce_arguments(
+    coerced, misses = coerce_arguments(
         {"limit": "5", "path": 123, "force": "yes",
          "tags": '["a", "b"]', "extra": "kept"},
         schema)
@@ -344,14 +344,31 @@ def test_coerce_arguments_types_values_against_the_schema():
         "limit": 5, "path": "123", "force": True,
         "tags": ["a", "b"], "extra": "kept",
     }
+    assert misses == 0
 
 
-def test_coerce_arguments_keeps_matching_and_uncoercible_values():
+def test_coerce_arguments_keeps_matching_and_counts_uncoercible_values():
     from moespresso.toolcalls.repair import coerce_arguments
 
     schema = {"properties": {"limit": {"type": "integer"},
                              "path": {"type": "string"}}}
     untouched = {"limit": 5, "path": "README.md"}
-    assert coerce_arguments(untouched, schema) == untouched
-    assert coerce_arguments({"limit": "many"}, schema) == {"limit": "many"}
-    assert coerce_arguments({"x": "1"}, {}) == {"x": "1"}
+    assert coerce_arguments(untouched, schema) == (untouched, 0)
+    # Fail-open: the value ships as parsed, and the miss is counted so the
+    # caller can surface it.
+    assert coerce_arguments({"limit": "many"}, schema) == ({"limit": "many"}, 1)
+    assert coerce_arguments({"x": "1"}, {}) == ({"x": "1"}, 0)
+
+
+def test_coerce_arguments_handles_nullable_unions_and_odd_shapes():
+    from moespresso.toolcalls.repair import coerce_arguments
+
+    schema = {"properties": {
+        "limit": {"type": ["integer", "null"]},
+        "odd": ["not", "a", "schema"],
+    }}
+    coerced, misses = coerce_arguments(
+        {"limit": None, "odd": "kept"}, schema)
+    assert coerced == {"limit": None, "odd": "kept"}
+    assert misses == 0
+    assert coerce_arguments({"limit": "7"}, schema) == ({"limit": 7}, 0)

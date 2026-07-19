@@ -195,7 +195,9 @@ aligned prompt-cache frontiers so a later process, or a new session sharing
 a long prompt prefix (an agent client's fixed system prompt and tools),
 restores an exact token prefix and prefills only the suffix. Serving enables
 it by default under `~/.cache/moespresso/disk_kv/<package>` with an 8 GiB
-LRU byte budget and a 1024-token stride:
+LRU byte budget per package, a 1024-token stride, and a 16k-token
+write-depth cap (checkpoints cover the shared-prefix region; deep
+conversation tails are not snapshotted):
 
 ```bash
 moespresso-serve ./models/ornith-35b --thinking off

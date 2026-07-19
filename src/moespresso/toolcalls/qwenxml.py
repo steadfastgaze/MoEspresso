@@ -57,6 +57,33 @@ _JSON_TYPES = {
 }
 
 
+def declared_type_of(declared) -> tuple[str | None, bool]:
+    """Resolve a schema ``type`` value to ``(primary, nullable)``.
+
+    JSON Schema allows a union list such as ``["integer", "null"]``: the
+    primary type is the first non-null string member and ``nullable``
+    records whether null is a member. A bare ``"null"`` and every
+    unrecognized shape resolve to no primary type, which downstream treats
+    as undeclared (the raw text is kept).
+    """
+    if isinstance(declared, str):
+        if declared == "null":
+            return None, True
+        return declared, False
+    if isinstance(declared, list):
+        primary = next(
+            (t for t in declared if isinstance(t, str) and t != "null"), None)
+        nullable = any(t == "null" for t in declared)
+        return primary, nullable
+    return None, False
+
+
+def declared_type_for(properties: dict, key: str):
+    """The raw declared ``type`` for one property, tolerating odd shapes."""
+    prop = properties.get(key)
+    return prop.get("type") if isinstance(prop, dict) else None
+
+
 def has_qwenxml_tool_call(content: str | None) -> bool:
     """True when the content carries a tool-call or function open marker."""
     if not content:
@@ -132,7 +159,7 @@ def _parse_parameters(inner: str, tool_name: str, schema: dict) -> dict:
                 f"{tool_name}: parameter element carries an empty name")
         if key in arguments:
             raise ToolCallParseError(f"{tool_name}: duplicate parameter {key!r}")
-        declared = (properties.get(key) or {}).get("type")
+        declared = declared_type_for(properties, key)
         arguments[key] = _decode_value(_trim_value(raw), declared, tool_name, key)
         remainder = remainder.replace(match.group(0), "", 1)
     if remainder.strip():
@@ -152,30 +179,35 @@ def _trim_value(raw: str) -> str:
     return raw
 
 
-def _decode_value(value: str, declared: str | None, tool_name: str, key: str):
+def _decode_value(value: str, declared, tool_name: str, key: str):
     """Decode a raw text value against its declared schema type.
 
     Undeclared and string-typed parameters keep the raw text. Any other
     declared type must decode as JSON of exactly that type; a bare word or a
     mistyped literal raises so the repair layer sees a typed failure instead
-    of an executor crash.
+    of an executor crash. A nullable union type (``["integer", "null"]``)
+    accepts the null literal and otherwise types against its non-null
+    member.
     """
-    expected = _JSON_TYPES.get(declared or "string")
+    primary, nullable = declared_type_of(declared)
+    if nullable and value == "null":
+        return None
+    expected = _JSON_TYPES.get(primary or "string")
     if expected is None:
         return value
     try:
         decoded = json.loads(value)
     except json.JSONDecodeError as e:
         raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {declared}, got "
+            f"{tool_name}: parameter {key!r} must be {primary}, got "
             f"undecodable value {value[:80]!r}: {e}"
         ) from e
-    if isinstance(decoded, bool) and declared != "boolean":
+    if isinstance(decoded, bool) and primary != "boolean":
         raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {declared}, got boolean")
+            f"{tool_name}: parameter {key!r} must be {primary}, got boolean")
     if not isinstance(decoded, expected):
         raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {declared}, got "
+            f"{tool_name}: parameter {key!r} must be {primary}, got "
             f"{type(decoded).__name__}"
         )
     return decoded

@@ -1,9 +1,11 @@
-"""Disk prompt-cache read path (frontier checkpoints).
+"""Disk prompt-cache tier (frontier checkpoints): writer and read path.
 
-Restore a served model's prompt-cache prefix from disk after a restart and
-prefill only the suffix. The feature is opt-in and single-process by contract:
-one process owns a disk root through a non-blocking file lock, so the index is a
-single JSON file rewritten under that lock with a temp file and an atomic rename.
+Restore a served model's prompt-cache prefix from disk and prefill only the
+suffix, after a restart or from a new session sharing a long prompt prefix.
+Serving enables the store by default (``MOESPRESSO_DISK_KV=off`` disables
+it). The store is single-process per root by contract: one process owns a
+disk root through a non-blocking file lock, so the index is a single JSON
+file rewritten under that lock with a temp file and an atomic rename.
 
 Boundaries this module keeps explicit:
 
@@ -23,9 +25,13 @@ Boundaries this module keeps explicit:
   any cache reaches the model. A refusal quarantines the entry and returns the
   engine to cold serving.
 
-Milestone M1 is the read path. The only writer here is the manual checkpoint
-helper used to create fixtures; the frontier writer that runs during generation
-is a later milestone.
+The frontier writer runs during prefill only: token accounting proposes
+aligned frontiers, every positional cache must independently report exactly
+the frontier offset before a write, and by default only frontiers within the
+write-depth cap are written, because the shallow shared-prefix region is
+where cross-session restores land while deep cumulative snapshots only add
+write traffic. The manual checkpoint helper creates fixtures through the
+same write path.
 """
 
 from __future__ import annotations
@@ -701,6 +707,7 @@ class DiskCheckpointStore:
         root_lock: DiskKVRootLock | None = None,
         stride: int | None = None,
         budget_bytes: int | None = None,
+        write_depth_tokens: int | None = None,
         log_fn: Callable[[str], None] | None = None,
     ):
         self.root = Path(root)
@@ -709,9 +716,11 @@ class DiskCheckpointStore:
         self.load_payload_fn = load_payload_fn or load_prompt_cache_payload
         self.save_payload_fn = save_payload_fn or save_prompt_cache_payload
         self.root_lock = root_lock
-        # The frontier writer reads the stride to place checkpoints; the read path
-        # never uses it. None means no writer runs (the read-only M1 shape).
+        # The frontier writer reads the stride to place checkpoints and the
+        # write-depth cap to bound them; the read path never uses either.
+        # None stride means no writer runs (the read-only shape).
         self.stride = validate_stride(stride) if stride is not None else None
+        self.write_depth_tokens = write_depth_tokens
         # None means an unbounded store. A positive cap evicts least-recently-used
         # entries under the root lock before a write that would exceed it.
         if budget_bytes is not None and budget_bytes <= 0:
@@ -1152,6 +1161,7 @@ class FrontierTracker:
         full_tokens: list[int],
         scope: dict,
         already_written: Callable[[dict, list[int]], bool] | None = None,
+        write_depth: int | None = None,
     ):
         validate_stride(stride)
         if restored_prefix < 0:
@@ -1161,6 +1171,10 @@ class FrontierTracker:
         self.full_tokens = list(full_tokens)
         self.scope = dict(scope)
         self._already_written = already_written or (lambda scope, tokens: False)
+        # Frontiers above the write-depth cap are never proposed: cumulative
+        # snapshot bytes grow with depth while cross-session restores land in
+        # the shallow shared-prefix region, so the deep tail is all cost.
+        self.write_depth = None if write_depth is None else int(write_depth)
         # Frontiers already handled in this call, so a repeated callback value or a
         # decode step that revisits the same boundary does not propose twice.
         self._handled: set[int] = set()
@@ -1173,6 +1187,8 @@ class FrontierTracker:
         if frontier <= self.restored_prefix:
             return False
         if frontier > len(self.full_tokens):
+            return False
+        if self.write_depth is not None and frontier > self.write_depth:
             return False
         if frontier in self._handled:
             return False
@@ -1301,6 +1317,7 @@ class FrontierWriter:
         self.write_seconds: list[float] = []
         self.refused_offset_mismatch = 0
         self.write_failures = 0
+        self.disabled = False
 
     def prefill_chunk_plan(self, default_step: int) -> list[int]:
         """Variable-step chunk plan that lands a callback on every frontier.
@@ -1358,6 +1375,11 @@ class FrontierWriter:
             self._capture(frontier)
 
     def _capture(self, frontier: int) -> None:
+        # A hard write fault (full or failing disk) disables the writer for
+        # the rest of the request: each later frontier would serialize an
+        # even larger snapshot into the same fault, all inside TTFT.
+        if self.disabled:
+            return
         # The cache classes' own offsets are the source of truth. Refuse the write
         # on any disagreement between the proposed frontier and the live offsets:
         # a non-frontier offset makes a write structurally impossible here.
@@ -1378,8 +1400,12 @@ class FrontierWriter:
                 session_cache_key=self.session_cache_key,
                 now=self._now_fn(),
             )
-        except Exception:  # noqa: BLE001 - a write fault never surfaces in a request
+        except Exception as e:  # noqa: BLE001 - a write fault never surfaces in a request
             self.write_failures += 1
+            self.disabled = True
+            log = getattr(self.store, "_log", _default_log)
+            log(f"[disk_kv] write failed token_count={frontier}; disabling "
+                f"checkpoint writes for this request: {e!r}")
             return
         # The budget path may skip an oversized payload (entry is None); it logged
         # its own reason and left nothing to record here.
@@ -1409,6 +1435,7 @@ DISK_KV_MODE_ENV = "MOESPRESSO_DISK_KV"
 DISK_KV_ROOT_ENV = "MOESPRESSO_DISK_KV_ROOT"
 DISK_KV_STRIDE_ENV = "MOESPRESSO_DISK_KV_STRIDE"
 DISK_KV_BYTES_ENV = "MOESPRESSO_DISK_KV_BYTES"
+DISK_KV_WRITE_DEPTH_ENV = "MOESPRESSO_DISK_KV_WRITE_DEPTH"
 
 DISK_KV_MODE_FRONTIER = "frontier"
 _DISK_KV_MODES_OFF = ("off", "0")
@@ -1423,8 +1450,16 @@ DISK_KV_BYTES_UNLIMITED = "unlimited"
 # A checkpoint set covering one long agent prompt runs to a few GiB, so the
 # default holds a handful of hot prefix regions without claiming a large
 # slice of the host disk.
+#
+# The write-depth cap bounds the cumulative-snapshot cost: each checkpoint
+# is a complete snapshot, so written bytes grow quadratically with region
+# depth while cross-session restores land in the shallow shared-prefix
+# region (an agent client's system prompt and tools). Capping writes at
+# 16k tokens keeps the whole shared-prefix win and drops the deep-tail
+# traffic that a long conversation would otherwise pay once per region.
 DEFAULT_DISK_KV_STRIDE = 1024
 DEFAULT_DISK_KV_BUDGET_BYTES = 8 * 1024**3
+DEFAULT_DISK_KV_WRITE_DEPTH = 16384
 
 
 @dataclass(frozen=True)
@@ -1445,6 +1480,9 @@ class DiskKVConfig:
     # payload bytes on disk; a write that would exceed it evicts least-recently-used
     # entries first. Zero and negative are refused at startup by config resolution.
     budget_bytes: int | None = None
+    # None means frontiers at any depth are written; a positive value writes
+    # only frontiers at or below this token depth.
+    write_depth_tokens: int | None = None
     explicit: bool = True
 
 
@@ -1532,9 +1570,15 @@ def resolve_disk_kv_config(
         default=(DEFAULT_DISK_KV_BUDGET_BYTES if package_dir is not None
                  else None),
     )
+    write_depth = _resolve_write_depth(
+        env.get(DISK_KV_WRITE_DEPTH_ENV),
+        default=(DEFAULT_DISK_KV_WRITE_DEPTH if package_dir is not None
+                 else None),
+    )
     return DiskKVConfig(
         enabled=True, root=resolved_root, stride=stride,
-        budget_bytes=budget_bytes, explicit=explicit)
+        budget_bytes=budget_bytes, write_depth_tokens=write_depth,
+        explicit=explicit)
 
 
 def _resolve_budget_bytes(raw: str | None, *,
@@ -1565,6 +1609,32 @@ def _resolve_budget_bytes(raw: str | None, *,
     if value < 0:
         raise DiskKVError(
             f"{DISK_KV_BYTES_ENV} must be positive or "
+            f"{DISK_KV_BYTES_UNLIMITED!r}, got {value}")
+    return value
+
+
+def _resolve_write_depth(raw: str | None, *,
+                         default: int | None = None) -> int | None:
+    """Read the checkpoint write-depth cap in tokens.
+
+    Absent means ``default`` (the serving path passes the bounded serving
+    default; direct callers keep unlimited). The literal ``unlimited``
+    writes frontiers at any depth. Zero and negative are refused: a store
+    that must not write is disabled with the mode flag, not a zero depth.
+    """
+    if raw is None:
+        return default
+    if raw == DISK_KV_BYTES_UNLIMITED:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise DiskKVError(
+            f"{DISK_KV_WRITE_DEPTH_ENV} must be an integer or "
+            f"{DISK_KV_BYTES_UNLIMITED!r}, got {raw!r}") from e
+    if value <= 0:
+        raise DiskKVError(
+            f"{DISK_KV_WRITE_DEPTH_ENV} must be positive or "
             f"{DISK_KV_BYTES_UNLIMITED!r}, got {value}")
     return value
 
@@ -1639,20 +1709,35 @@ def open_disk_store(config: DiskKVConfig) -> DiskCheckpointStore | None:
     load in serve startup, so a second owner is refused before the heavy load. On
     open the stale temp payloads of a crashed previous owner are cleaned up under
     the held lock.
+
+    Every open-time fault surfaces as ``DiskKVError``: an unwritable root,
+    a permission fault, or a corrupt index must land in the one exception
+    type the serve startup policy dispatches on (explicit stores refuse
+    startup, default-enabled stores degrade to memory-only serving).
     """
     if not config.enabled:
         return None
-    lock = DiskKVRootLock(config.root).acquire()
+    try:
+        lock = DiskKVRootLock(config.root).acquire()
+    except DiskKVError:
+        raise
+    except Exception as e:
+        raise DiskKVError(
+            f"disk KV root {config.root} cannot open: {e}") from e
     try:
         store = DiskCheckpointStore(
             config.root,
             root_lock=lock,
             stride=config.stride,
             budget_bytes=config.budget_bytes,
+            write_depth_tokens=config.write_depth_tokens,
         )
         store.cleanup_stale_temps()
         store.cleanup_orphan_payloads()
-    except Exception:
+    except Exception as e:
         lock.close()
-        raise
+        if isinstance(e, DiskKVError):
+            raise
+        raise DiskKVError(
+            f"disk KV store at {config.root} cannot open: {e}") from e
     return store

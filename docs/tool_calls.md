@@ -67,8 +67,13 @@ Failure handling is strict-parse-first:
 - Parsed argument values are typed against the request's tool schemas on
   every path: the Qwen XML parser types at parse time, and a DSML value
   whose `string` flag disagrees with the declared schema is coerced after
-  parse, so a client never receives `"5"` where the schema declares an
-  integer.
+  parse. Coercion is best-effort and fail-open: a value that cannot
+  coerce ships as parsed, because the client's own argument validation is
+  the final gate and its tool-error result feeds the model's retry, while
+  dropping the call to prose would end the turn. Such misses are counted
+  under `usage.moespresso.tool_call_coercion_misses`. Nullable union
+  types (`["integer", "null"]`) type against their non-null member and
+  accept the null literal.
 - Repair activity is reported per request under
   `usage.moespresso.tool_call_repair` (`fires`/`salvaged`/`failed`
   counters). A rising `failed` count is the alarm that the served dialect

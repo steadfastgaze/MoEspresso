@@ -411,11 +411,15 @@ class PrefixCacheGenerator:
         stride = getattr(store, "stride", None) if store is not None else None
         if store is None or stride is None:
             return None, {}
+        write_depth = getattr(store, "write_depth_tokens", None)
         # Cheap precheck: the smallest frontier this call could build is the first
         # stride multiple strictly above the restored prefix. If that exceeds the
-        # token count, no frontier is crossed and no tracker is built.
+        # token count or the write-depth cap, no frontier is crossed and no
+        # tracker is built.
         first_frontier = ((cached_tokens // stride) + 1) * stride
         if first_frontier > len(full_tokens):
+            return None, {}
+        if write_depth is not None and first_frontier > write_depth:
             return None, {}
 
         from moespresso.runtime.disk_kv import (
@@ -431,6 +435,7 @@ class PrefixCacheGenerator:
             full_tokens=list(full_tokens),
             scope=scope,
             already_written=store.has_entry,
+            write_depth=write_depth,
         )
         # Nothing eligible after the dedupe read: skip the writer entirely.
         if tracker.next_frontier_above(cached_tokens) is None:

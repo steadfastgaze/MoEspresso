@@ -854,6 +854,7 @@ def test_serve_default_disk_kv_opens_under_the_user_cache(
     assert str(tmp_path / "cache") in out
     assert "stride=1024" in out
     assert "budget=8GiB" in out
+    assert "write_depth=16384" in out
 
 
 def test_serve_degrades_when_default_disk_kv_cannot_open(
@@ -878,6 +879,32 @@ def test_serve_degrades_when_default_disk_kv_cannot_open(
     assert rc == 2
     out = capsys.readouterr().out
     assert "[serve] disk_kv=off (disk KV root is already locked)" in out
+    assert "FAILED: stop after the disk block" in out
+
+
+def test_serve_degrades_on_a_real_corrupt_default_store(
+        monkeypatch, capsys, tmp_path):
+    # Not a mocked DiskKVError: a corrupt index raises a raw JSON error
+    # inside the store, which must normalize into the degrade path.
+    from moespresso.runtime.disk_kv import default_disk_kv_root
+    import moespresso.runtime.http as h
+
+    monkeypatch.delenv("MOESPRESSO_DISK_KV", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    package_dir = tmp_path / "pkg"
+    root = default_disk_kv_root(
+        package_dir, {"XDG_CACHE_HOME": str(tmp_path / "cache")})
+    root.mkdir(parents=True)
+    (root / "index.json").write_text("not json", encoding="utf-8")
+
+    def fake_load_model(package_dir):
+        raise FileNotFoundError("stop after the disk block")
+
+    rc = h.serve(package_dir, load_model_fn=fake_load_model)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "[serve] disk_kv=off (disk KV store" in out
     assert "FAILED: stop after the disk block" in out
 
 

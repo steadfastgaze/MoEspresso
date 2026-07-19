@@ -55,8 +55,9 @@ GGUF recipe import -------------/
   in-memory prefix reuse.
 - [`ssd_streaming.md`](ssd_streaming.md): bounded expert residency, direct
   reads, slot pools, routed decode, and runtime controls.
-- [`disk_kv.md`](disk_kv.md): opt-in restart-warm prefix checkpoints and their
-  fail-closed restore contract.
+- [`disk_kv.md`](disk_kv.md): the default-on disk prefix-checkpoint tier
+  (restart-warm and cross-session resume) and its fail-closed restore
+  contract.
 
 ## Correctness and performance work
 

@@ -274,6 +274,75 @@ def test_non_object_tool_parameters_400():
             _tool_request(tools=[broken]), _generate_returning("x"))
 
 
+def test_malformed_schema_shapes_400():
+    for parameters, match in (
+        ({"properties": ["not", "a", "dict"]}, "properties"),
+        ({"properties": {"q": ["not a schema"]}}, "'q'"),
+        ({"properties": {"q": {"type": {"bad": True}}}}, "type"),
+    ):
+        tool = {"type": "function",
+                "function": {"name": "read", "parameters": parameters}}
+        with pytest.raises(http.RequestError, match=match):
+            http.chat_completion(
+                _tool_request(tools=[tool]), _generate_returning("x"))
+
+
+def test_nullable_union_schema_types_and_accepts_null():
+    # The standard nullable form a client emits; previously a TypeError.
+    nullable_tool = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "limit": {"type": ["integer", "null"]},
+                },
+            },
+        },
+    }
+    text = (
+        "t</think>\n<tool_call>\n<function=read>\n"
+        "<parameter=filePath>\nREADME.md\n</parameter>\n"
+        "<parameter=limit>\n5\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n"
+        "<parameter=filePath>\nDEVGUIDE.md\n</parameter>\n"
+        "<parameter=limit>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    response = http.chat_completion(
+        _tool_request(tools=[nullable_tool]), _generate_returning(text))
+    calls = response["choices"][0]["message"]["tool_calls"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "filePath": "README.md", "limit": 5}
+    assert json.loads(calls[1]["function"]["arguments"]) == {
+        "filePath": "DEVGUIDE.md", "limit": None}
+
+
+def test_coercion_misses_surface_in_usage():
+    text = (
+        f"<{DSML_TOKEN}tool_calls>\n"
+        f'<{DSML_TOKEN}invoke name="read">\n'
+        f'<{DSML_TOKEN}parameter name="filePath" string="true">a.md'
+        f"</{DSML_TOKEN}parameter>\n"
+        f'<{DSML_TOKEN}parameter name="limit" string="true">many'
+        f"</{DSML_TOKEN}parameter>\n"
+        f"</{DSML_TOKEN}invoke>\n"
+        f"</{DSML_TOKEN}tool_calls>"
+    )
+    response = http.chat_completion(
+        _tool_request(),
+        _generate_returning("t</think>\n" + text,
+                            prompt_tokens=5, completion_tokens=5),
+        tool_config=http.ToolCallConfig(dialect="dsml"))
+    calls = response["choices"][0]["message"]["tool_calls"]
+    # Fail-open: the unparseable integer ships as its parsed string.
+    assert json.loads(calls[0]["function"]["arguments"])["limit"] == "many"
+    assert response["usage"]["moespresso"]["tool_call_coercion_misses"] == 1
+
+
 def test_non_streaming_tool_request_skips_per_token_callback():
     seen = {}
 

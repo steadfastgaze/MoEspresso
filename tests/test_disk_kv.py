@@ -368,6 +368,104 @@ def test_resolve_config_unlimited_budget_literal(tmp_path):
     assert cfg.budget_bytes is None
 
 
+def test_resolve_config_write_depth_defaults_and_overrides(tmp_path):
+    from moespresso.runtime.disk_kv import DEFAULT_DISK_KV_WRITE_DEPTH
+
+    env = {"XDG_CACHE_HOME": str(tmp_path / "cache")}
+    assert resolve_disk_kv_config(
+        env, package_dir=tmp_path / "pkg"
+    ).write_depth_tokens == DEFAULT_DISK_KV_WRITE_DEPTH
+    assert resolve_disk_kv_config(
+        {**env, "MOESPRESSO_DISK_KV_WRITE_DEPTH": "4096"},
+        package_dir=tmp_path / "pkg").write_depth_tokens == 4096
+    assert resolve_disk_kv_config(
+        {**env, "MOESPRESSO_DISK_KV_WRITE_DEPTH": "unlimited"},
+        package_dir=tmp_path / "pkg").write_depth_tokens is None
+    explicit = resolve_disk_kv_config({
+        "MOESPRESSO_DISK_KV": "frontier",
+        "MOESPRESSO_DISK_KV_ROOT": str(tmp_path),
+        "MOESPRESSO_DISK_KV_STRIDE": "1024",
+    })
+    assert explicit.write_depth_tokens is None
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(DiskKVError, match="WRITE_DEPTH"):
+            resolve_disk_kv_config(
+                {**env, "MOESPRESSO_DISK_KV_WRITE_DEPTH": bad},
+                package_dir=tmp_path / "pkg")
+
+
+def test_tracker_write_depth_caps_proposed_frontiers():
+    from moespresso.runtime.disk_kv import FrontierTracker
+
+    tracker = FrontierTracker(
+        stride=1024,
+        restored_prefix=0,
+        full_tokens=list(range(5000)),
+        scope={"k": "v"},
+        write_depth=2048,
+    )
+    assert tracker.crossings_up_to(5000) == [1024, 2048]
+    assert tracker.next_frontier_above(2048) is None
+
+
+def test_open_disk_store_normalizes_raw_failures(tmp_path):
+    from moespresso.runtime.disk_kv import open_disk_store
+
+    corrupt = tmp_path / "corrupt-root"
+    corrupt.mkdir()
+    (corrupt / "index.json").write_text("not json", encoding="utf-8")
+    with pytest.raises(DiskKVError, match="cannot open"):
+        open_disk_store(DiskKVConfig(
+            enabled=True, root=corrupt, stride=1024))
+
+    unwritable_parent = tmp_path / "sealed"
+    unwritable_parent.mkdir()
+    unwritable_parent.chmod(0o500)
+    try:
+        with pytest.raises(DiskKVError, match="cannot open"):
+            open_disk_store(DiskKVConfig(
+                enabled=True, root=unwritable_parent / "root", stride=1024))
+    finally:
+        unwritable_parent.chmod(0o700)
+
+
+def test_frontier_writer_disables_after_first_hard_failure():
+    from moespresso.runtime.disk_kv import FrontierTracker, FrontierWriter
+
+    class _FailingStore:
+        def __init__(self):
+            self.attempts = 0
+            self.logged: list[str] = []
+
+        def _log(self, line: str) -> None:
+            self.logged.append(line)
+
+        def write_checkpoint(self, *args, **kwargs):
+            self.attempts += 1
+            raise OSError("disk full")
+
+    class _Cache:
+        offset = 1024
+        state = ["state"]
+        meta_state = ["meta"]
+
+    tracker = FrontierTracker(
+        stride=1024, restored_prefix=0,
+        full_tokens=list(range(4097)), scope={"k": "v"})
+    store = _FailingStore()
+    writer = FrontierWriter(store, tracker=tracker, caches=[_Cache()])
+    writer.on_prompt_progress(1024, 4097)
+    cache = _Cache()
+    cache.offset = 2048
+    writer.caches = [cache]
+    writer.on_prompt_progress(2048, 4097)
+
+    assert store.attempts == 1
+    assert writer.disabled is True
+    assert writer.write_failures == 1
+    assert any("disabling checkpoint writes" in line for line in store.logged)
+
+
 def test_open_disk_store_off_returns_none():
     assert open_disk_store(DiskKVConfig(enabled=False)) is None
 
