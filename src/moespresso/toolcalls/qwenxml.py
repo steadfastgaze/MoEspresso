@@ -202,6 +202,11 @@ def _decode_value(value: str, declared, tool_name: str, key: str):
     if nullable and value == "null":
         return None
     if not members:
+        if nullable:
+            # A null-only type accepts exactly the null literal.
+            raise ToolCallParseError(
+                f"{tool_name}: parameter {key!r} must be null, got "
+                f"{value[:80]!r}")
         return value
     typed = [m for m in members if m in _JSON_TYPES and m != "string"]
     if typed:

@@ -416,6 +416,8 @@ class PrefixCacheGenerator:
         stride = getattr(store, "stride", None) if store is not None else None
         if store is None or stride is None:
             return None, {}
+        if getattr(store, "writes_disabled", False):
+            return None, {}
         write_depth = getattr(store, "write_depth_tokens", None)
         # Cheap precheck: the smallest frontier this call could build is the first
         # stride multiple strictly above the restored prefix. If that exceeds the

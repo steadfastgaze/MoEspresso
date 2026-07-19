@@ -732,6 +732,11 @@ class DiskCheckpointStore:
         self.writes = 0
         self.evictions = 0
         self.quarantines = 0
+        # Set on a confirmed index fault; the writer precheck consults it so
+        # a corrupt index cannot trigger one payload serialization per
+        # request until the store reopens. Restores keep their own
+        # normalized fallback to cold serving.
+        self.writes_disabled = False
         self._closed = False
 
     def close(self) -> None:
@@ -744,8 +749,27 @@ class DiskCheckpointStore:
             if self.root_lock is not None:
                 self.root_lock.close()
 
+    def disable_writes(self, reason: str) -> None:
+        """Stop checkpoint writes until the store reopens, logging once."""
+        if self.writes_disabled:
+            return
+        self.writes_disabled = True
+        self._log(f"[disk_kv] writes disabled until restart: {reason}")
+
     def stats(self, *, last_event: str | None = None) -> dict:
-        entries = self.index.entries()
+        try:
+            entries = self.index.entries()
+        except Exception as e:  # noqa: BLE001 - health must not fail on the index
+            return {
+                "enabled": True,
+                "root": str(self.root),
+                "error": f"index unreadable: {e}",
+                "writes_disabled": self.writes_disabled,
+                "restores": self.restores,
+                "writes": self.writes,
+                "evictions": self.evictions,
+                "quarantines": self.quarantines,
+            }
         return {
             "enabled": True,
             "root": str(self.root),
@@ -753,6 +777,7 @@ class DiskCheckpointStore:
             "entries": len(entries),
             "payload_bytes": sum(entry.payload_bytes for entry in entries),
             "budget_bytes": self.budget_bytes,
+            "writes_disabled": self.writes_disabled,
             "restores": self.restores,
             "writes": self.writes,
             "evictions": self.evictions,
@@ -937,7 +962,8 @@ class DiskCheckpointStore:
         target = (scope_hash(scope), len(tokens), token_prefix_hash(tokens))
         try:
             entries = self.index.entries()
-        except Exception:  # noqa: BLE001 - planning must not surface a fault
+        except Exception as e:  # noqa: BLE001 - planning must not surface a fault
+            self.disable_writes(f"index unreadable: {e!r}")
             return False
         for entry in entries:
             if (entry.scope_hash, entry.token_count, entry.token_prefix_hash) == target:
@@ -1033,17 +1059,22 @@ class DiskCheckpointStore:
             safety_metadata=safety_metadata,
         )
         entry = replace(entry, payload_path=payload_path, payload_bytes=payload_bytes)
-        if not self._evict_to_fit(payload_bytes, keep_id=cache_id):
-            _delete_file(self.root / payload_path)
-            self._log(
-                f"[disk_kv] skip reason=budget token_count={len(tokens)} "
-                f"bytes={payload_bytes} budget={self.budget_bytes}")
-            return None
+        # Eviction and the index append both walk the index; either failing
+        # must delete the finished payload (an unindexed payload is invisible
+        # to the budget and survives as an orphan until the next open) and
+        # stop further writes, which would re-serialize into the same fault.
         try:
+            if not self._evict_to_fit(payload_bytes, keep_id=cache_id):
+                _delete_file(self.root / payload_path)
+                self._log(
+                    f"[disk_kv] skip reason=budget token_count={len(tokens)} "
+                    f"bytes={payload_bytes} budget={self.budget_bytes}")
+                return None
             self.index.put(entry)
-        except Exception:
+        except Exception as e:
             _delete_file(self.root / payload_path)
-            raise
+            self.disable_writes(f"index fault during write: {e!r}")
+            raise DiskKVError(f"disk KV checkpoint write failed: {e}") from e
         self.writes += 1
         self._log(
             f"[disk_kv] write token_count={len(tokens)} bytes={payload_bytes}")

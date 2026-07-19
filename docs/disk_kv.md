@@ -197,6 +197,14 @@ cold prefill because only the suffix is prefilled.
   write attempts for that request, because each later frontier would
   serialize an even larger snapshot into the same fault. The request itself
   completes normally; the next request tries again.
+- Index faults disable writes until restart. A confirmed index fault (a
+  corrupt index file, a failing index write) logs one line, deletes any
+  finished payload the fault interrupted, and stops checkpoint writes for
+  the store's lifetime, so a broken index cannot cost one payload
+  serialization per request. Restores keep falling back to cold serving,
+  and the `/health` disk block reports the fault (`error`,
+  `writes_disabled`) without failing the endpoint. Reopening the store (a
+  server restart) retries; startup cleanup removes any orphaned payloads.
 - Visibility. One operator log line prints on the serve stderr for each checkpoint
   decision (write, skip with reason, write failure, restore, quarantine). The `/health` endpoint's
   `prompt_cache` block carries a `disk` sub-block with the store's counters since

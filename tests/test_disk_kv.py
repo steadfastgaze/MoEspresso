@@ -447,6 +447,56 @@ def test_restore_normalizes_a_corrupt_index_to_diskkverror(tmp_path):
             registry=default_cache_registry(),
         )
     assert store.has_entry(scope, list(range(600))) is False
+    # A confirmed index fault stops writes until the store reopens, and
+    # the health snapshot degrades instead of raising.
+    assert store.writes_disabled is True
+    stats = store.stats()
+    assert stats["enabled"] is True
+    assert "index unreadable" in stats["error"]
+    assert stats["writes_disabled"] is True
+
+
+def test_write_checkpoint_cleans_payload_and_disables_on_index_fault(tmp_path):
+    from moespresso.runtime.disk_kv import (
+        DiskCheckpointStore,
+        build_cache_scope,
+    )
+
+    def fake_save(root, cache_id, **kwargs):
+        rel = f"{cache_id}.safetensors"
+        (root / rel).write_bytes(b"x" * 128)
+        return rel, 128
+
+    store = DiskCheckpointStore(
+        tmp_path, save_payload_fn=fake_save, stride=256,
+        budget_bytes=1024 * 1024)
+    (tmp_path / "index.json").write_text("not json", encoding="utf-8")
+    scope = build_cache_scope(
+        ("pkg", "render", "raw", 64, 0, "mlx_prompt_cache"), ("KVCache",))
+
+    with pytest.raises(DiskKVError, match="checkpoint write failed"):
+        store.write_checkpoint(
+            scope, [1, 2, 3],
+            cache_state_trees=[],
+            meta_state_trees=[],
+            cache_class_names=("KVCache",),
+            reason="aligned_frontier",
+        )
+
+    # The finished payload is deleted, not orphaned, and further requests
+    # skip serialization entirely.
+    assert [p for p in tmp_path.glob("*.safetensors")] == []
+    assert store.writes_disabled is True
+
+
+def test_disabled_store_writer_precheck(tmp_path):
+    from moespresso.runtime.disk_kv import DiskCheckpointStore
+
+    store = DiskCheckpointStore(tmp_path, stride=256)
+    store.disable_writes("index unreadable: test")
+    stats = store.stats()
+    assert stats["writes_disabled"] is True
+    assert "error" not in stats
 
 
 def test_frontier_writer_disables_after_first_hard_failure():

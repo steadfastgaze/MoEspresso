@@ -285,13 +285,13 @@ def _request_tools(request: dict) -> list[dict] | None:
                 declared = prop.get("type")
                 if declared is None or isinstance(declared, str):
                     continue
-                if (isinstance(declared, list)
+                if (isinstance(declared, list) and declared
                         and all(isinstance(t, str) for t in declared)):
                     continue
                 raise RequestError(
                     400,
                     f"tools[{index}] property {property_name!r} type must "
-                    f"be a string or a list of strings")
+                    f"be a string or a non-empty list of strings")
     choice = request.get("tool_choice")
     if choice in (None, "auto"):
         return tools

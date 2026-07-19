@@ -188,6 +188,9 @@ def coerce_arguments(arguments: dict, schema: dict) -> tuple[dict, int]:
         if nullable and value is None:
             continue
         if not members:
+            if nullable:
+                # A non-null value under a null-only type cannot coerce.
+                misses += 1
             continue
         if _matches_union(value, members):
             continue

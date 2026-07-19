@@ -658,6 +658,35 @@ def test_a_raising_disk_store_cold_serves_instead_of_surfacing():
     assert any("cold serving" in line for line in logged)
 
 
+def test_a_write_disabled_store_builds_no_writer():
+    # After a confirmed index fault the store flags writes_disabled; the
+    # writer precheck must then skip serialization entirely on every
+    # request instead of paying one doomed payload write per request.
+    full = list(range(1, 401))
+    seen = {}
+
+    class _DisabledDiskStore(_FakeDiskStore):
+        writes_disabled = True
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen["has_plan"] = "prefill_plan" in kwargs
+        return GenerationResult(text="ok", prompt_cache=kwargs["prompt_cache"])
+
+    gen = PrefixCacheGenerator(
+        "MODEL", _FakeTokenizer(full), {"artifact_id": "pkg"}, _FakeStore(),
+        make_prompt_cache_fn=lambda model: ["fresh"],
+        generate_fn=fake_generate,
+        disk_store=_DisabledDiskStore(stride=256),
+    )
+    result = gen(
+        "rendered prompt",
+        kv_policy=parse_kv_policy({"live_kv_format": "raw"}),
+        effective_rendering_id="render-id",
+    )
+    assert result.text == "ok"
+    assert seen["has_plan"] is False
+
+
 def test_frontier_writer_kwargs_carry_a_variable_step_plan_on_an_unaligned_hit():
     full = list(range(1, 701))
     tok = _FakeTokenizer(full)

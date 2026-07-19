@@ -250,3 +250,17 @@ def test_union_without_string_member_still_raises_on_mismatch():
     )
     with pytest.raises(ToolCallParseError, match="integer"):
         parse_qwenxml_tool_calls(content, UNION_SCHEMAS)
+
+
+def test_null_only_type_accepts_exactly_the_null_literal():
+    schemas = {"read": {"properties": {"marker": {"type": "null"}}}}
+    content = (
+        "<tool_call>\n<function=read>\n"
+        "<parameter=marker>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert parse_qwenxml_tool_calls(content, schemas)[0].arguments == {
+        "marker": None}
+    bad = content.replace("null", "anything")
+    with pytest.raises(ToolCallParseError, match="must be null"):
+        parse_qwenxml_tool_calls(bad, schemas)
