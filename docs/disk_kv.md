@@ -203,10 +203,16 @@ cold prefill because only the suffix is prefilled.
   write, or the health snapshot) logs one line, deletes any finished
   payload the fault interrupted, and stops checkpoint writes for the
   store's lifetime, with the writer refusing before payload serialization,
-  so a broken index cannot cost payload serializations on later requests. Restores keep falling back to cold serving,
-  and the `/health` disk block reports the fault (`error`,
-  `writes_disabled`) without failing the endpoint. Reopening the store (a
-  server restart) retries; startup cleanup removes any orphaned payloads.
+  so a broken index cannot cost payload serializations on later requests.
+  Restores keep falling back to cold serving, and the `/health` disk block
+  reports the fault without failing the endpoint: `error` when the index
+  is unreadable, and `writes_disabled` with `writes_disabled_reason`
+  whenever writes are off. A quarantine that cannot mutate the index (a
+  readable index on an unwritable disk) is itself a confirmed fault: the
+  store disables writes, keeps the caller's original restore error, and
+  remembers the entry as dead so later requests never re-load the
+  rejected payload. Reopening the store (a server restart) retries;
+  startup cleanup removes any orphaned payloads.
 - Visibility. One operator log line prints on the serve stderr for each checkpoint
   decision (write, skip with reason, write failure, restore, quarantine). The `/health` endpoint's
   `prompt_cache` block carries a `disk` sub-block with the store's counters since

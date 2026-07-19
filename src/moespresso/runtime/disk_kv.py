@@ -735,8 +735,12 @@ class DiskCheckpointStore:
         # Set on a confirmed index fault; the writer precheck consults it so
         # a corrupt index cannot trigger one payload serialization per
         # request until the store reopens. Restores keep their own
-        # normalized fallback to cold serving.
+        # normalized fallback to cold serving. Entries whose quarantine
+        # could not mutate the index are remembered here so later requests
+        # never re-load a known-bad payload.
         self.writes_disabled = False
+        self._writes_disabled_reason: str | None = None
+        self._dead_cache_ids: set[str] = set()
         self._closed = False
 
     def close(self) -> None:
@@ -750,10 +754,15 @@ class DiskCheckpointStore:
                 self.root_lock.close()
 
     def disable_writes(self, reason: str) -> None:
-        """Stop checkpoint writes until the store reopens, logging once."""
+        """Stop checkpoint writes until the store reopens, logging once.
+
+        The first reason is retained for the health snapshot, so a disabled
+        store is diagnosable from ``/health`` without reading serve logs.
+        """
         if self.writes_disabled:
             return
         self.writes_disabled = True
+        self._writes_disabled_reason = reason
         self._log(f"[disk_kv] writes disabled until restart: {reason}")
 
     def stats(self, *, last_event: str | None = None) -> dict:
@@ -766,12 +775,13 @@ class DiskCheckpointStore:
                 "root": str(self.root),
                 "error": f"index unreadable: {e}",
                 "writes_disabled": self.writes_disabled,
+                "writes_disabled_reason": self._writes_disabled_reason,
                 "restores": self.restores,
                 "writes": self.writes,
                 "evictions": self.evictions,
                 "quarantines": self.quarantines,
             }
-        return {
+        out = {
             "enabled": True,
             "root": str(self.root),
             "stride": self.stride,
@@ -788,6 +798,9 @@ class DiskCheckpointStore:
             ),
             "last_event": last_event,
         }
+        if self.writes_disabled:
+            out["writes_disabled_reason"] = self._writes_disabled_reason
+        return out
 
     def find_longest(self, scope: dict, tokens: list[int]) -> DiskKVEntry | None:
         return self.index.find_longest(scope, tokens)
@@ -821,6 +834,11 @@ class DiskCheckpointStore:
             self.disable_writes(f"index unreadable: {e!r}")
             raise DiskKVError(f"disk KV index lookup failed: {e}") from e
         if entry is None:
+            return None
+        if entry.cache_id in self._dead_cache_ids:
+            # A previous quarantine could not drop this entry from the
+            # index; treating it as absent avoids re-loading a payload the
+            # store already rejected.
             return None
         try:
             state_trees, meta_state_trees, metadata = self.load_payload_fn(
@@ -887,19 +905,33 @@ class DiskCheckpointStore:
         return caches
 
     def quarantine(self, entry: DiskKVEntry, *, reason: str = "invalid") -> None:
-        """Drop an invalid index entry and move its payload aside if present."""
-        self.index.remove(entry)
-        self.quarantines += 1
-        self._log(f"[disk_kv] quarantine reason={reason}")
-        payload = self.root / entry.payload_path
-        if not payload.exists():
-            return
-        quarantine_dir = self.root / "quarantine"
-        quarantine_dir.mkdir(parents=True, exist_ok=True)
-        target = quarantine_dir / payload.name
-        if target.exists():
-            target = quarantine_dir / f"{entry.cache_id}.{int(time.time())}.safetensors"
-        shutil.move(str(payload), str(target))
+        """Drop an invalid index entry and move its payload aside, best effort.
+
+        Quarantine runs inside restore failure handling and never raises: a
+        quarantine that cannot mutate the index (a readable index on an
+        unwritable or full disk) keeps the caller's original error intact,
+        disables writes, and marks the entry dead for the store's lifetime,
+        so later requests never re-load the known-bad payload.
+        """
+        self._dead_cache_ids.add(entry.cache_id)
+        try:
+            self.index.remove(entry)
+            self.quarantines += 1
+            self._log(f"[disk_kv] quarantine reason={reason}")
+            payload = self.root / entry.payload_path
+            if not payload.exists():
+                return
+            quarantine_dir = self.root / "quarantine"
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            target = quarantine_dir / payload.name
+            if target.exists():
+                target = quarantine_dir / f"{entry.cache_id}.{int(time.time())}.safetensors"
+            shutil.move(str(payload), str(target))
+        except Exception as e:  # noqa: BLE001 - never mask the restore error
+            self.disable_writes(f"index fault during quarantine: {e!r}")
+            self._log(
+                f"[disk_kv] quarantine failed; entry ignored until restart: "
+                f"{e!r}")
 
     def cleanup_stale_temps(self) -> list[str]:
         """Delete leftover ``.tmp.safetensors`` files under the startup lock.

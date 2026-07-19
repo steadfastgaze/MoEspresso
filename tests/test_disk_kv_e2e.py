@@ -18,6 +18,7 @@ from mlx_lm.models.cache import make_prompt_cache  # noqa: E402
 
 from moespresso.runtime.disk_kv import (  # noqa: E402
     DiskCheckpointStore,
+    DiskKVError,
     DiskKVInvalidPayload,
     DiskKVMetadataMismatch,
     FrontierTracker,
@@ -203,6 +204,48 @@ def test_mark_used_failure_keeps_the_validated_restore(tmp_path):
     # A failing LRU touch is an index write fault: later checkpoint
     # attempts would hit the same fault, so writes stop until reopen.
     assert store.writes_disabled is True
+
+
+def test_failed_quarantine_disables_writes_and_marks_the_entry_dead(tmp_path):
+    # Readable index on an unwritable root: payload validation fails, the
+    # quarantine cannot rewrite the index, and the store must keep the
+    # original restore error, disable writes, and never re-load the
+    # known-bad payload on later requests.
+    loads = []
+
+    def counting_load(root, rel):
+        loads.append(rel)
+        return load_prompt_cache_payload(root, rel)
+
+    store = DiskCheckpointStore(tmp_path, load_payload_fn=counting_load)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    entry = _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+
+    payload = tmp_path / entry.payload_path
+    with open(payload, "r+b") as fh:
+        fh.truncate(payload.stat().st_size // 2)
+
+    tmp_path.chmod(0o500)
+    try:
+        with pytest.raises(DiskKVError):
+            store.restore(
+                scope, list(range(600)),
+                make_cache_fn=lambda: [_kv_cache_empty()],
+                registry=default_cache_registry(),
+            )
+        assert store.writes_disabled is True
+        assert len(loads) == 1
+        assert store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [_kv_cache_empty()],
+            registry=default_cache_registry(),
+        ) is None
+        assert len(loads) == 1
+    finally:
+        tmp_path.chmod(0o700)
+    stats = store.stats()
+    assert stats["writes_disabled"] is True
+    assert "quarantine" in stats["writes_disabled_reason"]
 
 
 def test_restore_refuses_class_list_the_registry_does_not_know(tmp_path):

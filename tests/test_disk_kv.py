@@ -562,6 +562,7 @@ def test_disabled_store_writer_precheck(tmp_path):
     store.disable_writes("index unreadable: test")
     stats = store.stats()
     assert stats["writes_disabled"] is True
+    assert stats["writes_disabled_reason"] == "index unreadable: test"
     assert "error" not in stats
 
 
