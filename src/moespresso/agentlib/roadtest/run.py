@@ -402,6 +402,10 @@ class RoadtestRun:
             request_kwargs["tools"] = self.tools
             request_kwargs["chat_template_kwargs"] = (
                 self.config.loop.chat_template_kwargs())
+        # The road-test parses dialect emissions client-side (that is the
+        # instrument), so every request opts out of served tool-call
+        # parsing and reads the raw completion text.
+        request_kwargs.setdefault("verbatim_tool_calls", True)
         messages = conversation.request_messages()
         previous = self._last_sent[session]
         if previous is not None and not is_list_prefix(previous, messages):

@@ -89,6 +89,7 @@ class CompletionsClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stream: bool | None = None,
+        verbatim_tool_calls: bool = False,
         on_start: Callable[[], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         on_content: Callable[[str], None] | None = None,
@@ -97,7 +98,10 @@ class CompletionsClient:
 
         Accepts a ``Conversation`` (its messages and session cache key are
         used; an explicit ``session_cache_key`` argument wins) or a plain
-        message list.
+        message list. ``verbatim_tool_calls`` sends
+        ``metadata.moespresso_tool_calls: "verbatim"``, opting the request
+        out of served tool-call parsing so the completion text carries the
+        raw dialect emission; the client-side dialect parsers depend on it.
         """
         if isinstance(conversation, Conversation):
             messages = conversation.request_messages()
@@ -109,8 +113,13 @@ class CompletionsClient:
         body: dict = {"messages": messages}
         if self.model is not None:
             body["model"] = self.model
+        metadata: dict = {}
         if session_cache_key is not None:
-            body["metadata"] = {"moespresso_cache_key": session_cache_key}
+            metadata["moespresso_cache_key"] = session_cache_key
+        if verbatim_tool_calls:
+            metadata["moespresso_tool_calls"] = "verbatim"
+        if metadata:
+            body["metadata"] = metadata
         if tools is not None:
             body["tools"] = tools
         if response_format is not None:

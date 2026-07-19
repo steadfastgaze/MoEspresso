@@ -103,6 +103,8 @@ def run_episode(client, dialect, registry: ToolRegistry, episode: Episode,
     last_answer = ""
     started = time.monotonic()
     for step in range(1, episode.max_steps + 1):
+        # The study measures text dialects client-side; the verbatim flag
+        # keeps the serve layer from parsing the emission first.
         completion = client.complete(
             conversation,
             tools=dialect.request_tools(registry),
@@ -110,6 +112,7 @@ def run_episode(client, dialect, registry: ToolRegistry, episode: Episode,
             top_p=config.top_p,
             max_tokens=config.max_tokens,
             chat_template_kwargs=dict(THINKING_KWARGS),
+            verbatim_tool_calls=True,
         )
         record["requests"] += 1
         usage = completion.usage or {}

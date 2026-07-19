@@ -109,12 +109,23 @@ def render_tools(tools: list[dict]) -> str:
     )
 
 
-def encode_arguments_to_dsml(tool_call: dict[str, str]) -> str:
-    """Encode OpenAI function arguments into DSML parameter tags."""
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception:
-        arguments = {"arguments": tool_call["arguments"]}
+def encode_arguments_to_dsml(tool_call: dict) -> str:
+    """Encode OpenAI function arguments into DSML parameter tags.
+
+    ``arguments`` may be a decoded object or the OpenAI wire shape (a JSON
+    string). Anything that does not decode to an object renders as a
+    single ``arguments`` parameter carrying the raw value.
+    """
+    raw = tool_call["arguments"]
+    if isinstance(raw, dict):
+        arguments = raw
+    else:
+        try:
+            arguments = json.loads(raw)
+        except Exception:
+            arguments = {"arguments": raw}
+        if not isinstance(arguments, dict):
+            arguments = {"arguments": raw}
 
     parts = []
     for key, value in arguments.items():
@@ -146,9 +157,6 @@ def render_dsml_tool_calls(tool_calls: list[dict]) -> str:
     the dialect it emitted them in.
     """
     converted = _tool_calls_from_openai_format(tool_calls)
-    for entry in converted:
-        if not isinstance(entry["arguments"], str):
-            entry["arguments"] = _to_json(entry["arguments"])
     calls = [
         f'<{DSML_TOKEN}invoke name="{tc.get("name")}">\n'
         f"{encode_arguments_to_dsml(tc)}\n"

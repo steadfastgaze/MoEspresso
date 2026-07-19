@@ -1,11 +1,11 @@
 # Served tool calls
 
-The HTTP layer implements the OpenAI tools contract end to end. A request
-carries `tools` (JSON schemas). The render layer teaches the model a text
-dialect for invoking them. The model emits an invocation as marked-up text.
-The serve layer parses that text back into structured `tool_calls` entries
-and reports `finish_reason: "tool_calls"`. The client never sees the
-dialect; it sends JSON and receives JSON.
+The HTTP layer implements the OpenAI tools contract end to end. The render
+layer turns a request's `tools` schemas into dialect instructions inside
+the prompt, and the serve layer parses the model's marked-up emission back
+into structured `tool_calls` entries with `finish_reason: "tool_calls"`.
+The dialect text exists only between the server and the model; a client
+works with ordinary OpenAI JSON on both legs.
 
 ## Dialects
 
@@ -92,9 +92,11 @@ byte-identical.
 
 Per server process, resolved at startup and printed as a `[serve]` line:
 
-1. `MOESPRESSO_TOOL_CALLS=0` disables served tool-call parsing entirely
-   (tool markup returns verbatim as content). `MOESPRESSO_TOOL_REPAIR=0`
-   keeps parsing strict-only. Both default on.
+1. `MOESPRESSO_TOOL_CALLS=0` disables served tool-call handling entirely:
+   tools render exactly as sent, tool markup returns verbatim as content,
+   and the pre-parsing request contract applies (every message needs a
+   content key, `tool_choice` is not interpreted).
+   `MOESPRESSO_TOOL_REPAIR=0` keeps parsing strict-only. Both default on.
 2. `--tool-dialect native|dsml` selects explicitly.
 3. Otherwise the package's `agentic_profile.json` dialect of record
    applies (`dsml` for the Ornith family, from the recorded dialect
@@ -109,5 +111,18 @@ trained format can bleed through, and catching it costs nothing. Tool
 results still travel as `role: "tool"` messages either way.
 
 `tool_choice` accepts `auto` (default behavior) and `none` (tools are
-withheld from the render). A forced function selection is refused with a
-400 rather than accepted and not enforced.
+withheld from the render; note that flipping between `none` and `auto`
+inside one session changes the system region and costs a prefix re-render
+on that turn). A forced function selection is refused with a 400 rather
+than accepted and not enforced.
+
+## Per-request verbatim mode
+
+`metadata.moespresso_tool_calls: "verbatim"` opts a single request out of
+every served tool-call behavior: tools render exactly as sent, the
+completion text returns unparsed, and the pre-parsing request contract
+applies. The agent library's client exposes it as
+`complete(..., verbatim_tool_calls=True)`. The road-test and the dialect
+study send it on every request, because those instruments measure the raw
+text dialect client-side; without the flag the serve layer would parse the
+emission first and the instrument would read empty content.

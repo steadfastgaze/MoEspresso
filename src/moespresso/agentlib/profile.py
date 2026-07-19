@@ -30,8 +30,12 @@ from pathlib import Path
 from moespresso.agentlib.loop_policy import ToolNudgePolicy
 from moespresso.agentlib.sandbox import default_config_path
 
-AGENTIC_PROFILE_NAME = "agentic_profile.json"
-SUPPORTED_SCHEMA_VERSION = 1
+# One schema constant governs every reader of the sidecar: the package
+# module that writes it, the serve layer, and this client loader.
+from moespresso.package.agentic_profile import (
+    AGENTIC_PROFILE_NAME,
+    SCHEMA_VERSION as SUPPORTED_SCHEMA_VERSION,
+)
 
 SAMPLING_KEYS = frozenset({
     "temperature", "top_p", "top_k", "min_p",

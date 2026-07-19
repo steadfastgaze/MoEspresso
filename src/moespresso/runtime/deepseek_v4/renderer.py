@@ -14,10 +14,12 @@ from typing import Any
 
 # The DSML grammar (token, tools instruction block, serializers) lives in
 # moespresso.toolcalls.dsml so the parse side and other families share it.
-# DSML_TOKEN and render_tools stay re-exported here as part of the renderer's
-# public surface.
+# The grammar names stay re-exported here as part of the renderer's public
+# surface.
 from moespresso.toolcalls.dsml import (  # noqa: F401 (re-exported)
     DSML_TOKEN,
+    TOOLS_TEMPLATE,
+    encode_arguments_to_dsml,
     render_dsml_tool_calls,
     render_tools,
 )

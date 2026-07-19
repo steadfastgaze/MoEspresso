@@ -173,6 +173,71 @@ def resolve_tool_call_config(
     return ToolCallConfig(dialect=resolved, repair=repair_enabled)
 
 
+def _request_tool_calls_mode(request: dict) -> str | None:
+    """Read the optional per-request served tool-call mode from metadata.
+
+    ``metadata.moespresso_tool_calls: "verbatim"`` opts one request out of
+    served tool-call handling: tools render exactly as sent, the completion
+    text returns unparsed, and the pre-parsing request contract applies.
+    Engineering harnesses that measure text dialects client-side use it so
+    the instrument keeps reading raw emissions. Any other value is a
+    malformed request.
+    """
+    metadata = request.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    mode = metadata.get("moespresso_tool_calls")
+    if mode is None:
+        return None
+    if mode != "verbatim":
+        raise RequestError(
+            400, "metadata.moespresso_tool_calls supports only 'verbatim'")
+    return mode
+
+
+def _validate_history_tool_calls(tool_calls) -> None:
+    """Refuse assistant history tool_calls the render cannot express."""
+    if not isinstance(tool_calls, list):
+        raise RequestError(400, "assistant tool_calls must be a list")
+    for index, entry in enumerate(tool_calls):
+        function = entry.get("function") if isinstance(entry, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            raise RequestError(
+                400,
+                f"tool_calls[{index}] needs a function object with a name")
+
+
+def _served_tool_plan(
+    config: ToolCallConfig,
+    *,
+    ds4: bool,
+    tools: list[dict] | None,
+    tool_shaped: bool,
+) -> tuple[bool, tuple | None, str | None]:
+    """Resolve one request's served dialect facts in a single place.
+
+    Returns ``(swap_active, parse_dialects, identity_dialect)``. The taught
+    dialect and the parse-back dialect list are two views of one decision,
+    so they resolve together. DS4 always speaks DSML (the renderer owns
+    it). A template family under the DSML selection is taught DSML and
+    parsed as DSML first, with the family's trained native XML second
+    because that format can still bleed through. Native parses the
+    template's own XML. ``identity_dialect`` names the non-native dialect
+    a tool-shaped request renders under, for the rendering identity.
+    """
+    swap_active = (
+        not ds4 and tool_shaped and config.dialect == TOOL_DIALECT_DSML)
+    identity_dialect = TOOL_DIALECT_DSML if swap_active else None
+    if tools is None:
+        return swap_active, None, identity_dialect
+    if ds4:
+        return False, (DSML_DIALECT,), None
+    if swap_active:
+        return True, (DSML_DIALECT, QWENXML_DIALECT), identity_dialect
+    return False, (QWENXML_DIALECT,), None
+
+
 def _request_tools(request: dict) -> list[dict] | None:
     """Validate the request tools array and resolve ``tool_choice``.
 
@@ -247,57 +312,42 @@ def prepare_tool_messages(
 
     Returns ``(render_messages, template_tools)``. Under ``native`` the
     template receives the tools and assistant history keeps structured
-    ``tool_calls`` (with argument strings decoded so the template renders
-    parameter elements). Under ``dsml`` the template receives no tools:
-    the instruction block is appended to the system message and assistant
-    history serializes its tool calls into DSML text, so the model sees
-    one dialect everywhere. Input messages are never mutated, and a
-    request with no tool surface passes through unchanged.
+    ``tool_calls`` (argument strings decoded so the template renders
+    parameter elements, null content normalized to empty text). Under
+    ``dsml`` the template receives no tools: the instruction block is
+    appended to the system message and assistant history serializes its
+    tool calls into DSML text, so the model sees one dialect everywhere.
+    The input messages are never mutated.
     """
-    prepared: list[dict] | None = None
-
-    def writable() -> list[dict]:
-        nonlocal prepared
-        if prepared is None:
-            prepared = [dict(m) for m in messages]
-        return prepared
-
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+    prepared = [dict(m) for m in messages]
+    for entry in prepared:
+        if entry.get("role") != "assistant":
             continue
-        calls = message.get("tool_calls")
+        calls = entry.get("tool_calls")
         if not calls:
             continue
         if dialect == TOOL_DIALECT_DSML:
-            entry = dict(writable()[index])
             entry["content"] = (
                 (entry.get("content") or "") + render_dsml_tool_calls(calls))
             entry.pop("tool_calls", None)
-            writable()[index] = entry
         else:
-            decoded = _decoded_call_arguments(calls)
             # The template runs string operations on content, so the null
             # content of a calls-only assistant turn becomes empty text.
-            if decoded is not calls or message.get("content") is None:
-                entry = dict(writable()[index])
-                entry["tool_calls"] = decoded
-                entry["content"] = message.get("content") or ""
-                writable()[index] = entry
+            entry["tool_calls"] = _decoded_call_arguments(calls)
+            entry["content"] = entry.get("content") or ""
 
     if dialect != TOOL_DIALECT_DSML:
-        return (prepared if prepared is not None else messages), tools
+        return prepared, tools
     if tools:
-        out = writable()
         block = render_dsml_tools_block([t["function"] for t in tools])
-        for index, message in enumerate(out):
-            if message.get("role") == "system":
-                entry = dict(message)
-                entry["content"] = (entry.get("content") or "") + "\n\n" + block
-                out[index] = entry
+        for entry in prepared:
+            if entry.get("role") == "system":
+                entry["content"] = (
+                    (entry.get("content") or "") + "\n\n" + block)
                 break
         else:
-            out.insert(0, {"role": "system", "content": block})
-    return (prepared if prepared is not None else messages), None
+            prepared.insert(0, {"role": "system", "content": block})
+    return prepared, None
 
 
 def is_deepseek_v4_renderer(prompt_renderer: str | None) -> bool:
@@ -659,20 +709,24 @@ def chat_completion(
     messages = request.get("messages")
     if not isinstance(messages, list) or not messages:
         raise RequestError(400, "request must include a non-empty 'messages' list")
+    config = tool_config or DEFAULT_TOOL_CALL_CONFIG
+    # A verbatim-mode request opts out of every served tool-call behavior
+    # for this one request, so the exact pre-parsing request contract
+    # (strict content validation, tools rendered as sent) applies to it.
+    parse_enabled = config.parse and _request_tool_calls_mode(request) is None
     for m in messages:
         if not isinstance(m, dict):
             raise RequestError(400, "each message needs a 'content' field")
-        if "content" in m:
-            continue
-        # An assistant turn that only called tools legitimately has no
-        # content key; every other message still requires one.
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            continue
-        raise RequestError(400, "each message needs a 'content' field")
+        calls = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if parse_enabled and calls:
+            # An assistant turn that only called tools legitimately has no
+            # content key, but its entries must be renderable.
+            _validate_history_tool_calls(calls)
+        elif "content" not in m:
+            raise RequestError(400, "each message needs a 'content' field")
 
-    config = tool_config or DEFAULT_TOOL_CALL_CONFIG
     ds4 = is_deepseek_v4_renderer(prompt_renderer)
-    tools = _request_tools(request) if config.parse else None
+    tools = _request_tools(request) if parse_enabled else None
 
     try:
         kv_policy = effective_kv_policy(
@@ -700,24 +754,24 @@ def chat_completion(
         template_kwargs, prompt_renderer=prompt_renderer)
     thinking_enabled = bool(
         resolved_template_kwargs.get("enable_thinking", True))
-    # The served dialect applies to template families only; DS4's renderer
-    # owns DSML as part of the model contract. The swap is active for any
-    # tool-shaped request (tools now, or tool_calls history), so a session
-    # renders one dialect throughout.
+    # The swap covers any tool-shaped request (tools now, or tool_calls
+    # history), so a session renders one dialect throughout.
     tool_shaped = tools is not None or any(
         m.get("role") == "assistant" and m.get("tool_calls") for m in messages)
-    swap_active = (
-        not ds4 and config.parse and tool_shaped
-        and config.dialect == TOOL_DIALECT_DSML)
+    if parse_enabled:
+        swap_active, parse_dialects, identity_dialect = _served_tool_plan(
+            config, ds4=ds4, tools=tools, tool_shaped=tool_shaped)
+    else:
+        swap_active, parse_dialects, identity_dialect = False, None, None
     effective_rendering_id = rendering_identity(
         rendering_id,
         template_kwargs,
         prompt_renderer=prompt_renderer,
-        tool_dialect=TOOL_DIALECT_DSML if swap_active else None,
+        tool_dialect=identity_dialect,
     )
-    if ds4 or not config.parse:
+    if ds4 or not parse_enabled:
         render_messages, template_tools = messages, (
-            tools if config.parse else request.get("tools"))
+            tools if parse_enabled else request.get("tools"))
     else:
         render_messages, template_tools = prepare_tool_messages(
             messages,
@@ -740,15 +794,7 @@ def chat_completion(
     # max_tokens overruns is refused identically rather than clamped, so the
     # completion budget a client asked for is never silently shrunk.
     streamer = None
-    if tools is not None and config.parse:
-        if ds4:
-            parse_dialects = (DSML_DIALECT,)
-        elif swap_active:
-            # DSML is the taught dialect; the native XML parser stays second
-            # because the family's trained format can still bleed through.
-            parse_dialects = (DSML_DIALECT, QWENXML_DIALECT)
-        else:
-            parse_dialects = (QWENXML_DIALECT,)
+    if parse_dialects is not None:
         call_id_prefix = hashlib.sha256(prompt.encode()).hexdigest()[:12]
         streamer = ToolCallStreamer(
             parse_dialects,
@@ -763,10 +809,10 @@ def chat_completion(
 
     splitter = None
     response_callback = None
-    if streamer is not None:
+    if streamer is not None or delta_callback is not None:
 
         def route_delta(kind: str, text: str) -> None:
-            if kind == "content":
+            if streamer is not None and kind == "content":
                 streamer.push(text)
             elif delta_callback is not None:
                 delta_callback(kind, text)
@@ -775,12 +821,6 @@ def chat_completion(
             thinking_enabled=thinking_enabled,
             emit=route_delta,
         )
-    elif delta_callback is not None:
-        splitter = ReasoningSplitter(
-            thinking_enabled=thinking_enabled,
-            emit=delta_callback,
-        )
-    if splitter is not None:
 
         def response_callback(_step: int, response: object) -> None:
             splitter.push(str(getattr(response, "text", "")))

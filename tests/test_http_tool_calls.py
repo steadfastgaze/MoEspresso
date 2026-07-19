@@ -123,7 +123,7 @@ def test_prose_around_calls_stays_content():
         "</think>\n", 1)[1]
     response = http.chat_completion(_tool_request(), _generate_returning(text))
     message = response["choices"][0]["message"]
-    assert message["content"] == "\nLet me look.\n"
+    assert message["content"] == "\nLet me look."
     assert len(message["tool_calls"]) == 2
 
 
@@ -194,6 +194,48 @@ def test_parse_kill_switch_restores_verbatim_serving():
     assert "tool_calls" not in message
     assert "<tool_call>" in message["content"]
     assert response["choices"][0]["finish_reason"] == "stop"
+
+
+def test_parse_off_restores_strict_content_validation():
+    # The pre-parsing contract required a content key on every message; the
+    # relaxed assistant-tool_calls shape is accepted only when parsing is on.
+    request = _tool_request(messages=[
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "tool_calls": [{
+            "type": "function",
+            "function": {"name": "read", "arguments": "{}"},
+        }]},
+    ])
+    with pytest.raises(http.RequestError, match="content"):
+        http.chat_completion(
+            request, _generate_returning("x"),
+            tool_config=http.ToolCallConfig(parse=False))
+
+
+def test_verbatim_metadata_opts_one_request_out():
+    request = _tool_request(
+        metadata={"moespresso_tool_calls": "verbatim"})
+    response = http.chat_completion(
+        request, _generate_returning(QWEN_EMISSION))
+    message = response["choices"][0]["message"]
+    assert "tool_calls" not in message
+    assert "<tool_call>" in message["content"]
+
+
+def test_verbatim_metadata_rejects_unknown_values():
+    request = _tool_request(metadata={"moespresso_tool_calls": "off"})
+    with pytest.raises(http.RequestError, match="moespresso_tool_calls"):
+        http.chat_completion(request, _generate_returning("x"))
+
+
+def test_malformed_history_tool_calls_400():
+    request = _tool_request(messages=[
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"type": "function", "function": {}}]},
+    ])
+    with pytest.raises(http.RequestError, match="tool_calls\\[0\\]"):
+        http.chat_completion(request, _generate_returning("x"))
 
 
 # --- streaming ----------------------------------------------------------

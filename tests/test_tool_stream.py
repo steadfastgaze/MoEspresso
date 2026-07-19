@@ -113,10 +113,12 @@ def test_every_chunk_split_yields_identical_result():
 
 
 def test_text_around_blocks_stays_content_and_furniture_is_dropped():
+    # Trailing whitespace of the content stream is furniture on a tool-call
+    # turn: the newline between the prose and the first block goes with it.
     text = "Looking now.\n" + QWEN_TWO_CALLS + "\n"
     streamer, content_deltas, _ = _run(text)
-    assert streamer.content == "Looking now.\n"
-    assert "".join(content_deltas) == "Looking now.\n"
+    assert streamer.content == "Looking now."
+    assert "".join(content_deltas) == "Looking now."
     assert len(streamer.calls) == 2
 
 
@@ -162,6 +164,31 @@ def test_marker_mid_sentence_stays_prose():
     assert streamer.calls == []
     assert streamer.content == text
     assert "".join(content_deltas) == text
+
+
+def test_glued_blocks_without_separator_both_parse():
+    # The character after a close marker is a block boundary, so a second
+    # block glued directly to the first still parses.
+    glued = QWEN_TWO_CALLS.replace("</tool_call>\n<tool_call>",
+                                   "</tool_call><tool_call>")
+    streamer, _, _ = _run(glued)
+    assert [name for name, _ in _names_and_arguments(streamer)] == [
+        "read", "read"]
+    assert streamer.content == ""
+
+
+def test_unterminated_block_split_fuzz_matches_one_shot():
+    # The resumable close-marker scan must not change behavior at any chunk
+    # boundary, including when the block never closes and finish repairs it.
+    text = (
+        "lead-in\n<tool_call>\n<function=read>\n"
+        "<parameter=filePath>\nREADME.md\n</parameter>"
+    )
+    reference, _, _ = _run(text)
+    for cut in range(len(text) + 1):
+        streamer, _, _ = _run([text[:cut], text[cut:]])
+        assert streamer.calls == reference.calls, f"cut={cut}"
+        assert streamer.content == reference.content, f"cut={cut}"
 
 
 def test_malformed_block_is_repaired_and_counted():
@@ -248,6 +275,33 @@ def test_prose_before_naked_function_survives_salvage():
     streamer, _, _ = _run(text)
     assert len(streamer.calls) == 1
     assert streamer.content == "Reading the file.\n"
+
+
+def test_prose_after_naked_function_survives_salvage():
+    # Salvage strips the attempt region, not everything after it, so the
+    # non-streaming content keeps the trailing prose streamed clients saw.
+    text = (
+        "Reading the file.\n<function=read>\n"
+        "<parameter=filePath>\nREADME.md\n</parameter>\n</function>\n"
+        "Let me know if you need more."
+    )
+    streamer, _, _ = _run(text)
+    assert len(streamer.calls) == 1
+    assert "Reading the file." in streamer.content
+    assert "Let me know if you need more." in streamer.content
+    assert "<function=" not in streamer.content
+
+
+def test_quoted_mid_sentence_attempt_never_salvages():
+    # A function element quoted inside prose (not at a line start) is
+    # documentation, not an attempt; salvage must not turn it into a call.
+    text = (
+        "The format is <function=read>\n<parameter=filePath>\nX\n"
+        "</parameter>\n</function> on its own lines."
+    )
+    streamer, _, _ = _run(text)
+    assert streamer.calls == []
+    assert streamer.content == text
 
 
 def test_prose_only_turn_passes_through_untouched():

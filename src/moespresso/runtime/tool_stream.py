@@ -51,6 +51,7 @@ class ToolDialect:
     parse: Callable[[str, dict], list[ToolCall]]
     repair: Callable[[str, dict], list[ToolCall]]
     attempt_markers: tuple[str, ...] = ()
+    attempt_span_res: tuple = ()
 
 
 QWENXML_DIALECT = ToolDialect(
@@ -60,6 +61,7 @@ QWENXML_DIALECT = ToolDialect(
     parse=qwenxml.parse_qwenxml_tool_calls,
     repair=repair.repair_qwenxml_tool_calls,
     attempt_markers=("<function=",),
+    attempt_span_res=(repair._NAKED_FUNCTION_RE,),
 )
 
 DSML_DIALECT = ToolDialect(
@@ -69,6 +71,7 @@ DSML_DIALECT = ToolDialect(
     parse=lambda text, schemas: dsml.parse_dsml_tool_calls(text),
     repair=lambda text, schemas: repair.repair_dsml_tool_calls(text),
     attempt_markers=(dsml.INVOKE_OPEN_PREFIX,),
+    attempt_span_res=(repair._DSML_NAKED_INVOKE_RE,),
 )
 
 
@@ -85,13 +88,12 @@ class ToolCallStreamer:
     a JSON string). Both are optional; the accumulated ``content`` string
     and ``calls`` list carry the same data for non-streaming callers.
 
-    Whitespace-only text runs are held until either substantive text
-    follows (flushed together, order preserved) or the turn ends. A held
-    tail at end of turn is dropped when the turn produced calls and flushed
-    otherwise, so a pure tool-call turn ends with empty content instead of
-    marker-separator newlines, while every byte around real prose survives.
-    The held-run bookkeeping depends only on marker positions, never on
-    chunk boundaries, so any split of the same text yields the same content.
+    The trailing whitespace of the content stream is always held back
+    rather than emitted, then resolved at end of turn: dropped when the
+    turn produced calls (so marker-separator newlines never reach the
+    content of a tool-call turn) and flushed otherwise (so a prose turn
+    keeps every byte). Because the held tail is a pure function of the
+    content bytes, any chunking of the same text yields the same content.
     """
 
     def __init__(
@@ -119,6 +121,7 @@ class ToolCallStreamer:
         self.active: ToolDialect | None = None
         self._held_ws = ""
         self._line_start = True
+        self._scan_from = 0
         self._finished = False
 
     @property
@@ -130,11 +133,12 @@ class ToolCallStreamer:
     def _flush_content(self, text: str) -> None:
         if not text:
             return
-        if text.strip() == "":
-            self._held_ws += text
+        combined = self._held_ws + text
+        stripped = combined.rstrip()
+        if not stripped:
+            self._held_ws = combined
             return
-        out = self._held_ws + text
-        self._held_ws = ""
+        out, self._held_ws = combined[:len(stripped)], combined[len(stripped):]
         self.content_parts.append(out)
         if self.emit_content is not None:
             self.emit_content(out)
@@ -162,6 +166,19 @@ class ToolCallStreamer:
             if self.emit_tool_call is not None:
                 self.emit_tool_call(index, entry)
 
+    def _repair_or_flush(self, dialect: ToolDialect, text: str) -> None:
+        """Repair a strict-parse failure; text that still fails is content."""
+        if self.repair_enabled:
+            try:
+                salvaged = dialect.repair(text, self.schemas)
+            except ToolCallParseError:
+                salvaged = []
+            self.telemetry.record(salvaged=bool(salvaged))
+            if salvaged:
+                self._emit_calls(salvaged)
+                return
+        self._flush_content(text)
+
     def _handle_block(self, dialect: ToolDialect, block: str) -> None:
         try:
             parsed = dialect.parse(block, self.schemas)
@@ -170,16 +187,7 @@ class ToolCallStreamer:
         if parsed:
             self._emit_calls(parsed)
             return
-        if self.repair_enabled:
-            try:
-                salvaged = dialect.repair(block, self.schemas)
-            except ToolCallParseError:
-                salvaged = []
-            self.telemetry.record(salvaged=bool(salvaged))
-            if salvaged:
-                self._emit_calls(salvaged)
-                return
-        self._flush_content(block)
+        self._repair_or_flush(dialect, block)
 
     # --- marker scanning -------------------------------------------------
 
@@ -220,18 +228,30 @@ class ToolCallStreamer:
         while True:
             if self.active is not None:
                 end = self.buffer.find(
-                    self.active.close_marker, len(self.active.open_marker))
+                    self.active.close_marker, self._scan_from)
                 if end < 0:
+                    # Resume the next scan where this one left off; a close
+                    # marker split across chunks can begin at most
+                    # len(close)-1 characters before the buffer end. Without
+                    # this the whole block would rescan on every push.
+                    self._scan_from = max(
+                        self._scan_from,
+                        len(self.buffer) - len(self.active.close_marker) + 1,
+                    )
                     return
                 block = self._consume(end + len(self.active.close_marker))
                 dialect, self.active = self.active, None
                 self._handle_block(dialect, block)
+                # The character after a close marker is a block boundary;
+                # counting it as a line start lets a glued next block parse.
+                self._line_start = True
                 continue
             found = self._find_open()
             if found is not None:
                 index, dialect = found
                 self._flush_content(self._consume(index))
                 self.active = dialect
+                self._scan_from = len(dialect.open_marker)
                 continue
             hold = self._hold_length()
             self._flush_content(self._consume(len(self.buffer) - hold))
@@ -239,20 +259,36 @@ class ToolCallStreamer:
 
     # --- end of turn -----------------------------------------------------
 
+    @staticmethod
+    def _line_start_positions(text: str, markers) -> list[int]:
+        positions = []
+        for marker in markers:
+            start = 0
+            while True:
+                index = text.find(marker, start)
+                if index < 0:
+                    break
+                if index == 0 or text[index - 1] == "\n":
+                    positions.append(index)
+                    break
+                start = index + 1
+        return positions
+
     def _late_salvage(self) -> None:
         """Salvage a call attempt that never formed a complete block.
 
         Runs only when the turn produced no calls: a naked function or
-        invoke element (or an unpaired open marker that already flushed)
-        is still an attempt, and the repair layer knows these shapes. On
-        success the visible content is cut at the first attempt marker;
-        streamed clients have already seen the raw text, and the shaped
-        message carries the structured calls.
+        invoke element at a line start is still an attempt, and the repair
+        layer knows these shapes. A marker quoted mid-sentence never
+        triggers salvage, matching the streaming rule. On success the
+        attempt regions drop out of the visible content and the prose
+        around them survives; streamed clients have already seen the raw
+        text, and the shaped message carries the structured calls.
         """
         full = self.content + self._held_ws
         for dialect in self.dialects:
             markers = (dialect.open_marker, *dialect.attempt_markers)
-            positions = [p for p in (full.find(m) for m in markers) if p >= 0]
+            positions = self._line_start_positions(full, markers)
             if not positions:
                 continue
             try:
@@ -262,8 +298,14 @@ class ToolCallStreamer:
             self.telemetry.record(salvaged=bool(salvaged))
             if salvaged:
                 self._emit_calls(salvaged)
-                prefix = full[:min(positions)]
-                self.content_parts = [prefix] if prefix.strip() else []
+                visible = full
+                for span_re in dialect.attempt_span_res:
+                    visible = span_re.sub("", visible)
+                if dialect.open_marker in visible:
+                    # A leaked bare marker has no span to strip; fall back
+                    # to cutting at the first attempt position.
+                    visible = full[:min(positions)]
+                self.content_parts = [visible] if visible.strip() else []
                 self._held_ws = ""
             return
 
@@ -278,18 +320,10 @@ class ToolCallStreamer:
         if self.active is not None:
             raw, self.buffer = self.buffer, ""
             dialect, self.active = self.active, None
-            if truncated or not self.repair_enabled:
+            if truncated:
                 self._flush_content(raw)
             else:
-                try:
-                    salvaged = dialect.repair(raw, self.schemas)
-                except ToolCallParseError:
-                    salvaged = []
-                self.telemetry.record(salvaged=bool(salvaged))
-                if salvaged:
-                    self._emit_calls(salvaged)
-                else:
-                    self._flush_content(raw)
+                self._repair_or_flush(dialect, raw)
         elif self.buffer:
             self._flush_content(self._consume(len(self.buffer)))
         # The salvage scan runs only when no repair fired yet: a block whose

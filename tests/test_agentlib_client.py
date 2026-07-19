@@ -205,6 +205,17 @@ def test_no_metadata_without_a_session_key(fake_server):
     assert "metadata" not in _last_body(state)
 
 
+def test_verbatim_tool_calls_travels_beside_the_cache_key(fake_server):
+    state, url = fake_server
+    conv = Conversation(session_cache_key="road-test-1")
+    conv.add_user("hi")
+    CompletionsClient(url).complete(conv, verbatim_tool_calls=True)
+    assert _last_body(state)["metadata"] == {
+        "moespresso_cache_key": "road-test-1",
+        "moespresso_tool_calls": "verbatim",
+    }
+
+
 def test_explicit_session_key_wins_over_the_conversation(fake_server):
     state, url = fake_server
     conv = Conversation(session_cache_key="conv-key")
