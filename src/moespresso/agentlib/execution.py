@@ -28,7 +28,7 @@ from pathlib import Path
 
 from moespresso.agentlib import sandbox
 from moespresso.agentlib.sandbox import Decision, SandboxPolicy
-from moespresso.agentlib.toolcalls import ToolCall
+from moespresso.toolcalls.types import ToolCall
 from moespresso.agentlib.tools import ToolRegistry
 
 

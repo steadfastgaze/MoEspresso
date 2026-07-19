@@ -14,17 +14,16 @@ import json
 
 import pytest
 
-from moespresso.agentlib.dsml import parse_dsml_tool_calls
-from moespresso.agentlib.envelope import parse_action_envelope
-from moespresso.agentlib.qwenxml import parse_qwenxml_tool_calls
-from moespresso.agentlib.repair import (
+from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.dsml import DSML_TOKEN, parse_dsml_tool_calls
+from moespresso.toolcalls.envelope import parse_action_envelope
+from moespresso.toolcalls.qwenxml import parse_qwenxml_tool_calls
+from moespresso.toolcalls.repair import (
     repair_action_envelope,
     repair_dsml_tool_calls,
     repair_qwenxml_tool_calls,
 )
-from moespresso.agentlib.toolcalls import ToolCallParseError
-from moespresso.agentlib.tools import build_core_registry
-from moespresso.runtime.deepseek_v4.renderer import DSML_TOKEN
+from moespresso.toolcalls.types import ToolCallParseError
 
 SCHEMAS = {
     name: build_core_registry().spec(name).parameters
@@ -323,6 +322,6 @@ def test_dsml_unclosed_name_quote_is_restored():
 
 
 def test_dsml_wellformed_name_attribute_is_untouched_by_repair_regex():
-    from moespresso.agentlib.repair import _DSML_UNCLOSED_NAME_RE
+    from moespresso.toolcalls.repair import _DSML_UNCLOSED_NAME_RE
     good = f'<{T}parameter name="path" string="true">VERSION</{T}parameter>'
     assert _DSML_UNCLOSED_NAME_RE.sub(r'\1"\2', good) == good

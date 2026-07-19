@@ -50,7 +50,7 @@ from moespresso.agentlib.client import ClientError, CompletionsClient
 from moespresso.agentlib.conversation import Conversation
 from moespresso.agentlib.execution import execute_tool_call
 from moespresso.agentlib.sandbox import SandboxPolicy
-from moespresso.agentlib.toolcalls import (
+from moespresso.toolcalls.types import (
     ToolCall,
     ToolCallParseError,
     parse_tool_calls,

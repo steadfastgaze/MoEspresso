@@ -6,11 +6,11 @@ correctness, task success, and tokens spent. The arms:
 
 - ``native``: request-level tools rendered by the vendored Qwen template;
   the model emits ``<tool_call><function=...>`` XML parsed by
-  ``agentlib.qwenxml``.
+  ``moespresso.toolcalls.qwenxml``.
 - ``envelope``: the Terminus-2-style JSON action envelope in plain text,
-  parsed by ``agentlib.envelope``.
+  parsed by ``moespresso.toolcalls.envelope``.
 - ``dsml``: DeepSeek DSML text markers taught through the system prompt,
-  parsed by ``agentlib.dsml``.
+  parsed by ``moespresso.toolcalls.dsml``.
 
 The runner attaches to an already-running server and coordinates GPU use
 through the shared measurement lock. ``tests/test_dialect_study.py`` drives

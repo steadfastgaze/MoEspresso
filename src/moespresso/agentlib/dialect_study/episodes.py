@@ -32,7 +32,7 @@ from moespresso.agentlib.roadtest.fixture import (
     data_file_text,
     generate_fixture,
 )
-from moespresso.agentlib.toolcalls import ToolCall
+from moespresso.toolcalls.types import ToolCall
 
 VERSION_VALUE = "7.4.2"
 BUMPED_VERSION_VALUE = "7.4.3"

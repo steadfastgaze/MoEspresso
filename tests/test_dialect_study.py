@@ -32,9 +32,9 @@ from moespresso.agentlib.dialect_study.run import (
     run_episode,
     summarize,
 )
-from moespresso.agentlib.toolcalls import ToolCallParseError
 from moespresso.agentlib.tools import build_core_registry
-from moespresso.runtime.deepseek_v4.renderer import DSML_TOKEN
+from moespresso.toolcalls.dsml import DSML_TOKEN
+from moespresso.toolcalls.types import ToolCallParseError
 
 REGISTRY = build_core_registry()
 
@@ -149,7 +149,7 @@ def test_goal_check_judges_workspace_state(tmp_path):
 
 def test_call_correctness_matchers():
     r1 = _episode("r1-version")
-    from moespresso.agentlib.toolcalls import ToolCall
+    from moespresso.toolcalls.types import ToolCall
     assert r1.call_is_correct(ToolCall("read_file", {"path": "VERSION"}))
     assert not r1.call_is_correct(ToolCall("bash", {"command": "cat VERSION"}))
     assert not r1.call_is_correct(ToolCall("read_file", {"path": "README.md"}))

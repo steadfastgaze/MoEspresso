@@ -50,7 +50,6 @@ from pathlib import Path
 
 from moespresso.agentlib.client import ChatCompletion, ClientError, CompletionsClient
 from moespresso.agentlib.conversation import Conversation
-from moespresso.agentlib.dsml import parse_dsml_tool_calls
 from moespresso.agentlib.execution import execute_tool_call
 from moespresso.agentlib.loop_policy import NUDGE_MESSAGE
 from moespresso.agentlib.profile import (
@@ -58,7 +57,6 @@ from moespresso.agentlib.profile import (
     load_agentic_profile,
     resolve_loop_settings,
 )
-from moespresso.agentlib.repair import RepairTelemetry
 from moespresso.agentlib.roadtest.fixture import (
     DATA_FILE_COUNT,
     Fixture,
@@ -89,8 +87,10 @@ from moespresso.agentlib.subagent import (
     SubagentRunner,
     child_session_key,
 )
-from moespresso.agentlib.toolcalls import ToolCallParseError
 from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.dsml import parse_dsml_tool_calls
+from moespresso.toolcalls.repair import RepairTelemetry
+from moespresso.toolcalls.types import ToolCallParseError
 
 SESSION_CACHE_KEYS = {"a": "roadtest-a", "b": "roadtest-b"}
 

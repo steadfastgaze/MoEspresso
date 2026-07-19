@@ -30,7 +30,7 @@ from moespresso.agentlib.roadtest.run import (
     RunConfig,
     _package_run_settings,
 )
-from moespresso.runtime.deepseek_v4.renderer import _render_tool_calls
+from moespresso.toolcalls.dsml import render_dsml_tool_calls
 
 STRIDE = 256
 
@@ -54,7 +54,7 @@ def test_package_run_settings_use_default_served_context_limit(tmp_path):
 
 
 def _dsml(name: str, arguments: dict) -> str:
-    return _render_tool_calls([{
+    return render_dsml_tool_calls([{
         "id": "call_0",
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(arguments)},

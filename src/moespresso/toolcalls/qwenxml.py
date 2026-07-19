@@ -11,10 +11,11 @@ block that instructs the model to emit tool invocations as XML-tagged text:
     </function>
     </tool_call>
 
-The serve layer returns the completion text verbatim without parsing it, so
-the client extracts the calls from the text. This module is the native-dialect
-counterpart of ``dsml.parse_dsml_tool_calls``: well-formed calls come back as
-``ToolCall`` values in emission order, and a malformed block raises
+The serve layer converts these blocks into structured ``tool_calls`` when
+the request carries tools, and the agent client parses them from verbatim
+text. Both sides use this module. It is the native-dialect counterpart of
+``dsml.parse_dsml_tool_calls``: well-formed calls come back as ``ToolCall``
+values in emission order, and a malformed block raises
 ``ToolCallParseError`` so the same repair seam catches every dialect.
 
 Parameter values arrive as raw text. The template renders one newline around
@@ -33,7 +34,7 @@ from __future__ import annotations
 import json
 import re
 
-from moespresso.agentlib.toolcalls import ToolCall, ToolCallParseError
+from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"

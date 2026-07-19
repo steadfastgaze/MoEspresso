@@ -1,8 +1,8 @@
 """Qwen XML text-dialect tool-call parsing.
 
 The vendored qwen3_5 template instructs the model to emit tool invocations
-as ``<tool_call><function=...><parameter=...>`` XML text, returned verbatim
-by the serve layer. These tests pin the strict parsing contract: raw string
+as ``<tool_call><function=...><parameter=...>`` XML text. These tests pin
+the strict parsing contract: raw string
 values survive exactly (multiline included), schema-typed values decode as
 JSON of the declared type, and every structural defect raises instead of
 dropping or guessing a call.
@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from moespresso.agentlib.qwenxml import (
+from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.qwenxml import (
     has_qwenxml_tool_call,
     parse_qwenxml_tool_calls,
     strip_qwenxml_blocks,
 )
-from moespresso.agentlib.toolcalls import ToolCallParseError
-from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.types import ToolCallParseError
 
 SCHEMAS = {
     name: build_core_registry().spec(name).parameters

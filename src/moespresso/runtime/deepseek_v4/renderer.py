@@ -12,6 +12,16 @@ import copy
 import json
 from typing import Any
 
+# The DSML grammar (token, tools instruction block, serializers) lives in
+# moespresso.toolcalls.dsml so the parse side and other families share it.
+# DSML_TOKEN and render_tools stay re-exported here as part of the renderer's
+# public surface.
+from moespresso.toolcalls.dsml import (  # noqa: F401 (re-exported)
+    DSML_TOKEN,
+    render_dsml_tool_calls,
+    render_tools,
+)
+
 DEEPSEEK_V4_PROMPT_RENDERER = "deepseek_v4_dsv4"
 DEEPSEEK_V4_RENDERER_VERSION = "deepseek_v4_dsv4:1"
 
@@ -19,7 +29,6 @@ BOS_TOKEN = "<｜begin▁of▁sentence｜>"
 EOS_TOKEN = "<｜end▁of▁sentence｜>"
 THINKING_START_TOKEN = "<think>"
 THINKING_END_TOKEN = "</think>"
-DSML_TOKEN = "｜DSML｜"
 USER_SP_TOKEN = "<｜User｜>"
 ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
@@ -43,77 +52,12 @@ REASONING_EFFORT_MAX = (
     "assumption is left unchecked.\n\n"
 )
 
-TOOLS_TEMPLATE = """## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml_token}tool_calls>" block like the following:
-
-<{dsml_token}tool_calls>
-<{dsml_token}invoke name="$TOOL_NAME">
-<{dsml_token}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml_token}parameter>
-...
-</{dsml_token}invoke>
-<{dsml_token}invoke name="$TOOL_NAME2">
-...
-</{dsml_token}invoke>
-</{dsml_token}tool_calls>
-
-String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
-
-If thinking_mode is enabled (triggered by {thinking_start_token}), you MUST output your complete reasoning inside {thinking_start_token}...{thinking_end_token} BEFORE any tool calls or final response.
-
-Otherwise, output directly after {thinking_end_token} with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"""
-
-
 def _to_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
 def _tools_from_openai_format(tools: list[dict]) -> list[dict]:
     return [tool["function"] for tool in tools]
-
-
-def _tool_calls_from_openai_format(tool_calls: list[dict]) -> list[dict]:
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
-
-
-def encode_arguments_to_dsml(tool_call: dict[str, str]) -> str:
-    """Encode OpenAI function arguments into DSML parameter tags."""
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception:
-        arguments = {"arguments": tool_call["arguments"]}
-
-    parts = []
-    for key, value in arguments.items():
-        is_str = isinstance(value, str)
-        rendered = value if is_str else _to_json(value)
-        parts.append(
-            f'<{DSML_TOKEN}parameter name="{key}" string="{str(is_str).lower()}">'
-            f"{rendered}</{DSML_TOKEN}parameter>"
-        )
-    return "\n".join(parts)
-
-
-def render_tools(tools: list[dict]) -> str:
-    return TOOLS_TEMPLATE.format(
-        tool_schemas="\n".join(_to_json(t) for t in tools),
-        dsml_token=DSML_TOKEN,
-        thinking_start_token=THINKING_START_TOKEN,
-        thinking_end_token=THINKING_END_TOKEN,
-    )
 
 
 def find_last_user_index(messages: list[dict]) -> int:
@@ -251,22 +195,6 @@ def _render_content_blocks(msg: dict) -> str:
     return "\n\n".join(parts)
 
 
-def _render_tool_calls(tool_calls: list[dict]) -> str:
-    converted = _tool_calls_from_openai_format(tool_calls)
-    calls = [
-        f'<{DSML_TOKEN}invoke name="{tc.get("name")}">\n'
-        f"{encode_arguments_to_dsml(tc)}\n"
-        f"</{DSML_TOKEN}invoke>"
-        for tc in converted
-    ]
-    rendered_calls = "\n".join(calls)
-    return (
-        f"\n\n<{DSML_TOKEN}tool_calls>\n"
-        f"{rendered_calls}\n"
-        f"</{DSML_TOKEN}tool_calls>"
-    )
-
-
 def render_message(
     index: int,
     messages: list[dict],
@@ -322,7 +250,7 @@ def render_message(
         raise NotImplementedError("DS4 merges tool messages into user content blocks")
 
     elif role == "assistant":
-        tool_calls = _render_tool_calls(msg["tool_calls"]) if msg.get("tool_calls") else ""
+        tool_calls = render_dsml_tool_calls(msg["tool_calls"]) if msg.get("tool_calls") else ""
         reasoning = ""
         previous_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
         if thinking_mode == "thinking" and not previous_has_task:

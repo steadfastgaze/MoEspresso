@@ -37,9 +37,9 @@ from moespresso.agentlib.dialect_study.episodes import (
 )
 from moespresso.agentlib.execution import execute_tool_call
 from moespresso.agentlib.loop_policy import NUDGE_MESSAGE, ToolNudgePolicy
-from moespresso.agentlib.repair import RepairTelemetry
-from moespresso.agentlib.toolcalls import ToolCallParseError
 from moespresso.agentlib.tools import ToolRegistry, build_core_registry
+from moespresso.toolcalls.repair import RepairTelemetry
+from moespresso.toolcalls.types import ToolCallParseError
 
 DEFAULT_MAX_TOKENS = 512
 THINKING_KWARGS = {"enable_thinking": False}

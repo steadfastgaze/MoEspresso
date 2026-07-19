@@ -18,27 +18,28 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from moespresso.agentlib import repair
 from moespresso.agentlib.conversation import Conversation
-from moespresso.agentlib.dsml import (
+from moespresso.agentlib.execution import ToolResult
+from moespresso.agentlib.tools import ToolRegistry
+from moespresso.toolcalls import repair
+from moespresso.toolcalls.dsml import (
+    DSML_TOKEN,
     TOOL_CALLS_CLOSE,
     TOOL_CALLS_OPEN,
     parse_dsml_tool_calls,
+    render_tools,
 )
-from moespresso.agentlib.envelope import (
+from moespresso.toolcalls.envelope import (
     ActionEnvelope,
     envelope_system_block,
     parse_action_envelope,
 )
-from moespresso.agentlib.execution import ToolResult
-from moespresso.agentlib.qwenxml import (
+from moespresso.toolcalls.qwenxml import (
     has_qwenxml_tool_call,
     parse_qwenxml_tool_calls,
     strip_qwenxml_blocks,
 )
-from moespresso.agentlib.toolcalls import ToolCall, ToolCallParseError
-from moespresso.agentlib.tools import ToolRegistry
-from moespresso.runtime.deepseek_v4.renderer import DSML_TOKEN, render_tools
+from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 
 BASE_SYSTEM = (
     "You are a coding agent working inside a small telemetry-processing "

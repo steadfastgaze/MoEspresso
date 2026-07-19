@@ -1,12 +1,11 @@
 """DSML text-dialect tool-call parsing.
 
-The DeepSeek-V4 serve layer returns tool invocations as DSML markers inside
-the completion content. These tests pin the strict parsing contract: raw
-string values survive unchanged (multiline included), non-string values
-decode as JSON, and every structural defect raises instead of dropping or
-guessing a call. The round-trip test renders calls through the DS4
-renderer's own encoder and parses them back, tying the dialect's two ends
-to one grammar.
+DeepSeek-V4 emits tool invocations as DSML markers inside the completion
+content. These tests pin the strict parsing contract: raw string values
+survive unchanged (multiline included), non-string values decode as JSON,
+and every structural defect raises instead of dropping or guessing a call.
+The round-trip test renders calls through the dialect's own serializer and
+parses them back, tying the dialect's two ends to one grammar.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from moespresso.agentlib import (
     has_tool_call_block,
     parse_dsml_tool_calls,
 )
-from moespresso.runtime.deepseek_v4.renderer import DSML_TOKEN, _render_tool_calls
+from moespresso.toolcalls.dsml import DSML_TOKEN, render_dsml_tool_calls
 
 T = DSML_TOKEN
 
@@ -143,7 +142,7 @@ def test_renderer_round_trip():
             },
         },
     ]
-    rendered = _render_tool_calls(openai_calls)
+    rendered = render_dsml_tool_calls(openai_calls)
     calls = parse_dsml_tool_calls(rendered)
     assert [c.name for c in calls] == ["read_file", "bash"]
     assert calls[0].arguments == {"path": "src/metrics.py", "limit": 20}

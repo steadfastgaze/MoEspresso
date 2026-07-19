@@ -16,12 +16,11 @@ as the reference client for anything agentic on MoEspresso. It provides:
   executable-hook rules decide whether a bash command runs unsandboxed, runs
   under a generated Seatbelt profile, or is refused, and the non-bash tools
   get path-scope checks against the writable scope.
-- ``parse_tool_calls``: the strict native parser for OpenAI ``tool_calls``
-  in a response message. Tool-call repair and text-envelope dialects are
-  separate, later components that build on this seam.
-- ``parse_dsml_tool_calls``: the strict parser for the DeepSeek DSML text
-  dialect, for model families whose serve layer returns tool invocations
-  inside the completion content.
+- ``parse_tool_calls`` and ``parse_dsml_tool_calls``, re-exported from
+  ``moespresso.toolcalls``: the strict native parser for OpenAI
+  ``tool_calls`` in a response message, and the strict parser for the
+  DeepSeek DSML text dialect. The dialect grammars, parsers, and the repair
+  layer live in ``moespresso.toolcalls``, shared with the serve layer.
 - ``SubagentRunner`` and ``SubagentBrief``: the sequential subagent
   skeleton. A child runs a brief to completion in a forked conversation
   under a session cache key derived from the parent's, and its bounded
@@ -34,7 +33,6 @@ from moespresso.agentlib.client import (
     CompletionsClient,
 )
 from moespresso.agentlib.conversation import Conversation
-from moespresso.agentlib.dsml import has_tool_call_block, parse_dsml_tool_calls
 from moespresso.agentlib.execution import ToolResult, execute_tool_call
 from moespresso.agentlib.sandbox import (
     Decision,
@@ -62,16 +60,17 @@ from moespresso.agentlib.subagent import (
     SubagentRunner,
     child_session_key,
 )
-from moespresso.agentlib.toolcalls import (
-    ToolCall,
-    ToolCallParseError,
-    parse_tool_calls,
-)
 from moespresso.agentlib.tools import (
     CORE_TOOL_SPECS,
     ToolRegistry,
     ToolSpec,
     build_core_registry,
+)
+from moespresso.toolcalls.dsml import has_tool_call_block, parse_dsml_tool_calls
+from moespresso.toolcalls.types import (
+    ToolCall,
+    ToolCallParseError,
+    parse_tool_calls,
 )
 
 __all__ = [

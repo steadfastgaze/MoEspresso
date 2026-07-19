@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from moespresso.agentlib.toolcalls import ToolCall, ToolCallParseError
+from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 
 ENVELOPE_KEYS = frozenset({"analysis", "plan", "commands", "task_complete"})
 COMMAND_KEYS = frozenset({"tool", "args"})

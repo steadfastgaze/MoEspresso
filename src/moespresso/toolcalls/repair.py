@@ -1,6 +1,6 @@
 """Tool-call repair: salvage almost-valid completions behind the strict parsers.
 
-Every dialect parser in agentlib raises ``ToolCallParseError`` instead of
+Every dialect parser in this package raises ``ToolCallParseError`` instead of
 guessing. This module is the component that catches exactly that seam: given
 the raw completion text that failed strict parsing, it applies a bounded
 sequence of text transformations (code-fence removal, truncation closing,
@@ -22,14 +22,14 @@ import json
 import re
 from dataclasses import dataclass
 
-from moespresso.agentlib import dsml, qwenxml
-from moespresso.agentlib.envelope import (
+from moespresso.toolcalls import dsml, qwenxml
+from moespresso.toolcalls.dsml import DSML_TOKEN
+from moespresso.toolcalls.envelope import (
     ENVELOPE_KEYS,
     ActionEnvelope,
     envelope_from_object,
 )
-from moespresso.agentlib.toolcalls import ToolCall, ToolCallParseError
-from moespresso.runtime.deepseek_v4.renderer import DSML_TOKEN
+from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 
 _FENCE_LINE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*$\n?", re.MULTILINE)
 _FENCED_SEGMENT_RE = re.compile(r"```[A-Za-z0-9_-]*[ \t]*\n(.*?)```", re.DOTALL)

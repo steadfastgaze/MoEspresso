@@ -13,13 +13,13 @@ import json
 
 import pytest
 
-from moespresso.agentlib.envelope import (
+from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.envelope import (
     ActionEnvelope,
     envelope_system_block,
     parse_action_envelope,
 )
-from moespresso.agentlib.toolcalls import ToolCallParseError
-from moespresso.agentlib.tools import build_core_registry
+from moespresso.toolcalls.types import ToolCallParseError
 
 
 def _envelope(**overrides) -> str:
