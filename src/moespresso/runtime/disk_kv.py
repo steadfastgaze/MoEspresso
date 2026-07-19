@@ -1420,8 +1420,11 @@ DISK_KV_BYTES_UNLIMITED = "unlimited"
 # at most one stride of tail, so 1024 keeps a cold 10k-token prompt to a few
 # writes while a later restore re-prefills only a few seconds of tokens.
 # The budget bounds each per-package root; eviction is least-recently-used.
+# A checkpoint set covering one long agent prompt runs to a few GiB, so the
+# default holds a handful of hot prefix regions without claiming a large
+# slice of the host disk.
 DEFAULT_DISK_KV_STRIDE = 1024
-DEFAULT_DISK_KV_BUDGET_BYTES = 32 * 1024**3
+DEFAULT_DISK_KV_BUDGET_BYTES = 8 * 1024**3
 
 
 @dataclass(frozen=True)

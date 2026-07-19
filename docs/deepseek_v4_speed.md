@@ -48,7 +48,8 @@ numeric gates and record the MLX wheel.
 
 The headline measurements used an M3 Max with 40 GPU cores and 128 GB unified
 memory. Absolute runs were taken on AC power, at nominal thermal state, with an
-otherwise idle host and an exclusive GPU window.
+otherwise idle host and an exclusive GPU window, and with the disk KV tier off
+(`MOESPRESSO_DISK_KV=off`; it now defaults on when serving).
 
 For comparisons:
 

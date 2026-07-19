@@ -853,7 +853,7 @@ def test_serve_default_disk_kv_opens_under_the_user_cache(
     assert "[serve] disk_kv=frontier root=" in out
     assert str(tmp_path / "cache") in out
     assert "stride=1024" in out
-    assert "budget=32GiB" in out
+    assert "budget=8GiB" in out
 
 
 def test_serve_degrades_when_default_disk_kv_cannot_open(

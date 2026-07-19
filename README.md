@@ -194,7 +194,7 @@ The in-memory prefix cache is always on. The disk KV tier checkpoints
 aligned prompt-cache frontiers so a later process, or a new session sharing
 a long prompt prefix (an agent client's fixed system prompt and tools),
 restores an exact token prefix and prefills only the suffix. Serving enables
-it by default under `~/.cache/moespresso/disk_kv/<package>` with a 32 GiB
+it by default under `~/.cache/moespresso/disk_kv/<package>` with an 8 GiB
 LRU byte budget and a 1024-token stride:
 
 ```bash
@@ -286,7 +286,9 @@ The comparison matrix was measured on an M3 Max with 40 GPU cores and 128 GB
 unified memory. Every cell is the median of three fresh-process runs with an
 8-token prewarm and 256 measured output tokens. Engines were left-rotated
 between rounds; AC power, normal thermal state, greedy decoding, temperature
-0, vision off, and MTP/DFlash/speculation off were enforced. Values are
+0, vision off, and MTP/DFlash/speculation off were enforced. Runs used the
+memory-only cache path: the disk KV tier, now on by default when serving,
+was disabled (`MOESPRESSO_DISK_KV=off`). Values are
 **decode throughput / TTFT-derived prompt throughput**, in tokens per second.
 
 | DeepSeek context | MoEspresso | DwarfStar | llama.cpp | oMLX |

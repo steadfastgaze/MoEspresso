@@ -59,8 +59,9 @@ be overridden through environment variables read once at startup.
   writes. A smaller stride shortens the re-prefilled tail after a restore
   (at most one stride) at the cost of more first-time writes.
 - `MOESPRESSO_DISK_KV_BYTES`: the total byte budget for stored payloads per
-  root. Default 32 GiB when serving; the literal `unlimited` disables
-  eviction. A positive value caps the payload bytes on disk and evicts
+  root. Default 8 GiB when serving (a checkpoint set covering one long
+  agent prompt runs to a few GiB, so the default holds a handful of hot
+  prefix regions); the literal `unlimited` disables eviction. A positive value caps the payload bytes on disk and evicts
   least-recently-used checkpoints before a write that would exceed it. A
   value of `0` refuses startup with a message pointing at
   `MOESPRESSO_DISK_KV=off`, because a zero budget cannot hold any
@@ -77,7 +78,10 @@ disk KV. Malformed explicit values (a bad stride or budget) always refuse.
 
 The default location keeps everything under one directory:
 `~/.cache/moespresso`. Growth is bounded by the byte budget per package
-root, enforced by least-recently-used eviction. Deleting the directory (or
+root (8 GiB by default), enforced by least-recently-used eviction. There is
+no free-disk-space probe: the budget is the bound, and a write that fails
+for any reason, a full disk included, is skipped and logged while the
+request completes normally. Deleting the directory (or
 any single root) at any time is safe: the server holds no assumption that a
 checkpoint survives, and a missing or mismatched entry means cold serving,
 never a wrong restore. Package managers do not remove user caches on

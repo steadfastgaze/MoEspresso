@@ -62,6 +62,11 @@ host, so finish it before thermal conditioning.
 The published speed rows were measured on an M3 Max with 40 GPU cores and
 128 GB unified memory. Each table cell follows the same sequence:
 
+The published rows were measured with the disk KV tier off, before it became
+the serving default; disable it for a like-for-like run
+(`MOESPRESSO_DISK_KV=off moespresso-serve <package>`), or first-request
+checkpoint writes and later restores skew TTFT in both directions.
+
 1. Start a fresh engine process and load one model.
 2. Run an unmeasured eight-token generation on the selected prompt to compile
    kernels and warm the loaded stack.

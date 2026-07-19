@@ -18,7 +18,8 @@ the full-attention layers. The manifest declares a 262,144-token limit.
 
 Measurements used an M3 Max with 40 GPU cores and 128 GB unified memory. Absolute
 speed runs were taken on AC power at nominal thermal state without a competing
-model process or sustained GPU workload. Repeat ranges stayed within 0.66
+model process or sustained GPU workload, with the disk KV tier off
+(`MOESPRESSO_DISK_KV=off`; it now defaults on when serving). Repeat ranges stayed within 0.66
 percent. The matrix used three fresh processes per engine and context, with the
 engine order rotated between rounds. Each engine received the same prompt token
 IDs.
