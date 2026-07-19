@@ -85,7 +85,7 @@ loader produced (mlx_lm `load_tokenizer` + eos/chat handling). The runtime does
 **not** re-load it separately; that would diverge from the proven path. (One
 upstream false-positive "fix_mistral_regex" warning that transformers emits for
 non-Mistral tokenizers loaded from a mixed dir is filtered out by
-`_silence_false_mistral_warning`; the warning is dropped, never acted on.)
+`_silence_known_transformers_warnings`; the warning is dropped, never acted on.)
 
 ### Generation (`serve.generate_with_metadata`)
 

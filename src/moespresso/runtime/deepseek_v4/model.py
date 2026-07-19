@@ -3729,8 +3729,7 @@ def load_deepseek_v4_package_model(
     prewarm_seconds = _prewarm_wired_limit(model)
     if prewarm_seconds is not None:
         print(
-            f"[serve] wired-limit prewarm {prewarm_seconds:.2f}s at load; "
-            "the first request no longer pays it inside TTFT",
+            f"[serve] wired-limit prewarm {prewarm_seconds:.2f}s at load",
             flush=True,
         )
     return model, tokenizer

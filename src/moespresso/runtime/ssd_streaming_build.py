@@ -15,7 +15,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from moespresso.runtime.build import _silence_false_mistral_warning
+from moespresso.runtime.build import _silence_known_transformers_warnings
 from moespresso.runtime.expert_index import ExpertIndex, build_expert_index
 from moespresso.runtime.expert_slot_pool import BundleRowCache
 from moespresso.runtime.pooled_switchglu import (
@@ -580,7 +580,7 @@ def build_ssd_streaming_model(
     package_dir = Path(package_dir)
     run_lock = acquire_ssd_streaming_process_lock()
     try:
-        _silence_false_mistral_warning()
+        _silence_known_transformers_warnings()
         cfg = load_config(package_dir)
         seed = _mxtq_seed(package_dir, seed)
         manifest = _read_manifest(package_dir)

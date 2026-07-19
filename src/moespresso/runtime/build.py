@@ -36,13 +36,28 @@ class _DropMistralRegexWarning(logging.Filter):
         return "incorrect regex" not in msg and "fix_mistral_regex" not in msg
 
 
-def _silence_false_mistral_warning() -> None:
+class _DropDeepSeekV4RopeWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != (
+            "Unrecognized keys in `rope_parameters` for 'rope_type'='default': "
+            "{'attention_factor'}"
+        )
+
+
+def _silence_known_transformers_warnings() -> None:
     # The message is emitted by logger.warning in transformers'
     # tokenization_utils_tokenizers module, so the filter must sit on that logger:
     # a filter on the parent 'transformers' logger does not catch child records.
     lg = logging.getLogger("transformers.tokenization_utils_tokenizers")
     if not any(isinstance(f, _DropMistralRegexWarning) for f in lg.filters):
         lg.addFilter(_DropMistralRegexWarning())
+
+    # AutoTokenizer loads the model config while selecting a tokenizer. The
+    # Transformers DeepSeek-V4 config adds attention_factor itself, then warns
+    # about that field during its own RoPE validation.
+    lg = logging.getLogger("transformers.modeling_rope_utils")
+    if not any(isinstance(f, _DropDeepSeekV4RopeWarning) for f in lg.filters):
+        lg.addFilter(_DropDeepSeekV4RopeWarning())
 
 
 def _load_jangtq_quietly(load_fn, package_dir):
@@ -431,7 +446,7 @@ def build_model(
     (model, tokenizer): the tokenizer is the one jang's loader produced (mlx_lm
     load_tokenizer + eos/chat handling), the same one the established path uses;
     it is not re-loaded separately (that would diverge from the established path)."""
-    _silence_false_mistral_warning()  # jang loads the tokenizer below -> warning fires
+    _silence_known_transformers_warnings()  # jang loads the tokenizer below
     package_dir = Path(package_dir)
     adapter = _runtime_adapter_kind(manifest)
 

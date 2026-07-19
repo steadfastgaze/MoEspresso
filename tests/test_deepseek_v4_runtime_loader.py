@@ -1736,7 +1736,7 @@ def test_deepseek_v4_package_loader_prewarms_wired_limit_at_load(
 
     assert result == (model, "TOK")
     assert seen == [model]
-    assert "wired-limit prewarm 1.23s" in capsys.readouterr().out
+    assert capsys.readouterr().out == "[serve] wired-limit prewarm 1.23s at load\n"
 
 
 def test_deepseek_v4_package_loader_installs_ratio4_fast_prefill_by_default(

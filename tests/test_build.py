@@ -8,6 +8,7 @@ dropped on a successful load but re-emitted on failure, so a broken load stays r
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import sys
 import types
@@ -23,6 +24,7 @@ from moespresso.package.bundle import (
 )
 from moespresso.runtime.expert_index import build_expert_index
 from moespresso.runtime.build import (
+    _DropDeepSeekV4RopeWarning,
     UnsupportedRuntimeAdapter,
     _decoder_layers,
     _install_routed_experts_from_bundles,
@@ -32,6 +34,16 @@ from moespresso.runtime.build import (
     _wrap_mixed_bit_switchglus,
     build_model,
 )
+
+
+def test_deepseek_v4_rope_warning_filter_is_exact():
+    warning_filter = _DropDeepSeekV4RopeWarning()
+    prefix = "Unrecognized keys in `rope_parameters` for 'rope_type'='default': "
+    hidden = logging.makeLogRecord({"msg": prefix + "{'attention_factor'}"})
+    visible = logging.makeLogRecord({"msg": prefix + "{'another_field'}"})
+
+    assert not warning_filter.filter(hidden)
+    assert warning_filter.filter(visible)
 
 
 def test_load_jangtq_quietly_drops_banner_on_success(capsys):
