@@ -248,6 +248,72 @@ def test_failed_quarantine_disables_writes_and_marks_the_entry_dead(tmp_path):
     assert "quarantine" in stats["writes_disabled_reason"]
 
 
+def test_payload_move_failure_keeps_the_writer_functional(tmp_path):
+    # Index removal succeeds; only the payload move fails (the quarantine
+    # path is blocked by a file squatting on its directory name). That is
+    # payload housekeeping, not an index fault: writes stay enabled and
+    # the leftover payload is an orphan for the next open.
+    store = DiskCheckpointStore(tmp_path)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    entry = _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+
+    payload = tmp_path / entry.payload_path
+    with open(payload, "r+b") as fh:
+        fh.truncate(payload.stat().st_size // 2)
+    (tmp_path / "quarantine").write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(DiskKVInvalidPayload):
+        store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [_kv_cache_empty()],
+            registry=default_cache_registry(),
+        )
+
+    assert store.writes_disabled is False
+    assert store.quarantines == 1
+    assert store.has_entry(scope, list(range(512))) is False
+    assert payload.exists()
+
+
+def test_a_dead_longest_checkpoint_falls_back_to_a_shorter_one(tmp_path):
+    loads = []
+
+    def counting_load(root, rel):
+        loads.append(rel)
+        return load_prompt_cache_payload(root, rel)
+
+    store = DiskCheckpointStore(tmp_path, load_payload_fn=counting_load)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    _write_kv_checkpoint(store, scope, list(range(256)), length=256)
+    long_entry = _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+
+    long_payload = tmp_path / long_entry.payload_path
+    with open(long_payload, "r+b") as fh:
+        fh.truncate(long_payload.stat().st_size // 2)
+
+    tmp_path.chmod(0o500)
+    try:
+        with pytest.raises(DiskKVError):
+            store.restore(
+                scope, list(range(600)),
+                make_cache_fn=lambda: [_kv_cache_empty()],
+                registry=default_cache_registry(),
+            )
+        # The dead longest entry is excluded during selection, so the next
+        # valid checkpoint wins instead of forcing a full cold prefill.
+        hit = store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [_kv_cache_empty()],
+            registry=default_cache_registry(),
+        )
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert hit is not None
+    assert hit.cached_tokens == 256
+    assert len(loads) == 2
+
+
 def test_restore_refuses_class_list_the_registry_does_not_know(tmp_path):
     store = DiskCheckpointStore(tmp_path)
     scope = build_cache_scope(_model_key(), ("MysteryCache",))

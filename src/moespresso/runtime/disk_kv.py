@@ -381,11 +381,20 @@ class DiskKVIndex:
         data["entries"] = kept
         self._write(data)
 
-    def find_longest(self, scope: dict, tokens: list[int]) -> DiskKVEntry | None:
+    def find_longest(
+        self,
+        scope: dict,
+        tokens: list[int],
+        *,
+        exclude: set[str] | None = None,
+    ) -> DiskKVEntry | None:
         sid = scope_hash(scope)
         entries = [e for e in self.entries() if e.scope_hash == sid]
-        # Descending token count: the longest exact prefix wins.
+        # Descending token count: the longest exact prefix wins. ``exclude``
+        # skips known-bad cache ids so the next valid checkpoint can win.
         for entry in sorted(entries, key=lambda e: e.token_count, reverse=True):
+            if exclude and entry.cache_id in exclude:
+                continue
             if entry.token_count > len(tokens):
                 continue
             if entry.token_prefix_hash == token_prefix_hash(tokens[:entry.token_count]):
@@ -828,17 +837,16 @@ class DiskCheckpointStore:
         checkpoint.
         """
         try:
-            entry = self.index.find_longest(scope, full_tokens)
+            # Dead ids are entries a previous quarantine could not drop from
+            # the index; excluding them during selection lets the next valid
+            # (shorter) checkpoint win instead of forcing a full cold prefill.
+            entry = self.index.find_longest(
+                scope, full_tokens, exclude=self._dead_cache_ids)
         except Exception as e:  # noqa: BLE001 - normalize to the fallback type
             self._log(f"[disk_kv] index lookup failed; cold serving: {e!r}")
             self.disable_writes(f"index unreadable: {e!r}")
             raise DiskKVError(f"disk KV index lookup failed: {e}") from e
         if entry is None:
-            return None
-        if entry.cache_id in self._dead_cache_ids:
-            # A previous quarantine could not drop this entry from the
-            # index; treating it as absent avoids re-loading a payload the
-            # store already rejected.
             return None
         try:
             state_trees, meta_state_trees, metadata = self.load_payload_fn(
@@ -907,17 +915,29 @@ class DiskCheckpointStore:
     def quarantine(self, entry: DiskKVEntry, *, reason: str = "invalid") -> None:
         """Drop an invalid index entry and move its payload aside, best effort.
 
-        Quarantine runs inside restore failure handling and never raises: a
-        quarantine that cannot mutate the index (a readable index on an
-        unwritable or full disk) keeps the caller's original error intact,
-        disables writes, and marks the entry dead for the store's lifetime,
-        so later requests never re-load the known-bad payload.
+        Quarantine runs inside restore failure handling and never raises,
+        and its two phases fail independently. An index removal that cannot
+        rewrite the index (a readable index on an unwritable or full disk)
+        is a confirmed index fault: it keeps the caller's original error
+        intact, disables writes, and marks the entry dead for the store's
+        lifetime, so later requests never re-load the known-bad payload. A
+        payload move failing after a successful removal is not an index
+        fault: the writer stays functional and the leftover file is an
+        orphan the next open cleans up. The quarantine counter counts index
+        removals; payload disposal is best-effort housekeeping.
         """
         self._dead_cache_ids.add(entry.cache_id)
         try:
             self.index.remove(entry)
-            self.quarantines += 1
-            self._log(f"[disk_kv] quarantine reason={reason}")
+        except Exception as e:  # noqa: BLE001 - never mask the restore error
+            self.disable_writes(f"index fault during quarantine: {e!r}")
+            self._log(
+                f"[disk_kv] quarantine failed; entry ignored until restart: "
+                f"{e!r}")
+            return
+        self.quarantines += 1
+        self._log(f"[disk_kv] quarantine reason={reason}")
+        try:
             payload = self.root / entry.payload_path
             if not payload.exists():
                 return
@@ -928,10 +948,9 @@ class DiskCheckpointStore:
                 target = quarantine_dir / f"{entry.cache_id}.{int(time.time())}.safetensors"
             shutil.move(str(payload), str(target))
         except Exception as e:  # noqa: BLE001 - never mask the restore error
-            self.disable_writes(f"index fault during quarantine: {e!r}")
             self._log(
-                f"[disk_kv] quarantine failed; entry ignored until restart: "
-                f"{e!r}")
+                f"[disk_kv] quarantine payload move failed; orphan remains "
+                f"until the next open: {e!r}")
 
     def cleanup_stale_temps(self) -> list[str]:
         """Delete leftover ``.tmp.safetensors`` files under the startup lock.

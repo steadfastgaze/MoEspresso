@@ -211,8 +211,11 @@ cold prefill because only the suffix is prefilled.
   readable index on an unwritable disk) is itself a confirmed fault: the
   store disables writes, keeps the caller's original restore error, and
   remembers the entry as dead so later requests never re-load the
-  rejected payload. Reopening the store (a server restart) retries;
-  startup cleanup removes any orphaned payloads.
+  rejected payload while the next valid checkpoint still restores. A
+  payload move failing after a successful index removal is housekeeping,
+  not an index fault: writes stay enabled and the leftover file is an
+  orphan the next open cleans up. Reopening the store (a server restart)
+  retries; startup cleanup removes any orphaned payloads.
 - Visibility. One operator log line prints on the serve stderr for each checkpoint
   decision (write, skip with reason, write failure, restore, quarantine). The `/health` endpoint's
   `prompt_cache` block carries a `disk` sub-block with the store's counters since
