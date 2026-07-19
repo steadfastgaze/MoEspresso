@@ -16,11 +16,10 @@ contracts, and measured behavior.
   stored contiguously for one-read fetches, and the same expert pool covers
   both fully resident and SSD-backed execution. The package and runtime are
   designed around streaming from the beginning.
-- **Memory is a quality-and-context budget.** A package fixes a quality-gated
+- **Defaults favor quality at long context.** A package fixes a quality-gated
   quantization recipe. Serving defaults to a broadly usable 128K context
-  window. When memory cannot also keep every routed expert resident,
-  MoEspresso streams those experts from SSD instead of shrinking the window or
-  lowering tensor precision.
+  window. When memory cannot keep every routed expert resident,
+  MoEspresso streams those experts instead of shrinking the context window.
 - **K-quants and IQ-quants run inside MLX.** The public packages use
   GGML-family quantization formats through [`mlx-kquant`](#mlx-kquant-acknowledgement),
   rather than being limited to the usual affine-only MLX weight path.
