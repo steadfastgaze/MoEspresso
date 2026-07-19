@@ -38,7 +38,6 @@ HOST_PATH_MARKERS = (
 PRIVATE_PACKAGE_PAYLOAD_MARKERS = ("specs_archive/",)
 LICENSE_NAMES = {"LICENSE-MIT", "LICENSE-APACHE-2.0", "THIRD-PARTY-NOTICES"}
 LICENSE_BYTES = {name: (REPO_ROOT / name).read_bytes() for name in LICENSE_NAMES}
-EXPECTED_VERSION = "1.0.0"
 EXPECTED_LICENSE_EXPRESSION = "MIT OR Apache-2.0"
 EXPECTED_RUNTIME_REQUIREMENTS = {
     "jang",
@@ -50,6 +49,7 @@ EXPECTED_RUNTIME_REQUIREMENTS = {
 }
 README_BYTES = (REPO_ROOT / "README.md").read_bytes()
 PROJECT_METADATA = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+EXPECTED_VERSION = PROJECT_METADATA["project"]["version"]
 EXPECTED_SURFACE_SUFFIXES = (
     "moespresso/package/deepseek_v4/kquant_package.py",
     "moespresso/correctness/deepseek_v4/quality.py",
@@ -321,8 +321,10 @@ def _minimal_members(kind: str) -> dict[str, bytes]:
         members[license_name] = LICENSE_BYTES[license_name]
     if kind == "wheel":
         entry_points = "\n".join(f"{name} = package:main" for name in PUBLIC_ENTRY_POINTS)
-        members["moespresso-1.0.0.dist-info/entry_points.txt"] = entry_points.encode()
-        members["moespresso-1.0.0.dist-info/METADATA"] = _minimal_metadata()
+        members[f"moespresso-{EXPECTED_VERSION}.dist-info/entry_points.txt"] = (
+            entry_points.encode()
+        )
+        members[f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"] = _minimal_metadata()
     else:
         members["tests/test_ornith_gate.py"] = b"synthetic_fixture = True\n"
         members["PKG-INFO"] = _minimal_metadata()
@@ -383,12 +385,14 @@ def test_audit_rejects_private_references_in_package_payloads():
 
 def test_audit_rejects_incomplete_release_metadata():
     members = _minimal_members("wheel")
-    metadata_name = "moespresso-1.0.0.dist-info/METADATA"
+    metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
     members[metadata_name] = members[metadata_name].replace(
         b"License-Expression: MIT OR Apache-2.0\n", b"License-Expression: MIT\n"
     )
     members[metadata_name] = members[metadata_name].replace(README_BYTES, b"truncated\n")
-    members["moespresso-1.0.0.dist-info/entry_points.txt"] = b"moespresso-serve = pkg:main\n"
+    members[f"moespresso-{EXPECTED_VERSION}.dist-info/entry_points.txt"] = (
+        b"moespresso-serve = pkg:main\n"
+    )
 
     failures = audit_members("wheel", members)
 
@@ -399,7 +403,7 @@ def test_audit_rejects_incomplete_release_metadata():
 
 def test_audit_rejects_removed_compute_extra_metadata():
     members = _minimal_members("wheel")
-    metadata_name = "moespresso-1.0.0.dist-info/METADATA"
+    metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
     members[metadata_name] = members[metadata_name].replace(
         b"Requires-Dist: mlx>=0.31.2\n",
         b"Requires-Dist: mlx>=0.31.2; extra == 'compute'\nProvides-Extra: compute\n",

@@ -29,7 +29,7 @@ from moespresso.runtime.deepseek_v4.renderer import (
     render_deepseek_v4_prompt,
 )
 
-PRODUCER = {"tool": "moespresso.correctness", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.correctness", "version": "1.1.0"}
 DS4_Q0_FIXTURE_ROOT = (
     Path(__file__).resolve().parent / "fixtures" / "deepseek_v4" / "test_vectors"
 )

@@ -28,7 +28,7 @@ from moespresso.core.artifact import Validation, make_artifact
 from moespresso.inventory.architecture_profile import deepseek_v4_flash_profile, family_of
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
 
-PRODUCER = {"tool": "moespresso.package", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.package", "version": "1.1.0"}
 
 # The package format. MJTQ = "MoEspresso Jang TurboQuant": it reuses jang's TurboQuant codec
 # + tensor conventions (.tq_packed/.tq_norms/.tq_bits) for compression, but adds

@@ -40,7 +40,6 @@ def test_imported_version_matches_project_metadata():
     project_metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert project_metadata["project"]["version"] == "1.0.0"
     assert project_metadata["project"]["readme"] == "README.md"
     assert moespresso.__version__ == project_metadata["project"]["version"]
     assert importlib_metadata.version("moespresso") == project_metadata["project"]["version"]
@@ -53,7 +52,7 @@ def test_lock_and_artifact_producers_match_release_version():
     project_packages = [row for row in lock["package"] if row.get("name") == "moespresso"]
 
     assert len(project_packages) == 1
-    assert project_packages[0]["version"] == moespresso.__version__ == "1.0.0"
+    assert project_packages[0]["version"] == moespresso.__version__
 
     for relative_path in PRODUCER_FILES:
         producer = _literal_assignment(REPOSITORY_ROOT / relative_path, "PRODUCER")

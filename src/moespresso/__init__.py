@@ -8,4 +8,4 @@ The public runtime serves explicit packages for DeepSeek-V4-Flash and Ornith
 1.0 35B, resident or through bounded routed-expert residency.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -19,7 +19,7 @@ from moespresso.probe import weight_io
 from moespresso.probe.deepseek_v4.codec import load_dequantized_fp8_rows
 from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup
 
-PRODUCER = {"tool": "moespresso.correctness", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.correctness", "version": "1.1.0"}
 
 DEFAULT_SAMPLE_POLICY = {
     "seed": 42,

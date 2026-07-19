@@ -205,7 +205,7 @@ def force_override_preview_lines(plan: dict, *, limit: int = 20) -> list[str]:
     return lines
 
 
-PRODUCER = {"tool": "moespresso.package.plan", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.package.plan", "version": "1.1.0"}
 
 
 def make_package_plan(

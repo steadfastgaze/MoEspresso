@@ -20,7 +20,7 @@ from moespresso.optimize.monotone import (
 )
 from moespresso.optimize.sizes import affine_bytes, mx_float_bytes
 
-PRODUCER = {"tool": "moespresso.optimize", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.optimize", "version": "1.1.0"}
 
 # Roles kept fp16 (never quantized): only the router / shared-expert gates. They
 # select experts via argmax/top-k, a discrete decision a reconstruction-error proxy

@@ -31,7 +31,7 @@ AFFINE_GROUP_SIZES = (32, 64, 128)
 DEFAULT_EXPERT_SAMPLE = 2     # fine-grained MoE: experts in a layer are equivalent
 DEFAULT_SAMPLE_ROWS = 256
 
-PRODUCER = {"tool": "moespresso.probe", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.probe", "version": "1.1.0"}
 
 
 def imatrix_coverage_validations(

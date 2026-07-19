@@ -24,7 +24,7 @@ _SKIP_SUBSTR = (
     "vision", "visual", "audio", "image", "mtp",
 )
 
-PRODUCER = {"tool": "moespresso.inventory", "version": "1.0.0"}
+PRODUCER = {"tool": "moespresso.inventory", "version": "1.1.0"}
 
 
 def _classify_deepseek_v4(h: TensorHeader) -> dict | None:

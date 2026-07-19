@@ -53,7 +53,7 @@ unified memory. See [accuracy](#accuracy-focus) and [performance](#performance-f
 
 ## Install
 
-MoEspresso 1.0.0 requires an arm64 Apple Silicon Mac running macOS 26.2
+MoEspresso 1.1.0 requires an arm64 Apple Silicon Mac running macOS 26.2
 (Tahoe) or later.
 
 Install MoEspresso with Homebrew. The formula installs its required Python
