@@ -697,6 +697,13 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
         lambda package_dir: ("MODEL", _Tokenizer(), manifest),
     )
     monkeypatch.setattr(
+        serve,
+        "_preflight_manifest_for_cli",
+        lambda package_dir: (_ for _ in ()).throw(
+            AssertionError("context validation must not add a manifest preflight")
+        ),
+    )
+    monkeypatch.setattr(
         http,
         "render_prompt",
         lambda messages, tokenizer, **kwargs: "RENDERED:" + messages[0]["content"],
@@ -783,6 +790,68 @@ def test_generate_main_rejects_span_beyond_explicit_context_limit(
     output = capsys.readouterr().out
     assert "served context limit of 2 tokens" in output
     assert "2 prompt tokens plus max_tokens 1" in output
+
+
+def test_generate_main_reports_explicit_limit_above_package_after_load(
+    tmp_path, monkeypatch, capsys
+):
+    import moespresso.runtime.serve as serve
+
+    manifest = {
+        "artifact_id": "pkg:smoke",
+        "architecture": {
+            "family": "deepseek_v4_flash",
+            "config": {"max_position_embeddings": 10},
+        },
+        "tensors": [],
+        "files": [],
+    }
+    monkeypatch.setattr(
+        serve,
+        "load_served_model",
+        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
+    )
+
+    rc = main([
+        str(tmp_path / "pkg"),
+        "--max-context-tokens",
+        "11",
+    ])
+
+    assert rc == 2
+    assert "exceeds the package context limit of 10 tokens" in capsys.readouterr().out
+
+
+def test_generate_main_rejects_deepseek_below_minimum_residency(
+    tmp_path, monkeypatch, capsys
+):
+    import moespresso.runtime.serve as serve
+
+    manifest = {
+        "artifact_id": "pkg:smoke",
+        "architecture": {"family": "deepseek_v4_flash"},
+        "tensors": [],
+        "files": [],
+    }
+
+    class _Model:
+        _moespresso_ssd_streaming_capacity = 32
+        _moespresso_ssd_streaming_capacity_overrides = {}
+
+    monkeypatch.setattr(
+        serve,
+        "load_served_model",
+        lambda package_dir: (_Model(), _Tokenizer(), manifest),
+    )
+
+    rc = main([
+        str(tmp_path / "pkg"),
+        "--min-resident-experts",
+        "48",
+    ])
+
+    assert rc == 2
+    assert "capacity 32 is below the requested minimum of 48" in capsys.readouterr().out
 
 
 def test_generate_main_maps_deepseek_v4_thinking_selections(

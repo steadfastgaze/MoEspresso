@@ -86,8 +86,10 @@ package came from the probe/optimizer route or the GGUF recipe route.
 `GET /health`. The endpoint supports SSE streaming (`stream: true`) with
 `reasoning_content`/`content` deltas, sampling pass-through
 (`top_k`, `min_p`, `presence_penalty`), refusal of unsupported
-`repetition_penalty` values, and refusal of requests over the package's
-declared context limit. The server warms generation before announcing
+`repetition_penalty` values, and refusal of requests over the effective served
+context limit. Serving defaults to 128K or the package's architecture limit,
+whichever is smaller; `--max-context-tokens` selects any positive limit up to
+that architecture limit. The server warms generation before announcing
 readiness. Prefix reuse is in-memory by default; setting
 `MOESPRESSO_DISK_KV=frontier` adds the opt-in restart-warm disk checkpoint
 tier. Details: `docs/runtime_resident.md` and `docs/disk_kv.md`.

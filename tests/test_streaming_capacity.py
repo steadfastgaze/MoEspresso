@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 
 import pytest
 
@@ -58,33 +60,46 @@ def test_min_capacity_is_router_fanout_plus_staging():
 
 
 def test_min_resident_experts_is_an_optional_fail_closed_floor():
-    validate_min_resident_experts(
-        capacity=48,
-        requested=None,
-        package_experts=256,
+    model = SimpleNamespace(
+        _moespresso_ssd_streaming_capacity=48,
+        _moespresso_ssd_streaming_capacity_overrides={3: 52},
     )
     validate_min_resident_experts(
-        capacity=48,
+        model,
+        requested=None,
+    )
+    validate_min_resident_experts(
+        model,
         requested=48,
-        package_experts=256,
     )
     with pytest.raises(StreamingCapacityError, match="below the requested minimum"):
         validate_min_resident_experts(
-            capacity=47,
-            requested=48,
-            package_experts=256,
+            model,
+            requested=49,
         )
     with pytest.raises(StreamingCapacityError, match="must be >= 1"):
         validate_min_resident_experts(
-            capacity=48,
+            model,
             requested=0,
-            package_experts=256,
         )
-    with pytest.raises(StreamingCapacityError, match="package expert count"):
+    with pytest.raises(StreamingCapacityError, match="reports resident expert capacity"):
         validate_min_resident_experts(
-            capacity=256,
-            requested=257,
-            package_experts=256,
+            SimpleNamespace(),
+            requested=1,
+        )
+
+
+def test_min_resident_experts_checks_per_layer_overrides():
+    model = SimpleNamespace(
+        _moespresso_ssd_streaming_capacity=48,
+        _moespresso_ssd_streaming_capacity_overrides={3: 32, 9: 64},
+    )
+
+    validate_min_resident_experts(model, requested=32)
+    with pytest.raises(StreamingCapacityError, match="capacity 32"):
+        validate_min_resident_experts(
+            model,
+            requested=33,
         )
 
 

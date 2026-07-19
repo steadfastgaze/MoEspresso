@@ -825,10 +825,10 @@ class RoadtestRun:
     EXTENSION_TURN_TOKEN_ALLOWANCE = 12_000
 
     def _at_context_ceiling(self, turn_id: str) -> bool:
-        """True when another extension turn could cross the declared limit.
+        """True when another extension turn could cross the served limit.
 
         The server refuses a request whose prompt plus completion budget
-        exceeds the model's declared context limit, so the growth phase
+        exceeds the served context limit, so the growth phase
         stops while the next turn still fits and the run ends cleanly.
         """
         limit = self.config.context_limit
@@ -941,7 +941,7 @@ class RoadtestRun:
 
 
 def _package_run_settings(package_dir: Path) -> tuple[LoopSettings | None, int | None]:
-    """Loop settings and context limit a package directory declares.
+    """Loop settings and default served context limit for a package.
 
     The loop settings resolve from the package's agentic profile alone
     (no user config layer: a certification run must not absorb host
@@ -951,7 +951,7 @@ def _package_run_settings(package_dir: Path) -> tuple[LoopSettings | None, int |
     """
     # Imported here: the manifest reader lives with the runtime cache code
     # and is only needed when a real package is on the command line.
-    from moespresso.runtime.prefix_cache import declared_context_limit
+    from moespresso.runtime.prefix_cache import effective_context_limit
 
     loop = None
     profile = load_agentic_profile(package_dir)
@@ -963,7 +963,7 @@ def _package_run_settings(package_dir: Path) -> tuple[LoopSettings | None, int |
     manifest_path = package_dir / "package_manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        context_limit = declared_context_limit(manifest)
+        context_limit = effective_context_limit(manifest)
     return loop, context_limit
 
 
@@ -1055,7 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"thinking_for_tools={loop.thinking_for_tools} "
                   f"reprompt={loop.reprompt_enabled}/{loop.reprompt_limit}")
         if context_limit is not None:
-            print(f"[roadtest] declared context limit: {context_limit}")
+            print(f"[roadtest] served context limit: {context_limit}")
 
     if args.smoke:
         base_url = args.base_url or f"http://127.0.0.1:{args.port}"

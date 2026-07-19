@@ -334,15 +334,15 @@ on an in-memory miss; it is off unless enabled and is documented separately in
 1. **Encode** the rendered prompt to token ids with the same BOS/special-token
    rule MLX uses (`encode_rendered_prompt`), so cache keys match the generation
    token stream exactly.
-2. **Refuse an over-limit request** before any cache access. The generator
-   reads the package's declared context limit (`declared_context_limit`, from
-   the manifest's embedded config `max_position_embeddings`; for
-   position-scaled families the field already holds the scaled ceiling), and
-   raises `ContextLimitError` when prompt tokens plus the requested
-   `max_tokens` exceed it; the HTTP layer maps that to a 400. The check runs
+2. **Refuse an over-limit request** before any cache access. The generator uses
+   the effective served context limit: 128K or the package's architecture
+   limit, whichever is smaller, unless `--max-context-tokens` explicitly
+   selects another positive value up to the architecture limit. It raises
+   `ContextLimitError` when prompt tokens plus the requested `max_tokens`
+   exceed that limit; the HTTP layer maps the error to a 400. The check runs
    before `fetch_nearest_cache` because the store hands entries out by move: a
    refusal after the fetch would cost the session its chain entry. A package
-   that declares nothing gets no limit.
+   without a declared architecture limit uses the 128K default.
 3. **Bucket** under `cache_model_key` = `(artifact_id, effective_rendering_id,
    live_kv_format, kv_group_size, quantized_kv_start)`. Token ids alone aren't
    enough: the same tokens under another package, render policy, or KV format

@@ -867,8 +867,12 @@ def test_serve_accepts_deepseek_v4_prompt_cache_bounds(monkeypatch):
 
     manifest = _deepseek_v4_manifest()
 
+    class _Model:
+        _moespresso_ssd_streaming_capacity = 48
+        _moespresso_ssd_streaming_capacity_overrides = {}
+
     def fake_load_model(package_dir):
-        return "MODEL", "TOKENIZER", manifest
+        return _Model(), "TOKENIZER", manifest
 
     seen = {}
 
@@ -887,6 +891,7 @@ def test_serve_accepts_deepseek_v4_prompt_cache_bounds(monkeypatch):
             prompt_cache_size=4,
             prompt_cache_bytes=1024,
             max_context_tokens=30000,
+            min_resident_experts=48,
             startup_warmup=False,
             load_model_fn=fake_load_model,
         )
@@ -894,6 +899,50 @@ def test_serve_accepts_deepseek_v4_prompt_cache_bounds(monkeypatch):
     assert seen["prompt_cache_size"] == 4
     assert seen["prompt_cache_bytes"] == 1024
     assert seen["context_limit"] == 30000
+
+
+def test_serve_rejects_deepseek_below_minimum_residency(capsys):
+    import moespresso.runtime.http as h
+
+    manifest = _deepseek_v4_manifest()
+
+    class _Model:
+        _moespresso_ssd_streaming_capacity = 32
+        _moespresso_ssd_streaming_capacity_overrides = {}
+
+    rc = h.serve(
+        "/tmp/pkg",
+        min_resident_experts=48,
+        startup_warmup=False,
+        load_model_fn=lambda package_dir: (_Model(), "TOKENIZER", manifest),
+    )
+
+    assert rc == 2
+    assert "capacity 32 is below the requested minimum of 48" in capsys.readouterr().out
+
+
+def test_serve_uses_default_context_limit(monkeypatch):
+    import moespresso.runtime.http as h
+
+    manifest = _deepseek_v4_manifest()
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_build_cache_generator(model, tokenizer, mani, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(h, "build_cache_generator", fake_build_cache_generator)
+    with pytest.raises(_Stop):
+        h.serve(
+            "/tmp/pkg",
+            startup_warmup=False,
+            load_model_fn=lambda package_dir: ("MODEL", "TOKENIZER", manifest),
+        )
+
+    assert seen["context_limit"] == 131072
 
 
 def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):

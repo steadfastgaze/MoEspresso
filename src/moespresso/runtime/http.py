@@ -493,8 +493,8 @@ def chat_completion(
         tools=request.get("tools"),
         response_format=request.get("response_format"),
     )
-    # An over-limit request (prompt tokens plus max_tokens past the model's
-    # declared context limit) is a client error. The generator refuses it before
+    # An over-limit request (prompt tokens plus max_tokens past the served
+    # context limit) is a client error. The generator refuses it before
     # any cache access and the refusal names the
     # limit and both request-side counts. The prompt that fits but whose
     # max_tokens overruns is refused identically rather than clamped, so the
@@ -950,7 +950,10 @@ def serve(
         open_disk_store,
         resolve_disk_kv_config,
     )
-    from moespresso.runtime.streaming_capacity import StreamingCapacityError
+    from moespresso.runtime.streaming_capacity import (
+        StreamingCapacityError,
+        validate_min_resident_experts,
+    )
 
     try:
         disk_kv_config = resolve_disk_kv_config()
@@ -967,10 +970,11 @@ def serve(
 
     try:
         try:
-            load_kwargs = {}
-            if min_resident_experts is not None:
-                load_kwargs["min_resident_experts"] = int(min_resident_experts)
-            model, tokenizer, manifest = load_model_fn(package_dir, **load_kwargs)
+            model, tokenizer, manifest = load_model_fn(package_dir)
+            validate_min_resident_experts(
+                model,
+                requested=min_resident_experts,
+            )
         except (FileNotFoundError, StreamingCapacityError) as e:
             # PackageNotFoundError and friends: one clear line, no traceback
             print(f"FAILED: {e}")
@@ -1124,20 +1128,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry; "
                              "RSS remains a separate process measurement.")
-    parser.add_argument(
-        "--max-context-tokens",
-        type=int,
-        default=None,
-        help="Maximum prompt-plus-output context tokens. Default: 131072 or "
-             "the package limit, whichever is smaller.",
+    from moespresso.runtime.serve import (
+        add_runtime_limit_arguments,
+        validate_runtime_limit_arguments,
     )
-    parser.add_argument(
-        "--min-resident-experts",
-        type=int,
-        default=None,
-        help="Require at least this many resident routed experts per layer; "
-             "startup fails when the planned pool is smaller.",
-    )
+
+    add_runtime_limit_arguments(parser)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--prompt-cache-size", type=int, default=None,
@@ -1163,10 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
              "(default: auto; off restores lazy first-request setup)",
     )
     args = parser.parse_args(argv)
-    if args.max_context_tokens is not None and args.max_context_tokens < 1:
-        parser.error("--max-context-tokens must be >= 1")
-    if args.min_resident_experts is not None and args.min_resident_experts < 1:
-        parser.error("--min-resident-experts must be >= 1")
+    validate_runtime_limit_arguments(parser, args)
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)

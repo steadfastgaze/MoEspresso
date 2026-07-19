@@ -33,7 +33,6 @@ from moespresso.runtime.streaming_capacity import (
     choose_capacity,
     is_routed_expert_payload_key,
     package_capacity_budget,
-    validate_min_resident_experts,
 )
 
 _SWITCH_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
@@ -571,7 +570,6 @@ def build_ssd_streaming_model(
     *,
     capacity_per_layer: int | None = None,
     capacity_overrides: Mapping[int, int] | None = None,
-    min_resident_experts: int | None = None,
     eviction_policy: str = "lfu",
     seed: int = 42,
 ):
@@ -667,11 +665,6 @@ def build_ssd_streaming_model(
             # where prediction has headroom.
             spare_slots = min(16, max(0, capacity_per_layer - 24))
             capacity_per_layer = capacity_per_layer - spare_slots
-        validate_min_resident_experts(
-            capacity=int(capacity_per_layer),
-            requested=min_resident_experts,
-            package_experts=index.num_experts,
-        )
         installed = install_pooled_switchglus(
             model,
             package_dir=package_dir,

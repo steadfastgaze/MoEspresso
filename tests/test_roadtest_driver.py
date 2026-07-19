@@ -25,10 +25,32 @@ import pytest
 
 from moespresso.agentlib.profile import LoopSettings
 from moespresso.agentlib.roadtest.fixture import DEFECT_FIX_LINE, DEFECT_LINE
-from moespresso.agentlib.roadtest.run import RoadtestRun, RunConfig
+from moespresso.agentlib.roadtest.run import (
+    RoadtestRun,
+    RunConfig,
+    _package_run_settings,
+)
 from moespresso.runtime.deepseek_v4.renderer import _render_tool_calls
 
 STRIDE = 256
+
+
+def test_package_run_settings_use_default_served_context_limit(tmp_path):
+    package_dir = tmp_path / "package"
+    package_dir.mkdir()
+    (package_dir / "package_manifest.json").write_text(
+        json.dumps({
+            "architecture": {
+                "config": {"max_position_embeddings": 262144},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    loop, context_limit = _package_run_settings(package_dir)
+
+    assert loop is None
+    assert context_limit == 131072
 
 
 def _dsml(name: str, arguments: dict) -> str:

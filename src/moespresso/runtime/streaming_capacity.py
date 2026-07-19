@@ -100,25 +100,34 @@ def min_capacity(*, max_router_fanout: int, staging_slots: int = 2) -> int:
 
 
 def validate_min_resident_experts(
+    model,
     *,
-    capacity: int,
     requested: int | None,
-    package_experts: int,
 ) -> None:
-    """Enforce an optional operator floor without changing auto capacity."""
+    """Enforce an optional floor against the loaded runtime capacity."""
     if requested is None:
         return
     requested = int(requested)
     if requested < 1:
         raise StreamingCapacityError("--min-resident-experts must be >= 1")
-    if requested > int(package_experts):
+
+    base_capacity = getattr(model, "_moespresso_ssd_streaming_capacity", None)
+    if base_capacity is None:
         raise StreamingCapacityError(
-            f"--min-resident-experts {requested} exceeds the package expert "
-            f"count of {package_experts}"
+            "--min-resident-experts requires a routed runtime that reports "
+            "resident expert capacity"
         )
-    if int(capacity) < requested:
+    capacities = [int(base_capacity)]
+    overrides = getattr(
+        model,
+        "_moespresso_ssd_streaming_capacity_overrides",
+        None,
+    ) or {}
+    capacities.extend(int(capacity) for capacity in overrides.values())
+    actual = min(capacities)
+    if actual < requested:
         raise StreamingCapacityError(
-            f"planned resident expert capacity {capacity} is below the "
+            f"loaded resident expert capacity {actual} is below the "
             f"requested minimum of {requested}"
         )
 

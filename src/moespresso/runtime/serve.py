@@ -61,7 +61,6 @@ def build_manifest_runtime(
     *,
     resident_builder: Callable[[dict, Path], tuple] | None = None,
     streaming_builder: Callable[[Path], tuple] | None = None,
-    min_resident_experts: int | None = None,
 ):
     """Build the runtime declared by the manifest.
 
@@ -75,22 +74,9 @@ def build_manifest_runtime(
             from moespresso.runtime.ssd_streaming_build import build_ssd_streaming_model
 
             streaming_builder = build_ssd_streaming_model
-        if min_resident_experts is None:
-            built = streaming_builder(package_dir)
-        else:
-            built = streaming_builder(
-                package_dir,
-                min_resident_experts=int(min_resident_experts),
-            )
+        built = streaming_builder(package_dir)
         model, tokenizer = built[:2]
         return model, tokenizer
-
-    if min_resident_experts is not None:
-        from moespresso.runtime.streaming_capacity import StreamingCapacityError
-
-        raise StreamingCapacityError(
-            "min_resident_experts requires a routed SSD-streaming package"
-        )
 
     if resident_builder is None:
         from moespresso.runtime.build import build_model
@@ -101,8 +87,6 @@ def build_manifest_runtime(
 def _manifest_driven_backend(
     manifest: dict,
     package_dir: Path,
-    *,
-    min_resident_experts: int | None = None,
 ):
     """The mjtq backend: build via the proven jang loader (runtime.build).
 
@@ -111,11 +95,7 @@ def _manifest_driven_backend(
     (TQ experts -> metal-kernel modules, affine -> mlx QuantizedLinear, per-tensor
     bits via tensor_map): no dequant at load. Returns (model, tokenizer); the
     tokenizer is loaded from the package by mlx_lm."""
-    return build_manifest_runtime(
-        manifest,
-        package_dir,
-        min_resident_experts=min_resident_experts,
-    )
+    return build_manifest_runtime(manifest, package_dir)
 
 
 def _apple_silicon_generation() -> int | None:
@@ -259,7 +239,6 @@ def load_served_model(
     *,
     manifest: dict | None = None,
     build_fn: Callable[[dict, Path], tuple] = _manifest_driven_backend,
-    min_resident_experts: int | None = None,
 ):
     """Build (model, tokenizer, manifest) from a mjtq package.
 
@@ -288,14 +267,7 @@ def load_served_model(
 
     default_ornith_mlx_command_buffer_limit(manifest)
     default_kq_seg_tile_for_hardware()
-    if min_resident_experts is None:
-        model, tokenizer = build_fn(manifest, package_dir)
-    else:
-        model, tokenizer = build_fn(
-            manifest,
-            package_dir,
-            min_resident_experts=int(min_resident_experts),
-        )
+    model, tokenizer = build_fn(manifest, package_dir)
     print(_runtime_truth_line(model, manifest), flush=True)
     return model, tokenizer, manifest
 
@@ -797,6 +769,34 @@ def _generation_json_payload(
     }
 
 
+def add_runtime_limit_arguments(parser) -> None:
+    """Add the shared context and expert-residency CLI controls."""
+    from moespresso.runtime.prefix_cache import DEFAULT_CONTEXT_LIMIT
+
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="Maximum prompt-plus-output context tokens. Default: "
+             f"{DEFAULT_CONTEXT_LIMIT:,} or the package limit, whichever is smaller.",
+    )
+    parser.add_argument(
+        "--min-resident-experts",
+        type=int,
+        default=None,
+        help="Require at least this many resident routed experts per layer; "
+             "startup fails when the loaded capacity is smaller.",
+    )
+
+
+def validate_runtime_limit_arguments(parser, args) -> None:
+    """Reject non-positive shared runtime limits at the CLI boundary."""
+    if args.max_context_tokens is not None and args.max_context_tokens < 1:
+        parser.error("--max-context-tokens must be >= 1")
+    if args.min_resident_experts is not None and args.min_resident_experts < 1:
+        parser.error("--min-resident-experts must be >= 1")
+
+
 def main(argv: list[str] | None = None) -> int:
     """`uv run moespresso-generate <package_dir> [--prompt ...]`: load + generate.
 
@@ -816,20 +816,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry and "
                              "can simulate a smaller pool; it is not an RSS cap.")
-    parser.add_argument(
-        "--max-context-tokens",
-        type=int,
-        default=None,
-        help="Maximum prompt-plus-output context tokens. Default: 131072 or "
-             "the package limit, whichever is smaller.",
-    )
-    parser.add_argument(
-        "--min-resident-experts",
-        type=int,
-        default=None,
-        help="Require at least this many resident routed experts per layer; "
-             "loading fails when the planned pool is smaller.",
-    )
+    add_runtime_limit_arguments(parser)
     parser.add_argument("--prompt", default="Hello", help="Prompt to generate from")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -845,32 +832,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-out", type=Path,
                         help="Write structured generation metadata to this JSON file.")
     args = parser.parse_args(argv)
-    if args.max_context_tokens is not None and args.max_context_tokens < 1:
-        parser.error("--max-context-tokens must be >= 1")
-    if args.min_resident_experts is not None and args.min_resident_experts < 1:
-        parser.error("--min-resident-experts must be >= 1")
+    validate_runtime_limit_arguments(parser, args)
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
 
     pkg = Path(args.package_dir)
-    preflight_manifest = _preflight_manifest_for_cli(pkg)
-    if preflight_manifest is not None:
-        from moespresso.runtime.prefix_cache import effective_context_limit
-
-        try:
-            effective_context_limit(
-                preflight_manifest,
-                requested=args.max_context_tokens,
-            )
-        except ValueError as e:
-            parser.error(str(e))
     if args.thinking is not None:
         from moespresso.runtime.http import (
             is_deepseek_v4_manifest,
             thinking_effort_option_error,
         )
 
+        preflight_manifest = _preflight_manifest_for_cli(pkg)
         if preflight_manifest is not None:
             option_error = thinking_effort_option_error(
                 args.thinking,
@@ -880,13 +854,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
     print(f"Loading package from its manifest: {pkg}")
-    from moespresso.runtime.streaming_capacity import StreamingCapacityError
+    from moespresso.runtime.streaming_capacity import (
+        StreamingCapacityError,
+        validate_min_resident_experts,
+    )
 
     try:
-        load_kwargs = {}
-        if args.min_resident_experts is not None:
-            load_kwargs["min_resident_experts"] = args.min_resident_experts
-        model, tokenizer, manifest = load_served_model(pkg, **load_kwargs)
+        model, tokenizer, manifest = load_served_model(pkg)
+        validate_min_resident_experts(
+            model,
+            requested=args.min_resident_experts,
+        )
     except (PackageNotFoundError, StreamingCapacityError) as e:
         print(f"FAILED: {e}")
         return 2
@@ -895,10 +873,14 @@ def main(argv: list[str] | None = None) -> int:
         effective_context_limit,
     )
 
-    context_limit = effective_context_limit(
-        manifest,
-        requested=args.max_context_tokens,
-    )
+    try:
+        context_limit = effective_context_limit(
+            manifest,
+            requested=args.max_context_tokens,
+        )
+    except ValueError as e:
+        print(f"FAILED: {e}")
+        return 2
     print(
         f"[generate] context_limit={context_limit} "
         f"package_limit={declared_context_limit(manifest) or 'unknown'}"

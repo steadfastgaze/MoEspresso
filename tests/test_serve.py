@@ -175,24 +175,24 @@ def test_manifest_runtime_uses_ssd_streaming_for_moe_tq(tmp_path):
     assert calls == [("streaming", tmp_path)]
 
 
-def test_manifest_runtime_threads_explicit_minimum_residency(tmp_path):
+def test_manifest_runtime_keeps_deepseek_on_its_owned_adapter(tmp_path):
     calls = []
     manifest = {
-        "architecture": {"family": "qwen3_5_moe"},
-        "required_ops": ["affine_dequant", "tq_dequant"],
+        "architecture": {"family": "deepseek_v4_flash"},
+        "required_ops": ["affine_dequant", "mxfp4_dequant"],
     }
 
-    def streaming_builder(package_dir, *, min_resident_experts):
-        calls.append((package_dir, min_resident_experts))
-        return "M", "T", 3
+    def resident_builder(manifest_arg, package_dir):
+        calls.append((manifest_arg, package_dir))
+        return "DS4", "T"
 
     assert build_manifest_runtime(
         manifest,
         tmp_path,
-        streaming_builder=streaming_builder,
-        min_resident_experts=48,
-    ) == ("M", "T")
-    assert calls == [(tmp_path, 48)]
+        resident_builder=resident_builder,
+        streaming_builder=lambda _path: ("BAD", "BAD"),
+    ) == ("DS4", "T")
+    assert calls == [(manifest, tmp_path)]
 
 
 def test_manifest_runtime_uses_ssd_streaming_for_qwen_kquant_moe(tmp_path):

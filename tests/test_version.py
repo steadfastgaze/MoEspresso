@@ -45,7 +45,7 @@ def test_imported_version_matches_project_metadata():
     assert moespresso.__version__ == project_metadata["project"]["version"]
     assert importlib_metadata.version("moespresso") == project_metadata["project"]["version"]
     assert project_metadata["build-system"]["requires"] == ["hatchling==1.31.0"]
-    assert f"MoEspresso {moespresso.__version__} targets" in readme
+    assert f"MoEspresso {moespresso.__version__} requires" in readme
 
 
 def test_lock_and_artifact_producers_match_release_version():

@@ -142,7 +142,7 @@ The main serving controls are:
   architecture limit. The default is 128K or the package limit, whichever is
   smaller.
 - `--min-resident-experts` requires a minimum routed-expert capacity per layer
-  and fails at startup when the planned pool is smaller.
+  and fails at startup when the loaded capacity is smaller.
 
 ## Memory policy and SSD expert streaming
 
