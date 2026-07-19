@@ -94,6 +94,27 @@ def profile_for_family(family: str | None) -> dict | None:
     return copy.deepcopy(profile) if profile is not None else None
 
 
+def read_agentic_profile(package_dir: Path) -> dict | None:
+    """Read a package's agentic profile sidecar, or None.
+
+    Returns None when the file is absent, unreadable, not an object, or
+    carries a ``schema_version`` above ``SCHEMA_VERSION``: readers fail
+    closed on versions they do not understand, and a consumer treats a
+    missing profile as "the client decides".
+    """
+    path = Path(package_dir) / AGENTIC_PROFILE_NAME
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(profile, dict):
+        return None
+    version = profile.get("schema_version")
+    if not isinstance(version, int) or version > SCHEMA_VERSION:
+        return None
+    return profile
+
+
 def write_agentic_profile(package_dir: Path, *, family: str | None) -> dict | None:
     """Write the family's profile sidecar into the package.
 

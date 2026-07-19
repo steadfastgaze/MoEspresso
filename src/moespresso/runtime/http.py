@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -46,6 +48,13 @@ from moespresso.runtime.kv_policy import (
     parse_kv_policy,
     validate_runtime_policy,
 )
+from moespresso.runtime.tool_stream import (
+    DSML_DIALECT,
+    QWENXML_DIALECT,
+    ToolCallStreamer,
+)
+from moespresso.toolcalls.dsml import render_dsml_tool_calls
+from moespresso.toolcalls.dsml import render_tools as render_dsml_tools_block
 
 # --- pure core: request dict + generator -> response dict / error ---
 
@@ -106,6 +115,189 @@ def request_stream_options(request: dict) -> tuple[bool, bool]:
     if not isinstance(include_usage, bool):
         raise RequestError(400, "stream_options.include_usage must be a boolean")
     return stream, include_usage
+
+
+TOOL_DIALECT_NATIVE = "native"
+TOOL_DIALECT_DSML = "dsml"
+
+
+@dataclass(frozen=True)
+class ToolCallConfig:
+    """Server-resolved tool-call policy for template-family packages.
+
+    ``dialect`` selects how a request's tools are taught to the model and
+    which text dialect the serve layer parses back: ``native`` keeps the
+    vendored template's own tool rendering (Qwen XML for the Qwen families),
+    ``dsml`` teaches the DSML dialect through the system block instead.
+    DeepSeek-V4 ignores the dialect: its renderer owns DSML as part of the
+    model contract. ``parse`` off restores the pre-parsing behavior (tool
+    markup returns verbatim as content); ``repair`` off keeps parsing
+    strict-only.
+    """
+
+    dialect: str = TOOL_DIALECT_NATIVE
+    parse: bool = True
+    repair: bool = True
+
+
+DEFAULT_TOOL_CALL_CONFIG = ToolCallConfig()
+
+
+def resolve_tool_call_config(
+    package_dir: Path | None = None,
+    *,
+    dialect: str | None = None,
+) -> ToolCallConfig:
+    """Resolve the served tool-call policy for one server process.
+
+    Precedence: env kill switches, then the explicit ``dialect`` selection
+    (the ``--tool-dialect`` flag), then the package's agentic profile
+    sidecar, then native. ``MOESPRESSO_TOOL_CALLS=0`` disables served
+    tool-call parsing entirely and ``MOESPRESSO_TOOL_REPAIR=0`` keeps
+    parsing strict-only; both default on.
+    """
+    if os.environ.get("MOESPRESSO_TOOL_CALLS") == "0":
+        return ToolCallConfig(parse=False)
+    repair_enabled = os.environ.get("MOESPRESSO_TOOL_REPAIR") != "0"
+    resolved = dialect
+    if resolved is None and package_dir is not None:
+        from moespresso.package.agentic_profile import read_agentic_profile
+
+        profile = read_agentic_profile(package_dir)
+        if profile is not None:
+            declared = profile.get("dialect")
+            if declared in (TOOL_DIALECT_NATIVE, TOOL_DIALECT_DSML):
+                resolved = declared
+    if resolved not in (TOOL_DIALECT_NATIVE, TOOL_DIALECT_DSML):
+        resolved = TOOL_DIALECT_NATIVE
+    return ToolCallConfig(dialect=resolved, repair=repair_enabled)
+
+
+def _request_tools(request: dict) -> list[dict] | None:
+    """Validate the request tools array and resolve ``tool_choice``.
+
+    Returns the tools to serve with, or None for a tool-free request.
+    ``tool_choice`` accepts ``auto`` (the default behavior) and ``none``
+    (the tools are withheld from the render, so the model cannot call
+    them). A forced selection is refused loudly rather than accepted and
+    not enforced.
+    """
+    tools = request.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise RequestError(400, "tools must be a list")
+        for index, tool in enumerate(tools):
+            function = tool.get("function") if isinstance(tool, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(name, str) or not name:
+                raise RequestError(
+                    400, f"tools[{index}] needs a function object with a name")
+    choice = request.get("tool_choice")
+    if choice in (None, "auto"):
+        return tools
+    if choice == "none":
+        return None
+    raise RequestError(
+        400,
+        "tool_choice supports 'auto' and 'none'; forced tool selection is "
+        "not implemented",
+    )
+
+
+def _tool_parameter_schemas(tools: list[dict]) -> dict[str, dict]:
+    return {
+        tool["function"]["name"]: (tool["function"].get("parameters") or {})
+        for tool in tools
+    }
+
+
+def _decoded_call_arguments(tool_calls: list) -> list:
+    """Tool-call entries with JSON-string arguments decoded to objects.
+
+    The vendored template renders mapping arguments as dialect parameter
+    elements but can only dump a string argument raw, so history turns
+    would re-render off-dialect. Returns the original list unchanged when
+    nothing decodes, keeping tool-free renders byte-identical.
+    """
+    decoded = []
+    changed = False
+    for entry in tool_calls:
+        function = entry.get("function") if isinstance(entry, dict) else None
+        arguments = (
+            function.get("arguments") if isinstance(function, dict) else None)
+        if isinstance(arguments, str):
+            try:
+                as_object = json.loads(arguments)
+            except json.JSONDecodeError:
+                as_object = None
+            if isinstance(as_object, dict):
+                entry = {**entry, "function": {**function, "arguments": as_object}}
+                changed = True
+        decoded.append(entry)
+    return decoded if changed else tool_calls
+
+
+def prepare_tool_messages(
+    messages: list[dict],
+    tools: list[dict] | None,
+    *,
+    dialect: str,
+) -> tuple[list[dict], list[dict] | None]:
+    """Shape template-family messages for rendering under the served dialect.
+
+    Returns ``(render_messages, template_tools)``. Under ``native`` the
+    template receives the tools and assistant history keeps structured
+    ``tool_calls`` (with argument strings decoded so the template renders
+    parameter elements). Under ``dsml`` the template receives no tools:
+    the instruction block is appended to the system message and assistant
+    history serializes its tool calls into DSML text, so the model sees
+    one dialect everywhere. Input messages are never mutated, and a
+    request with no tool surface passes through unchanged.
+    """
+    prepared: list[dict] | None = None
+
+    def writable() -> list[dict]:
+        nonlocal prepared
+        if prepared is None:
+            prepared = [dict(m) for m in messages]
+        return prepared
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not calls:
+            continue
+        if dialect == TOOL_DIALECT_DSML:
+            entry = dict(writable()[index])
+            entry["content"] = (
+                (entry.get("content") or "") + render_dsml_tool_calls(calls))
+            entry.pop("tool_calls", None)
+            writable()[index] = entry
+        else:
+            decoded = _decoded_call_arguments(calls)
+            # The template runs string operations on content, so the null
+            # content of a calls-only assistant turn becomes empty text.
+            if decoded is not calls or message.get("content") is None:
+                entry = dict(writable()[index])
+                entry["tool_calls"] = decoded
+                entry["content"] = message.get("content") or ""
+                writable()[index] = entry
+
+    if dialect != TOOL_DIALECT_DSML:
+        return (prepared if prepared is not None else messages), tools
+    if tools:
+        out = writable()
+        block = render_dsml_tools_block([t["function"] for t in tools])
+        for index, message in enumerate(out):
+            if message.get("role") == "system":
+                entry = dict(message)
+                entry["content"] = (entry.get("content") or "") + "\n\n" + block
+                out[index] = entry
+                break
+        else:
+            out.insert(0, {"role": "system", "content": block})
+    return (prepared if prepared is not None else messages), None
 
 
 def is_deepseek_v4_renderer(prompt_renderer: str | None) -> bool:
@@ -278,6 +470,7 @@ def rendering_identity(
     template_kwargs: dict | None = None,
     *,
     prompt_renderer: str | None = None,
+    tool_dialect: str | None = None,
 ) -> str:
     """The effective rendering identity a prefix cache must key on.
 
@@ -286,6 +479,11 @@ def rendering_identity(
     the runtime template kwargs (enable_thinking/preserve_thinking change the tokens). This
     combines them into one stable id so a cache built under one render policy is never reused
     under another. Order-independent in the kwargs; deterministic.
+
+    ``tool_dialect`` names a non-native served tool dialect when the request
+    renders under one (the DSML swap changes the rendered bytes for the same
+    messages). It enters the payload only when set, so every identity minted
+    before the field existed stays byte-identical.
     """
     kwargs = effective_template_kwargs(
         template_kwargs,
@@ -296,12 +494,15 @@ def rendering_identity(
         if is_deepseek_v4_renderer(prompt_renderer)
         else prompt_renderer
     )
+    payload_fields = {
+        "rendering_id": rendering_id,
+        "template_kwargs": kwargs,
+        "prompt_renderer": renderer_version,
+    }
+    if tool_dialect is not None:
+        payload_fields["tool_dialect"] = tool_dialect
     payload = json.dumps(
-        {
-            "rendering_id": rendering_id,
-            "template_kwargs": kwargs,
-            "prompt_renderer": renderer_version,
-        },
+        payload_fields,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -438,6 +639,8 @@ def chat_completion(
     ready_callback: Callable[[], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     delta_callback: Callable[[str, str], None] | None = None,
+    tool_config: ToolCallConfig | None = None,
+    tool_delta_callback: Callable[[int, dict], None] | None = None,
 ) -> dict:
     """Pure chat-completions handler: validate, render, generate, shape.
 
@@ -445,14 +648,31 @@ def chat_completion(
     is injected (the real one is a closure over the loaded model; tests pass a fake).
     `created` is supplied by the caller (no wall-clock read in the core). Raises
     RequestError(400) on a malformed body.
+
+    When the request carries tools and `tool_config.parse` is on, the
+    completion's dialect tool-call blocks are parsed (strict first, repair on
+    failure) into OpenAI `tool_calls`, `finish_reason` becomes `tool_calls`,
+    and `tool_delta_callback(index, entry)` streams each parsed call. Text
+    that fails both parse and repair stays in `content`, never dropped.
     """
     request_stream_options(request)
     messages = request.get("messages")
     if not isinstance(messages, list) or not messages:
         raise RequestError(400, "request must include a non-empty 'messages' list")
     for m in messages:
-        if not isinstance(m, dict) or "content" not in m:
+        if not isinstance(m, dict):
             raise RequestError(400, "each message needs a 'content' field")
+        if "content" in m:
+            continue
+        # An assistant turn that only called tools legitimately has no
+        # content key; every other message still requires one.
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            continue
+        raise RequestError(400, "each message needs a 'content' field")
+
+    config = tool_config or DEFAULT_TOOL_CALL_CONFIG
+    ds4 = is_deepseek_v4_renderer(prompt_renderer)
+    tools = _request_tools(request) if config.parse else None
 
     try:
         kv_policy = effective_kv_policy(
@@ -480,17 +700,37 @@ def chat_completion(
         template_kwargs, prompt_renderer=prompt_renderer)
     thinking_enabled = bool(
         resolved_template_kwargs.get("enable_thinking", True))
+    # The served dialect applies to template families only; DS4's renderer
+    # owns DSML as part of the model contract. The swap is active for any
+    # tool-shaped request (tools now, or tool_calls history), so a session
+    # renders one dialect throughout.
+    tool_shaped = tools is not None or any(
+        m.get("role") == "assistant" and m.get("tool_calls") for m in messages)
+    swap_active = (
+        not ds4 and config.parse and tool_shaped
+        and config.dialect == TOOL_DIALECT_DSML)
     effective_rendering_id = rendering_identity(
         rendering_id,
         template_kwargs,
         prompt_renderer=prompt_renderer,
+        tool_dialect=TOOL_DIALECT_DSML if swap_active else None,
     )
+    if ds4 or not config.parse:
+        render_messages, template_tools = messages, (
+            tools if config.parse else request.get("tools"))
+    else:
+        render_messages, template_tools = prepare_tool_messages(
+            messages,
+            tools,
+            dialect=(
+                TOOL_DIALECT_DSML if swap_active else TOOL_DIALECT_NATIVE),
+        )
     prompt = render_prompt(
-        messages,
+        render_messages,
         tokenizer,
         template_kwargs=template_kwargs,
         prompt_renderer=prompt_renderer,
-        tools=request.get("tools"),
+        tools=template_tools,
         response_format=request.get("response_format"),
     )
     # An over-limit request (prompt tokens plus max_tokens past the served
@@ -499,13 +739,48 @@ def chat_completion(
     # limit and both request-side counts. The prompt that fits but whose
     # max_tokens overruns is refused identically rather than clamped, so the
     # completion budget a client asked for is never silently shrunk.
+    streamer = None
+    if tools is not None and config.parse:
+        if ds4:
+            parse_dialects = (DSML_DIALECT,)
+        elif swap_active:
+            # DSML is the taught dialect; the native XML parser stays second
+            # because the family's trained format can still bleed through.
+            parse_dialects = (DSML_DIALECT, QWENXML_DIALECT)
+        else:
+            parse_dialects = (QWENXML_DIALECT,)
+        call_id_prefix = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+        streamer = ToolCallStreamer(
+            parse_dialects,
+            parameter_schemas=_tool_parameter_schemas(tools),
+            emit_content=(
+                (lambda text: delta_callback("content", text))
+                if delta_callback is not None else None),
+            emit_tool_call=tool_delta_callback,
+            repair_enabled=config.repair,
+            make_call_id=lambda index: f"call_{call_id_prefix}_{index}",
+        )
+
     splitter = None
     response_callback = None
-    if delta_callback is not None:
+    if streamer is not None:
+
+        def route_delta(kind: str, text: str) -> None:
+            if kind == "content":
+                streamer.push(text)
+            elif delta_callback is not None:
+                delta_callback(kind, text)
+
+        splitter = ReasoningSplitter(
+            thinking_enabled=thinking_enabled,
+            emit=route_delta,
+        )
+    elif delta_callback is not None:
         splitter = ReasoningSplitter(
             thinking_enabled=thinking_enabled,
             emit=delta_callback,
         )
+    if splitter is not None:
 
         def response_callback(_step: int, response: object) -> None:
             splitter.push(str(getattr(response, "text", "")))
@@ -538,11 +813,23 @@ def chat_completion(
             splitter.push(generated.text)
         splitter.finish()
         reasoning, content = splitter.reasoning, splitter.content
+        if streamer is not None:
+            streamer.finish(truncated=generated.finish_reason == "length")
+            content = streamer.content
     else:
         reasoning, content = split_complete_text(
             generated.text, thinking_enabled=thinking_enabled,
             prompt_opened_thinking=prompt.rstrip().endswith(THINK_OPEN))
+    finish_reason = generated.finish_reason
     message = {"role": "assistant", "content": content}
+    if streamer is not None and streamer.calls:
+        message["tool_calls"] = list(streamer.calls)
+        if not content:
+            message["content"] = None
+        # A turn cut off at the token limit keeps `length`: the caller must
+        # know the call list may be incomplete.
+        if finish_reason == "stop":
+            finish_reason = "tool_calls"
     if reasoning:
         message["reasoning_content"] = reasoning
 
@@ -554,7 +841,7 @@ def chat_completion(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": generated.finish_reason,
+            "finish_reason": finish_reason,
         }],
     }
     if generated.prompt_tokens is not None and generated.completion_tokens is not None:
@@ -594,6 +881,12 @@ def chat_completion(
                     generated.generation_seconds or 0.0, 4),
                 "generation_tps": tps,
             }
+    # Repair activity is the adoption evidence for a repair-dependent
+    # dialect, so a request that fired the repair layer reports its counters.
+    if (streamer is not None and streamer.telemetry.fires
+            and "usage" in response):
+        response["usage"].setdefault("moespresso", {})["tool_call_repair"] = (
+            streamer.telemetry.as_dict())
     return response
 
 
@@ -690,6 +983,20 @@ class _ChatSSEWriter:
             "finish_reason": None,
         }]))
 
+    def tool_call_delta(self, index: int, entry: dict) -> None:
+        """Write one parsed tool call as a single complete delta.
+
+        Each call arrives whole (id, name, full arguments JSON) in one
+        chunk: a client cannot act on a partial call, so splitting the
+        arguments across chunks buys nothing.
+        """
+        self.start()
+        self._event(self._chunk([{
+            "index": 0,
+            "delta": {"tool_calls": [{"index": index, **entry}]},
+            "finish_reason": None,
+        }]))
+
     def finish(self, response: dict) -> None:
         self.start()
         choice = response["choices"][0]
@@ -766,6 +1073,7 @@ def make_handler(
     stats: Callable[[], dict] | None = None,
     runtime_stats: Callable[[], dict] | None = None,
     clock: Callable[[], int] = lambda: 0,
+    tool_config: ToolCallConfig | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a request handler class bound to a loaded generator.
 
@@ -825,6 +1133,9 @@ def make_handler(
                     progress_callback=(
                         stream_writer.progress if stream_writer else None),
                     delta_callback=(stream_writer.delta if stream_writer else None),
+                    tool_config=tool_config,
+                    tool_delta_callback=(
+                        stream_writer.tool_call_delta if stream_writer else None),
                 )
             except ClientDisconnected:
                 return
@@ -918,6 +1229,7 @@ def serve(
     max_context_tokens: int | None = None,
     min_resident_experts: int | None = None,
     thinking: str | None = None,
+    tool_dialect: str | None = None,
     startup_warmup: bool = True,
     load_model_fn: Callable | None = None,
     startup_warmup_fn: Callable | None = None,
@@ -1079,6 +1391,19 @@ def serve(
             except SSDStreamingBuildError:
                 return {"enabled": False}
 
+        tool_config = resolve_tool_call_config(
+            package_dir, dialect=tool_dialect)
+        if tool_config.parse:
+            dialect_label = (
+                "dsml(renderer)" if ds4_contract else tool_config.dialect)
+            print(
+                f"[serve] tool_calls=on dialect={dialect_label} "
+                f"repair={'on' if tool_config.repair else 'off'}",
+                flush=True,
+            )
+        else:
+            print("[serve] tool_calls=off (verbatim completions)", flush=True)
+
         serve_lock = threading.Lock()
         handler = make_handler(
             serialized_generator(generate, serve_lock),
@@ -1088,7 +1413,8 @@ def serve(
             server_template_kwargs=server_template_kwargs,
             stats=serialized_stats(cache_generator.cache_stats, serve_lock),
             runtime_stats=serialized_stats(runtime_stats, serve_lock),
-            clock=lambda: int(time.time()))
+            clock=lambda: int(time.time()),
+            tool_config=tool_config)
         # Single-threaded on purpose: every request is handled on the thread
         # that loaded the model. The pinned MLX gives each thread its own
         # default stream, and the load path leaves deliberately lazy arrays
@@ -1152,6 +1478,18 @@ def main(argv: list[str] | None = None) -> int:
                              "(DeepSeek-V4: off). Per-request render fields "
                              "remain enforced by the model contract.")
     parser.add_argument(
+        "--tool-dialect",
+        choices=("auto", "native", "dsml"),
+        default="auto",
+        help="Tool-call dialect served to template families: native keeps "
+             "the vendored template's own tool rendering, dsml teaches the "
+             "DSML dialect through the system block. auto (the default) "
+             "takes the package agentic profile's dialect of record, "
+             "falling back to native. DeepSeek-V4 ignores this flag; its "
+             "renderer owns the dialect. MOESPRESSO_TOOL_CALLS=0 disables "
+             "served tool-call parsing entirely.",
+    )
+    parser.add_argument(
         "--startup-warmup",
         choices=("auto", "off"),
         default="auto",
@@ -1188,6 +1526,7 @@ def main(argv: list[str] | None = None) -> int:
         max_context_tokens=args.max_context_tokens,
         min_resident_experts=args.min_resident_experts,
         thinking=args.thinking,
+        tool_dialect=None if args.tool_dialect == "auto" else args.tool_dialect,
         startup_warmup=args.startup_warmup != "off",
     )
 

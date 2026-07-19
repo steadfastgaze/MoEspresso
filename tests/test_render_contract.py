@@ -491,6 +491,41 @@ def test_structured_reasoning_replay_matches_raw_served_bytes(
     assert structured_render == raw_render
 
 
+def test_served_tool_calls_replay_matches_raw_served_bytes():
+    # The serve layer parses the emission into structured tool_calls and the
+    # client echoes that message back on turn 2. prepare_tool_messages plus
+    # the template must re-render the exact served bytes (the strict parser
+    # trims exactly the newlines the template re-inserts), so the KV prefix
+    # extends across the tool turn instead of re-prefilling it.
+    from moespresso.runtime.http import prepare_tool_messages
+
+    tools = [_LOOKUP_TOOL]
+    completion = f"need to check this\n</think>\n{_MATRIX_TOOL_CALL}"
+    raw_history = _MATRIX_BASE + [{"role": "assistant", "content": completion}]
+    # The shapes the serve layer returns: reasoning split off, content None,
+    # arguments as a JSON string with typed values decoded by schema.
+    structured_history = _MATRIX_BASE + [{
+        "role": "assistant",
+        "reasoning_content": "need to check this\n",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_deadbeef_0",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q": "record 7"}'},
+        }],
+    }]
+    prepared, template_tools = prepare_tool_messages(
+        structured_history, tools, dialect="native")
+
+    raw_render = _matrix_render(
+        raw_history, thinking_on=True, tools=tools,
+        add_generation_prompt=False)
+    structured_render = _matrix_render(
+        prepared, thinking_on=True, tools=template_tools,
+        add_generation_prompt=False)
+    assert structured_render == raw_render
+
+
 def test_thinking_off_replay_re_emits_the_empty_scaffold():
     history = _MATRIX_BASE + [
         {"role": "assistant", "content": "Record 7 is active."},
