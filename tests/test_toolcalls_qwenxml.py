@@ -208,3 +208,45 @@ def test_template_replay_shape_round_trips():
     calls = parse_qwenxml_tool_calls(content, SCHEMAS)
     assert calls[0].name == "edit"
     assert calls[0].arguments["path"] == "src/metrics.py"
+
+
+UNION_SCHEMAS = {
+    "read": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": ["integer", "string", "null"]},
+            "count": {"type": ["integer", "null"]},
+        },
+    },
+}
+
+
+def _union_call(value: str) -> str:
+    return (
+        "<tool_call>\n<function=read>\n"
+        f"<parameter=limit>\n{value}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+
+def test_union_types_try_members_in_declared_order():
+    # Every member of a declared union is a valid target, not just the
+    # first: 5 decodes as the integer member, prose falls back to the
+    # string member, and the null literal reads as null.
+    assert parse_qwenxml_tool_calls(
+        _union_call("5"), UNION_SCHEMAS)[0].arguments == {"limit": 5}
+    assert parse_qwenxml_tool_calls(
+        _union_call("five please"), UNION_SCHEMAS)[0].arguments == {
+        "limit": "five please"}
+    assert parse_qwenxml_tool_calls(
+        _union_call("null"), UNION_SCHEMAS)[0].arguments == {"limit": None}
+
+
+def test_union_without_string_member_still_raises_on_mismatch():
+    content = (
+        "<tool_call>\n<function=read>\n"
+        "<parameter=count>\nmany\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ToolCallParseError, match="integer"):
+        parse_qwenxml_tool_calls(content, UNION_SCHEMAS)

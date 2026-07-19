@@ -393,6 +393,11 @@ class PrefixCacheGenerator:
             )
         except DiskKVError:
             return None
+        except Exception as e:  # noqa: BLE001 - the docstring contract above
+            log = getattr(self.disk_store, "_log", None)
+            if log is not None:
+                log(f"[disk_kv] restore failed; cold serving: {e!r}")
+            return None
 
     def _frontier_writer(
         self, model_key, full_tokens, cached_tokens, prompt_cache,

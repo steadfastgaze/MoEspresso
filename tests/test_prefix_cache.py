@@ -624,6 +624,40 @@ class _FakeDiskStore:
         return {"enabled": True}
 
 
+def test_a_raising_disk_store_cold_serves_instead_of_surfacing():
+    # The disk store normalizes its own faults, and this caller-level
+    # backstop makes the docstring contract unconditional: any disk error,
+    # typed or not, is a cold miss, never a request failure.
+    full = list(range(1, 401))
+    logged = []
+
+    class _RaisingDiskStore:
+        stride = None
+
+        def _log(self, line):
+            logged.append(line)
+
+        def restore(self, *args, **kwargs):
+            raise RuntimeError("index exploded mid-request")
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        return GenerationResult(text="ok", prompt_cache=kwargs["prompt_cache"])
+
+    gen = PrefixCacheGenerator(
+        "MODEL", _FakeTokenizer(full), {"artifact_id": "pkg"}, _FakeStore(),
+        make_prompt_cache_fn=lambda model: ["fresh"],
+        generate_fn=fake_generate,
+        disk_store=_RaisingDiskStore(),
+    )
+    result = gen(
+        "rendered prompt",
+        kv_policy=parse_kv_policy({"live_kv_format": "raw"}),
+        effective_rendering_id="render-id",
+    )
+    assert result.text == "ok"
+    assert any("cold serving" in line for line in logged)
+
+
 def test_frontier_writer_kwargs_carry_a_variable_step_plan_on_an_unaligned_hit():
     full = list(range(1, 701))
     tok = _FakeTokenizer(full)

@@ -57,7 +57,9 @@ be overridden through environment variables read once at startup.
   write cost lands once, in the first request that covers a new prefix
   region, and is reported in that request's usage block. Decode never
   writes. A smaller stride shortens the re-prefilled tail after a restore
-  (at most one stride) at the cost of more first-time writes.
+  (at most one stride, for divergence points within the write-depth cap;
+  past the cap the unsaved tail re-prefills whole) at the cost of more
+  first-time writes.
 - `MOESPRESSO_DISK_KV_BYTES`: the byte budget for stored payloads, per
   root, not machine-wide: every package fingerprint has its own root and
   its own budget, and quarantined payloads sit outside it. Default 8 GiB

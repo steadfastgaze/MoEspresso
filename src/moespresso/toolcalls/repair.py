@@ -108,14 +108,16 @@ def _coerce_qwenxml_values(text: str, parameter_schemas: dict[str, dict]) -> str
 
         def fix_parameter(pmatch: re.Match) -> str:
             key, raw = pmatch.group(1), pmatch.group(2)
-            primary, _nullable = qwenxml.declared_type_of(
+            members, _nullable = qwenxml.union_members(
                 qwenxml.declared_type_for(properties, key))
-            if primary in (None, "string"):
+            if not members or qwenxml.accepts_raw_text(members):
+                # Raw text already satisfies the union; nothing to rewrite.
                 return pmatch.group(0)
-            fixed = _lenient_scalar(raw.strip(), primary)
-            if fixed is None:
-                return pmatch.group(0)
-            return f"<parameter={key}>\n{fixed}\n</parameter>"
+            for member in members:
+                fixed = _lenient_scalar(raw.strip(), member)
+                if fixed is not None:
+                    return f"<parameter={key}>\n{fixed}\n</parameter>"
+            return pmatch.group(0)
 
         inner = qwenxml._PARAM_RE.sub(fix_parameter, match.group(2))
         return f"<function={name}>{inner}</function>"
@@ -181,30 +183,45 @@ def coerce_arguments(arguments: dict, schema: dict) -> tuple[dict, int]:
     out = dict(arguments)
     misses = 0
     for key, value in arguments.items():
-        primary, nullable = qwenxml.declared_type_of(
+        members, nullable = qwenxml.union_members(
             qwenxml.declared_type_for(properties, key))
         if nullable and value is None:
             continue
-        if primary is None:
+        if not members:
             continue
-        if primary == "string":
-            if not isinstance(value, str):
-                out[key] = json.dumps(value, ensure_ascii=False)
+        if _matches_union(value, members):
             continue
-        expected = qwenxml._JSON_TYPES.get(primary)
-        if expected is None:
-            continue
-        if isinstance(value, expected) and not (
-                isinstance(value, bool) and primary != "boolean"):
-            continue
-        fixed = (
-            _lenient_scalar(value.strip(), primary)
-            if isinstance(value, str) else None)
-        if fixed is not None:
-            out[key] = json.loads(fixed)
-        else:
+        fixed = None
+        if isinstance(value, str):
+            for member in members:
+                if member == "string" or member not in qwenxml._JSON_TYPES:
+                    continue
+                fixed = _lenient_scalar(value.strip(), member)
+                if fixed is not None:
+                    out[key] = json.loads(fixed)
+                    break
+        elif "string" in members:
+            out[key] = json.dumps(value, ensure_ascii=False)
+            fixed = out[key]
+        if fixed is None:
             misses += 1
     return out, misses
+
+
+def _matches_union(value, members: tuple[str, ...]) -> bool:
+    for member in members:
+        if member == "string":
+            if isinstance(value, str):
+                return True
+            continue
+        expected = qwenxml._JSON_TYPES.get(member)
+        if expected is None:
+            # An unrecognized member accepts anything, matching the parser.
+            return True
+        if isinstance(value, expected) and not (
+                isinstance(value, bool) and member != "boolean"):
+            return True
+    return False
 
 
 def repair_qwenxml_tool_calls(

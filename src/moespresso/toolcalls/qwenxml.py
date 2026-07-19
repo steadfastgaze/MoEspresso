@@ -39,6 +39,7 @@ from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 _FUNCTION_OPEN_PREFIX = "<function="
+_UNDECODABLE = object()
 
 _BLOCK_RE = re.compile(
     re.escape(TOOL_CALL_OPEN) + r"(.*?)" + re.escape(TOOL_CALL_CLOSE), re.DOTALL
@@ -57,25 +58,31 @@ _JSON_TYPES = {
 }
 
 
-def declared_type_of(declared) -> tuple[str | None, bool]:
-    """Resolve a schema ``type`` value to ``(primary, nullable)``.
+def union_members(declared) -> tuple[tuple[str, ...], bool]:
+    """Resolve a schema ``type`` value to ``(members, nullable)``.
 
-    JSON Schema allows a union list such as ``["integer", "null"]``: the
-    primary type is the first non-null string member and ``nullable``
-    records whether null is a member. A bare ``"null"`` and every
-    unrecognized shape resolve to no primary type, which downstream treats
-    as undeclared (the raw text is kept).
+    JSON Schema allows a union list such as ``["integer", "string",
+    "null"]``: ``members`` is every non-null string member in declared
+    order and ``nullable`` records whether null is a member. A bare
+    ``"null"`` resolves to no members, and every unrecognized shape
+    resolves to ``((), False)``, which downstream treats as undeclared
+    (the raw text is kept).
     """
     if isinstance(declared, str):
         if declared == "null":
-            return None, True
-        return declared, False
+            return (), True
+        return (declared,), False
     if isinstance(declared, list):
-        primary = next(
-            (t for t in declared if isinstance(t, str) and t != "null"), None)
+        members = tuple(
+            t for t in declared if isinstance(t, str) and t != "null")
         nullable = any(t == "null" for t in declared)
-        return primary, nullable
-    return None, False
+        return members, nullable
+    return (), False
+
+
+def accepts_raw_text(members: tuple[str, ...]) -> bool:
+    """Whether a union keeps raw text: a string or unrecognized member."""
+    return any(m == "string" or m not in _JSON_TYPES for m in members)
 
 
 def declared_type_for(properties: dict, key: str):
@@ -182,32 +189,35 @@ def _trim_value(raw: str) -> str:
 def _decode_value(value: str, declared, tool_name: str, key: str):
     """Decode a raw text value against its declared schema type.
 
-    Undeclared and string-typed parameters keep the raw text. Any other
-    declared type must decode as JSON of exactly that type; a bare word or a
-    mistyped literal raises so the repair layer sees a typed failure instead
-    of an executor crash. A nullable union type (``["integer", "null"]``)
-    accepts the null literal and otherwise types against its non-null
-    member.
+    Undeclared and string-typed parameters keep the raw text. A declared
+    union tries its typed members in declared order (the first whose JSON
+    decoding matches wins), falls back to raw text when a string member is
+    present, and accepts the null literal when nullable; a bare ``null``
+    under ``["string", "null"]`` reads as null, because a nullable client
+    schema expects the null, not the four-letter string. A value that
+    matches no member raises so the repair layer sees a typed failure
+    instead of an executor crash.
     """
-    primary, nullable = declared_type_of(declared)
+    members, nullable = union_members(declared)
     if nullable and value == "null":
         return None
-    expected = _JSON_TYPES.get(primary or "string")
-    if expected is None:
+    if not members:
         return value
-    try:
-        decoded = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {primary}, got "
-            f"undecodable value {value[:80]!r}: {e}"
-        ) from e
-    if isinstance(decoded, bool) and primary != "boolean":
-        raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {primary}, got boolean")
-    if not isinstance(decoded, expected):
-        raise ToolCallParseError(
-            f"{tool_name}: parameter {key!r} must be {primary}, got "
-            f"{type(decoded).__name__}"
-        )
-    return decoded
+    typed = [m for m in members if m in _JSON_TYPES and m != "string"]
+    if typed:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = _UNDECODABLE
+        if decoded is not _UNDECODABLE:
+            for member in typed:
+                if isinstance(decoded, bool) and member != "boolean":
+                    continue
+                if isinstance(decoded, _JSON_TYPES[member]):
+                    return decoded
+    if accepts_raw_text(members):
+        return value
+    label = " or ".join(members)
+    raise ToolCallParseError(
+        f"{tool_name}: parameter {key!r} must be {label}, got "
+        f"unmatching value {value[:80]!r}")

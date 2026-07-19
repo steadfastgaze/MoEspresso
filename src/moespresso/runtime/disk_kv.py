@@ -780,8 +780,19 @@ class DiskCheckpointStore:
         the payload (integrity, then embedded metadata vs the index, then the
         prefix-length and class-list gates); reconstruct live caches and graft the
         state. A refusal quarantines the entry and re-raises the domain error.
+
+        Every fault on this path surfaces as ``DiskKVError`` so the caller's
+        cold-serve fallback always fires: a corrupt index or an unreadable
+        payload raises the normalized error instead of a raw one, and a
+        failure of the LRU touch after a validated restore is logged and
+        absorbed, because index bookkeeping must not invalidate a good
+        checkpoint.
         """
-        entry = self.index.find_longest(scope, full_tokens)
+        try:
+            entry = self.index.find_longest(scope, full_tokens)
+        except Exception as e:  # noqa: BLE001 - normalize to the fallback type
+            self._log(f"[disk_kv] index lookup failed; cold serving: {e!r}")
+            raise DiskKVError(f"disk KV index lookup failed: {e}") from e
         if entry is None:
             return None
         try:
@@ -800,7 +811,17 @@ class DiskCheckpointStore:
         except DiskKVError:
             self.quarantine(entry)
             raise
-        updated = self.index.mark_used(entry)
+        except Exception as e:  # noqa: BLE001 - normalize to the fallback type
+            self.quarantine(entry)
+            raise DiskKVError(
+                f"disk KV restore failed for token_count={entry.token_count}: "
+                f"{e}") from e
+        try:
+            updated = self.index.mark_used(entry)
+        except Exception as e:  # noqa: BLE001 - keep the validated restore
+            self._log(
+                f"[disk_kv] mark_used failed; keeping the restore: {e!r}")
+            updated = entry
         self.restores += 1
         self._log(f"[disk_kv] restore cached_tokens={entry.token_count}")
         return DiskKVHit(
@@ -908,10 +929,17 @@ class DiskCheckpointStore:
         The frontier writer reads this before a write so a checkpoint that already
         exists (from a previous session or an earlier request) is not rewritten.
         The check is on the same identity the index dedupes on: scope hash, token
-        count, and token-prefix hash.
+        count, and token-prefix hash. An unreadable index answers False and
+        never raises: this runs during prefill planning outside the write
+        boundary, and the write path's own failure handling then logs once
+        and disables the writer for the request.
         """
         target = (scope_hash(scope), len(tokens), token_prefix_hash(tokens))
-        for entry in self.index.entries():
+        try:
+            entries = self.index.entries()
+        except Exception:  # noqa: BLE001 - planning must not surface a fault
+            return False
+        for entry in entries:
             if (entry.scope_hash, entry.token_count, entry.token_prefix_hash) == target:
                 return True
         return False
@@ -1443,8 +1471,9 @@ DISK_KV_BYTES_UNLIMITED = "unlimited"
 
 # Serving defaults. The stride trades first-write cost against restore
 # granularity: checkpoints are written only during prefill (once per new
-# prefix region, deduplicated against the store), and a restore re-prefills
-# at most one stride of tail, so 1024 keeps a cold 10k-token prompt to a few
+# prefix region, deduplicated against the store), and a restore whose
+# divergence point sits within the write-depth cap re-prefills at most one
+# stride of tail, so 1024 keeps a cold 10k-token prompt to a few
 # writes while a later restore re-prefills only a few seconds of tokens.
 # The budget bounds each per-package root; eviction is least-recently-used.
 # A checkpoint set covering one long agent prompt runs to a few GiB, so the

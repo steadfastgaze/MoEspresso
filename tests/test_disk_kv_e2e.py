@@ -179,6 +179,29 @@ def _kv_cache_empty():
     return KVCache()
 
 
+def test_mark_used_failure_keeps_the_validated_restore(tmp_path):
+    # A full or read-only disk during the LRU touch is index bookkeeping,
+    # not a restore fault: the validated checkpoint must still serve.
+    store = DiskCheckpointStore(tmp_path)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+
+    tmp_path.chmod(0o500)
+    try:
+        hit = store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [_kv_cache_empty()],
+            registry=default_cache_registry(),
+        )
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert hit is not None
+    assert hit.cached_tokens == 512
+    assert hit.suffix_tokens == list(range(512, 600))
+    assert store.restores == 1
+
+
 def test_restore_refuses_class_list_the_registry_does_not_know(tmp_path):
     store = DiskCheckpointStore(tmp_path)
     scope = build_cache_scope(_model_key(), ("MysteryCache",))

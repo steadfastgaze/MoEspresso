@@ -429,6 +429,26 @@ def test_open_disk_store_normalizes_raw_failures(tmp_path):
         unwritable_parent.chmod(0o700)
 
 
+def test_restore_normalizes_a_corrupt_index_to_diskkverror(tmp_path):
+    from moespresso.runtime.disk_kv import (
+        DiskCheckpointStore,
+        build_cache_scope,
+        default_cache_registry,
+    )
+
+    store = DiskCheckpointStore(tmp_path)
+    (tmp_path / "index.json").write_text("not json", encoding="utf-8")
+    scope = build_cache_scope(
+        ("pkg", "render", "raw", 64, 0, "mlx_prompt_cache"), ("KVCache",))
+    with pytest.raises(DiskKVError, match="index lookup failed"):
+        store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [],
+            registry=default_cache_registry(),
+        )
+    assert store.has_entry(scope, list(range(600))) is False
+
+
 def test_frontier_writer_disables_after_first_hard_failure():
     from moespresso.runtime.disk_kv import FrontierTracker, FrontierWriter
 

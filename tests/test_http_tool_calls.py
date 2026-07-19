@@ -321,6 +321,35 @@ def test_nullable_union_schema_types_and_accepts_null():
         "filePath": "DEVGUIDE.md", "limit": None}
 
 
+def test_multi_member_union_schema_types_each_member():
+    union_tool = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": ["integer", "string", "null"]},
+                },
+            },
+        },
+    }
+    text = (
+        "t</think>\n<tool_call>\n<function=read>\n"
+        "<parameter=limit>\n5\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n"
+        "<parameter=limit>\nfive please\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    response = http.chat_completion(
+        _tool_request(tools=[union_tool]), _generate_returning(text))
+    calls = response["choices"][0]["message"]["tool_calls"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"limit": 5}
+    assert json.loads(calls[1]["function"]["arguments"]) == {
+        "limit": "five please"}
+
+
 def test_coercion_misses_surface_in_usage():
     text = (
         f"<{DSML_TOKEN}tool_calls>\n"

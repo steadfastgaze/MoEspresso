@@ -372,3 +372,15 @@ def test_coerce_arguments_handles_nullable_unions_and_odd_shapes():
     assert coerced == {"limit": None, "odd": "kept"}
     assert misses == 0
     assert coerce_arguments({"limit": "7"}, schema) == ({"limit": 7}, 0)
+
+
+def test_coerce_arguments_respects_multi_member_unions():
+    from moespresso.toolcalls.repair import coerce_arguments
+
+    schema = {"properties": {"limit": {"type": ["integer", "string"]}}}
+    # A string value is already valid under the string member: no
+    # coercion, no miss, matching JSON Schema union semantics.
+    assert coerce_arguments({"limit": "7"}, schema) == ({"limit": "7"}, 0)
+    assert coerce_arguments({"limit": 7}, schema) == ({"limit": 7}, 0)
+    # A value valid under no member coerces toward the string member.
+    assert coerce_arguments({"limit": True}, schema) == ({"limit": "true"}, 0)

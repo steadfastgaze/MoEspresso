@@ -157,9 +157,10 @@ holds.
   writes happen only at proven live frontiers during prefill: token
   accounting proposes, and every positional cache must independently
   report exactly the frontier offset before a write, so an unaligned
-  write is structurally impossible. Writes are blocking, atomic,
-  quarantined on failure, and their TTFT cost is measured and logged,
-  never hidden.
+  write is structurally impossible. Writes are blocking and atomic; a
+  hard write failure logs once and disables the writer for the request,
+  restore-time validation failures quarantine the payload, and the TTFT
+  cost of writes is measured and logged, never hidden.
 - One fused routed-MoE operation per layer, one dispatch boundary to Python.
   Never split a routed op into resident and missing partial matmuls; that
   measured slower despite better wait counters.

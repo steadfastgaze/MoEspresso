@@ -204,9 +204,10 @@ moespresso-serve ./models/ornith-35b --thinking off
 MOESPRESSO_DISK_KV=off moespresso-serve ./models/ornith-35b   # memory-only
 ```
 
-`MOESPRESSO_DISK_KV_ROOT`, `MOESPRESSO_DISK_KV_STRIDE`, and
-`MOESPRESSO_DISK_KV_BYTES` (`unlimited` disables eviction) override the
-defaults. A root has one process owner, restores are package/render/KV-policy
+`MOESPRESSO_DISK_KV_ROOT`, `MOESPRESSO_DISK_KV_STRIDE`,
+`MOESPRESSO_DISK_KV_BYTES` (`unlimited` disables eviction), and
+`MOESPRESSO_DISK_KV_WRITE_DEPTH` (`unlimited` snapshots any depth) override
+the defaults. A root has one process owner, restores are package/render/KV-policy
 scoped, and every mismatch fails closed to cold prefill. Deleting
 `~/.cache/moespresso` is always safe. See the
 [disk KV contract](docs/disk_kv.md) for the full guarantees.
