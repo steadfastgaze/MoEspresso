@@ -691,18 +691,20 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
         "files": [1],
     }
 
-    monkeypatch.setattr(
-        serve,
-        "load_served_model",
-        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
-    )
-    monkeypatch.setattr(
-        serve,
-        "_preflight_manifest_for_cli",
-        lambda package_dir: (_ for _ in ()).throw(
-            AssertionError("context validation must not add a manifest preflight")
-        ),
-    )
+    preflight_calls = []
+
+    def fake_preflight(package_dir):
+        preflight_calls.append(package_dir)
+        return manifest
+
+    expected_manifest = manifest
+
+    def fake_load(package_dir, *, manifest):
+        assert manifest is expected_manifest
+        return "MODEL", _Tokenizer(), manifest
+
+    monkeypatch.setattr(serve, "_preflight_manifest_for_cli", fake_preflight)
+    monkeypatch.setattr(serve, "load_served_model", fake_load)
     monkeypatch.setattr(
         http,
         "render_prompt",
@@ -746,6 +748,7 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
     assert payload["generated_token_ids"] == [101, 102]
     assert payload["params"]["max_tokens"] == 5
     assert payload["params"]["thinking"] == "off"
+    assert preflight_calls == [tmp_path / "pkg"]
 
 
 def test_generate_main_rejects_span_beyond_explicit_context_limit(
@@ -792,7 +795,7 @@ def test_generate_main_rejects_span_beyond_explicit_context_limit(
     assert "2 prompt tokens plus max_tokens 1" in output
 
 
-def test_generate_main_reports_explicit_limit_above_package_after_load(
+def test_generate_main_rejects_explicit_limit_above_package_before_load(
     tmp_path, monkeypatch, capsys
 ):
     import moespresso.runtime.serve as serve
@@ -808,18 +811,26 @@ def test_generate_main_reports_explicit_limit_above_package_after_load(
     }
     monkeypatch.setattr(
         serve,
+        "_preflight_manifest_for_cli",
+        lambda package_dir: manifest,
+    )
+    monkeypatch.setattr(
+        serve,
         "load_served_model",
-        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid context must fail before model loading")
+        ),
     )
 
-    rc = main([
-        str(tmp_path / "pkg"),
-        "--max-context-tokens",
-        "11",
-    ])
+    with pytest.raises(SystemExit) as exc:
+        main([
+            str(tmp_path / "pkg"),
+            "--max-context-tokens",
+            "11",
+        ])
 
-    assert rc == 2
-    assert "exceeds the package context limit of 10 tokens" in capsys.readouterr().out
+    assert exc.value.code == 2
+    assert "exceeds the package context limit of 10 tokens" in capsys.readouterr().err
 
 
 def test_generate_main_rejects_deepseek_below_minimum_residency(

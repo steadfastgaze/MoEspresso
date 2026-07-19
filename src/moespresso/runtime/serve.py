@@ -838,20 +838,30 @@ def main(argv: list[str] | None = None) -> int:
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
 
     pkg = Path(args.package_dir)
-    if args.thinking is not None:
+    preflight_manifest = _preflight_manifest_for_cli(pkg)
+    context_limit = None
+    if preflight_manifest is not None:
+        from moespresso.runtime.prefix_cache import effective_context_limit
+
+        try:
+            context_limit = effective_context_limit(
+                preflight_manifest,
+                requested=args.max_context_tokens,
+            )
+        except ValueError as e:
+            parser.error(str(e))
+    if args.thinking is not None and preflight_manifest is not None:
         from moespresso.runtime.http import (
             is_deepseek_v4_manifest,
             thinking_effort_option_error,
         )
 
-        preflight_manifest = _preflight_manifest_for_cli(pkg)
-        if preflight_manifest is not None:
-            option_error = thinking_effort_option_error(
-                args.thinking,
-                is_deepseek_v4=is_deepseek_v4_manifest(preflight_manifest))
-            if option_error is not None:
-                print(option_error)
-                return 2
+        option_error = thinking_effort_option_error(
+            args.thinking,
+            is_deepseek_v4=is_deepseek_v4_manifest(preflight_manifest))
+        if option_error is not None:
+            print(option_error)
+            return 2
 
     print(f"Loading package from its manifest: {pkg}")
     from moespresso.runtime.streaming_capacity import (
@@ -860,7 +870,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        model, tokenizer, manifest = load_served_model(pkg)
+        if preflight_manifest is None:
+            model, tokenizer, manifest = load_served_model(pkg)
+        else:
+            model, tokenizer, manifest = load_served_model(
+                pkg,
+                manifest=preflight_manifest,
+            )
         validate_min_resident_experts(
             model,
             requested=args.min_resident_experts,
@@ -873,14 +889,15 @@ def main(argv: list[str] | None = None) -> int:
         effective_context_limit,
     )
 
-    try:
-        context_limit = effective_context_limit(
-            manifest,
-            requested=args.max_context_tokens,
-        )
-    except ValueError as e:
-        print(f"FAILED: {e}")
-        return 2
+    if context_limit is None:
+        try:
+            context_limit = effective_context_limit(
+                manifest,
+                requested=args.max_context_tokens,
+            )
+        except ValueError as e:
+            print(f"FAILED: {e}")
+            return 2
     print(
         f"[generate] context_limit={context_limit} "
         f"package_limit={declared_context_limit(manifest) or 'unknown'}"
