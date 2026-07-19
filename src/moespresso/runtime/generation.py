@@ -11,7 +11,7 @@ from typing import Any
 
 
 class ContextLimitError(ValueError):
-    """A request whose token span exceeds the model's declared context limit.
+    """A request whose token span exceeds the served context limit.
 
     Raised before any generation or cache mutation. The serve layer maps it
     to a 400 so the client learns the limit, its prompt token count, and its
@@ -24,7 +24,7 @@ class ContextLimitError(ValueError):
         self.prompt_tokens = int(prompt_tokens)
         self.max_tokens = int(max_tokens)
         super().__init__(
-            f"the request exceeds the model's declared context limit of "
+            f"the request exceeds the served context limit of "
             f"{self.limit} tokens: {self.prompt_tokens} prompt tokens plus "
             f"max_tokens {self.max_tokens}"
         )

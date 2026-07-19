@@ -713,6 +713,7 @@ def build_cache_generator(
     tokenizer,
     manifest: dict,
     *,
+    context_limit: int | None = None,
     prompt_cache_size: int = 10,
     prompt_cache_bytes: int | None = None,
     memory_store_factory: Callable | None = None,
@@ -726,7 +727,7 @@ def build_cache_generator(
     """
     from moespresso.runtime.prefix_cache import (
         PrefixCacheGenerator,
-        declared_context_limit,
+        effective_context_limit,
         make_prompt_cache_store,
     )
 
@@ -746,7 +747,11 @@ def build_cache_generator(
         memory_store_factory(prompt_cache_size, prompt_cache_bytes),
         after_generate_fn=maybe_adapt_ssd_streaming_capacity,
         disk_store=disk_store,
-        context_limit=declared_context_limit(manifest),
+        context_limit=(
+            effective_context_limit(manifest)
+            if context_limit is None
+            else int(context_limit)
+        ),
     )
 
 
@@ -910,6 +915,8 @@ def serve(
     port: int = 8080,
     prompt_cache_size: int | None = None,
     prompt_cache_bytes: int | None = None,
+    max_context_tokens: int | None = None,
+    min_resident_experts: int | None = None,
     thinking: str | None = None,
     startup_warmup: bool = True,
     load_model_fn: Callable | None = None,
@@ -943,6 +950,7 @@ def serve(
         open_disk_store,
         resolve_disk_kv_config,
     )
+    from moespresso.runtime.streaming_capacity import StreamingCapacityError
 
     try:
         disk_kv_config = resolve_disk_kv_config()
@@ -959,12 +967,33 @@ def serve(
 
     try:
         try:
-            model, tokenizer, manifest = load_model_fn(package_dir)
-        except FileNotFoundError as e:
+            load_kwargs = {}
+            if min_resident_experts is not None:
+                load_kwargs["min_resident_experts"] = int(min_resident_experts)
+            model, tokenizer, manifest = load_model_fn(package_dir, **load_kwargs)
+        except (FileNotFoundError, StreamingCapacityError) as e:
             # PackageNotFoundError and friends: one clear line, no traceback
             print(f"FAILED: {e}")
             return 2
         model_id = manifest["subject"].get("source_root", "moespresso")
+        from moespresso.runtime.prefix_cache import (
+            declared_context_limit,
+            effective_context_limit,
+        )
+
+        try:
+            context_limit = effective_context_limit(
+                manifest,
+                requested=max_context_tokens,
+            )
+        except ValueError as e:
+            print(f"FAILED: {e}", flush=True)
+            return 2
+        print(
+            f"[serve] context_limit={context_limit} "
+            f"package_limit={declared_context_limit(manifest) or 'unknown'}",
+            flush=True,
+        )
 
         resolved_prompt_cache_size = (
             DEFAULT_PROMPT_CACHE_SIZE
@@ -1027,6 +1056,7 @@ def serve(
             model,
             tokenizer,
             manifest,
+            context_limit=context_limit,
             prompt_cache_size=resolved_prompt_cache_size,
             prompt_cache_bytes=prompt_cache_bytes,
             disk_store=disk_store,
@@ -1094,6 +1124,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry; "
                              "RSS remains a separate process measurement.")
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="Maximum prompt-plus-output context tokens. Default: 131072 or "
+             "the package limit, whichever is smaller.",
+    )
+    parser.add_argument(
+        "--min-resident-experts",
+        type=int,
+        default=None,
+        help="Require at least this many resident routed experts per layer; "
+             "startup fails when the planned pool is smaller.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--prompt-cache-size", type=int, default=None,
@@ -1119,11 +1163,24 @@ def main(argv: list[str] | None = None) -> int:
              "(default: auto; off restores lazy first-request setup)",
     )
     args = parser.parse_args(argv)
+    if args.max_context_tokens is not None and args.max_context_tokens < 1:
+        parser.error("--max-context-tokens must be >= 1")
+    if args.min_resident_experts is not None and args.min_resident_experts < 1:
+        parser.error("--min-resident-experts must be >= 1")
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
     manifest = _preflight_manifest_for_cli(Path(args.package_dir))
     if manifest is not None:
+        from moespresso.runtime.prefix_cache import effective_context_limit
+
+        try:
+            effective_context_limit(
+                manifest,
+                requested=args.max_context_tokens,
+            )
+        except ValueError as e:
+            parser.error(str(e))
         option_error = thinking_effort_option_error(
             args.thinking, is_deepseek_v4=is_deepseek_v4_manifest(manifest))
         if option_error is not None:
@@ -1135,6 +1192,8 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes,
+        max_context_tokens=args.max_context_tokens,
+        min_resident_experts=args.min_resident_experts,
         thinking=args.thinking,
         startup_warmup=args.startup_warmup != "off",
     )

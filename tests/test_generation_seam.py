@@ -47,7 +47,9 @@ def _resp(text, token, *, finish_reason=None, prompt_tokens=3, generation_tokens
 
 
 class _Tokenizer:
-    def encode(self, text):
+    bos_token = None
+
+    def encode(self, text, add_special_tokens=True):
         return list(range(len(text.split())))
 
     def decode(self, token_ids):
@@ -692,7 +694,7 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         serve,
         "load_served_model",
-        lambda package_dir: ("MODEL", "TOKENIZER", manifest),
+        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
     )
     monkeypatch.setattr(
         http,
@@ -718,6 +720,8 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
         str(tmp_path / "pkg"),
         "--prompt",
         "hello",
+        "--max-context-tokens",
+        "30000",
         "--max-tokens",
         "5",
         "--temperature",
@@ -737,6 +741,50 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
     assert payload["params"]["thinking"] == "off"
 
 
+def test_generate_main_rejects_span_beyond_explicit_context_limit(
+    tmp_path, monkeypatch, capsys
+):
+    import moespresso.runtime.http as http
+    import moespresso.runtime.serve as serve
+
+    manifest = {
+        "artifact_id": "pkg:smoke",
+        "architecture": {"family": "deepseek_v4_flash"},
+        "tensors": [],
+        "files": [],
+    }
+    monkeypatch.setattr(
+        serve,
+        "load_served_model",
+        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
+    )
+    monkeypatch.setattr(
+        http,
+        "render_prompt",
+        lambda messages, tokenizer, **kwargs: "one two",
+    )
+    monkeypatch.setattr(
+        serve,
+        "generate_with_metadata",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("generation must not start")
+        ),
+    )
+
+    rc = main([
+        str(tmp_path / "pkg"),
+        "--max-context-tokens",
+        "2",
+        "--max-tokens",
+        "1",
+    ])
+
+    assert rc == 2
+    output = capsys.readouterr().out
+    assert "served context limit of 2 tokens" in output
+    assert "2 prompt tokens plus max_tokens 1" in output
+
+
 def test_generate_main_maps_deepseek_v4_thinking_selections(
     tmp_path, monkeypatch, capsys
 ):
@@ -753,7 +801,7 @@ def test_generate_main_maps_deepseek_v4_thinking_selections(
 
     monkeypatch.setattr(
         serve, "load_served_model",
-        lambda package_dir: ("MODEL", "TOKENIZER", manifest))
+        lambda package_dir: ("MODEL", _Tokenizer(), manifest))
 
     def fake_render(messages, tokenizer, template_kwargs=None, **kwargs):
         seen["template_kwargs"] = template_kwargs

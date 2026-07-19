@@ -343,7 +343,10 @@ def test_build_cache_generator_builds_in_memory_generator(tmp_path):
 
 
 def test_declared_context_limit_resolves_both_package_shapes():
-    from moespresso.runtime.prefix_cache import declared_context_limit
+    from moespresso.runtime.prefix_cache import (
+        declared_context_limit,
+        effective_context_limit,
+    )
 
     # DeepSeek-V4 Flash: top-level field, the YaRN-scaled ceiling.
     ds4 = {"architecture": {"config": {
@@ -362,6 +365,18 @@ def test_declared_context_limit_resolves_both_package_shapes():
     # No declaration: no limit, the pre-existing behavior.
     assert declared_context_limit({"architecture": {"config": {}}}) is None
     assert declared_context_limit({}) is None
+
+    assert effective_context_limit(ds4) == 131072
+    assert effective_context_limit(ornith) == 131072
+    assert effective_context_limit(
+        {"architecture": {"config": {"max_position_embeddings": 65536}}}
+    ) == 65536
+    assert effective_context_limit(ornith, requested=30000) == 30000
+    assert effective_context_limit(ornith, requested=262144) == 262144
+    with pytest.raises(ValueError, match="must be >= 1"):
+        effective_context_limit(ornith, requested=0)
+    with pytest.raises(ValueError, match="exceeds the package context limit"):
+        effective_context_limit(ornith, requested=262145)
 
 
 def test_chat_completion_maps_context_limit_error_to_a_400():
@@ -383,15 +398,25 @@ def test_chat_completion_maps_context_limit_error_to_a_400():
     assert "max_tokens 4096" in e.value.message
 
 
-def test_build_cache_generator_resolves_the_context_limit():
+def test_build_cache_generator_resolves_the_effective_context_limit():
+    manifest = {"artifact_id": "pkg", "architecture": {"config": {
+        "max_position_embeddings": 262144}}}
     gen = build_cache_generator(
         "MODEL",
         "TOK",
-        {"artifact_id": "pkg", "architecture": {"config": {
-            "max_position_embeddings": 262144}}},
+        manifest,
         memory_store_factory=lambda size, max_bytes: "memory-store",
     )
-    assert gen.context_limit == 262144
+    assert gen.context_limit == 131072
+
+    overridden = build_cache_generator(
+        "MODEL",
+        "TOK",
+        manifest,
+        context_limit=30000,
+        memory_store_factory=lambda size, max_bytes: "memory-store",
+    )
+    assert overridden.context_limit == 30000
 
 
 # --- sampling parameter pass-through and validation ---
@@ -759,9 +784,21 @@ def test_main_threads_prompt_cache_options_to_serve(monkeypatch):
     assert str(seen["package_dir"]) == "/tmp/pkg"
     assert seen["prompt_cache_size"] == 4
     assert seen["startup_warmup"] is True
+    assert seen["max_context_tokens"] is None
+    assert seen["min_resident_experts"] is None
 
-    assert h.main(["/tmp/pkg", "--startup-warmup", "off"]) == 0
+    assert h.main([
+        "/tmp/pkg",
+        "--startup-warmup",
+        "off",
+        "--max-context-tokens",
+        "30000",
+        "--min-resident-experts",
+        "48",
+    ]) == 0
     assert seen["startup_warmup"] is False
+    assert seen["max_context_tokens"] == 30000
+    assert seen["min_resident_experts"] == 48
 
 
 def test_serve_maps_deepseek_v4_thinking_selection(monkeypatch, capsys):
@@ -849,12 +886,14 @@ def test_serve_accepts_deepseek_v4_prompt_cache_bounds(monkeypatch):
             "/tmp/pkg",
             prompt_cache_size=4,
             prompt_cache_bytes=1024,
+            max_context_tokens=30000,
             startup_warmup=False,
             load_model_fn=fake_load_model,
         )
 
     assert seen["prompt_cache_size"] == 4
     assert seen["prompt_cache_bytes"] == 1024
+    assert seen["context_limit"] == 30000
 
 
 def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):

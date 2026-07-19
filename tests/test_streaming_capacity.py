@@ -17,6 +17,7 @@ from moespresso.runtime.streaming_capacity import (
     min_capacity,
     non_routed_payload_bytes,
     package_capacity_budget,
+    validate_min_resident_experts,
 )
 
 
@@ -54,6 +55,37 @@ def test_bytes_per_layer_slot_comes_from_index_geometry(tmp_path):
 def test_min_capacity_is_router_fanout_plus_staging():
     assert min_capacity(max_router_fanout=4) == 6
     assert min_capacity(max_router_fanout=8, staging_slots=8) == 16
+
+
+def test_min_resident_experts_is_an_optional_fail_closed_floor():
+    validate_min_resident_experts(
+        capacity=48,
+        requested=None,
+        package_experts=256,
+    )
+    validate_min_resident_experts(
+        capacity=48,
+        requested=48,
+        package_experts=256,
+    )
+    with pytest.raises(StreamingCapacityError, match="below the requested minimum"):
+        validate_min_resident_experts(
+            capacity=47,
+            requested=48,
+            package_experts=256,
+        )
+    with pytest.raises(StreamingCapacityError, match="must be >= 1"):
+        validate_min_resident_experts(
+            capacity=48,
+            requested=0,
+            package_experts=256,
+        )
+    with pytest.raises(StreamingCapacityError, match="package expert count"):
+        validate_min_resident_experts(
+            capacity=256,
+            requested=257,
+            package_experts=256,
+        )
 
 
 def test_choose_capacity_uses_remaining_budget_and_caps_at_num_experts():

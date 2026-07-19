@@ -99,6 +99,30 @@ def min_capacity(*, max_router_fanout: int, staging_slots: int = 2) -> int:
     return max_router_fanout + staging_slots
 
 
+def validate_min_resident_experts(
+    *,
+    capacity: int,
+    requested: int | None,
+    package_experts: int,
+) -> None:
+    """Enforce an optional operator floor without changing auto capacity."""
+    if requested is None:
+        return
+    requested = int(requested)
+    if requested < 1:
+        raise StreamingCapacityError("--min-resident-experts must be >= 1")
+    if requested > int(package_experts):
+        raise StreamingCapacityError(
+            f"--min-resident-experts {requested} exceeds the package expert "
+            f"count of {package_experts}"
+        )
+    if int(capacity) < requested:
+        raise StreamingCapacityError(
+            f"planned resident expert capacity {capacity} is below the "
+            f"requested minimum of {requested}"
+        )
+
+
 def choose_capacity(budget: CapacityBudget) -> int:
     """Return the largest safe capacity, capped at full residency."""
     if budget.bytes_per_capacity_unit <= 0:

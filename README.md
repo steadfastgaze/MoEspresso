@@ -17,10 +17,10 @@ contracts, and measured behavior.
   both fully resident and SSD-backed execution. The package and runtime are
   designed around streaming from the beginning.
 - **Memory is a quality-and-context budget.** A package fixes a quality-gated
-  quantization recipe; at runtime, KV and activation space are reserved before
-  the remaining memory is assigned to expert residency. MoEspresso does not
-  silently lower tensor precision or shorten the declared context merely to
-  keep every routed expert resident.
+  quantization recipe. Serving defaults to a broadly usable 128K context
+  window. When memory cannot also keep every routed expert resident,
+  MoEspresso streams those experts from SSD instead of shrinking the window or
+  lowering tensor precision.
 - **K-quants and IQ-quants run inside MLX.** The public packages use
   GGML-family quantization formats through [`mlx-kquant`](#mlx-kquant-acknowledgement),
   rather than being limited to the usual affine-only MLX weight path.
@@ -139,6 +139,11 @@ The main serving controls are:
   mainly for measurement.
 - `--max-memory-gb` sets the expert-pool capacity planner's startup ceiling.
   Its exact meaning matters, so it is described below.
+- `--max-context-tokens` selects any positive context limit up to the package's
+  architecture limit. The default is 128K or the package limit, whichever is
+  smaller.
+- `--min-resident-experts` requires a minimum routed-expert capacity per layer
+  and fails at startup when the planned pool is smaller.
 
 ## Memory policy and SSD expert streaming
 
@@ -165,11 +170,11 @@ This loads every expert before serving and fails when the planned pool cannot
 hold all 256 experts. It exercises the same pooled routed graph as SSD
 streaming; the only difference is that every row is already resident.
 
-This ordering is the quality-first policy: the operator-configured fixed
-KV/activation allowance is accounted for before extra expert residency. The
-planner does not infer future context growth from incoming requests, but it
-also does not change tensor precision or shorten the package's declared
-context limit merely to keep more experts resident.
+Serving defaults to a 128K context limit. Each package retains its larger
+architecture limit, which can be selected explicitly with
+`--max-context-tokens`. The operator-configured fixed KV/activation allowance
+is accounted for before extra expert residency, and the planner does not infer
+future context growth from incoming requests.
 
 `--max-memory-gb` caps the input to that startup capacity calculation. It is
 **not an RSS limit**. It selects a smaller or larger fixed expert pool after

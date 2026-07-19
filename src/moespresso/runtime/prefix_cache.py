@@ -23,6 +23,9 @@ from moespresso.runtime.deepseek_v4.cache import DEEPSEEK_V4_CACHE_KIND
 from moespresso.runtime.serve import generate_with_metadata
 
 
+DEFAULT_CONTEXT_LIMIT = 128 * 1024
+
+
 def encode_rendered_prompt(tokenizer, rendered_prompt: str) -> list[int]:
     """Encode a rendered prompt with the same string rules MLX uses.
 
@@ -50,8 +53,7 @@ def declared_context_limit(manifest: dict) -> int | None:
     level, or under ``text_config`` for wrapped multimodal families. For
     position-scaled families the field already holds the scaled ceiling
     (DeepSeek-V4 Flash declares 1048576 via YaRN factor 16 over an
-    original 65536). Returns None when the package declares nothing;
-    serving then applies no limit, the pre-existing behavior.
+    original 65536). Returns None when the package declares nothing.
     """
     architecture = manifest.get("architecture") or {}
     config = architecture.get("config") or {}
@@ -64,6 +66,50 @@ def declared_context_limit(manifest: dict) -> int | None:
                 return None
             return limit if limit > 0 else None
     return None
+
+
+def effective_context_limit(
+    manifest: dict,
+    requested: int | None = None,
+) -> int:
+    """Resolve the served limit without changing the package contract.
+
+    Packages retain their architecture limit. Serving defaults to 128K or the
+    package limit, whichever is smaller; an explicit operator value may select
+    any positive limit up to the package maximum.
+    """
+    declared = declared_context_limit(manifest)
+    if requested is None:
+        return (
+            min(DEFAULT_CONTEXT_LIMIT, declared)
+            if declared
+            else DEFAULT_CONTEXT_LIMIT
+        )
+
+    limit = int(requested)
+    if limit < 1:
+        raise ValueError("--max-context-tokens must be >= 1")
+    if declared is not None and limit > declared:
+        raise ValueError(
+            f"--max-context-tokens {limit} exceeds the package context limit "
+            f"of {declared} tokens"
+        )
+    return limit
+
+
+def validate_context_span(
+    *,
+    limit: int | None,
+    prompt_tokens: int,
+    max_tokens: int,
+) -> None:
+    """Refuse a prompt plus completion budget beyond the served limit."""
+    if limit is not None and int(prompt_tokens) + int(max_tokens) > int(limit):
+        raise ContextLimitError(
+            limit=int(limit),
+            prompt_tokens=int(prompt_tokens),
+            max_tokens=int(max_tokens),
+        )
 
 
 def supported_live_kv_formats(manifest: dict) -> list[str]:
@@ -306,8 +352,7 @@ class PrefixCacheGenerator:
     after_generate_fn: Callable | None = None
     disk_store: Any = None
     disk_registry: Any = None
-    # Declared maximum sequence length in tokens (declared_context_limit);
-    # None applies no limit.
+    # Effective served sequence limit in tokens.
     context_limit: int | None = None
     _cache_class_names: tuple[str, ...] | None = None
     _closed: bool = False
@@ -468,15 +513,13 @@ class PrefixCacheGenerator:
         # Refuse an over-limit request before any cache access: the store
         # hands entries out by move, so a refusal after the fetch would cost
         # the session its chain entry. Prompt plus requested completion
-        # budget must fit the declared limit; a request exactly at the limit
+        # budget must fit the served limit; a request exactly at the limit
         # passes (the sequence occupies positions 0 through limit - 1).
-        if (self.context_limit is not None
-                and len(full_tokens) + int(max_tokens) > self.context_limit):
-            raise ContextLimitError(
-                limit=self.context_limit,
-                prompt_tokens=len(full_tokens),
-                max_tokens=int(max_tokens),
-            )
+        validate_context_span(
+            limit=self.context_limit,
+            prompt_tokens=len(full_tokens),
+            max_tokens=max_tokens,
+        )
 
         # A streaming transport may commit its response only after all request
         # and context validation has passed.  This hook intentionally runs
