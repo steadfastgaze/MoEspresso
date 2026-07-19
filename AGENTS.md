@@ -143,17 +143,21 @@ holds.
   pre-rendered text.
 - Verification (sha256 + manifest checks) stays off the serve hot path as the
   separate `moespresso-verify` gate. Do not add it to the load path.
-- KV cache and prefix reuse are in-memory by default. The opt-in disk KV
-  read path (`MOESPRESSO_DISK_KV=frontier`) restores only exact
-  token-prefix checkpoints at 256-aligned frontiers, fails closed to cold
-  serving on any mismatch, and is gated by the recorded safety evidence
-  that aligned saves round-trip bit-identically on hybrid
-  (KV + recurrent-state) caches. Checkpoint
-  writes happen only at proven live frontiers: token accounting proposes,
-  and every positional cache must independently report exactly the
-  frontier offset before a write, so an unaligned write is structurally
-  impossible. Writes are blocking, atomic, quarantined on failure, and
-  their TTFT cost is measured and logged, never hidden.
+- KV cache and prefix reuse are in-memory first. The disk KV read path
+  restores only exact token-prefix checkpoints at 256-aligned frontiers,
+  fails closed to cold serving on any mismatch, and is gated by the
+  recorded safety evidence that aligned saves round-trip bit-identically
+  on hybrid (KV + recurrent-state) caches. Serving enables the store by
+  default under a per-package root in the user cache directory with an
+  LRU byte budget; `MOESPRESSO_DISK_KV=off` is the kill switch, and a
+  default-enabled store that cannot open degrades to memory-only serving
+  while an explicitly requested one refuses startup. Checkpoint
+  writes happen only at proven live frontiers during prefill: token
+  accounting proposes, and every positional cache must independently
+  report exactly the frontier offset before a write, so an unaligned
+  write is structurally impossible. Writes are blocking, atomic,
+  quarantined on failure, and their TTFT cost is measured and logged,
+  never hidden.
 - One fused routed-MoE operation per layer, one dispatch boundary to Python.
   Never split a routed op into resident and missing partial matmuls; that
   measured slower despite better wait counters.

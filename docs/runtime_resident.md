@@ -324,9 +324,10 @@ exactly one entry instead of one snapshot per request (rotating-window caches
 report untrimmable, which otherwise measured 3.30 GB retained at 89.8k tokens
 under the ten-entry cap). The cost is that a branch from an earlier prefix
 loses its in-memory hit and is served by the disk frontier restore, which is
-exact. This prefix reuse is **in-memory by default**. An opt-in disk KV cache
-adds a restart-warm second tier that restores an exact token prefix from disk
-on an in-memory miss; it is off unless enabled and is documented separately in
+exact. This prefix reuse is **in-memory first**. The disk KV cache adds a
+second tier that restores an exact token prefix from disk on an in-memory
+miss; serving enables it by default under a per-package root
+(`MOESPRESSO_DISK_KV=off` disables it) and it is documented separately in
 `docs/disk_kv.md`.
 
 `PrefixCacheGenerator.__call__` per request:
@@ -466,7 +467,7 @@ package streams.
 | `thinking.py` | Per-family thinking on/off resolution; refuse loudly. |
 | `kv_policy.py` | Pure live-KV policy parse/validate → mlx_lm kwargs (in-memory). |
 | `prefix_cache.py` | In-memory prefix reuse: `PromptCacheStore`, one live timeline per chain; declared-context-limit refusal. |
-| `disk_kv.py` | The opt-in disk KV checkpoint tier (`docs/disk_kv.md`). |
+| `disk_kv.py` | The disk KV checkpoint tier, on by default when serving (`docs/disk_kv.md`). |
 | `kquant_install.py` | Manifest-driven swap of constructed MLX modules to mlx-kquant module classes before K-quant wire bytes load. |
 | `owned_switchglu.py` | `OwnedSwitchGLU` forward immune to jang's class-level fused patch (mixed gate/up bits). |
 | `deepseek_v4/` | DeepSeek-V4 runtime graph adapter, cache contract, native/helper probes, and speed replay tools. |

@@ -1411,11 +1411,29 @@ DISK_KV_STRIDE_ENV = "MOESPRESSO_DISK_KV_STRIDE"
 DISK_KV_BYTES_ENV = "MOESPRESSO_DISK_KV_BYTES"
 
 DISK_KV_MODE_FRONTIER = "frontier"
+_DISK_KV_MODES_OFF = ("off", "0")
+DISK_KV_BYTES_UNLIMITED = "unlimited"
+
+# Serving defaults. The stride trades first-write cost against restore
+# granularity: checkpoints are written only during prefill (once per new
+# prefix region, deduplicated against the store), and a restore re-prefills
+# at most one stride of tail, so 1024 keeps a cold 10k-token prompt to a few
+# writes while a later restore re-prefills only a few seconds of tokens.
+# The budget bounds each per-package root; eviction is least-recently-used.
+DEFAULT_DISK_KV_STRIDE = 1024
+DEFAULT_DISK_KV_BUDGET_BYTES = 32 * 1024**3
 
 
 @dataclass(frozen=True)
 class DiskKVConfig:
-    """Resolved disk KV operator config. ``enabled`` is false when the flag is off."""
+    """Resolved disk KV operator config. ``enabled`` is false when the flag is off.
+
+    ``explicit`` records whether the operator asked for the store by setting
+    the mode flag. Serving fails loudly when an explicitly requested store
+    cannot open, and degrades to memory-only serving when a default-enabled
+    store cannot (a locked root or an unwritable cache directory must not
+    take the server down when nobody asked for disk KV).
+    """
 
     enabled: bool
     root: Path | None = None
@@ -1424,65 +1442,127 @@ class DiskKVConfig:
     # payload bytes on disk; a write that would exceed it evicts least-recently-used
     # entries first. Zero and negative are refused at startup by config resolution.
     budget_bytes: int | None = None
+    explicit: bool = True
 
 
-def resolve_disk_kv_config(env: dict[str, str] | None = None) -> DiskKVConfig:
+def default_disk_kv_root(package_dir: Path | str,
+                         env: dict[str, str] | None = None) -> Path:
+    """The serving default disk KV root for one package.
+
+    Lives under the user cache directory (``XDG_CACHE_HOME`` or
+    ``~/.cache``) as ``moespresso/disk_kv/<package-fingerprint>``. The
+    per-package fingerprint exists for the single-owner root lock: servers
+    for different packages run concurrently without contending for one
+    root. Correctness never depends on the split; the checkpoint scope hash
+    gates every restore regardless of which root holds the entry. Deleting
+    the whole ``moespresso`` cache directory is always safe: a missing
+    checkpoint means cold serving, never a wrong restore.
+    """
+    env = os.environ if env is None else env
+    cache_home = env.get("XDG_CACHE_HOME")
+    if cache_home:
+        base = Path(cache_home)
+    else:
+        home = env.get("HOME")
+        base = (Path(home) if home else Path.home()) / ".cache"
+    fingerprint = hashlib.sha256(
+        str(Path(package_dir).resolve()).encode()).hexdigest()[:12]
+    return base / "moespresso" / "disk_kv" / fingerprint
+
+
+def resolve_disk_kv_config(
+    env: dict[str, str] | None = None,
+    *,
+    package_dir: Path | str | None = None,
+) -> DiskKVConfig:
     """Read the disk KV operator surface from the environment.
 
-    Default off. The only enabling value is ``MOESPRESSO_DISK_KV=frontier``, which
-    requires ``MOESPRESSO_DISK_KV_ROOT`` and a ``MOESPRESSO_DISK_KV_STRIDE`` that is
-    a positive multiple of 256. An unknown mode or a missing root fails closed at
-    startup rather than serving a half-configured store.
+    With ``package_dir`` (the serving path) the store defaults on: the root
+    derives from the package under the user cache directory, the stride
+    defaults to ``DEFAULT_DISK_KV_STRIDE``, and the byte budget defaults to
+    ``DEFAULT_DISK_KV_BUDGET_BYTES``. ``MOESPRESSO_DISK_KV=off`` (or ``0``)
+    is the kill switch, and every explicit environment value overrides its
+    default. Without ``package_dir`` no default root exists, so the store
+    stays off unless ``MOESPRESSO_DISK_KV=frontier`` names a root and a
+    stride explicitly, and an absent budget means unbounded. An unknown
+    mode or a half-configured explicit store fails closed at startup.
     """
     env = os.environ if env is None else env
     mode = env.get(DISK_KV_MODE_ENV)
-    if not mode:
+    if mode in _DISK_KV_MODES_OFF:
         return DiskKVConfig(enabled=False)
-    if mode != DISK_KV_MODE_FRONTIER:
+    if mode and mode != DISK_KV_MODE_FRONTIER:
         raise DiskKVError(
-            f"{DISK_KV_MODE_ENV} must be {DISK_KV_MODE_FRONTIER!r} to enable disk "
-            f"KV (got {mode!r})")
+            f"{DISK_KV_MODE_ENV} must be {DISK_KV_MODE_FRONTIER!r} or "
+            f"'off' (got {mode!r})")
+    explicit = bool(mode)
+    if not mode and package_dir is None:
+        return DiskKVConfig(enabled=False)
+
     root = env.get(DISK_KV_ROOT_ENV)
     if not root:
-        raise DiskKVError(
-            f"{DISK_KV_MODE_ENV}={DISK_KV_MODE_FRONTIER} requires {DISK_KV_ROOT_ENV}")
+        if package_dir is None:
+            raise DiskKVError(
+                f"{DISK_KV_MODE_ENV}={DISK_KV_MODE_FRONTIER} requires "
+                f"{DISK_KV_ROOT_ENV}")
+        resolved_root = default_disk_kv_root(package_dir, env)
+    else:
+        resolved_root = Path(root)
+
     stride_raw = env.get(DISK_KV_STRIDE_ENV)
     if stride_raw is None:
-        raise DiskKVError(
-            f"{DISK_KV_MODE_ENV}={DISK_KV_MODE_FRONTIER} requires {DISK_KV_STRIDE_ENV}")
-    try:
-        stride = int(stride_raw)
-    except ValueError as e:
-        raise DiskKVStrideError(
-            f"{DISK_KV_STRIDE_ENV} must be an integer, got {stride_raw!r}") from e
+        if package_dir is None:
+            raise DiskKVError(
+                f"{DISK_KV_MODE_ENV}={DISK_KV_MODE_FRONTIER} requires "
+                f"{DISK_KV_STRIDE_ENV}")
+        stride = DEFAULT_DISK_KV_STRIDE
+    else:
+        try:
+            stride = int(stride_raw)
+        except ValueError as e:
+            raise DiskKVStrideError(
+                f"{DISK_KV_STRIDE_ENV} must be an integer, got {stride_raw!r}"
+            ) from e
     validate_stride(stride)
-    budget_bytes = _resolve_budget_bytes(env.get(DISK_KV_BYTES_ENV))
+    budget_bytes = _resolve_budget_bytes(
+        env.get(DISK_KV_BYTES_ENV),
+        default=(DEFAULT_DISK_KV_BUDGET_BYTES if package_dir is not None
+                 else None),
+    )
     return DiskKVConfig(
-        enabled=True, root=Path(root), stride=stride, budget_bytes=budget_bytes)
+        enabled=True, root=resolved_root, stride=stride,
+        budget_bytes=budget_bytes, explicit=explicit)
 
 
-def _resolve_budget_bytes(raw: str | None) -> int | None:
-    """Read the optional disk KV byte budget.
+def _resolve_budget_bytes(raw: str | None, *,
+                          default: int | None = None) -> int | None:
+    """Read the disk KV byte budget.
 
-    Absent means unlimited (no eviction). Zero is refused with a message pointing
-    the operator at the feature flag: a zero budget cannot hold any checkpoint, so
-    the intent is to disable the feature, which is done by unsetting the mode flag.
-    A negative budget is refused as a misconfiguration.
+    Absent means ``default`` (the serving path passes the bounded serving
+    default; direct callers keep unbounded). The literal ``unlimited``
+    disables eviction explicitly. Zero is refused with a message pointing
+    the operator at the kill switch: a zero budget cannot hold any
+    checkpoint, so the intent is to disable the feature. A negative budget
+    is refused as a misconfiguration.
     """
     if raw is None:
+        return default
+    if raw == DISK_KV_BYTES_UNLIMITED:
         return None
     try:
         value = int(raw)
     except ValueError as e:
         raise DiskKVError(
-            f"{DISK_KV_BYTES_ENV} must be an integer, got {raw!r}") from e
+            f"{DISK_KV_BYTES_ENV} must be an integer or "
+            f"{DISK_KV_BYTES_UNLIMITED!r}, got {raw!r}") from e
     if value == 0:
         raise DiskKVError(
-            f"{DISK_KV_BYTES_ENV}=0 cannot hold any checkpoint; to turn the feature "
-            f"off unset {DISK_KV_MODE_ENV} instead of setting a zero byte budget")
+            f"{DISK_KV_BYTES_ENV}=0 cannot hold any checkpoint; to turn the "
+            f"feature off set {DISK_KV_MODE_ENV}=off instead of a zero budget")
     if value < 0:
         raise DiskKVError(
-            f"{DISK_KV_BYTES_ENV} must be positive (unlimited when unset), got {value}")
+            f"{DISK_KV_BYTES_ENV} must be positive or "
+            f"{DISK_KV_BYTES_UNLIMITED!r}, got {value}")
     return value
 
 

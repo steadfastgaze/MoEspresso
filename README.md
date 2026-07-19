@@ -188,23 +188,26 @@ optimistic because macOS may retain the whole package in page cache.
 See [SSD streaming](docs/ssd_streaming.md) for the capacity formula, runtime
 controls, direct-read path, and measurement caveats.
 
-## Disk KV for restart-warm sessions
+## Disk KV for restart-warm and cross-session resume
 
-The in-memory prefix cache is on by default. Disk KV is a separate opt-in tier
-that checkpoints aligned prompt-cache frontiers so a later process can restore
-an exact token prefix and prefill only the suffix:
+The in-memory prefix cache is always on. The disk KV tier checkpoints
+aligned prompt-cache frontiers so a later process, or a new session sharing
+a long prompt prefix (an agent client's fixed system prompt and tools),
+restores an exact token prefix and prefills only the suffix. Serving enables
+it by default under `~/.cache/moespresso/disk_kv/<package>` with a 32 GiB
+LRU byte budget and a 1024-token stride:
 
 ```bash
-MOESPRESSO_DISK_KV=frontier \
-MOESPRESSO_DISK_KV_ROOT=/path/to/kv-root \
-MOESPRESSO_DISK_KV_STRIDE=4096 \
 moespresso-serve ./models/ornith-35b --thinking off
+MOESPRESSO_DISK_KV=off moespresso-serve ./models/ornith-35b   # memory-only
 ```
 
-`MOESPRESSO_DISK_KV_BYTES` optionally sets an on-disk payload budget with LRU
-eviction. A root has one process owner, restores are package/render/KV-policy
-scoped, and every mismatch fails closed to cold prefill. See the
-[disk KV contract](docs/disk_kv.md) before using it for long sessions.
+`MOESPRESSO_DISK_KV_ROOT`, `MOESPRESSO_DISK_KV_STRIDE`, and
+`MOESPRESSO_DISK_KV_BYTES` (`unlimited` disables eviction) override the
+defaults. A root has one process owner, restores are package/render/KV-policy
+scoped, and every mismatch fails closed to cold prefill. Deleting
+`~/.cache/moespresso` is always safe. See the
+[disk KV contract](docs/disk_kv.md) for the full guarantees.
 
 ## Why a MoEspresso package exists
 

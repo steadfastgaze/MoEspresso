@@ -1295,8 +1295,11 @@ def serve(
     httpd = None
 
     # Acquire the disk KV root lock before the model load: a second owner must be
-    # refused before the heavy load. Off by default; enabled only by
-    # MOESPRESSO_DISK_KV=frontier with a root and a valid stride.
+    # refused before the heavy load. Serving defaults the store on under a
+    # per-package root in the user cache directory; MOESPRESSO_DISK_KV=off is
+    # the kill switch. A default-enabled store that cannot open (locked root,
+    # unwritable cache directory) degrades to memory-only serving; an
+    # explicitly requested one still refuses startup.
     from moespresso.runtime.disk_kv import (
         DiskKVError,
         open_disk_store,
@@ -1307,18 +1310,27 @@ def serve(
         validate_min_resident_experts,
     )
 
+    disk_kv_config = None
     try:
-        disk_kv_config = resolve_disk_kv_config()
+        disk_kv_config = resolve_disk_kv_config(package_dir=package_dir)
         disk_store = open_disk_store(disk_kv_config)
     except DiskKVError as e:
-        print(f"FAILED: {e}")
-        return 2
+        if disk_kv_config is None or disk_kv_config.explicit:
+            print(f"FAILED: {e}")
+            return 2
+        print(f"[serve] disk_kv=off ({e})", flush=True)
+        disk_store = None
     if disk_store is not None:
+        budget = disk_kv_config.budget_bytes
+        budget_label = (
+            "unlimited" if budget is None else f"{budget / 1024**3:.0f}GiB")
         print(
             f"[serve] disk_kv=frontier root={disk_kv_config.root} "
-            f"stride={disk_kv_config.stride}",
+            f"stride={disk_kv_config.stride} budget={budget_label}",
             flush=True,
         )
+    elif disk_kv_config is not None and not disk_kv_config.enabled:
+        print("[serve] disk_kv=off", flush=True)
 
     try:
         try:

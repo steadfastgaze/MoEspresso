@@ -302,6 +302,72 @@ def test_resolve_config_rejects_unaligned_stride(tmp_path):
         })
 
 
+def test_resolve_config_serving_defaults_on(tmp_path):
+    from moespresso.runtime.disk_kv import (
+        DEFAULT_DISK_KV_BUDGET_BYTES,
+        DEFAULT_DISK_KV_STRIDE,
+    )
+
+    package = tmp_path / "pkg"
+    cfg = resolve_disk_kv_config(
+        {"XDG_CACHE_HOME": str(tmp_path / "cache")}, package_dir=package)
+    assert cfg.enabled
+    assert cfg.explicit is False
+    assert cfg.stride == DEFAULT_DISK_KV_STRIDE
+    assert cfg.budget_bytes == DEFAULT_DISK_KV_BUDGET_BYTES
+    assert cfg.root is not None
+    assert cfg.root.parent == tmp_path / "cache" / "moespresso" / "disk_kv"
+
+
+def test_resolve_config_default_root_is_per_package_and_stable(tmp_path):
+    env = {"XDG_CACHE_HOME": str(tmp_path / "cache")}
+    package_a = tmp_path / "pkg-a"
+    package_b = tmp_path / "pkg-b"
+    root_a = resolve_disk_kv_config(env, package_dir=package_a).root
+    root_b = resolve_disk_kv_config(env, package_dir=package_b).root
+    assert root_a != root_b
+    assert root_a == resolve_disk_kv_config(env, package_dir=package_a).root
+
+
+def test_resolve_config_kill_switch(tmp_path):
+    for mode in ("off", "0"):
+        cfg = resolve_disk_kv_config(
+            {"MOESPRESSO_DISK_KV": mode}, package_dir=tmp_path / "pkg")
+        assert cfg == DiskKVConfig(enabled=False)
+        assert resolve_disk_kv_config(
+            {"MOESPRESSO_DISK_KV": mode}) == DiskKVConfig(enabled=False)
+
+
+def test_resolve_config_explicit_frontier_with_package_uses_defaults(tmp_path):
+    cfg = resolve_disk_kv_config(
+        {"MOESPRESSO_DISK_KV": "frontier",
+         "XDG_CACHE_HOME": str(tmp_path / "cache")},
+        package_dir=tmp_path / "pkg")
+    assert cfg.enabled
+    assert cfg.explicit is True
+
+
+def test_resolve_config_env_values_override_serving_defaults(tmp_path):
+    cfg = resolve_disk_kv_config(
+        {
+            "MOESPRESSO_DISK_KV_ROOT": str(tmp_path / "explicit-root"),
+            "MOESPRESSO_DISK_KV_STRIDE": "4096",
+            "MOESPRESSO_DISK_KV_BYTES": "1048576",
+        },
+        package_dir=tmp_path / "pkg")
+    assert cfg.root == tmp_path / "explicit-root"
+    assert cfg.stride == 4096
+    assert cfg.budget_bytes == 1048576
+
+
+def test_resolve_config_unlimited_budget_literal(tmp_path):
+    cfg = resolve_disk_kv_config(
+        {"MOESPRESSO_DISK_KV_BYTES": "unlimited",
+         "XDG_CACHE_HOME": str(tmp_path / "cache")},
+        package_dir=tmp_path / "pkg")
+    assert cfg.budget_bytes is None
+
+
 def test_open_disk_store_off_returns_none():
     assert open_disk_store(DiskKVConfig(enabled=False)) is None
 
@@ -733,7 +799,7 @@ def test_config_refuses_zero_and_negative_budget_at_startup(tmp_path):
         "MOESPRESSO_DISK_KV_ROOT": str(tmp_path),
         "MOESPRESSO_DISK_KV_STRIDE": "256",
     }
-    with pytest.raises(DiskKVError, match="unset MOESPRESSO_DISK_KV"):
+    with pytest.raises(DiskKVError, match="MOESPRESSO_DISK_KV=off"):
         resolve_disk_kv_config({**base, "MOESPRESSO_DISK_KV_BYTES": "0"})
     with pytest.raises(DiskKVError, match="positive"):
         resolve_disk_kv_config({**base, "MOESPRESSO_DISK_KV_BYTES": "-5"})

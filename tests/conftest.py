@@ -12,11 +12,24 @@ import json
 import struct
 
 import numpy as np
+import pytest
 
 from moespresso.package.bundle import (
     assemble_layer_bundle,
     encode_bundle_metadata,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disk_kv_off_for_tests(monkeypatch):
+    """Serving defaults the disk KV store on under the user cache directory.
+
+    The suite must never write checkpoints into the real user cache, so
+    every test runs with the kill switch set. A test that exercises the
+    store sets its own environment (a test-level monkeypatch overrides
+    this fixture) or passes an explicit env dict to the resolver.
+    """
+    monkeypatch.setenv("MOESPRESSO_DISK_KV", "off")
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 

@@ -155,10 +155,10 @@ stall time of a physical 32 GB machine.
 
 ## Restart-warm sessions
 
-The opt-in disk KV tier works with Ornith's hybrid cache, including recurrent
-state. It restores only exact token-prefix checkpoints and fails closed to cold
-prefill on mismatch. Configuration and safety evidence live in
-[`disk_kv.md`](disk_kv.md).
+The disk KV tier, on by default when serving, works with Ornith's hybrid
+cache, including recurrent state. It restores only exact token-prefix
+checkpoints and fails closed to cold prefill on mismatch. Configuration and
+safety evidence live in [`disk_kv.md`](disk_kv.md).
 
 ## Promotion checklist
 

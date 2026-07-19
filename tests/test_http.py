@@ -836,6 +836,75 @@ def test_serve_maps_deepseek_v4_thinking_selection(monkeypatch, capsys):
     }
 
 
+def test_serve_default_disk_kv_opens_under_the_user_cache(
+        monkeypatch, capsys, tmp_path):
+    import moespresso.runtime.http as h
+
+    monkeypatch.delenv("MOESPRESSO_DISK_KV", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    def fake_load_model(package_dir):
+        raise FileNotFoundError("stop after the disk block")
+
+    rc = h.serve(tmp_path / "pkg", load_model_fn=fake_load_model)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "[serve] disk_kv=frontier root=" in out
+    assert str(tmp_path / "cache") in out
+    assert "stride=1024" in out
+    assert "budget=32GiB" in out
+
+
+def test_serve_degrades_when_default_disk_kv_cannot_open(
+        monkeypatch, capsys, tmp_path):
+    import moespresso.runtime.disk_kv as disk_kv
+    import moespresso.runtime.http as h
+
+    monkeypatch.delenv("MOESPRESSO_DISK_KV", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    def fake_open(config):
+        assert config.explicit is False
+        raise disk_kv.DiskKVError("disk KV root is already locked")
+
+    monkeypatch.setattr(disk_kv, "open_disk_store", fake_open)
+
+    def fake_load_model(package_dir):
+        raise FileNotFoundError("stop after the disk block")
+
+    rc = h.serve(tmp_path / "pkg", load_model_fn=fake_load_model)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "[serve] disk_kv=off (disk KV root is already locked)" in out
+    assert "FAILED: stop after the disk block" in out
+
+
+def test_serve_fails_when_explicit_disk_kv_cannot_open(
+        monkeypatch, capsys, tmp_path):
+    import moespresso.runtime.disk_kv as disk_kv
+    import moespresso.runtime.http as h
+
+    monkeypatch.setenv("MOESPRESSO_DISK_KV", "frontier")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    def fake_open(config):
+        assert config.explicit is True
+        raise disk_kv.DiskKVError("disk KV root is already locked")
+
+    monkeypatch.setattr(disk_kv, "open_disk_store", fake_open)
+
+    def fake_load_model(package_dir):
+        raise AssertionError("the model must not load after a refused store")
+
+    rc = h.serve(tmp_path / "pkg", load_model_fn=fake_load_model)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "FAILED: disk KV root is already locked" in out
+
+
 def test_serve_rejects_thinking_max_without_effort_mechanism(capsys):
     import moespresso.runtime.http as h
 

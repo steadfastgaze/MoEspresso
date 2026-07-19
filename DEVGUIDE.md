@@ -50,7 +50,7 @@ each produced artifact actually carries.
 | `package/` | `convert.py`, `plan.py`, `manifest.py`, `write.py`, `bundle.py`, `hotlist.py`, `tokenizer.py`, `templates.py`, `templates/` (vendored chat templates), `sidecars.py`, `agentic_profile.py`, `constants.py`, `tq.py`, `kquant_format.py`, `kquant_recipe.py`, `kquant_backend.py`, `kquant_bundle.py`, `kquant_cache.py`, `kquant_gguf.py`, `deepseek_v4/`, `qwen/` | build-time orchestration, the common package-plan IR, the byte-deterministic writer, the manifest, tokenizer/template packaging, sidecar and agentic-profile generation, shared MJTQ/K-quant format contracts, shared GGUF K-quant parsing, encode cache, and model-specific GGUF recipe/package builders | `docs/package_format.md` |
 | `correctness/` | `ladder.py`, `gate.py`, `goldens.py`, `reconstruct.py`, `tq_reference.py`, `environment.py`, `deepseek_v4/`, `qwen35/`, `ornith/` | the general correctness ladder, the convert-time gate, environment gating for measured runs, and model-specific quality gates and debug tools | `docs/correctness_ladder.md` |
 | `toolcalls/` | `types.py`, `qwenxml.py`, `dsml.py`, `envelope.py`, `repair.py` | tool-call dialects as pure stdlib code: the `ToolCall` type, strict per-dialect parsers, the DSML grammar and serializers, and the bounded repair layer. Shared by the serve layer (parse side) and agentlib (client side) | `docs/tool_calls.md` |
-| `runtime/` | `serve.py`, `build.py`, `http.py`, `chat_stream.py`, `tool_stream.py`, `generation.py`, `verify.py`, `thinking.py`, `kv_policy.py`, `prefix_cache.py`, `disk_kv.py`, `kquant_install.py`, `owned_switchglu.py`, `deepseek_v4/`, `qwen/` | serve a package from its manifest; one-shot and HTTP entry points with SSE streaming; served tool-call extraction into OpenAI `tool_calls`; in-memory KV and prefix reuse; declared-context-limit refusal; the opt-in disk KV checkpoint tier; K-quant module installation; model-specific runtime adapters, kernels, and probes | `docs/runtime_resident.md`, `docs/tool_calls.md`, `docs/disk_kv.md` |
+| `runtime/` | `serve.py`, `build.py`, `http.py`, `chat_stream.py`, `tool_stream.py`, `generation.py`, `verify.py`, `thinking.py`, `kv_policy.py`, `prefix_cache.py`, `disk_kv.py`, `kquant_install.py`, `owned_switchglu.py`, `deepseek_v4/`, `qwen/` | serve a package from its manifest; one-shot and HTTP entry points with SSE streaming; served tool-call extraction into OpenAI `tool_calls`; in-memory KV and prefix reuse; declared-context-limit refusal; the default-on disk KV checkpoint tier; K-quant module installation; model-specific runtime adapters, kernels, and probes | `docs/runtime_resident.md`, `docs/tool_calls.md`, `docs/disk_kv.md` |
 | `runtime/` (streaming) | `ssd_streaming_build.py`, `streaming_capacity.py`, `expert_index.py`, `expert_loader.py`, `expert_pool.py`, `expert_slot_pool.py`, `expert_locality.py`, `pooled_switchglu.py`, `routed_decode_kernel.py`, `gather_tq_split_norms.py`, `pread_into.py`, `native_gate.py`, `streaming_run_lock.py` | stream routed experts from disk within a memory budget | `docs/ssd_streaming.md` |
 | `agentlib/` | `client.py`, `conversation.py`, `sse.py`, `loop_policy.py`, `profile.py`, `sandbox.py`, `subagent.py`, `tools.py`, `execution.py`, `roadtest/`, `dialect_study/` | an agent loop over the served HTTP surface: SSE consumption, loop policy, agentic-profile resolution, sandboxed tool execution, and the served road-test harness. Dialect parsing and repair come from `toolcalls/`. It speaks to the server over HTTP and reads the package's `agentic_profile.json`; it imports no runtime internals | `docs/package_format.md` (agentic profile) |
 
@@ -91,9 +91,10 @@ package came from the probe/optimizer route or the GGUF recipe route.
 context limit. Serving defaults to 128K or the package's architecture limit,
 whichever is smaller; `--max-context-tokens` selects any positive limit up to
 that architecture limit. The server warms generation before announcing
-readiness. Prefix reuse is in-memory by default; setting
-`MOESPRESSO_DISK_KV=frontier` adds the opt-in restart-warm disk checkpoint
-tier. Details: `docs/runtime_resident.md` and `docs/disk_kv.md`.
+readiness. Prefix reuse is in-memory first, with the disk KV checkpoint
+tier on by default under a per-package root in the user cache directory
+(`MOESPRESSO_DISK_KV=off` disables it). Details: `docs/runtime_resident.md`
+and `docs/disk_kv.md`.
 
 ## Entry points
 

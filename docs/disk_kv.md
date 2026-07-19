@@ -1,15 +1,18 @@
-# Disk KV cache: restart-warm resume
+# Disk KV cache: restart-warm and cross-session resume
 
-The disk KV cache restores a served model's prompt-cache prefix from disk after a
-restart and prefills only the suffix. A long session that would otherwise reprefill
-its whole history on the first request after a restart resumes warm instead. The
-feature is opt-in, single-process, and narrow: it recovers an exact token prefix
-into the same package and the same cache policy, and falls back to a cold prefill
+The disk KV cache restores a served model's prompt-cache prefix from disk and
+prefills only the suffix. A long session that would otherwise reprefill its
+whole history after a restart resumes warm, and a new session whose prompt
+shares a long prefix with an earlier one (an agent client's fixed system
+prompt and tool schemas) skips the shared region. The store is
+single-process-per-root and narrow: it recovers an exact token prefix into
+the same package and the same cache policy, and falls back to a cold prefill
 on anything it cannot prove safe.
 
-By default nothing is written to or read from disk. The in-memory prefix cache is
-unchanged and is consulted first; the disk store is consulted only on an in-memory
-miss, and only when the feature is turned on.
+Serving enables the store by default under a per-package root in the user
+cache directory; `MOESPRESSO_DISK_KV=off` turns it off. The in-memory prefix
+cache is unchanged and is consulted first; the disk store is consulted only
+on an in-memory miss.
 
 ---
 
@@ -31,28 +34,55 @@ protocol change is needed.
 
 ---
 
-## The opt-in contract
+## Configuration
 
-The feature is off unless the mode flag is set. All configuration is through
-environment variables read once at startup.
+Serving turns the store on by default with bounded defaults; every value can
+be overridden through environment variables read once at startup.
 
-- `MOESPRESSO_DISK_KV`: the mode. The only enabling value is `frontier`. Unset (the
-  default) means the store never opens and the runtime is memory-only. Any other
-  value refuses startup.
-- `MOESPRESSO_DISK_KV_ROOT`: the disk root directory. Required when the mode is
-  `frontier`. One process owns this root for its lifetime (see the root lock below).
-- `MOESPRESSO_DISK_KV_STRIDE`: the checkpoint stride in tokens. Required when the
-  mode is `frontier`. Must be a positive multiple of 256. A checkpoint is written
-  each time prefill reaches a multiple of the stride.
-- `MOESPRESSO_DISK_KV_BYTES`: an optional total byte budget for stored payloads.
-  Unset means unbounded (no eviction). A positive value caps the payload bytes on
-  disk and evicts least-recently-used checkpoints before a write that would exceed
-  it. A value of `0` refuses startup with a message telling the operator to unset
-  `MOESPRESSO_DISK_KV` instead, because a zero budget cannot hold any checkpoint. A
-  negative value refuses startup as a misconfiguration.
+- `MOESPRESSO_DISK_KV`: the mode. `off` (or `0`) disables the store for the
+  process. `frontier` requests it explicitly, which makes configuration
+  faults refuse startup instead of degrading (see below). Unset means the
+  serving default: enabled with the derived root and default stride and
+  budget. Any other value refuses startup.
+- `MOESPRESSO_DISK_KV_ROOT`: the disk root directory. Default:
+  `$XDG_CACHE_HOME/moespresso/disk_kv/<package-fingerprint>` (falling back
+  to `~/.cache`). The fingerprint keys on the package directory so servers
+  for different packages never contend for one root lock; correctness never
+  depends on the split, because the checkpoint scope gates every restore.
+  One process owns a root for its lifetime (see the root lock below).
+- `MOESPRESSO_DISK_KV_STRIDE`: the checkpoint stride in tokens. Default
+  1024; must be a positive multiple of 256. A checkpoint is written each
+  time prefill reaches a multiple of the stride. Checkpoints are written
+  only during prefill and only for frontiers not already on disk, so the
+  write cost lands once, in the first request that covers a new prefix
+  region, and is reported in that request's usage block. Decode never
+  writes. A smaller stride shortens the re-prefilled tail after a restore
+  (at most one stride) at the cost of more first-time writes.
+- `MOESPRESSO_DISK_KV_BYTES`: the total byte budget for stored payloads per
+  root. Default 32 GiB when serving; the literal `unlimited` disables
+  eviction. A positive value caps the payload bytes on disk and evicts
+  least-recently-used checkpoints before a write that would exceed it. A
+  value of `0` refuses startup with a message pointing at
+  `MOESPRESSO_DISK_KV=off`, because a zero budget cannot hold any
+  checkpoint. A negative value refuses startup as a misconfiguration.
 
-A missing root, a missing or non-multiple stride, or an unknown mode fails startup
-with a clear message rather than serving a half-configured store.
+Startup failure policy: with `MOESPRESSO_DISK_KV=frontier` set, a root that
+cannot open (already locked, unwritable) refuses startup, as does any
+malformed value. Under the serving default, an unopenable store prints one
+`[serve] disk_kv=off (reason)` line and the process serves memory-only: a
+locked cache directory must not take down a server nobody configured for
+disk KV. Malformed explicit values (a bad stride or budget) always refuse.
+
+## On-disk footprint and removal
+
+The default location keeps everything under one directory:
+`~/.cache/moespresso`. Growth is bounded by the byte budget per package
+root, enforced by least-recently-used eviction. Deleting the directory (or
+any single root) at any time is safe: the server holds no assumption that a
+checkpoint survives, and a missing or mismatched entry means cold serving,
+never a wrong restore. Package managers do not remove user caches on
+uninstall, so after removing MoEspresso itself, `~/.cache/moespresso` is
+the one path to delete.
 
 ---
 
