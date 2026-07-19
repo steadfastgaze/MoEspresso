@@ -925,11 +925,18 @@ class DiskCheckpointStore:
         fault: the writer stays functional and the leftover file is an
         orphan the next open cleans up. The quarantine counter counts index
         removals; payload disposal is best-effort housekeeping.
+
+        The dead marker is set only when removal fails: cache ids are
+        deterministic (scope plus token prefix), so a marker surviving a
+        successful removal would shadow the fresh valid checkpoint a later
+        cold prefill writes under the same id. In the failure branch no
+        replacement can appear either, because writes are disabled with
+        the marker, so a live marker never hides a valid entry.
         """
-        self._dead_cache_ids.add(entry.cache_id)
         try:
             self.index.remove(entry)
         except Exception as e:  # noqa: BLE001 - never mask the restore error
+            self._dead_cache_ids.add(entry.cache_id)
             self.disable_writes(f"index fault during quarantine: {e!r}")
             self._log(
                 f"[disk_kv] quarantine failed; entry ignored until restart: "

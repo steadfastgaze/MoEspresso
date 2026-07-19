@@ -275,6 +275,35 @@ def test_payload_move_failure_keeps_the_writer_functional(tmp_path):
     assert payload.exists()
 
 
+def test_successful_quarantine_does_not_poison_a_rewritten_checkpoint(tmp_path):
+    # Cache ids are deterministic, so a later cold prefill rewrites the
+    # same prefix under the same id. A quarantine that succeeded must not
+    # leave a dead marker shadowing that fresh valid checkpoint.
+    store = DiskCheckpointStore(tmp_path)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    entry = _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+    payload = tmp_path / entry.payload_path
+    with open(payload, "r+b") as fh:
+        fh.truncate(payload.stat().st_size // 2)
+
+    with pytest.raises(DiskKVInvalidPayload):
+        store.restore(
+            scope, list(range(600)),
+            make_cache_fn=lambda: [_kv_cache_empty()],
+            registry=default_cache_registry(),
+        )
+
+    fresh = _write_kv_checkpoint(store, scope, list(range(512)), length=512)
+    assert fresh.cache_id == entry.cache_id
+    hit = store.restore(
+        scope, list(range(600)),
+        make_cache_fn=lambda: [_kv_cache_empty()],
+        registry=default_cache_registry(),
+    )
+    assert hit is not None
+    assert hit.cached_tokens == 512
+
+
 def test_a_dead_longest_checkpoint_falls_back_to_a_shorter_one(tmp_path):
     loads = []
 
