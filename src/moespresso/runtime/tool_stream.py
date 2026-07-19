@@ -15,11 +15,18 @@ instruct the model to put them; a marker quoted mid-sentence stays prose.
 
 A completed block that fails the strict parse goes through the bounded
 repair layer; a block that still fails flushes back to the content channel,
-so bytes are never silently dropped. An unterminated block at end of turn is
-repaired the same way, except when generation stopped at the token limit:
-closing a half-emitted value would fabricate a plausible but wrong argument,
-so a truncated block always flushes as content. Everything here runs on
-already-decoded text after each decode step; nothing touches the token loop.
+so bytes are never silently dropped. A naked function or invoke element at
+a line start (the wrapper marker dropped, an observed malformation) buffers
+the same way through its own element markers, so a repaired call never
+leaks its raw markup into streamed content. An unterminated block at end of
+turn is repaired the same way, except when generation stopped at the token
+limit: closing a half-emitted value would fabricate a plausible but wrong
+argument, so a truncated block always flushes as content.
+
+Parsed argument values are typed against the request's tool schemas on
+every path: the Qwen XML parser types at parse time, and values whose
+grammar carries its own typing (the DSML string attribute) are corrected
+after parse when they disagree with the declared schema.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from dataclasses import dataclass
 
 from moespresso.runtime.chat_stream import _marker_suffix_length
 from moespresso.toolcalls import dsml, qwenxml, repair
-from moespresso.toolcalls.repair import RepairTelemetry
+from moespresso.toolcalls.repair import RepairTelemetry, coerce_arguments
 from moespresso.toolcalls.types import ToolCall, ToolCallParseError
 
 
@@ -40,9 +47,10 @@ class ToolDialect:
 
     ``parse`` and ``repair`` take ``(text, parameter_schemas)`` and return
     the calls in emission order; both raise ``ToolCallParseError`` on text
-    they cannot accept. ``attempt_markers`` are substrings that mark a
-    call attempt outside a complete block (a naked function element), used
-    only by the end-of-turn salvage scan.
+    they cannot accept. ``attempt_blocks`` are additional (open, close)
+    marker pairs that delimit a call attempt outside a complete block (a
+    naked function element); a buffered attempt fails the strict parse and
+    goes through repair like any malformed block.
     """
 
     name: str
@@ -50,8 +58,7 @@ class ToolDialect:
     close_marker: str
     parse: Callable[[str, dict], list[ToolCall]]
     repair: Callable[[str, dict], list[ToolCall]]
-    attempt_markers: tuple[str, ...] = ()
-    attempt_span_res: tuple = ()
+    attempt_blocks: tuple[tuple[str, str], ...] = ()
 
 
 QWENXML_DIALECT = ToolDialect(
@@ -60,8 +67,7 @@ QWENXML_DIALECT = ToolDialect(
     close_marker=qwenxml.TOOL_CALL_CLOSE,
     parse=qwenxml.parse_qwenxml_tool_calls,
     repair=repair.repair_qwenxml_tool_calls,
-    attempt_markers=("<function=",),
-    attempt_span_res=(repair._NAKED_FUNCTION_RE,),
+    attempt_blocks=(("<function=", "</function>"),),
 )
 
 DSML_DIALECT = ToolDialect(
@@ -70,8 +76,9 @@ DSML_DIALECT = ToolDialect(
     close_marker=dsml.TOOL_CALLS_CLOSE,
     parse=lambda text, schemas: dsml.parse_dsml_tool_calls(text),
     repair=lambda text, schemas: repair.repair_dsml_tool_calls(text),
-    attempt_markers=(dsml.INVOKE_OPEN_PREFIX,),
-    attempt_span_res=(repair._DSML_NAKED_INVOKE_RE,),
+    attempt_blocks=(
+        (dsml.INVOKE_OPEN_PREFIX, f"</{dsml.DSML_TOKEN}invoke>"),
+    ),
 )
 
 
@@ -118,7 +125,9 @@ class ToolCallStreamer:
         self.telemetry = RepairTelemetry()
         self.content_parts: list[str] = []
         self.buffer = ""
-        self.active: ToolDialect | None = None
+        # While buffering a block: the owning dialect and the close marker
+        # of the specific (primary or attempt) block that opened.
+        self.active: tuple[ToolDialect, str] | None = None
         self._held_ws = ""
         self._line_start = True
         self._scan_from = 0
@@ -154,12 +163,14 @@ class ToolCallStreamer:
     def _emit_calls(self, parsed: list[ToolCall]) -> None:
         for call in parsed:
             index = len(self.calls)
+            arguments = coerce_arguments(
+                call.arguments, self.schemas.get(call.name) or {})
             entry = {
                 "id": self.make_call_id(index),
                 "type": "function",
                 "function": {
                     "name": call.name,
-                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
                 },
             }
             self.calls.append(entry)
@@ -196,25 +207,31 @@ class ToolCallStreamer:
             return self._line_start
         return self.buffer[index - 1] == "\n"
 
-    def _find_open(self) -> tuple[int, ToolDialect] | None:
-        best: tuple[int, ToolDialect] | None = None
+    def _open_candidates(self):
         for dialect in self.dialects:
+            yield dialect, dialect.open_marker, dialect.close_marker
+            for open_marker, close_marker in dialect.attempt_blocks:
+                yield dialect, open_marker, close_marker
+
+    def _find_open(self) -> tuple[int, ToolDialect, str, str] | None:
+        best: tuple[int, ToolDialect, str, str] | None = None
+        for dialect, open_marker, close_marker in self._open_candidates():
             start = 0
             while True:
-                index = self.buffer.find(dialect.open_marker, start)
+                index = self.buffer.find(open_marker, start)
                 if index < 0:
                     break
                 if self._at_line_start(index):
                     if best is None or index < best[0]:
-                        best = (index, dialect)
+                        best = (index, dialect, open_marker, close_marker)
                     break
                 start = index + 1
         return best
 
     def _hold_length(self) -> int:
         hold = 0
-        for dialect in self.dialects:
-            length = _marker_suffix_length(self.buffer, dialect.open_marker)
+        for _dialect, open_marker, _close in self._open_candidates():
+            length = _marker_suffix_length(self.buffer, open_marker)
             if length and self._at_line_start(len(self.buffer) - length):
                 hold = max(hold, length)
         return hold
@@ -227,8 +244,8 @@ class ToolCallStreamer:
         self.buffer += text
         while True:
             if self.active is not None:
-                end = self.buffer.find(
-                    self.active.close_marker, self._scan_from)
+                dialect, close_marker = self.active
+                end = self.buffer.find(close_marker, self._scan_from)
                 if end < 0:
                     # Resume the next scan where this one left off; a close
                     # marker split across chunks can begin at most
@@ -236,11 +253,11 @@ class ToolCallStreamer:
                     # this the whole block would rescan on every push.
                     self._scan_from = max(
                         self._scan_from,
-                        len(self.buffer) - len(self.active.close_marker) + 1,
+                        len(self.buffer) - len(close_marker) + 1,
                     )
                     return
-                block = self._consume(end + len(self.active.close_marker))
-                dialect, self.active = self.active, None
+                block = self._consume(end + len(close_marker))
+                self.active = None
                 self._handle_block(dialect, block)
                 # The character after a close marker is a block boundary;
                 # counting it as a line start lets a glued next block parse.
@@ -248,10 +265,10 @@ class ToolCallStreamer:
                 continue
             found = self._find_open()
             if found is not None:
-                index, dialect = found
+                index, dialect, open_marker, close_marker = found
                 self._flush_content(self._consume(index))
-                self.active = dialect
-                self._scan_from = len(dialect.open_marker)
+                self.active = (dialect, close_marker)
+                self._scan_from = len(open_marker)
                 continue
             hold = self._hold_length()
             self._flush_content(self._consume(len(self.buffer) - hold))
@@ -259,58 +276,8 @@ class ToolCallStreamer:
 
     # --- end of turn -----------------------------------------------------
 
-    @staticmethod
-    def _line_start_positions(text: str, markers) -> list[int]:
-        positions = []
-        for marker in markers:
-            start = 0
-            while True:
-                index = text.find(marker, start)
-                if index < 0:
-                    break
-                if index == 0 or text[index - 1] == "\n":
-                    positions.append(index)
-                    break
-                start = index + 1
-        return positions
-
-    def _late_salvage(self) -> None:
-        """Salvage a call attempt that never formed a complete block.
-
-        Runs only when the turn produced no calls: a naked function or
-        invoke element at a line start is still an attempt, and the repair
-        layer knows these shapes. A marker quoted mid-sentence never
-        triggers salvage, matching the streaming rule. On success the
-        attempt regions drop out of the visible content and the prose
-        around them survives; streamed clients have already seen the raw
-        text, and the shaped message carries the structured calls.
-        """
-        full = self.content + self._held_ws
-        for dialect in self.dialects:
-            markers = (dialect.open_marker, *dialect.attempt_markers)
-            positions = self._line_start_positions(full, markers)
-            if not positions:
-                continue
-            try:
-                salvaged = dialect.repair(full, self.schemas)
-            except ToolCallParseError:
-                salvaged = []
-            self.telemetry.record(salvaged=bool(salvaged))
-            if salvaged:
-                self._emit_calls(salvaged)
-                visible = full
-                for span_re in dialect.attempt_span_res:
-                    visible = span_re.sub("", visible)
-                if dialect.open_marker in visible:
-                    # A leaked bare marker has no span to strip; fall back
-                    # to cutting at the first attempt position.
-                    visible = full[:min(positions)]
-                self.content_parts = [visible] if visible.strip() else []
-                self._held_ws = ""
-            return
-
     def finish(self, *, truncated: bool = False) -> None:
-        """Resolve the tail: unterminated blocks, held text, late salvage.
+        """Resolve the tail: an unterminated block, then the held text.
 
         ``truncated`` means generation stopped at the token limit, so an
         unterminated block is flushed as content instead of repaired.
@@ -318,20 +285,15 @@ class ToolCallStreamer:
         if self._finished:
             return
         if self.active is not None:
+            dialect, _close_marker = self.active
             raw, self.buffer = self.buffer, ""
-            dialect, self.active = self.active, None
+            self.active = None
             if truncated:
                 self._flush_content(raw)
             else:
                 self._repair_or_flush(dialect, raw)
         elif self.buffer:
             self._flush_content(self._consume(len(self.buffer)))
-        # The salvage scan runs only when no repair fired yet: a block whose
-        # repair already failed would fail again on the superset text and
-        # double-count the same attempt.
-        if (not self.calls and self.repair_enabled and not truncated
-                and self.telemetry.fires == 0):
-            self._late_salvage()
         if self._held_ws:
             if self.calls:
                 self._held_ws = ""

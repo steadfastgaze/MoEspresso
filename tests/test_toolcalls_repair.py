@@ -325,3 +325,33 @@ def test_dsml_wellformed_name_attribute_is_untouched_by_repair_regex():
     from moespresso.toolcalls.repair import _DSML_UNCLOSED_NAME_RE
     good = f'<{T}parameter name="path" string="true">VERSION</{T}parameter>'
     assert _DSML_UNCLOSED_NAME_RE.sub(r'\1"\2', good) == good
+
+
+def test_coerce_arguments_types_values_against_the_schema():
+    from moespresso.toolcalls.repair import coerce_arguments
+
+    schema = {"properties": {
+        "limit": {"type": "integer"},
+        "path": {"type": "string"},
+        "force": {"type": "boolean"},
+        "tags": {"type": "array"},
+    }}
+    coerced = coerce_arguments(
+        {"limit": "5", "path": 123, "force": "yes",
+         "tags": '["a", "b"]', "extra": "kept"},
+        schema)
+    assert coerced == {
+        "limit": 5, "path": "123", "force": True,
+        "tags": ["a", "b"], "extra": "kept",
+    }
+
+
+def test_coerce_arguments_keeps_matching_and_uncoercible_values():
+    from moespresso.toolcalls.repair import coerce_arguments
+
+    schema = {"properties": {"limit": {"type": "integer"},
+                             "path": {"type": "string"}}}
+    untouched = {"limit": 5, "path": "README.md"}
+    assert coerce_arguments(untouched, schema) == untouched
+    assert coerce_arguments({"limit": "many"}, schema) == {"limit": "many"}
+    assert coerce_arguments({"x": "1"}, {}) == {"x": "1"}

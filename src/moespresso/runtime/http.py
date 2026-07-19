@@ -206,6 +206,12 @@ def _validate_history_tool_calls(tool_calls) -> None:
             raise RequestError(
                 400,
                 f"tool_calls[{index}] needs a function object with a name")
+        arguments = function.get("arguments")
+        if arguments is not None and not isinstance(arguments, (str, dict)):
+            raise RequestError(
+                400,
+                f"tool_calls[{index}] arguments must be a JSON string or "
+                f"object")
 
 
 def _served_tool_plan(
@@ -257,6 +263,12 @@ def _request_tools(request: dict) -> list[dict] | None:
             if not isinstance(name, str) or not name:
                 raise RequestError(
                     400, f"tools[{index}] needs a function object with a name")
+            parameters = function.get("parameters")
+            if parameters is not None and not isinstance(parameters, dict):
+                raise RequestError(
+                    400,
+                    f"tools[{index}] function.parameters must be a JSON "
+                    f"schema object")
     choice = request.get("tool_choice")
     if choice in (None, "auto"):
         return tools
@@ -276,6 +288,20 @@ def _tool_parameter_schemas(tools: list[dict]) -> dict[str, dict]:
     }
 
 
+def _template_argument_value(value):
+    """A decoded argument value in the form the template renders on-dialect.
+
+    The template routes mappings and lists through its JSON filter but
+    renders every scalar through plain string conversion, which turns JSON
+    ``true``/``null`` into Python-literal text. Booleans and null therefore
+    travel as their JSON text, so the rendered parameter value matches the
+    emission byte for byte.
+    """
+    if value is None or isinstance(value, bool):
+        return json.dumps(value)
+    return value
+
+
 def _decoded_call_arguments(tool_calls: list) -> list:
     """Tool-call entries with JSON-string arguments decoded to objects.
 
@@ -290,14 +316,23 @@ def _decoded_call_arguments(tool_calls: list) -> list:
         function = entry.get("function") if isinstance(entry, dict) else None
         arguments = (
             function.get("arguments") if isinstance(function, dict) else None)
+        as_object = None
         if isinstance(arguments, str):
             try:
                 as_object = json.loads(arguments)
             except json.JSONDecodeError:
                 as_object = None
-            if isinstance(as_object, dict):
-                entry = {**entry, "function": {**function, "arguments": as_object}}
-                changed = True
+            if not isinstance(as_object, dict):
+                as_object = None
+        elif isinstance(arguments, dict):
+            as_object = arguments
+        if as_object is not None:
+            shaped = {
+                key: _template_argument_value(value)
+                for key, value in as_object.items()
+            }
+            entry = {**entry, "function": {**function, "arguments": shaped}}
+            changed = True
         decoded.append(entry)
     return decoded if changed else tool_calls
 
@@ -821,9 +856,14 @@ def chat_completion(
             thinking_enabled=thinking_enabled,
             emit=route_delta,
         )
+        # Incremental pushes exist for delta consumers only. A non-streaming
+        # tool request classifies the completed text once after generation
+        # (the splitter's saw_input fallback below) instead of paying a
+        # callback inside every decode step.
+        if delta_callback is not None or tool_delta_callback is not None:
 
-        def response_callback(_step: int, response: object) -> None:
-            splitter.push(str(getattr(response, "text", "")))
+            def response_callback(_step: int, response: object) -> None:
+                splitter.push(str(getattr(response, "text", "")))
 
     generate_kwargs = {
         "max_tokens": int(request.get("max_tokens", DEFAULT_MAX_TOKENS)),

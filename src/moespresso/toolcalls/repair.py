@@ -158,6 +158,40 @@ def _lenient_scalar(value: str, declared: str) -> str | None:
     return None
 
 
+def coerce_arguments(arguments: dict, schema: dict) -> dict:
+    """Best-effort typing of parsed argument values against a tool schema.
+
+    The Qwen XML parser types values at parse time from the same schemas.
+    This pass covers dialects whose grammar carries its own typing (the
+    DSML ``string`` attribute) when the emission's typing disagrees with
+    the declared schema: a string value declared as a non-string type
+    decodes through the lenient scalar rules, and a non-string value
+    declared string becomes its JSON text. A value that cannot coerce
+    keeps its parsed form; this never raises.
+    """
+    properties = (schema or {}).get("properties") or {}
+    out = dict(arguments)
+    for key, value in arguments.items():
+        declared = (properties.get(key) or {}).get("type")
+        if declared is None:
+            continue
+        if declared == "string":
+            if not isinstance(value, str):
+                out[key] = json.dumps(value, ensure_ascii=False)
+            continue
+        expected = qwenxml._JSON_TYPES.get(declared)
+        if expected is None:
+            continue
+        if isinstance(value, expected) and not (
+                isinstance(value, bool) and declared != "boolean"):
+            continue
+        if isinstance(value, str):
+            fixed = _lenient_scalar(value.strip(), declared)
+            if fixed is not None:
+                out[key] = json.loads(fixed)
+    return out
+
+
 def repair_qwenxml_tool_calls(
     content: str,
     parameter_schemas: dict[str, dict] | None = None,

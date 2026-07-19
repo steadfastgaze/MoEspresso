@@ -33,30 +33,42 @@ can serve DSML instead through the dialect swap below.
 `runtime.tool_stream.ToolCallStreamer` sits on the answer channel of the
 streaming classifier (`runtime.chat_stream.ReasoningSplitter`), so text
 inside a thinking block never triggers it. It scans decoded text for
-dialect open markers at line starts, holds back only the longest tail that
-could begin a marker, and buffers each block until its close marker. A
-completed block goes to the strict parser; the parsed calls stream out as
-`tool_calls` deltas (one complete call per delta) and land on the response
-message with `finish_reason: "tool_calls"`. Text around blocks flows as
-ordinary content.
+dialect open markers at line starts (the block wrapper, and the bare
+function or invoke element for the wrapper-dropped malformation), holds
+back only the longest tail that could begin a marker, and buffers each
+block until its close marker. A completed block goes to the strict parser;
+the parsed calls stream out as `tool_calls` deltas (one complete call per
+delta) and land on the response message with `finish_reason:
+"tool_calls"`. Text around blocks flows as ordinary content, and a marker
+quoted mid-sentence stays prose.
 
-Everything runs on already-decoded text, off the token loop. Decode
-throughput does not change, and no logits or sampling behavior are touched;
-a request without `tools` skips the whole path and serves byte-identically
-to a server without it.
+Parsing adds no model work: logits, sampling, and decode arithmetic are
+untouched, and a request without `tools` skips the whole path and serves
+byte-identically to a server without it. A streaming request classifies
+each decoded chunk between decode steps, exactly like the reasoning
+splitter it chains onto, at the cost of a string scan over a few bytes per
+step. A non-streaming request parses the completed text once after
+generation.
 
 Failure handling is strict-parse-first:
 
 - A block the strict parser rejects goes to the repair layer
   (`toolcalls.repair`): a bounded sequence of text transformations for the
-  malformed shapes small models actually emit (dropped closers, naked
-  function elements, wrong quoting, mistyped scalar values). The first
-  transformed candidate the strict parser accepts wins.
+  malformed shapes small models actually emit (dropped closers, missing
+  wrappers, wrong quoting, mistyped scalar values). The first transformed
+  candidate the strict parser accepts wins. Because attempts buffer
+  through their own markers, a repaired call never leaks raw markup into
+  streamed content.
 - Text that still fails flushes back into `content`, so bytes are never
   silently dropped.
 - A block left open when generation hit the token limit is never repaired:
   closing a half-emitted value would fabricate a plausible but wrong
   argument. The turn keeps `finish_reason: "length"` and the raw text.
+- Parsed argument values are typed against the request's tool schemas on
+  every path: the Qwen XML parser types at parse time, and a DSML value
+  whose `string` flag disagrees with the declared schema is coerced after
+  parse, so a client never receives `"5"` where the schema declares an
+  integer.
 - Repair activity is reported per request under
   `usage.moespresso.tool_call_repair` (`fires`/`salvaged`/`failed`
   counters). A rising `failed` count is the alarm that the served dialect

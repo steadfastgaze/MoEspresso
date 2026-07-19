@@ -238,6 +238,91 @@ def test_malformed_history_tool_calls_400():
         http.chat_completion(request, _generate_returning("x"))
 
 
+def test_non_object_history_arguments_400():
+    request = _tool_request(messages=[
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"type": "function",
+                         "function": {"name": "read", "arguments": 5}}]},
+    ])
+    with pytest.raises(http.RequestError, match="arguments"):
+        http.chat_completion(request, _generate_returning("x"))
+
+
+def test_history_call_without_arguments_renders_under_dsml():
+    request = _tool_request(messages=[
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"type": "function", "function": {"name": "read"}}]},
+        {"role": "tool", "content": "text"},
+    ])
+    tok = _CapturingTokenizer()
+    response = http.chat_completion(
+        request, _generate_returning("t</think>done"), tokenizer=tok,
+        tool_config=http.ToolCallConfig(dialect="dsml"))
+    assert response["choices"][0]["message"]["content"] == "done"
+    # The injected system message sits at index 0, so the assistant is [2].
+    assistant = tok.calls[0]["messages"][2]
+    assert f'<{DSML_TOKEN}invoke name="read">' in assistant["content"]
+
+
+def test_non_object_tool_parameters_400():
+    broken = {"type": "function",
+              "function": {"name": "read", "parameters": "not a schema"}}
+    with pytest.raises(http.RequestError, match="parameters"):
+        http.chat_completion(
+            _tool_request(tools=[broken]), _generate_returning("x"))
+
+
+def test_non_streaming_tool_request_skips_per_token_callback():
+    seen = {}
+
+    def generate(prompt, **opts):
+        seen["has_callback"] = "response_callback" in opts
+        return GenerationResult(text=QWEN_EMISSION)
+
+    response = http.chat_completion(_tool_request(), generate)
+    assert seen["has_callback"] is False
+    assert len(response["choices"][0]["message"]["tool_calls"]) == 2
+
+
+def test_streaming_tool_request_keeps_per_token_callback():
+    seen = {}
+
+    def generate(prompt, **opts):
+        seen["has_callback"] = "response_callback" in opts
+        return GenerationResult(text=QWEN_EMISSION)
+
+    http.chat_completion(
+        _tool_request(), generate,
+        tool_delta_callback=lambda index, entry: None)
+    assert seen["has_callback"] is True
+
+
+def test_streamed_deltas_never_carry_repaired_naked_markup():
+    text = (
+        "t</think>\n<function=read>\n"
+        "<parameter=filePath>\n/proj/README.md\n</parameter>\n</function>"
+    )
+    chunks = [text[i:i + 5] for i in range(0, len(text), 5)]
+
+    def generate(prompt, **opts):
+        for step, piece in enumerate(chunks, start=1):
+            response = type("Response", (), {"text": piece})()
+            opts["response_callback"](step, response)
+        return GenerationResult(text=text)
+
+    deltas: list[tuple[str, str]] = []
+    response = http.chat_completion(
+        _tool_request(), generate,
+        delta_callback=lambda kind, piece: deltas.append((kind, piece)),
+        tool_delta_callback=lambda index, entry: None)
+    content = "".join(piece for kind, piece in deltas if kind == "content")
+    assert "<function=" not in content
+    message = response["choices"][0]["message"]
+    assert [c["function"]["name"] for c in message["tool_calls"]] == ["read"]
+
+
 # --- streaming ----------------------------------------------------------
 
 

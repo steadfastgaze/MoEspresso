@@ -253,7 +253,10 @@ def test_truncated_turn_never_repairs_the_dangling_block():
     assert streamer.telemetry.fires == 0
 
 
-def test_naked_function_is_salvaged_at_end_of_turn():
+def test_naked_function_buffers_in_stream_and_repairs():
+    # A line-start function element with no wrapper is a call attempt: it
+    # buffers through its own element markers, so the raw markup never
+    # reaches the streamed content even though repair is what parses it.
     text = (
         "<function=read>\n"
         "<parameter=filePath>\nREADME.md\n</parameter>\n"
@@ -261,40 +264,61 @@ def test_naked_function_is_salvaged_at_end_of_turn():
     )
     streamer, content_deltas, _ = _run(text)
     assert _names_and_arguments(streamer) == [("read", {"filePath": "README.md"})]
-    # The raw text already streamed as deltas; the shaped message drops it.
     assert streamer.content == ""
-    assert "".join(content_deltas) == text
+    assert content_deltas == []
+    assert streamer.telemetry.as_dict() == {"fires": 1, "salvaged": 1, "failed": 0}
+
+
+def test_naked_dsml_invoke_buffers_in_stream_and_repairs():
+    text = (
+        f'<{T}invoke name="read">\n'
+        f'<{T}parameter name="filePath" string="true">README.md'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>"
+    )
+    streamer, content_deltas, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("read", {"filePath": "README.md"})]
+    assert content_deltas == []
     assert streamer.telemetry.salvaged == 1
 
 
-def test_prose_before_naked_function_survives_salvage():
-    text = (
-        "Reading the file.\n<function=read>\n"
-        "<parameter=filePath>\nREADME.md\n</parameter>\n</function>"
-    )
-    streamer, _, _ = _run(text)
-    assert len(streamer.calls) == 1
-    assert streamer.content == "Reading the file.\n"
-
-
-def test_prose_after_naked_function_survives_salvage():
-    # Salvage strips the attempt region, not everything after it, so the
-    # non-streaming content keeps the trailing prose streamed clients saw.
+def test_prose_around_naked_function_survives():
     text = (
         "Reading the file.\n<function=read>\n"
         "<parameter=filePath>\nREADME.md\n</parameter>\n</function>\n"
         "Let me know if you need more."
     )
-    streamer, _, _ = _run(text)
+    streamer, content_deltas, _ = _run(text)
     assert len(streamer.calls) == 1
-    assert "Reading the file." in streamer.content
-    assert "Let me know if you need more." in streamer.content
-    assert "<function=" not in streamer.content
+    assert streamer.content == (
+        "Reading the file.\n\nLet me know if you need more.")
+    assert "<function=" not in "".join(content_deltas)
 
 
-def test_quoted_mid_sentence_attempt_never_salvages():
+def test_naked_function_chunk_split_fuzz_matches_one_shot():
+    text = (
+        "Reading the file.\n<function=read>\n"
+        "<parameter=filePath>\nREADME.md\n</parameter>\n</function>\n"
+        "Done."
+    )
+    reference, _, _ = _run(text)
+    for cut in range(len(text) + 1):
+        streamer, _, _ = _run([text[:cut], text[cut:]])
+        assert streamer.calls == reference.calls, f"cut={cut}"
+        assert streamer.content == reference.content, f"cut={cut}"
+
+
+def test_truncated_naked_attempt_flushes_as_content():
+    streamer = ToolCallStreamer((QWENXML_DIALECT,), parameter_schemas=SCHEMAS)
+    streamer.push("<function=read>\n<parameter=filePath>\n/pro")
+    streamer.finish(truncated=True)
+    assert streamer.calls == []
+    assert streamer.content == "<function=read>\n<parameter=filePath>\n/pro"
+
+
+def test_quoted_mid_sentence_attempt_stays_prose():
     # A function element quoted inside prose (not at a line start) is
-    # documentation, not an attempt; salvage must not turn it into a call.
+    # documentation, not an attempt; it must not buffer or become a call.
     text = (
         "The format is <function=read>\n<parameter=filePath>\nX\n"
         "</parameter>\n</function> on its own lines."
@@ -302,6 +326,24 @@ def test_quoted_mid_sentence_attempt_never_salvages():
     streamer, _, _ = _run(text)
     assert streamer.calls == []
     assert streamer.content == text
+
+
+def test_dsml_mislabeled_string_flag_coerces_to_schema_type():
+    # The model may mark an integer parameter string="true"; the declared
+    # schema wins after parse, so the client receives a typed value.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read">\n'
+        f'<{T}parameter name="filePath" string="false">123</{T}parameter>\n'
+        f'<{T}parameter name="limit" string="true">5</{T}parameter>\n'
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [
+        ("read", {"filePath": "123", "limit": 5}),
+    ]
+    assert streamer.telemetry.fires == 0
 
 
 def test_prose_only_turn_passes_through_untouched():

@@ -526,6 +526,48 @@ def test_served_tool_calls_replay_matches_raw_served_bytes():
     assert structured_render == raw_render
 
 
+def test_served_bool_and_null_arguments_replay_byte_identical():
+    # The template renders scalar argument values through plain string
+    # conversion, so Python True/None would re-render as Python literals.
+    # The serve-side decode carries booleans and null as their JSON text,
+    # keeping the replayed turn byte-identical to the raw emission.
+    from moespresso.runtime.http import prepare_tool_messages
+
+    tools = [_LOOKUP_TOOL]
+    raw_call = (
+        "<tool_call>\n<function=lookup>\n"
+        "<parameter=q>\nrecord 7\n</parameter>\n"
+        "<parameter=flag>\ntrue\n</parameter>\n"
+        "<parameter=note>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    completion = f"need to check this\n</think>\n{raw_call}"
+    raw_history = _MATRIX_BASE + [{"role": "assistant", "content": completion}]
+    structured_history = _MATRIX_BASE + [{
+        "role": "assistant",
+        "reasoning_content": "need to check this\n",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_deadbeef_0",
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "arguments": '{"q": "record 7", "flag": true, "note": null}',
+            },
+        }],
+    }]
+    prepared, template_tools = prepare_tool_messages(
+        structured_history, tools, dialect="native")
+
+    raw_render = _matrix_render(
+        raw_history, thinking_on=True, tools=tools,
+        add_generation_prompt=False)
+    structured_render = _matrix_render(
+        prepared, thinking_on=True, tools=template_tools,
+        add_generation_prompt=False)
+    assert structured_render == raw_render
+
+
 def test_thinking_off_replay_re_emits_the_empty_scaffold():
     history = _MATRIX_BASE + [
         {"role": "assistant", "content": "Record 7 is active."},

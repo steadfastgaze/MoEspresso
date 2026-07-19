@@ -139,10 +139,11 @@ def encode_arguments_to_dsml(tool_call: dict) -> str:
 
 
 def _tool_calls_from_openai_format(tool_calls: list[dict]) -> list[dict]:
+    # An absent arguments field means a call with no parameters.
     return [
         {
             "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
+            "arguments": tool_call["function"].get("arguments", "{}"),
         }
         for tool_call in tool_calls
     ]
