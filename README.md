@@ -63,7 +63,7 @@ runtime and native dependencies:
 brew install steadfastgaze/tap/moespresso
 ```
 
-## Download and verify a package
+## Quick start
 
 Install the Hugging Face CLI with Homebrew:
 
@@ -71,34 +71,31 @@ Install the Hugging Face CLI with Homebrew:
 brew install hf
 ```
 
-Then download one of the public packages into an explicit directory:
+Download the Ornith package into an explicit directory:
 
 ```bash
-hf download steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso \
-  --local-dir ./models/deepseek-v4-flash
-
 hf download steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso \
   --local-dir ./models/ornith-35b
 ```
 
-You can verify the package correctness via:
+Or download the DeepSeek-V4-Flash package:
 
 ```bash
-moespresso-verify ./models/deepseek-v4-flash
+hf download steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso \
+  --local-dir ./models/deepseek-v4-flash
+```
+
+You can verify the package:
+
+```bash
 moespresso-verify ./models/ornith-35b
 ```
 
 Verification checks the manifest's identity and validity, every declared
 member's path, size, and SHA-256, the tensor keys in every shard, and the
-manifest-derived sidecars.
-
-## Run
-
-Serve either verified package over the OpenAI-compatible chat-completions
-endpoint:
+manifest-derived sidecars. Start the local server:
 
 ```bash
-moespresso-serve ./models/deepseek-v4-flash --thinking off
 moespresso-serve ./models/ornith-35b --thinking off
 ```
 
@@ -106,20 +103,32 @@ The server performs one short isolated warmup before announcing readiness,
 then exposes `POST /v1/chat/completions` and `GET /health` on
 `127.0.0.1:8080` by default.
 
-```bash
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [{"role": "user", "content": "Explain a hash table in two sentences."}],
-    "max_tokens": 256,
-    "temperature": 0.7
-  }'
-```
+Leave that terminal running. With OpenCode installed, configure and start it
+from a second terminal:
 
-Set `"stream": true` for server-sent events. Thinking-capable responses expose
-`reasoning_content` separately from `content`. `moespresso-generate` provides
-the same manifest-driven load and generation path for a single prompt without
-starting a server.
+```bash
+moecode() {
+  OPENCODE_CONFIG_CONTENT='{
+    "provider": {
+      "moespresso": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "MoEspresso (local)",
+        "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+        "models": {
+          "MoEspresso": {
+            "name": "model @ MoEspresso",
+            "limit": { "context": 131072, "output": 32768 }
+          }
+        }
+      }
+    },
+    "model": "moespresso/MoEspresso",
+    "small_model": "moespresso/MoEspresso"
+  }' opencode "$@"
+}
+
+moecode
+```
 
 The main serving controls are:
 
