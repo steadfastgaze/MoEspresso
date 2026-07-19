@@ -200,6 +200,9 @@ def test_mark_used_failure_keeps_the_validated_restore(tmp_path):
     assert hit.cached_tokens == 512
     assert hit.suffix_tokens == list(range(512, 600))
     assert store.restores == 1
+    # A failing LRU touch is an index write fault: later checkpoint
+    # attempts would hit the same fault, so writes stop until reopen.
+    assert store.writes_disabled is True
 
 
 def test_restore_refuses_class_list_the_registry_does_not_know(tmp_path):

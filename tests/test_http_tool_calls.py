@@ -280,6 +280,8 @@ def test_malformed_schema_shapes_400():
         ({"properties": {"q": ["not a schema"]}}, "'q'"),
         ({"properties": {"q": {"type": {"bad": True}}}}, "type"),
         ({"properties": {"q": {"type": []}}}, "non-empty"),
+        ({"properties": {"q": {"type": "integre"}}}, "unknown type"),
+        ({"properties": {"q": {"type": ["integer", "strng"]}}}, "unknown type"),
     ):
         tool = {"type": "function",
                 "function": {"name": "read", "parameters": parameters}}

@@ -120,6 +120,12 @@ def request_stream_options(request: dict) -> tuple[bool, bool]:
 TOOL_DIALECT_NATIVE = "native"
 TOOL_DIALECT_DSML = "dsml"
 
+# The seven JSON Schema primitive type names. A tool property declaring
+# anything else (a typo such as "integre") is refused at validation, because
+# the parser would otherwise silently treat it as unconstrained.
+_JSON_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"})
+
 
 @dataclass(frozen=True)
 class ToolCallConfig:
@@ -283,15 +289,25 @@ def _request_tools(request: dict) -> list[dict] | None:
                         f"tools[{index}] property {property_name!r} must be "
                         f"a schema object")
                 declared = prop.get("type")
-                if declared is None or isinstance(declared, str):
+                if declared is None:
                     continue
-                if (isinstance(declared, list) and declared
-                        and all(isinstance(t, str) for t in declared)):
-                    continue
-                raise RequestError(
-                    400,
-                    f"tools[{index}] property {property_name!r} type must "
-                    f"be a string or a non-empty list of strings")
+                members = (
+                    [declared] if isinstance(declared, str)
+                    else declared if (isinstance(declared, list) and declared)
+                    else None)
+                if members is None or not all(
+                        isinstance(t, str) for t in members):
+                    raise RequestError(
+                        400,
+                        f"tools[{index}] property {property_name!r} type "
+                        f"must be a string or a non-empty list of strings")
+                unknown = [t for t in members if t not in _JSON_SCHEMA_TYPES]
+                if unknown:
+                    raise RequestError(
+                        400,
+                        f"tools[{index}] property {property_name!r} has "
+                        f"unknown type {unknown[0]!r}; JSON Schema types "
+                        f"are: {', '.join(sorted(_JSON_SCHEMA_TYPES))}")
     choice = request.get("tool_choice")
     if choice in (None, "auto"):
         return tools

@@ -760,6 +760,7 @@ class DiskCheckpointStore:
         try:
             entries = self.index.entries()
         except Exception as e:  # noqa: BLE001 - health must not fail on the index
+            self.disable_writes(f"index unreadable: {e!r}")
             return {
                 "enabled": True,
                 "root": str(self.root),
@@ -817,6 +818,7 @@ class DiskCheckpointStore:
             entry = self.index.find_longest(scope, full_tokens)
         except Exception as e:  # noqa: BLE001 - normalize to the fallback type
             self._log(f"[disk_kv] index lookup failed; cold serving: {e!r}")
+            self.disable_writes(f"index unreadable: {e!r}")
             raise DiskKVError(f"disk KV index lookup failed: {e}") from e
         if entry is None:
             return None
@@ -846,6 +848,7 @@ class DiskCheckpointStore:
         except Exception as e:  # noqa: BLE001 - keep the validated restore
             self._log(
                 f"[disk_kv] mark_used failed; keeping the restore: {e!r}")
+            self.disable_writes(f"index fault during mark_used: {e!r}")
             updated = entry
         self.restores += 1
         self._log(f"[disk_kv] restore cached_tokens={entry.token_count}")
@@ -1030,6 +1033,10 @@ class DiskCheckpointStore:
         (returns None); the store never evicts every other entry for one oversized
         payload.
         """
+        if self.writes_disabled:
+            # Refuse before the payload serialization: a store that already
+            # confirmed an index fault must not pay the write cost again.
+            raise DiskKVError("disk KV writes are disabled for this store")
         if not tokens:
             raise DiskKVError("cannot checkpoint an empty token sequence")
         prefix_hash = token_prefix_hash(tokens)
@@ -1436,8 +1443,10 @@ class FrontierWriter:
     def _capture(self, frontier: int) -> None:
         # A hard write fault (full or failing disk) disables the writer for
         # the rest of the request: each later frontier would serialize an
-        # even larger snapshot into the same fault, all inside TTFT.
-        if self.disabled:
+        # even larger snapshot into the same fault, all inside TTFT. The
+        # store-level flag covers the fault discovered mid-request (the
+        # dedupe read during planning), before any snapshot is taken.
+        if self.disabled or getattr(self.store, "writes_disabled", False):
             return
         # The cache classes' own offsets are the source of truth. Refuse the write
         # on any disagreement between the proposed frontier and the live offsets:

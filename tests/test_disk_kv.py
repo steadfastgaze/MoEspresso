@@ -446,14 +446,80 @@ def test_restore_normalizes_a_corrupt_index_to_diskkverror(tmp_path):
             make_cache_fn=lambda: [],
             registry=default_cache_registry(),
         )
-    assert store.has_entry(scope, list(range(600))) is False
-    # A confirmed index fault stops writes until the store reopens, and
-    # the health snapshot degrades instead of raising.
+    # The lookup failure alone confirms the fault: writes stop before any
+    # other index read runs, and the health snapshot degrades instead of
+    # raising.
     assert store.writes_disabled is True
+    assert store.has_entry(scope, list(range(600))) is False
     stats = store.stats()
     assert stats["enabled"] is True
     assert "index unreadable" in stats["error"]
     assert stats["writes_disabled"] is True
+
+
+def test_stats_alone_confirms_the_fault_and_disables_writes(tmp_path):
+    from moespresso.runtime.disk_kv import DiskCheckpointStore
+
+    store = DiskCheckpointStore(tmp_path, stride=256)
+    (tmp_path / "index.json").write_text("not json", encoding="utf-8")
+    stats = store.stats()
+    assert "index unreadable" in stats["error"]
+    assert store.writes_disabled is True
+
+
+def test_disabled_store_refuses_before_payload_serialization(tmp_path):
+    from moespresso.runtime.disk_kv import (
+        DiskCheckpointStore,
+        build_cache_scope,
+    )
+
+    saves = []
+
+    def fake_save(root, cache_id, **kwargs):
+        saves.append(cache_id)
+        return "never", 0
+
+    store = DiskCheckpointStore(tmp_path, save_payload_fn=fake_save, stride=256)
+    store.disable_writes("index unreadable: test")
+    scope = build_cache_scope(
+        ("pkg", "render", "raw", 64, 0, "mlx_prompt_cache"), ("KVCache",))
+    with pytest.raises(DiskKVError, match="disabled"):
+        store.write_checkpoint(
+            scope, [1, 2, 3],
+            cache_state_trees=[],
+            meta_state_trees=[],
+            cache_class_names=("KVCache",),
+            reason="aligned_frontier",
+        )
+    assert saves == []
+
+
+def test_frontier_writer_skips_capture_on_a_disabled_store():
+    from moespresso.runtime.disk_kv import FrontierTracker, FrontierWriter
+
+    class _DisabledStore:
+        writes_disabled = True
+        attempts = 0
+
+        def write_checkpoint(self, *args, **kwargs):
+            self.attempts += 1
+            raise AssertionError("must not be called")
+
+    class _Cache:
+        offset = 1024
+        state = ["state"]
+        meta_state = ["meta"]
+
+    tracker = FrontierTracker(
+        stride=1024, restored_prefix=0,
+        full_tokens=list(range(2049)), scope={"k": "v"})
+    store = _DisabledStore()
+    writer = FrontierWriter(store, tracker=tracker, caches=[_Cache()])
+    writer.on_prompt_progress(1024, 2049)
+    assert store.attempts == 0
+    # A skip is not a failure: the per-request failure state stays clean.
+    assert writer.disabled is False
+    assert writer.write_failures == 0
 
 
 def test_write_checkpoint_cleans_payload_and_disables_on_index_fault(tmp_path):
