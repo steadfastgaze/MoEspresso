@@ -26,6 +26,12 @@ import json
 
 import numpy as np
 
+from moespresso.package.iqk_format import (
+    IQK_GEOMETRY,
+    IQK_LAYOUT_IK_WIRE,
+    IQK_LAYOUTS,
+    normalize_iqk_layout,
+)
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
 
 METADATA_KEY = "expert_bundles"
@@ -36,10 +42,13 @@ PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 TQ_CODEC = "tq"
 MXFP4_CODEC = "mxfp4"
 KQUANT_CODEC = "kquant"
-COMPONENTS = ("packed", "norms", "scales", "weight")
+IQK_CODEC = "iqk"
 TQ_COMPONENTS = ("packed", "norms")
 MXFP4_COMPONENTS = ("packed", "scales")
 KQUANT_COMPONENTS = ("weight", "scales")
+# IQ_K members carry every scale inside the row, so one opaque byte block per
+# expert is the whole payload: `[n_experts, out_features, bytes_per_row]`.
+IQK_COMPONENTS = ("blocks",)
 
 # The fixed within-row component order. Readers must derive offsets from the
 # metadata, never from this tuple: it exists so the writer is deterministic
@@ -58,8 +67,13 @@ _COMPONENT_DTYPES = {
     "norms": ("F16", np.float16),
     "scales": ("U8", np.uint8),
     "weight": ("U8", np.uint8),
+    "blocks": ("U8", np.uint8),
 }
-NP_DTYPES = {"U32": np.uint32, "F16": np.float16, "U8": np.uint8}
+NP_DTYPES = {
+    "U32": np.uint32,
+    "F16": np.float16,
+    "U8": np.uint8,
+}
 
 
 class BundleFormatError(ValueError):
@@ -73,6 +87,8 @@ def _components_for_codec(codec: str) -> tuple[str, ...]:
         return MXFP4_COMPONENTS
     if codec == KQUANT_CODEC:
         return KQUANT_COMPONENTS
+    if codec == IQK_CODEC:
+        return IQK_COMPONENTS
     raise BundleFormatError(f"unsupported expert codec {codec!r}")
 
 
@@ -83,6 +99,8 @@ def _component_ndim(codec: str, component: str) -> int:
         return 3
     if codec == KQUANT_CODEC:
         return 2 if component == "scales" else 3
+    if codec == IQK_CODEC:
+        return 3
     raise BundleFormatError(f"unsupported expert codec {codec!r}")
 
 
@@ -134,6 +152,8 @@ def assemble_layer_bundle(
     bits: dict[str, int],
     codecs: dict[str, str] | None = None,
     kquant_codecs: dict[str, str] | None = None,
+    iqk_codecs: dict[str, str] | None = None,
+    iqk_layout: str = IQK_LAYOUT_IK_WIRE,
 ) -> tuple[np.ndarray, dict]:
     """Stacked per-projection arrays -> (bundle uint8 [N, row_bytes], geometry).
 
@@ -141,12 +161,18 @@ def assemble_layer_bundle(
     codec to its stacked array. TQ uses packed `[n_experts, out, packed_cols]`
     uint32 and norms `[n_experts, out]` float16. mxfp4 uses packed
     `[n_experts, out, in/8]` uint32 and scales `[n_experts, out, in/32]` uint8.
+    IQ_K uses blocks `[n_experts, out, bytes_per_row]` uint8, one member per
+    projection named in `iqk_codecs` and one wire layout for the bundle.
     The returned geometry dict is one layer's entry for shard metadata and
     records, per component, the exact within-row byte range + per-expert shape
     + dtype.
     """
     codecs = codecs or {p: TQ_CODEC for p in PROJECTIONS}
     kquant_codecs = kquant_codecs or {}
+    iqk_codecs = iqk_codecs or {}
+    if iqk_layout not in IQK_LAYOUTS:
+        raise BundleFormatError(
+            f"unknown IQ_K wire layout {iqk_layout!r}; known: {list(IQK_LAYOUTS)}")
     order = row_order_for_codecs(codecs)
     missing = [k for k in order if k not in components]
     extra = [k for k in components if k not in order]
@@ -197,6 +223,13 @@ def assemble_layer_bundle(
                 bits=b,
                 kquant_codec=kquant_codecs.get(proj),
             )
+        elif codec == IQK_CODEC:
+            _validate_iqk_component_shape(
+                proj,
+                components[(proj, "blocks")],
+                bits=b,
+                iqk_codec=iqk_codecs.get(proj),
+            )
         else:
             raise BundleFormatError(f"{proj}: unsupported codec {codec!r}")
 
@@ -215,6 +248,19 @@ def assemble_layer_bundle(
             projections[p]["group_size"] = geometry.group_size
             projections[p]["bytes_per_block"] = geometry.bytes_per_block
             projections[p]["weights_per_block"] = geometry.weights_per_block
+        elif codecs[p] == IQK_CODEC:
+            icodec = iqk_codecs[p]
+            geometry = IQK_GEOMETRY[icodec]
+            bytes_per_row = int(components[(p, "blocks")].shape[2])
+            projections[p]["iqk_codec"] = icodec
+            projections[p]["layout"] = iqk_layout
+            projections[p]["ggml_type"] = geometry.ggml_type
+            projections[p]["weights_per_block"] = geometry.weights_per_block
+            projections[p]["bytes_per_block"] = geometry.bytes_per_block
+            projections[p]["row_meta_bytes"] = geometry.row_meta_bytes
+            projections[p]["bytes_per_row"] = bytes_per_row
+            projections[p]["in_features"] = geometry.in_features_for_row_bytes(
+                bytes_per_row)
     offset = 0
     for proj, comp in order:
         arr = components[(proj, comp)]
@@ -329,6 +375,43 @@ def _validate_layer_geometry(layer: int, geo: dict) -> dict:
                 or p.get("weights_per_block") != geometry.weights_per_block
             ):
                 raise BundleFormatError(f"{where} {proj}: bad kquant params {p!r}")
+        elif codec == IQK_CODEC:
+            icodec = p.get("iqk_codec")
+            geometry = IQK_GEOMETRY.get(icodec)
+            if geometry is None:
+                raise BundleFormatError(
+                    f"{where} {proj}: unknown IQ_K codec {icodec!r}")
+            # Normalizing on decode is what lets a package written before the
+            # name was corrected serve unchanged: every consumer downstream
+            # reads the current spelling out of this dict.
+            p["layout"] = normalize_iqk_layout(p.get("layout"))
+            if p["layout"] not in IQK_LAYOUTS:
+                raise BundleFormatError(
+                    f"{where} {proj}: unknown IQ_K wire layout {p.get('layout')!r}")
+            if (
+                b != geometry.bits
+                or p.get("ggml_type") != geometry.ggml_type
+                or p.get("weights_per_block") != geometry.weights_per_block
+                or p.get("bytes_per_block") != geometry.bytes_per_block
+                or p.get("row_meta_bytes") != geometry.row_meta_bytes
+            ):
+                raise BundleFormatError(f"{where} {proj}: bad IQ_K params {p!r}")
+            blocks_shape = (p.get("blocks") or {}).get("shape")
+            if not (isinstance(blocks_shape, list) and len(blocks_shape) == 2):
+                raise BundleFormatError(
+                    f"{where} {proj}: bad IQ_K blocks shape {blocks_shape!r}")
+            if p.get("bytes_per_row") != blocks_shape[1]:
+                raise BundleFormatError(
+                    f"{where} {proj}: IQ_K bytes_per_row {p.get('bytes_per_row')!r} "
+                    f"!= stored row width {blocks_shape[1]}")
+            try:
+                in_features = geometry.in_features_for_row_bytes(blocks_shape[1])
+            except ValueError as e:
+                raise BundleFormatError(f"{where} {proj}: {e}") from e
+            if p.get("in_features") != in_features:
+                raise BundleFormatError(
+                    f"{where} {proj}: IQ_K in_features {p.get('in_features')!r} "
+                    f"!= {in_features} implied by the row width")
         c = p.get(comp)
         if not isinstance(c, dict):
             raise BundleFormatError(f"{where} {proj}.{comp}: missing component")
@@ -419,6 +502,31 @@ def _validate_kquant_component_shape(
             f"{where}: kquant codec {kquant_codec!r} uses "
             f"{geometry.bytes_per_block}-byte blocks, but bytes_per_row "
             f"{weight.shape[2]} is not divisible by it")
+
+
+def _validate_iqk_component_shape(
+    where: str,
+    blocks: np.ndarray,
+    *,
+    bits: int,
+    iqk_codec: str | None,
+) -> None:
+    if iqk_codec is None:
+        raise BundleFormatError(f"{where}: missing IQ_K codec")
+    geometry = IQK_GEOMETRY.get(iqk_codec)
+    if geometry is None:
+        raise BundleFormatError(f"{where}: unknown IQ_K codec {iqk_codec!r}")
+    if bits != geometry.bits:
+        raise BundleFormatError(
+            f"{where}: IQ_K codec {iqk_codec!r} sits in the {geometry.bits}-bit "
+            f"band, got {bits!r}")
+    if blocks.ndim != 3:
+        raise BundleFormatError(
+            f"{where}: IQ_K blocks must be 3D, got {blocks.ndim}D")
+    try:
+        geometry.in_features_for_row_bytes(int(blocks.shape[2]))
+    except ValueError as e:
+        raise BundleFormatError(f"{where}: {e}") from e
 
 
 def component_array(rows: np.ndarray, component: dict) -> np.ndarray:

@@ -83,15 +83,21 @@ class LongContextItem:
 # Q1 number theory (integer), Q2 group theory (hard, integer), Q6 probability
 # (fraction), Q8 combinatorics (integer). None is the resistor-network item that
 # the task gate found runs to the cap.
+# Caps carry headroom for seed-dependent reasoning appetite: a multi-seed
+# probe measured per-item spreads of 2.2-3.0x across seeds (Q1 1293-2865,
+# Q2 2304-6827, Q8 4063-7289 tokens), so a cap near a single seed's usage
+# truncates on an unlucky draw and a truncated row fails the gate. Raised
+# caps do not slow a passing run; generation stops at the answer. The probe did
+# not cover the Q6 item, so its cap is the single-seed measurement unchanged.
 HARD_REASONING: tuple[HardReasoningItem, ...] = (
     HardReasoningItem(id="hr_q1_number_theory", question_number="1",
-                      seed=20260709, max_tokens=3072),
+                      seed=20260709, max_tokens=6144),
     HardReasoningItem(id="hr_q2_group_theory", question_number="2",
-                      seed=20260709, max_tokens=10240, token_hungry=True),
+                      seed=20260709, max_tokens=16384, token_hungry=True),
     HardReasoningItem(id="hr_q6_probability", question_number="6",
                       seed=20260709, max_tokens=3072),
     HardReasoningItem(id="hr_q8_combinatorics", question_number="8",
-                      seed=20260709, max_tokens=10240),
+                      seed=20260709, max_tokens=12288),
 )
 
 

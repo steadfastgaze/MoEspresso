@@ -42,12 +42,14 @@ The format identity lives in `manifest.py`:
 
 ## The `package_plan`: the writer-facing allocation
 
-Two build routes produce packages: the probe/optimizer route
-(`moespresso-convert`) and the GGUF K-quant recipe route
+Three build routes produce packages: the probe/optimizer route
+(`moespresso-convert`), the GGUF K-quant recipe route
 (`moespresso-ds4-kquant-package`, `moespresso-qwen-kquant-package`, with the
 per-model recipe mapping in `package/deepseek_v4/recipe.py` and
-`package/qwen/recipe.py` and the shared GGUF parsing in `kquant_recipe.py`).
-Both converge on one artifact before anything is written: the `package_plan`
+`package/qwen/recipe.py` and the shared GGUF parsing in `kquant_recipe.py`),
+and the converted-artifact route (`moespresso-ds4-iqk-package`), which packages
+routed-expert bytes a separate conversion stage already encoded.
+All converge on one artifact before anything is written: the `package_plan`
 (`plan.py`). The plan carries the normalized per-tensor allocation, the
 producer identity (`producer_kind`, `producer_reference`), the chained
 `source_decision_id`/`source_probe_id` (null on the recipe route), the
@@ -109,7 +111,7 @@ linear-attn / SSM fields the graph needs and forced the loader back to
 `_passthrough_entry`): `source_name`, `role` (the typed vocabulary), `kind`
 (`expert | affine | fp16_passthrough | raw_dtype_passthrough | passthrough`),
 the on-disk location (`shard` file + `key_prefix`), and the weight format with
-its params. Eight formats exist:
+its params. Nine formats exist:
 
 - **`tq`** (routed experts): `format_params = {tq_version, bits, seed}`. The TQ
   transform is declared by **versioned reference**: the engine knows what
@@ -131,6 +133,37 @@ its params. Eight formats exist:
   codecs; the entry also carries the `module_weight_key`/`module_path` the
   mlx-kquant installer needs. The manifest builder fails closed on a codec
   outside the registry or a missing module key.
+- **`iqk`** (routed experts or dense): an IQ_K block codec by member name.
+  `format_params = {iqk_codec, layout, bits, ggml_type, weights_per_block,
+  bytes_per_block, row_meta_bytes}` plus the `module_weight_key`/`module_path`
+  the installer needs. Every scale lives inside the row, so a projection stores
+  one component, `blocks` (uint8, `[out_features, bytes_per_row]` per expert),
+  where `bytes_per_row = row_meta_bytes + (in_features / 256) * bytes_per_block`
+  from `iqk_format.IQK_GEOMETRY`. The rate therefore depends on the row width
+  and no member has a single bits-per-weight. The member is a per-(layer,
+  role) fact: a package built from a mixed allocation carries different members
+  in one layer and nothing downstream reads a package-wide bit width. `layout`
+  is `ik_wire` for the quantizer's own row-major byte stream, or `iqk_relayout`
+  once a build step has rearranged the same encoded bytes for the decode
+  kernels; a reader that understands one refuses the other. The manifest
+  builder fails closed on a member outside the registry and on an unknown
+  layout. The two layouts spend the same bits, so a relayout row is exactly as
+  wide as the wire row it replaces and both live inside the same `blocks`
+  component with no shape, offset, or row stride moving; a relayout row holds
+  its own streams end to end in the order `mlx_iqk.format` declares, so
+  element `[r]` of `blocks` is still row `r`'s payload.
+  `moespresso-ds4-iqk-relayout` moves a built package between them without
+  re-encoding, writes new plan and manifest ids, and gates the move by turning
+  every rewritten row back into wire bytes and by decoding sampled rows through
+  both references. Only `iqk_relayout` serves. The target expert pool is
+  described in `docs/ssd_streaming.md`; resident sidecars and dense IQ_K are
+  described in `docs/runtime_resident.md`.
+  A dense tensor may also declare `iqk`, restricted to the 4- to 6-bit members
+  (`iqk_format.IQK_DENSE_MEMBERS`: `iq4_ks`, `iq4_k`, `iq5_k`, `iq6_k`); a
+  routed-only member on a dense tensor is a blocking validation. No package
+  declares dense IQ_K today and the dense relayout step does not exist, so the
+  dense serving routes described in `docs/runtime_resident.md` guard an
+  unproven path.
 - **`fp16`** (passthrough): `format_params = {}`. The array is stored as
   float16.
 - **`f32_passthrough`**: the array is stored as float32, verbatim.
@@ -140,9 +173,9 @@ its params. Eight formats exist:
   to this format; a manifest that declares any of them at a downcast format is
   refused with a blocking `package.control_tensor_downcast` validation.
 
-Routed experts accept `tq`, `mxfp4`, or `kquant`; dense tensors accept
-`affine`, `mxfp4`, `mxfp8`, or `kquant`; anything else is a blocking
-validation.
+Routed experts accept `tq`, `mxfp4`, `kquant`, or `iqk`; dense tensors
+accept `affine`, `mxfp4`, `mxfp8`, `kquant`, or `iqk` at a dense member;
+anything else is a blocking validation.
 
 `passthrough` tensors (structural norms, SSM state, conv1d) are stored
 verbatim in source (pre-sanitize) form. This is load-bearing: e.g. `conv1d.weight`
@@ -165,14 +198,23 @@ serve path does not repeat a tens-of-gigabytes hash pass at every startup.
 `required_ops` is the sorted set the engine must support, derived from the
 tensor formats actually present: `tq → tq_dequant`, `affine → affine_dequant`,
 `mxfp4 → mxfp4_dequant`, `mxfp8 → mxfp8_dequant`, `kquant → kquant_dequant`,
-`fp16 → fp16_passthrough`, `f32_passthrough → f32_passthrough`,
+`iqk → iqk_dequant`, `fp16 → fp16_passthrough`,
+`f32_passthrough → f32_passthrough`,
 `raw_dtype_passthrough → raw_dtype_passthrough`. The runtime adapter selection
-(`runtime/build.py`) keys off `required_ops` + `family`: `deepseek_v4_flash`
-builds the `mjtq_dsv4` adapter, a dense `qwen3_5_dense` whose ops stay within
-the dense affine set builds `regular_jang_v2`, a `qwen3_5_moe` package with
-K-quant experts builds `qwen_kquant_moe`, and any other family with
+(`runtime/build.py`) keys off `required_ops` + `family` and resolves to one of
+four kinds: `deepseek_v4_flash` builds the `mjtq_dsv4` adapter; a dense
+`qwen3_5_dense` whose ops stay within the dense affine set builds
+`regular_jang_v2`; a `qwen3_5_moe` package carrying `kquant_dequant` without
+`tq_dequant` builds `qwen_kquant_moe`; and any other family with
 `tq_dequant` builds `jangtq_moe`. An unrecognized combination raises
-`UnsupportedRuntimeAdapter` rather than guessing.
+`UnsupportedRuntimeAdapter` rather than guessing. The kind also selects the
+top-level model builder. `jangtq_moe` and `qwen_kquant_moe` take the shared
+pooled builder. The `mjtq_dsv4` builder installs routed IQ_K experts into the
+same persistent pool internally: capacity equal to the expert count is fully
+resident, while smaller capacities stream missing bundle rows. Selected
+layers can grow through the runtime's post-request pool transaction.
+The dense adapter uses the resident builder in `runtime/serve.py`. Runtime
+details are in `docs/runtime_resident.md` and `docs/ssd_streaming.md`.
 
 The manifest also carries a top-level `optimized_kernels_expected` flag
 (default false), copied from the plan. Setting it is an explicit
@@ -191,8 +233,10 @@ blocking validations for, among others:
 - `package.empty_plan`: the plan has no allocation (infeasible) so there is
   nothing to package.
 - `package.unsupported_expert_format` / `package.unsupported_dense_format` /
-  `package.unsupported_kquant_codec` / `package.control_tensor_downcast`: a
-  format outside the declared vocabulary for its tensor class.
+  `package.unsupported_kquant_codec` / `package.unsupported_iqk_codec` /
+  `package.unsupported_iqk_layout` / `package.control_tensor_downcast`: a
+  format, codec, or wire layout outside the declared vocabulary for its tensor
+  class.
 
 `moespresso-verify` adds the integrity layer: it validates the manifest's
 content id, status, package-format version, and embedded blocking findings;
@@ -235,10 +279,26 @@ closed on a schema version above the one they support.
 
 The shipped family profiles use promoted results from served studies:
 
-- Ornith 1.0 35B uses the DSML dialect with repair required. The recorded study
-  completed all 15 tasks with repair enabled. The observed quoting malformations
-  were salvaged, and any unsalvaged repair remains an alarm condition. The profile
-  records the sampling settings exercised by that study.
+- Ornith 1.0 35B uses the native dialect, the XML its vendored chat template
+  teaches, with repair optional. A structural emission battery of eleven
+  write-shaped requests carrying 4-45 KB parameter values was scored on the
+  shipping K-quant package and an unquantized Q8_0 reference at a greedy and a
+  sampled profile. Every native arm came back with zero structural defects and
+  zero strict-parse rejections, at 8 to 11 usable calls out of 11 per pass, and
+  the misses are elicitation rather than emission. Teaching DSML in-context
+  instead drops the closing quote after the parameter name, so the name
+  attribute swallows the following `string=` and the parser sees one attribute
+  where two were taught. That hits 73 to 81 per cent of parameter opens on both
+  artifacts, at emission offsets 28 to 1607, which is the parameter's opening
+  tag rather than deep in a long value, and no DSML arm produced a single usable
+  call through the full parse and repair path. The unquantized reference is the
+  worse of the two, which rules the quantization level out and leaves the
+  dialect as the cause.
+  Repair stays optional because it has nothing to fix at native and cannot
+  rescue DSML. The thinking flag, the re-prompt policy and the sampling
+  settings carry over from the earlier loop study that recorded them; the
+  battery ran a greedy and a higher-temperature profile and the dialect result
+  is the same at both.
 - DeepSeek-V4-Flash uses the DSML dialect with repair optional. Its road-test
   campaign produced 40 tool requests with no malformations. The campaign did not
   establish sampling defaults, so the profile leaves sampling to the client.
@@ -265,6 +325,8 @@ A mjtq package directory contains:
 - `expert_hotlist.json` (cold-start hotlist, below) when the source is a routed
   MoE with imatrix counts.
 - `agentic_profile.json` (above) for families with a profile of record.
+- The bundled drafter's shards and sidecar manifest, when the package declares
+  a `drafter` component (below).
 - Generated jang-compatible sidecars (`config.json`, `jang_config.json`;
   written by `sidecars.py`): a compat view for the loader, generated from the
   manifest, with the manifest staying the source of truth.
@@ -291,9 +353,10 @@ pair per projection in a fixed per-codec order (`row_order_for_codecs`). The
 components depend on each projection's declared codec:
 
 ```
-tq      -> [ packed | norms ]     (packed uint32, norms float16)
-mxfp4   -> [ packed | scales ]    (packed uint32, scales uint8 UE8M0)
-kquant  -> [ weight | scales ]    (both uint8 wire bytes)
+tq      -> [ packed | norms ]        (packed uint32, norms float16)
+mxfp4   -> [ packed | scales ]       (packed uint32, scales uint8 UE8M0)
+kquant  -> [ weight | scales ]       (both uint8 wire bytes)
+iqk     -> [ blocks ]                (uint8 wire bytes; scales live in the row)
 ```
 
 so an all-TQ layer's row reads
@@ -324,6 +387,13 @@ same `row_order`. Older stacked packages (`tq_packed` / `tq_norms` / `tq_bits`)
 are **not readable**: the runtime fails loud with a re-convert message rather
 than guess at an old layout.
 
+IQ_K target experts use this bundle directly through the pooled runtime. A
+miss reads one `blocks` row and splits its declared relayout streams into the
+selected slot. At capacity equal to the declared expert count, the default
+startup policy loads every row and runs the zero-miss identity-slot path through
+the same `PooledSwitchGLU` graph. Smaller capacities retain the same graph and
+replace slot contents from bundle rows on demand.
+
 ## The cold-start expert hotlist
 
 `hotlist.py` bakes a cold-start expert hotlist into the package from the
@@ -350,6 +420,109 @@ expert index (and at least `num_experts` counters per layer) and raises
 `write_package_expert_hotlist()` returns 0 (writes nothing) for a dense model or
 a package with no routed experts; the convert caller logs an alignment failure
 and proceeds without a hotlist rather than shipping a wrong one.
+
+## Draft-model sidecar manifests
+
+Speculative-decoding drafters load from standalone sidecar folders (builders
+in `package/deepseek_v4/dspark_sidecar.py`, `mtp_sidecar.py`, and
+`dflash_sidecar.py`; usage in `docs/speculative_decoding.md`). A sidecar is
+not a mjtq package. It carries its own manifest (`dspark_sidecar.json` /
+`mtp_sidecar.json` / `dflash_sidecar.json`), content-hashed through the
+`core/artifact.py` helpers, with a per-tensor format table and per-file
+sha256 provenance. The loaders (`runtime/deepseek_v4/dspark_load.py`,
+`mtp_load.py`, `dflash_load.py`) validate the manifest fail-closed, quantize
+the module tree per the manifest, strip the constructed skeleton
+(`spec_decode.strip_draft_skeleton` swaps every lazy random-init parameter
+for a zero-stride placeholder so no evaluation between construction and the
+strict load can allocate the full float32 tree), and strict-load the
+weights.
+
+The DSpark builder resolves the drafter stage count from a declaration
+only: top-level `config.json` `n_mtp_layers` first, the checkpoint's
+`inference/config.json` second, and refusal when neither declares it. The
+count is unrelated to `len(dspark_target_layer_ids)` (drafter depth versus
+tapped main-stack layers) and is never inferred from it. The manifest
+provenance records the resolved `n_mtp_layers` and `n_mtp_layers_source`.
+
+The DSpark builder has a second experts mode, `--experts-format iqk
+--routed-artifacts <dir>`, that takes the routed projections from
+pre-encoded IQ_K conversion artifacts instead of the source checkpoint. The
+staging directory holds one raw cell per stage and projection (expert-major
+ik-wire rows) plus an `inventory.json` with per-file digests, written by the
+converter only after every unit completes; the builder refuses a staging
+directory without the inventory and verifies every digest before consuming
+a cell. Each expert row is rearranged onto the decode kernels'
+`iqk_relayout` under the same two gates the package relayout step runs
+(every row unpacked back to wire bytes and compared exactly, plus a
+deterministic per-expert row sample decoded through ik's CPU dequantizer
+and the relayout reference and compared as fp16 bit patterns), then stored
+as one uint8 tensor per stage and projection under
+`blocks.N.mlp.switch_mlp.<proj>.iqk_blocks`, shaped
+`[num_experts, out_features, row_bytes]`. The manifest row carries the
+member (`iqk_codec`), the layout, and the projection geometry per tensor,
+so a mixed-member allocation is a manifest fact rather than a schema
+change; the consumed staging digests and the gate counts land under the
+manifest's provenance. At load the stored rows are not draft-tree parameters:
+the loader replaces each stage's `mlp.switch_mlp` with the resident IQ_K switch
+in `runtime/deepseek_v4/iqk_experts.py`, splits the stored rows into the
+relayout streams the kernels take, verifies every blocks tensor against its
+manifest row, and refuses any layout other than `iqk_relayout` by name. DSpark
+keeps all of its routed rows resident; the target model's pooled installation
+does not wrap the sidecar. The resident switch also remains the reference
+implementation for full-capacity target-pool identity checks.
+
+Three manifest kinds exist, all at schema version 1:
+
+- `deepseek_v4_dspark_sidecar`: the DSpark drafter (three draft blocks, the
+  Markov head, and the confidence head), one shard per draft stage.
+- `deepseek_v4_mtp_sidecar`: the MTP drafter (one vendored decoder block plus
+  the fusion projections and norms), one shard. The manifest records the
+  chained draft depth cap (block size 3).
+- `deepseek_v4_dflash_sidecar`: the DFlash drafter (five dense llama-type
+  layers, the `fc` feature projection, the pruned 32000-entry head, and the
+  raw d2t/t2d vocabulary tables), one shard. Projections and the head are
+  affine 8-bit; the norms and the tables are passthrough. `fc` is affine
+  8-bit by default (measured acceptance-neutral and cheaper to ingest);
+  the builder's `--fc-format bf16` produces a source-dtype passthrough
+  variant. The choice is recorded per tensor and under the manifest's
+  `build_options.fc_format`. The shard additionally carries
+  sample rows of the dropped verifier embedding under the reserved
+  `embed_sample.*` names; the loader compares them against the target
+  embedding and logs the delta.
+
+Per-tensor formats come from a four-entry vocabulary; an unknown format fails
+closed at load:
+
+| Format | Params | Used for |
+|---|---|---|
+| `mxfp4` | group 32, bits 4 | routed draft experts: byte-lossless repack from source FP4 (E2M1 packed, UE8M0 per-32 scales) into the MLX mxfp4 layout, with a per-group dequant identity check at build |
+| `affine8` | group 32, bits 8 | dense FP8 projections after dequant (attention, shared experts, DSpark `main_proj`, MTP `e_proj`/`h_proj`), and any expert group that failed the mxfp4 identity check (recorded in the manifest) |
+| `passthrough` | source dtype, or fp32 where noted | norms and Markov tables (source dtype); router gate weight and bias, hyper-connection parameters, attention sink, and the confidence projection (fp32) |
+| `iqk` | `iqk_codec` member, `iqk_relayout` layout, per-tensor `num_experts`/`out_features`/`in_features` | DSpark routed draft experts relaid from IQ_K conversion artifacts, served through the mlx-iqk decode kernels |
+
+No sidecar stores an embedding; the drafter shares the target package's at
+load time. DSpark and MTP also share the target language-model head, while
+DFlash carries its own pruned draft-vocabulary head.
+
+### The bundled drafter component
+
+`moespresso-ds4-dspark-bundle` writes a new package directory whose files are
+hard links to the source package's shards and furniture plus a DSpark
+sidecar's shards and manifest, and extends the package manifest with a
+declared `drafter` component (`package/deepseek_v4/dspark_bundle.py`). The
+component records the identity (path, size, sha256) of every sidecar file, the
+sidecar's own artifact id, and the source package's manifest id, so
+`moespresso-verify` covers the drafter bytes and the runtime resolves the
+drafter from the manifest alone. This is the step that lets a package select a
+drafter automatically; a package with no `drafter` key serves plain.
+
+The component is declared `optional` under an all-or-nothing contract: a
+distribution of the same package without the drafter files verifies clean and
+serves with the absence counted, while a partially present component is
+corruption and fails verification. Removing the drafter from a bundled package
+is deleting its declared files, never a rebuild. Bytes are never re-encoded;
+a link that cannot be created falls back to a copy and the bundle report
+records which files copied.
 
 ## Why this matters
 

@@ -39,6 +39,7 @@ _KEY_SUFFIXES = {
     "tq": ("tq_bundle",),
     "mxfp4": ("tq_bundle",),
     "kquant": ("tq_bundle",),
+    "iqk": ("tq_bundle",),
     "mxfp8": ("weight", "scales"),
     "affine": ("weight", "scales", "biases"),
     "fp16": (None,),  # the prefix itself is the key
@@ -254,6 +255,89 @@ def _identity_groups(manifest: dict) -> list[tuple[str, object]]:
     return groups
 
 
+def _verify_drafter_component(manifest: dict, package_dir: Path) -> list[Validation]:
+    """Identity checks for the declared draft-model component.
+
+    The component is all-or-nothing. With every declared file present, each
+    identity is hashed like any other declared file. With every declared file
+    absent, a component marked ``optional`` reads as a clean non-blocking
+    entry: the distribution shipped without the drafter and the package
+    serves plain. A partially present component is corruption and blocks, as
+    does any absence from a component not marked optional.
+    """
+    drafter = manifest.get("drafter")
+    if drafter is None:
+        return []
+    out: list[Validation] = []
+    if not isinstance(drafter, dict):
+        out.append(_validation(
+            "runtime.invalid_drafter_component",
+            "manifest drafter component must be an object",
+            path="/drafter",
+        ))
+        return out
+    files = drafter.get("files")
+    if not isinstance(files, list) or not files:
+        out.append(_validation(
+            "runtime.invalid_drafter_component",
+            "manifest drafter component declares no files",
+            path="/drafter/files",
+        ))
+        return out
+
+    present: list[bool] = []
+    names: list[str] = []
+    for index, identity in enumerate(files):
+        declared = identity.get("path") if isinstance(identity, dict) else None
+        path = _declared_path(
+            package_dir,
+            declared,
+            manifest_path=f"/drafter/files/{index}/path",
+            out=out,
+        )
+        if path is None:
+            return out
+        names.append(str(declared))
+        present.append(path.is_file())
+
+    if not any(present):
+        if drafter.get("optional") is True:
+            out.append(Validation(
+                "info",
+                "runtime.drafter_component_absent",
+                f"optional drafter component is absent ({len(names)} declared "
+                "file(s) not present); the package serves without a drafter",
+                path="/drafter",
+                phase="runtime",
+                blocking=False,
+            ))
+            return out
+        out.append(_validation(
+            "runtime.missing_drafter_component",
+            "drafter component is declared without optional and none of its "
+            "files are present",
+            path="/drafter/files",
+        ))
+        return out
+    if not all(present):
+        missing = [name for name, here in zip(names, present) if not here]
+        out.append(_validation(
+            "runtime.partial_drafter_component",
+            "drafter component is partially present; missing: "
+            + ", ".join(sorted(missing)),
+            path="/drafter/files",
+            expected=sorted(names),
+            actual=sorted(name for name, here in zip(names, present) if here),
+        ))
+    for index, identity in enumerate(files):
+        if not present[index]:
+            continue
+        issues, _ = _verify_identity(
+            package_dir, f"/drafter/files/{index}", identity)
+        out.extend(issues)
+    return out
+
+
 def _verify_identity(
     package_dir: Path,
     manifest_path: str,
@@ -375,6 +459,9 @@ def verify_package(manifest: dict, package_dir: Path) -> list[Validation]:
         out.extend(issues)
         if manifest_path.startswith("/files/") and declared is not None:
             declared_shards.add(declared)
+
+    # The bundled drafter carries its own all-or-nothing presence contract.
+    out.extend(_verify_drafter_component(manifest, package_dir))
 
     # Every declared tensor key must be present in a manifest-declared shard.
     headers: dict[str, set[str] | None] = {}

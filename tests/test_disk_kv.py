@@ -1,7 +1,7 @@
-"""Disk prompt-cache read path.
+"""Disk target and attachment storage, budgets, and fault isolation.
 
 The pure parts (root lock, token-prefix hash, scope and entry round-trip, the
-JSON index longest-prefix selection, stride and config validation) run without
+JSON indexes, longest-prefix selection, stride and config validation) run without
 MLX. The payload schema round-trip and the three fail-closed cases use MLX arrays
 through injected save/load callables so the codec is exercised without a model.
 """
@@ -9,11 +9,23 @@ through injected save/load callables so the codec is exercised without a model.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from moespresso.runtime.disk_kv import (
+    ATTACHMENT_SCHEMA_VERSION,
+    ATTACHMENT_STATUS_HIT,
+    ATTACHMENT_STATUS_INVALID,
+    ATTACHMENT_STATUS_MISSING,
+    ATTACHMENT_STATUS_UNAVAILABLE,
     DiskCheckpointStore,
+    DiskKVAttachmentEntry,
+    DiskKVAttachmentEnvelope,
+    DiskKVAttachmentIdentity,
+    DiskKVAttachmentIndex,
     DiskKVConfig,
     DiskKVEntry,
     DiskKVError,
@@ -24,14 +36,18 @@ from moespresso.runtime.disk_kv import (
     DiskKVStrideError,
     FrontierTracker,
     FrontierWriter,
+    build_attachment_safety_metadata,
     build_cache_scope,
     build_safety_metadata,
     caches_all_at_offset,
+    caches_shared_offset,
     default_cache_registry,
     open_disk_store,
     resolve_disk_kv_config,
     scope_hash,
     token_prefix_hash,
+    validate_attachment_identity,
+    validate_attachment_payload_metadata,
     validate_cache_classes,
     validate_payload_metadata,
     validate_stride,
@@ -741,6 +757,14 @@ def test_offset_gate_refuses_when_no_cache_reports_an_offset():
     assert not caches_all_at_offset([_FakeCache(None), _FakeCache(None)], 512)
 
 
+def test_shared_offset_reports_only_an_agreed_positional_frontier():
+    assert caches_shared_offset(
+        [_FakeCache(512), _FakeCache(None), _FakeCache(512)]
+    ) == 512
+    assert caches_shared_offset([_FakeCache(512), _FakeCache(256)]) is None
+    assert caches_shared_offset([_FakeCache(None), _FakeCache(None)]) is None
+
+
 # --- frontier writer: capture gates and atomicity ----------------------------
 
 
@@ -1185,3 +1209,523 @@ def test_operator_log_line_per_decision(tmp_path):
     joined = "\n".join(lines)
     assert "write" in joined
     assert "evict" in joined
+
+
+# --- attachment-v1 store ----------------------------------------------------
+
+
+def _attachment_identity(target, *, artifact_id="art-a", rail=("spec", "rail-a")):
+    return DiskKVAttachmentIdentity.from_target(
+        target,
+        attachment_kind="drafter_state",
+        envelope_schema="deepseek_v4_spec_cache_v1",
+        drafter_family="dspark",
+        artifact_id=artifact_id,
+        capsule_kind="deepseek_v4_dspark_state",
+        capsule_schema_major=1,
+        capsule_schema_minor=0,
+        producer_rail=rail,
+    )
+
+
+def _attachment_envelope(identity):
+    capsule = SimpleNamespace(
+        kind=identity.capsule_kind,
+        schema_major=identity.capsule_schema_major,
+        schema_minor=identity.capsule_schema_minor,
+        frontier=identity.target_token_count,
+        metadata=(("dtype", "float16"), ("stages", 3)),
+        tensors=(),
+    )
+    return DiskKVAttachmentEnvelope.from_capsule(identity, capsule)
+
+
+def _attachment_file_codec(nbytes: int):
+    records = {}
+
+    def save(root, attachment_id, *, envelope, safety_metadata):
+        rel = (
+            f"attachments/payloads/{attachment_id[:2]}/"
+            f"{attachment_id}.safetensors"
+        )
+        path = Path(root) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"a" * nbytes)
+        records[rel] = (envelope, dict(safety_metadata))
+        return rel, path.stat().st_size
+
+    def load(root, rel):
+        path = Path(root) / rel
+        if not path.exists():
+            raise DiskKVError("missing attachment payload")
+        return records[rel]
+
+    return save, load, records
+
+
+def _attachment_store(tmp_path, *, budget=1000, target_bytes=100, attachment_bytes=25):
+    save_attachment, load_attachment, records = _attachment_file_codec(
+        attachment_bytes)
+    store = DiskCheckpointStore(
+        tmp_path,
+        save_payload_fn=_file_save_fn(target_bytes),
+        save_attachment_payload_fn=save_attachment,
+        load_attachment_payload_fn=load_attachment,
+        budget_bytes=budget,
+        log_fn=lambda line: None,
+    )
+    return store, records
+
+
+def test_old_target_v1_root_opens_without_attachment_fields(tmp_path):
+    scope = _scope(classes=("KVCache",))
+    entry = DiskKVEntry.from_tokens(
+        scope,
+        [1, 2, 3],
+        payload_path="payloads/aa/old.safetensors",
+        payload_bytes=12,
+        cache_class_names=("KVCache",),
+    )
+    raw_entry = entry.to_json_obj()
+    raw_entry.pop("session_cache_key")
+    (tmp_path / "index.json").write_text(
+        json.dumps({"schema_version": entry.schema_version, "entries": [raw_entry]}),
+        encoding="utf-8",
+    )
+
+    store = DiskCheckpointStore(tmp_path, log_fn=lambda line: None)
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == entry.cache_id
+    assert store.attachments_available is True
+    assert (tmp_path / "attachments" / "index.json").exists()
+    target_index = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    assert target_index["schema_version"] == entry.schema_version
+    assert "identity" not in target_index["entries"][0]
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("target_cache_id", "wrong-cache"),
+        ("target_scope_hash", "wrong-scope"),
+        ("target_token_count", 4),
+        ("target_token_prefix_hash", "wrong-prefix"),
+    ],
+)
+def test_attachment_identity_refuses_each_target_mismatch(tmp_path, field, bad):
+    store, _ = _attachment_store(tmp_path)
+    target = _write(store, _scope(classes=("KVCache",)), [1, 2, 3])
+    identity = _attachment_identity(target)
+    with pytest.raises(DiskKVMetadataMismatch, match=field):
+        validate_attachment_identity(target, replace(identity, **{field: bad}))
+
+
+@pytest.mark.parametrize(
+    "metadata_key",
+    [
+        "attachment_schema_version",
+        "attachment_id",
+        "attachment_identity",
+        "target_cache_id",
+        "target_scope_hash",
+        "target_token_count",
+        "target_token_prefix_hash",
+        "attachment_kind",
+        "envelope_schema",
+        "drafter_family",
+        "artifact_id",
+        "capsule_kind",
+        "capsule_schema_major",
+        "capsule_schema_minor",
+        "producer_rail",
+    ],
+)
+def test_attachment_payload_repeats_and_validates_every_identity_field(
+    tmp_path, metadata_key,
+):
+    store, _ = _attachment_store(tmp_path)
+    target = _write(store, _scope(classes=("KVCache",)), [1, 2, 3])
+    identity = _attachment_identity(target)
+    entry = DiskKVAttachmentEntry.from_identity(
+        identity, payload_path="attachments/payloads/aa/x.safetensors",
+        payload_bytes=10)
+    metadata = build_attachment_safety_metadata(entry)
+    metadata[metadata_key] = "mismatch"
+    with pytest.raises(DiskKVMetadataMismatch, match=metadata_key):
+        validate_attachment_payload_metadata(entry, metadata)
+
+
+def test_attachment_index_round_trip_is_separate_from_target_index(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    target = _write(store, _scope(classes=("KVCache",)), [1, 2, 3])
+    identity = _attachment_identity(target)
+    entry = DiskKVAttachmentEntry.from_identity(
+        identity, payload_path="attachments/payloads/aa/x.safetensors",
+        payload_bytes=10)
+    store.attachment_index.put(entry)
+
+    restored = DiskKVAttachmentIndex(tmp_path).find(identity)
+    assert restored == entry
+    attachment_raw = json.loads(
+        (tmp_path / "attachments" / "index.json").read_text(encoding="utf-8"))
+    assert attachment_raw["schema_version"] == ATTACHMENT_SCHEMA_VERSION
+    target_raw = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    assert target_raw["schema_version"] != ATTACHMENT_SCHEMA_VERSION
+    assert all("attachment_id" not in item for item in target_raw["entries"])
+
+
+def test_attachment_lookup_statuses_do_not_change_target_presence(tmp_path):
+    store, records = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+
+    missing = store.restore_attachment(target, identity)
+    assert missing.status == ATTACHMENT_STATUS_MISSING
+
+    attachment = store.write_attachment(target, _attachment_envelope(identity))
+    records[attachment.payload_path] = (_attachment_envelope(identity), {})
+    invalid = store.restore_attachment(target, identity)
+    assert invalid.status == ATTACHMENT_STATUS_INVALID
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+    assert (tmp_path / target.payload_path).exists()
+    assert not store.has_attachment(target, identity)
+
+    (tmp_path / "attachments" / "index.json").write_text("{bad", encoding="utf-8")
+    unavailable = store.restore_attachment(target, identity)
+    assert unavailable.status == ATTACHMENT_STATUS_UNAVAILABLE
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+
+
+def test_missing_attachment_payload_is_quarantined_without_target(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+    attachment = store.write_attachment(target, _attachment_envelope(identity))
+    (tmp_path / attachment.payload_path).unlink()
+
+    result = store.restore_attachment(target, identity)
+    assert result.status == ATTACHMENT_STATUS_INVALID
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+    assert (tmp_path / target.payload_path).exists()
+    assert store.attachment_index.entries() == []
+
+
+def test_attachment_quarantine_isolated_from_other_pair(tmp_path):
+    store, records = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target_a = _write(store, scope, [1, 2, 3], now=1)
+    target_b = _write(store, scope, [4, 5, 6], now=2)
+    identity_a = _attachment_identity(target_a, artifact_id="art-a")
+    identity_b = _attachment_identity(target_b, artifact_id="art-b")
+    attachment_a = store.write_attachment(
+        target_a, _attachment_envelope(identity_a), now=1)
+    attachment_b = store.write_attachment(
+        target_b, _attachment_envelope(identity_b), now=2)
+    records[attachment_a.payload_path] = (_attachment_envelope(identity_a), {})
+
+    assert store.restore_attachment(target_a, identity_a).status == (
+        ATTACHMENT_STATUS_INVALID)
+    assert store.restore_attachment(target_b, identity_b).status == ATTACHMENT_STATUS_HIT
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+    assert store.find_exact(scope, [4, 5, 6]) is not None
+    assert store.attachment_index.find(identity_a) is None
+    assert store.attachment_index.find(identity_b).attachment_id == attachment_b.attachment_id
+
+
+def test_attachment_reconciliation_cleans_crash_windows_and_dangling_rows(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target_kept = _write(store, scope, [1, 2, 3], now=1)
+    target_dangling = _write(store, scope, [4, 5, 6], now=2)
+    kept_identity = _attachment_identity(target_kept, artifact_id="kept")
+    dangling_identity = _attachment_identity(target_dangling, artifact_id="dangling")
+    kept = store.write_attachment(
+        target_kept, _attachment_envelope(kept_identity), now=1)
+    dangling = store.write_attachment(
+        target_dangling, _attachment_envelope(dangling_identity), now=2)
+    # Simulate an older target-only runtime removing the target without cascading.
+    store.index.remove(target_dangling)
+
+    orphan = tmp_path / "attachments" / "payloads" / "zz" / "orphan.safetensors"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"orphan")
+    stale = orphan.with_name("crash.tmp.safetensors")
+    stale.write_bytes(b"temp")
+
+    reconciled = store.reconcile_attachments()
+    assert stale.relative_to(tmp_path).as_posix() in reconciled["stale_temps"]
+    assert dangling.attachment_id in reconciled["dangling_entries"]
+    assert orphan.relative_to(tmp_path).as_posix() in reconciled["orphan_payloads"]
+    assert (tmp_path / kept.payload_path).exists()
+    assert store.attachment_index.find(kept_identity) is not None
+    assert not (tmp_path / dangling.payload_path).exists()
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+
+
+def test_combined_budget_evicts_attachments_before_targets(tmp_path):
+    store, _ = _attachment_store(
+        tmp_path, budget=250, target_bytes=100, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target_a = _write(store, scope, [1, 2, 3], now=1)
+    target_b = _write(store, scope, [4, 5, 6], now=2)
+    identity_a = _attachment_identity(target_a, artifact_id="art-a")
+    identity_b = _attachment_identity(target_b, artifact_id="art-b")
+    store.write_attachment(target_a, _attachment_envelope(identity_a), now=1)
+    store.write_attachment(target_b, _attachment_envelope(identity_b), now=2)
+
+    assert store.attachment_index.find(identity_a) is None
+    assert store.attachment_index.find(identity_b) is not None
+    assert {entry.cache_id for entry in store.index.entries()} == {
+        target_a.cache_id, target_b.cache_id,
+    }
+    stats = store.stats()
+    assert stats["payload_bytes"] == 230
+    assert stats["target_payload_bytes"] == 200
+    assert stats["attachment_payload_bytes"] == 30
+    assert stats["attachment_evictions"] == 1
+
+
+def test_attachment_budget_never_evicts_its_own_target(tmp_path):
+    store, _ = _attachment_store(
+        tmp_path, budget=100, target_bytes=80, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+
+    assert store.write_attachment(target, _attachment_envelope(identity)) is None
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+    assert (tmp_path / target.payload_path).exists()
+    assert store.attachment_index.entries() == []
+
+
+def test_target_eviction_cascades_its_attachments(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+    attachment = store.write_attachment(target, _attachment_envelope(identity))
+
+    store._evict_target_entry(target)
+    assert store.find_exact(scope, [1, 2, 3]) is None
+    assert store.attachment_index.find(identity) is None
+    assert not (tmp_path / attachment.payload_path).exists()
+
+
+def test_attachment_index_commit_failure_leaves_target_and_no_orphan(
+    tmp_path, monkeypatch,
+):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+
+    def fail_put(entry):
+        raise OSError("attachment index full")
+
+    monkeypatch.setattr(store.attachment_index, "put", fail_put)
+    assert store.write_attachment(target, _attachment_envelope(identity)) is None
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+    assert (tmp_path / target.payload_path).exists()
+    assert not list((tmp_path / "attachments" / "payloads").rglob("*.safetensors"))
+
+
+def test_attachment_writer_cannot_return_or_delete_the_target_payload(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    target_path = tmp_path / target.payload_path
+    original = target_path.read_bytes()
+    identity = _attachment_identity(target)
+
+    def unsafe_save(root, attachment_id, *, envelope, safety_metadata):
+        return target.payload_path, target.payload_bytes
+
+    store.save_attachment_payload_fn = unsafe_save
+    assert store.write_attachment(target, _attachment_envelope(identity)) is None
+    assert target_path.read_bytes() == original
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+
+
+def test_attachment_index_fault_does_not_disable_target_writer(tmp_path, monkeypatch):
+    store, _ = _attachment_store(
+        tmp_path, budget=200, target_bytes=100, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3], now=1)
+    identity = _attachment_identity(target)
+    store.write_attachment(target, _attachment_envelope(identity), now=1)
+
+    def fail_remove(entry):
+        raise OSError("attachment index read-only")
+
+    monkeypatch.setattr(store.attachment_index, "remove", fail_remove)
+    # A new target would need the attachment evicted. The optional-index fault
+    # skips this checkpoint but must not poison later generic target writes.
+    assert _write(store, scope, [4, 5, 6], now=2) is None
+    assert store.writes_disabled is False
+    assert store.attachments_available is False
+    assert store.find_exact(scope, [1, 2, 3]) is not None
+
+
+def test_unavailable_attachment_index_uses_physical_bytes_for_budget(tmp_path):
+    store, _ = _attachment_store(
+        tmp_path, budget=250, target_bytes=100, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target_a = _write(store, scope, [1, 2, 3], now=1)
+    identity = _attachment_identity(target_a)
+    attachment = store.write_attachment(
+        target_a, _attachment_envelope(identity), now=1)
+    attachment_path = tmp_path / attachment.payload_path
+    store.close()
+
+    (tmp_path / "attachments" / "index.json").write_text(
+        json.dumps({"schema_version": "unknown", "entries": []}),
+        encoding="utf-8",
+    )
+    reopened = DiskCheckpointStore(
+        tmp_path,
+        save_payload_fn=_file_save_fn(100),
+        budget_bytes=250,
+        log_fn=lambda line: None,
+    )
+
+    assert reopened.attachments_available is False
+    stats = reopened.stats()
+    assert stats["attachment_entries"] is None
+    assert stats["attachment_payload_bytes"] == 30
+    assert stats["attachment_accounting"] == "filesystem"
+    assert stats["payload_bytes"] == 130
+
+    target_b = _write(reopened, scope, [4, 5, 6], now=2)
+    assert target_b is not None
+    # Another target would exceed the combined cap. Without dependency rows,
+    # the store skips it instead of evicting a target and orphaning its capsule.
+    assert _write(reopened, scope, [7, 8, 9], now=3) is None
+    assert reopened.writes_disabled is False
+    assert {entry.cache_id for entry in reopened.index.entries()} == {
+        target_a.cache_id, target_b.cache_id,
+    }
+    assert attachment_path.exists()
+    assert reopened.stats()["payload_bytes"] == 230
+
+
+def test_unavailable_attachment_index_does_not_double_count_target_replacement(
+    tmp_path,
+):
+    store, _ = _attachment_store(
+        tmp_path, budget=150, target_bytes=100, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3], now=1)
+    identity = _attachment_identity(target)
+    attachment = store.write_attachment(
+        target, _attachment_envelope(identity), now=1)
+    store.close()
+
+    (tmp_path / "attachments" / "index.json").write_text(
+        json.dumps({"schema_version": "unknown", "entries": []}),
+        encoding="utf-8",
+    )
+    reopened = DiskCheckpointStore(
+        tmp_path,
+        save_payload_fn=_file_save_fn(100),
+        budget_bytes=150,
+        log_fn=lambda line: None,
+    )
+
+    replacement = _write(reopened, scope, [1, 2, 3], now=2)
+    assert replacement is not None
+    assert replacement.cache_id == target.cache_id
+    assert len(reopened.index.entries()) == 1
+    assert (tmp_path / attachment.payload_path).exists()
+    assert reopened.stats()["payload_bytes"] == 130
+
+
+def test_target_eviction_stops_if_attachment_cascade_becomes_unavailable(
+    tmp_path, monkeypatch,
+):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3], now=1)
+    identity = _attachment_identity(target)
+    attachment = store.write_attachment(
+        target, _attachment_envelope(identity), now=1)
+
+    def fail_entries():
+        raise OSError("attachment index unreadable")
+
+    monkeypatch.setattr(store.attachment_index, "entries", fail_entries)
+    assert store._evict_target_entry(target) is None
+    assert store.attachments_available is False
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+    assert (tmp_path / target.payload_path).exists()
+    assert (tmp_path / attachment.payload_path).exists()
+
+
+def test_unknown_attachment_bytes_fail_closed_only_for_bounded_writes(
+    tmp_path, monkeypatch,
+):
+    store, _ = _attachment_store(
+        tmp_path, budget=200, target_bytes=100, attachment_bytes=30)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3], now=1)
+    store.disable_attachments("synthetic index fault")
+    monkeypatch.setattr(store, "_attachment_payload_bytes_on_disk", lambda: None)
+
+    assert _write(store, scope, [4, 5, 6], now=2) is None
+    assert store.writes_disabled is False
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+    store.budget_bytes = None
+    assert _write(store, scope, [7, 8, 9], now=3) is not None
+
+
+def test_unknown_attachment_index_schema_disables_only_attachments(tmp_path):
+    scope = _scope(classes=("KVCache",))
+    index = DiskKVIndex(tmp_path)
+    target = DiskKVEntry.from_tokens(
+        scope,
+        [1, 2, 3],
+        payload_path="payloads/aa/target.safetensors",
+        payload_bytes=10,
+        cache_class_names=("KVCache",),
+    )
+    index.put(target)
+    attachment_root = tmp_path / "attachments"
+    attachment_root.mkdir()
+    (attachment_root / "index.json").write_text(
+        json.dumps({"schema_version": "unknown", "entries": []}),
+        encoding="utf-8",
+    )
+
+    store = DiskCheckpointStore(tmp_path, log_fn=lambda line: None)
+    identity = _attachment_identity(target)
+    assert store.attachments_available is False
+    assert store.has_attachment(target, identity) is False
+    assert store.restore_attachment(target, identity).status == (
+        ATTACHMENT_STATUS_UNAVAILABLE)
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+
+
+def test_exact_target_lookup_and_pair_dedupe_are_nonthrowing(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    scope = _scope(classes=("KVCache",))
+    target = _write(store, scope, [1, 2, 3])
+    identity = _attachment_identity(target)
+    store.write_attachment(target, _attachment_envelope(identity))
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+    assert store.has_attachment(target, identity) is True
+
+    (tmp_path / "attachments" / "index.json").write_text("{bad", encoding="utf-8")
+    assert store.has_attachment(target, identity) is False
+    assert store.find_exact(scope, [1, 2, 3]).cache_id == target.cache_id
+
+    (tmp_path / "index.json").write_text("{bad", encoding="utf-8")
+    assert store.find_exact(scope, [1, 2, 3]) is None
+
+
+def test_attachment_reconciliation_removes_stale_index_temp(tmp_path):
+    store, _ = _attachment_store(tmp_path)
+    stale = tmp_path / "attachments" / "index.json.tmp"
+    stale.write_text("partial", encoding="utf-8")
+    result = store.reconcile_attachments()
+    assert stale.relative_to(tmp_path).as_posix() in result["stale_temps"]
+    assert not stale.exists()

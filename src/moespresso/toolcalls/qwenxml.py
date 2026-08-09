@@ -24,9 +24,12 @@ and keeps everything else, multiline values included. A parameter whose
 declared schema type is not string must decode as JSON of that type; the
 schemas come from the caller's tool registry. The parser is strict: an
 unclosed block, a function element outside a block, stray text between
-elements, a duplicate parameter, or an undecodable typed value all raise
-instead of guessing. Tool-call repair is a separate component that builds on
-exactly that error.
+elements, a duplicate parameter, an undecodable typed value, or a parameter
+opened before the previous one closed all raise instead of guessing.
+Tool-call repair is a separate component that builds on exactly that error.
+
+``docs/tool_calls.md`` states the nested-parameter rule both marker dialects
+share and why an ambiguous column-zero marker resolves as structure.
 """
 
 from __future__ import annotations
@@ -34,11 +37,16 @@ from __future__ import annotations
 import json
 import re
 
-from moespresso.toolcalls.types import ToolCall, ToolCallParseError
+from moespresso.toolcalls.types import (
+    ToolCall,
+    ToolCallParseError,
+    opens_nested_marker,
+)
 
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 _FUNCTION_OPEN_PREFIX = "<function="
+_PARAMETER_OPEN_PREFIX = "<parameter="
 _UNDECODABLE = object()
 
 _BLOCK_RE = re.compile(
@@ -164,6 +172,10 @@ def _parse_parameters(inner: str, tool_name: str, schema: dict) -> dict:
         if not key:
             raise ToolCallParseError(
                 f"{tool_name}: parameter element carries an empty name")
+        if opens_nested_marker(raw, _PARAMETER_OPEN_PREFIX):
+            raise ToolCallParseError(
+                f"{tool_name}: parameter {key!r} opens another parameter "
+                "element before its own closer")
         if key in arguments:
             raise ToolCallParseError(f"{tool_name}: duplicate parameter {key!r}")
         declared = declared_type_for(properties, key)

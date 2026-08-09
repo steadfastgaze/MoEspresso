@@ -21,6 +21,7 @@ from moespresso.package.manifest import build_package_manifest, file_identity, l
 from moespresso.package.plan import package_plan_from_decision
 from moespresso.runtime.serve import (
     MANIFEST_NAME,
+    _install_detokenizer_clone_factory,
     build_manifest_runtime,
     load_served_model,
 )
@@ -31,6 +32,136 @@ ARCH = {"model_type": "qwen3_moe",
         "text_config": {"num_hidden_layers": 1, "num_experts": 8,
                         "layer_types": ["full_attention"]}}
 SHARD = "model-00001-of-00001.safetensors"
+
+
+def _tokenizer_wrapper(detokenizer_factory, *, vocab=None):
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    wrapper = object.__new__(TokenizerWrapper)
+    wrapper._tokenizer = type(
+        "InnerTokenizer",
+        (),
+        {
+            "clean_up_tokenization_spaces": False,
+            "vocab": vocab or {"a": 0, "b": 1},
+            "decode": lambda self, token_ids: "".join(
+                str(token) for token in token_ids
+            ),
+        },
+    )()
+    wrapper._detokenizer_class = detokenizer_factory
+    return wrapper
+
+
+def test_detokenizer_clone_factory_shares_tables_not_request_state():
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    tokenizer = _tokenizer_wrapper(BPEStreamingDetokenizer)
+
+    assert _install_detokenizer_clone_factory(tokenizer) is True
+    first = tokenizer.detokenizer
+    second = tokenizer.detokenizer
+
+    assert type(first) is BPEStreamingDetokenizer
+    assert type(second) is BPEStreamingDetokenizer
+    assert first is not second
+    assert first.tokenmap is second.tokenmap
+    assert first.tokens is not second.tokens
+    first.add_token(0)
+    assert first.tokens == [0]
+    assert second.tokens == []
+
+
+def test_detokenizer_clone_factory_is_per_tokenizer_and_idempotent():
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    left = _tokenizer_wrapper(BPEStreamingDetokenizer, vocab={"a": 0})
+    right = _tokenizer_wrapper(BPEStreamingDetokenizer, vocab={"z": 0})
+
+    assert _install_detokenizer_clone_factory(left) is True
+    installed = left._detokenizer_class
+    assert _install_detokenizer_clone_factory(left) is True
+    assert left._detokenizer_class is installed
+    assert _install_detokenizer_clone_factory(right) is True
+    assert left.detokenizer.tokenmap is not right.detokenizer.tokenmap
+
+
+def test_detokenizer_clone_factory_preserves_spm_options_and_state_isolation():
+    from functools import partial
+
+    from mlx_lm.tokenizer_utils import SPMStreamingDetokenizer
+
+    tokenizer = _tokenizer_wrapper(
+        partial(SPMStreamingDetokenizer, trim_space=False),
+        vocab={"\u2581hello": 0, "world": 1},
+    )
+
+    assert _install_detokenizer_clone_factory(tokenizer) is True
+    first = tokenizer.detokenizer
+    second = tokenizer.detokenizer
+
+    assert type(first) is SPMStreamingDetokenizer
+    assert first.trim_space is False
+    assert first.tokenmap is second.tokenmap
+    assert first.tokens is not second.tokens
+    first.add_token(0)
+    assert first.text == " hello"
+    assert second.text == ""
+
+
+def test_detokenizer_clone_factory_isolates_naive_request_buffers():
+    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
+    tokenizer = _tokenizer_wrapper(NaiveStreamingDetokenizer)
+
+    assert _install_detokenizer_clone_factory(tokenizer) is True
+    first = tokenizer.detokenizer
+    second = tokenizer.detokenizer
+
+    assert type(first) is NaiveStreamingDetokenizer
+    assert first._tokenizer is second._tokenizer
+    assert first.tokens is not second.tokens
+    assert first._current_tokens is not second._current_tokens
+    first.add_token(1)
+    assert first.text == "1"
+    assert second.text == ""
+
+
+def test_detokenizer_clone_failure_falls_back_without_poisoning(monkeypatch):
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    import moespresso.runtime.serve as serve_module
+
+    tokenizer = _tokenizer_wrapper(BPEStreamingDetokenizer)
+    assert _install_detokenizer_clone_factory(tokenizer) is True
+    real_copy = serve_module.copy.copy
+    calls = 0
+
+    def flaky_copy(value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic clone failure")
+        return real_copy(value)
+
+    monkeypatch.setattr(serve_module.copy, "copy", flaky_copy)
+    fallback = tokenizer.detokenizer
+    clone = tokenizer.detokenizer
+
+    assert type(fallback) is BPEStreamingDetokenizer
+    assert type(clone) is BPEStreamingDetokenizer
+    assert fallback.tokenmap is not clone.tokenmap
+    assert calls == 2
+
+
+def test_detokenizer_clone_factory_leaves_unknown_factory_unchanged():
+    class CustomDetokenizer:
+        pass
+
+    tokenizer = _tokenizer_wrapper(CustomDetokenizer)
+
+    assert _install_detokenizer_clone_factory(tokenizer) is False
+    assert tokenizer._detokenizer_class is CustomDetokenizer
 
 
 def _affine_unit(name, role, layer_index=0):

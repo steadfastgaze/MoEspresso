@@ -23,8 +23,12 @@ A parameter with ``string="true"`` carries its raw text value unchanged
 (multiline values included), and ``string="false"`` carries JSON that must
 decode successfully. The parser is strict: an unclosed block, an invoke
 without a name, a parameter without the ``string`` attribute, stray text
-between elements, or invalid JSON all raise instead of guessing. Tool-call
-repair is a separate component that builds on exactly that error.
+between elements, invalid JSON, or a parameter opened before the previous
+one closed all raise instead of guessing. Tool-call repair is a separate
+component that builds on exactly that error.
+
+``docs/tool_calls.md`` states the nested-parameter rule both marker dialects
+share and why an ambiguous column-zero marker resolves as structure.
 """
 
 from __future__ import annotations
@@ -33,7 +37,11 @@ import json
 import re
 from typing import Any
 
-from moespresso.toolcalls.types import ToolCall, ToolCallParseError
+from moespresso.toolcalls.types import (
+    ToolCall,
+    ToolCallParseError,
+    opens_nested_marker,
+)
 
 DSML_TOKEN = "｜DSML｜"
 
@@ -182,7 +190,9 @@ def parse_dsml_tool_calls(content: str | None) -> list[ToolCall]:
 
     Returns an empty list when the content carries no block. Raises
     ``ToolCallParseError`` on any structural defect so a truncated or
-    hand-mangled block never silently drops a call.
+    hand-mangled block never silently drops a call, and so a parameter
+    opened before the previous one closed never silently merges two
+    arguments into one.
     """
     if not content or TOOL_CALLS_OPEN not in content:
         return []
@@ -222,6 +232,11 @@ def _parse_parameters(inner: str, tool_name: str) -> dict:
         key, is_string, raw = match.group(1), match.group(2), match.group(3)
         if not key:
             raise ToolCallParseError(f"{tool_name}: DSML parameter carries an empty name")
+        if opens_nested_marker(raw, _PARAM_OPEN_PREFIX):
+            raise ToolCallParseError(
+                f"{tool_name}: parameter {key!r} opens another DSML parameter "
+                "before its own closer"
+            )
         if key in arguments:
             raise ToolCallParseError(f"{tool_name}: duplicate DSML parameter {key!r}")
         if is_string == "true":

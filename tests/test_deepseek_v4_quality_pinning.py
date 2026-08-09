@@ -48,7 +48,7 @@ def test_q1_pins_residency_before_model_load(monkeypatch, tmp_path):
     monkeypatch.delenv(PREWARM_ENV)
     monkeypatch.setattr(serve_mod, "load_served_model", _raise)
     with pytest.raises(_SentinelLoad):
-        quality.q1_deepseek_v4_official_top20_parity(tmp_path / "pkg")
+        quality.q1_deepseek_v4_selected_token_identity(tmp_path / "pkg")
     import os
 
     assert os.environ[PREWARM_ENV] == "all"

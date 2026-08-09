@@ -10,12 +10,20 @@ entry points containing `qwen` describe the Qwen architecture implementation
 used by Ornith, plus engineering harnesses around that implementation. Their
 presence does not add a third public product.
 
-Committed DeepSeek-V4 Q0/Q1 prompts and provider vectors remain public so the
-gates match the fixtures published by antirez/ds4. Q2 provider captures remain
-under `src/moespresso/correctness/fixtures/deepseek_v4/private/`. Unpublished
-Ornith benchmark questions, answer keys, and verification programs remain under
-`src/moespresso/correctness/fixtures/ornith/private/`. Never copy either private
-set into source, tests, logs, documentation, wheels, or source distributions.
+The DeepSeek-V4 fixture boundary is drawn by provenance, not by ladder rung.
+Material the upstream antirez/ds4 suite published stays public and committed so
+the gates run against those fixtures. Anything captured from a provider stays
+under `src/moespresso/correctness/fixtures/deepseek_v4/private/`: API-derived
+continuations, selected-token records, and top-logprob payloads, whether they
+serve Q1 or Q2, together with the Q4 teacher and candidate logit dumps and the
+marker set they are scored against. The WikiText corpus is third-party text
+referenced by digest and never copied in. `docs/deepseek_v4_quality.md` is the
+authority on which side a given fixture falls.
+
+Unpublished Ornith benchmark questions, answer keys, and verification programs
+remain under `src/moespresso/correctness/fixtures/ornith/private/`. Never copy
+either private set into source, tests, logs, documentation, wheels, or source
+distributions.
 
 The public Ornith gate surface covers the project-owned agentic-coding and
 long-context instruments:
@@ -103,7 +111,16 @@ holds.
   GGUF-recipe package builders. Model-specific GGUF recipe mapping lives beside
   those builders, for example `package.deepseek_v4.recipe` and
   `package.qwen.recipe`; `package.kquant_recipe` is the shared GGUF parser and
-  fit-check helper. Do not put conversion orchestration back under `runtime/`.
+  fit-check helper. Three further builder groups live in the same package.
+  `package.deepseek_v4.iqk_package` assembles converted IQ_K routed-expert
+  artifacts under an allocation and reads no GGUF recipe;
+  `package.deepseek_v4.iqk_relayout` rewrites a built package's routed bundles
+  onto the decode kernels' wire, and `package.iqk_format` plus
+  `package.iqk_relayout` hold the shared member and layout contracts. Drafter
+  sidecars are package construction too: `package.deepseek_v4.dspark_sidecar`,
+  `mtp_sidecar`, and `dflash_sidecar` write a sidecar, and `dspark_bundle`
+  attaches a built DSpark sidecar to a package as its declared optional drafter
+  component. Do not put conversion orchestration back under `runtime/`.
 - Package-owned compatibility files live in `moespresso.package`: tokenizer
   copying, vendored chat templates, and generated jang sidecars are package
   construction concerns. Runtime loads the resulting package files.
@@ -143,11 +160,21 @@ holds.
   pre-rendered text.
 - Verification (sha256 + manifest checks) stays off the serve hot path as the
   separate `moespresso-verify` gate. Do not add it to the load path.
-- KV cache and prefix reuse are in-memory first. The disk KV read path
-  restores only exact token-prefix checkpoints at 256-aligned frontiers,
-  fails closed to cold serving on any mismatch, and is gated by the
-  recorded safety evidence that aligned saves round-trip bit-identically
-  on hybrid (KV + recurrent-state) caches. Serving enables the store by
+- KV cache and prefix reuse are in-memory first. The in-memory store keeps
+  plain and speculative producers on separate rails, where a speculative rail
+  identifies the cache schema, the numeric producer lattice, the drafter
+  family, the sidecar artifact, and the resolved schedule. A resumable DSpark
+  entry pairs its target cache with a state capsule at the same public token
+  frontier, and lookup probes both rails without moving either entry. Only
+  committed public state is published: rejected proposal rows and transient
+  verify frontiers never enter a cache tier. A speculative path without the
+  complete state protocol serves from a fresh per-request cache and bypasses
+  both tiers.
+- The disk KV read path restores a target cache only from exact token-prefix
+  checkpoints at 256-aligned frontiers, fails closed to cold serving on any
+  mismatch, and is gated by the recorded safety evidence that aligned saves
+  round-trip bit-identically on hybrid (KV + recurrent-state) caches.
+  Serving enables the store by
   default under a per-package root in the user cache directory with an
   LRU byte budget and a write-depth cap (checkpoints cover the shallow
   shared-prefix region; deep cumulative snapshots are write traffic with
@@ -161,16 +188,34 @@ holds.
   hard write failure logs once and disables the writer for the request,
   restore-time validation failures quarantine the payload, and the TTFT
   cost of writes is measured and logged, never hidden.
-- One fused routed-MoE operation per layer, one dispatch boundary to Python.
-  Never split a routed op into resident and missing partial matmuls; that
-  measured slower despite better wait counters.
+- A DSpark drafter-state companion is a second disk persistence class bound to
+  a validated target, with its own schema version, index, payload tree, and
+  quarantine tree. It never substitutes for a target. The paired prefill
+  callback writes only at allowlisted aligned frontiers, and only after both
+  the target caches and the drafter state independently report exactly that
+  frontier; it commits the target first and the companion second. Restore
+  follows the same order: a companion is selected only after its target
+  restores, and only for the exact target identity and producer rail. Companion
+  failure stays local. A companion that is missing, unreadable, invalid, or
+  identity-incompatible is skipped or quarantined on its own while the restored
+  target keeps serving the suffix with plain decoding, and companion read and
+  write faults set a separate disable flag, so target checkpointing keeps
+  running. Target eviction cascades removal to every dependent companion.
+- Never split a routed-MoE op by residency. Issuing separate resident and
+  missing partial matmuls measured slower despite better wait counters, so the
+  pooled routed path keeps one fused operation per layer behind one dispatch
+  boundary to Python. Dispatch count on its own is not the rule.
 
 **Correctness**
 - Correctness requires token or logit identity. Plausible text can still hide
   wrong logits. Any change to caching, routing, KV, or
   artifact loading must compare logits or top-tokens against a reference.
-- Quality ladders are model-specific. DeepSeek-V4 keeps the Q0/Q1/Q2/Q3 gates;
-  other model families need their own quality gates.
+- Quality ladders are model-specific. DeepSeek-V4 keeps Q0 through Q4 plus the
+  teacher-forced WikiText perplexity arm. A package recipe or quantized-math
+  change requires Q1, Q2, Q3, Q4, and the perplexity arm; the perplexity arm is
+  the only instrument that has caught a numeric blowup every numbered gate
+  scored as finite. `docs/deepseek_v4_quality.md` records which gates each kind
+  of change requires. Other model families need their own quality gates.
 - DS4-derived evaluation fixtures need an explicit public/private boundary.
   Before adding expected continuations, official-answer files, or top-logprob
   arrays, check the upstream release boundary. Private oracle material belongs
@@ -180,6 +225,21 @@ holds.
 
 - Measure or revert. A performance change must clear a real numeric threshold on
   a same-artifact A/B; below it, revert with a short note on why.
+- Benchmark with the disk KV tier off (`MOESPRESSO_DISK_KV=off`) unless the
+  disk KV tier is itself the subject. The tier writes checkpoints on the first
+  request over a prompt and skips or restores on later ones, so request timing
+  depends on store state that persists across requests and processes:
+  first-request writes inflate TTFT, warm-store runs omit that cost, and an
+  estimator that compares two requests absorbs the difference into its result.
+  That failure mode inflated a recorded decode level by ten percent.
+- Pin `MOESPRESSO_DS4_DRAFTER` to the same value in both arms unless
+  speculation is the subject, and record which arm drafted. Automatic drafter
+  selection is capacity-gated, so the decision depends on the host's usable
+  wired budget and can land differently across two runs of the same code. The
+  in-memory speculative producer rail is a second source of request-to-request
+  state that `MOESPRESSO_DISK_KV=off` does not clear. The startup line names
+  the resolved drafter state, so an unpinned arm can still be identified from
+  the log.
 - Prove an A/B's two arms actually differ before trusting a null result. A common
   trap is two arms that silently run the same code path.
 - A metric used to judge a change must be independent of the change.
@@ -191,12 +251,22 @@ holds.
   under all locks.
 - Run `make lint` and `make test` before considering a change done, including
   for changes touching conversion, package writing, runtime serving,
-  MLX/Jang/mlx-kquant paths, or model-specific quality gates.
+  MLX/Jang/mlx-kquant/mlx-iqk paths or
+  model-specific quality gates.
+- Run `make roadtest` for cache, checkpoint, and restart-resume changes. It
+  drives a cumulative agentic session against a really served package through
+  the `agentlib/` runner and asserts cache events, disk checkpoints, and
+  restart resume turn over turn, which no unit test covers. It is opt-in and
+  GPU-bound, so it is never part of `make test`.
 - Run `make dist-check` for release-facing changes. The wheel and source
   distribution must exclude `specs_archive/`, every `*/private/` fixture tree,
   environment files, caches, bytecode, and machine-local paths. They must carry
-  both license files and the expected DeepSeek-V4, Ornith, and technical Qwen
-  architecture surfaces.
+  `LICENSE-MIT`, `LICENSE-APACHE-2.0`, and `THIRD-PARTY-NOTICES`, and
+  the expected DeepSeek-V4, Ornith, and technical Qwen architecture surfaces. The
+  audit pins the wheel's `License-File` metadata to exactly those three names
+  and compares each one byte for byte against the repository copy, so it
+  confirms the files ship and says nothing about their content. Vendoring code
+  means updating `THIRD-PARTY-NOTICES` by hand.
 
 ## Where to start
 

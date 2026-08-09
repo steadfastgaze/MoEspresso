@@ -1,13 +1,21 @@
 # Disk KV cache: restart-warm and cross-session resume
 
-The disk KV cache restores a served model's prompt-cache prefix from disk and
-prefills only the suffix. A long session that would otherwise reprefill its
-whole history after a restart resumes warm, and a new session whose prompt
-shares a long prefix with an earlier one (an agent client's fixed system
-prompt and tool schemas) skips the shared region. The store is
-single-process-per-root and narrow: it recovers an exact token prefix into
-the same package and the same cache policy, and falls back to a cold prefill
-on anything it cannot prove safe.
+The disk KV cache restores a served model's target prompt-cache prefix from
+disk and prefills only the suffix. A long session that would otherwise
+reprefill its whole history after a restart resumes warm, and a new session
+whose prompt shares a long prefix with an earlier one (an agent client's fixed
+system prompt and tool schemas) skips the shared region. Resumable DeepSeek-V4
+DSpark requests may bind an optional drafter-state companion to that target
+checkpoint. The target remains the authoritative cache entry.
+`docs/speculative_decoding.md` states which drafter families are resumable and
+what the runtime checks before it resumes speculation; this document covers the
+durable side.
+
+The store is single-process-per-root and narrow: it recovers an exact token
+prefix into the same package and the same cache policy, and falls back to a
+cold prefill on anything it cannot prove safe. A DSpark companion is held to
+additional model and producer identity checks. Rejecting it does not reject a
+valid target.
 
 Serving enables the store by default under a per-package root in the user
 cache directory; `MOESPRESSO_DISK_KV=off` turns it off. The in-memory prefix
@@ -27,10 +35,23 @@ whose token prefix matches the incoming request exactly, then prefills only the
 tokens past that prefix. The restore reaches the first generated token faster than
 a cold prefill of the same prompt.
 
+For an eligible DSpark request, every new aligned speculative checkpoint may
+add an optional companion to its authoritative target. The writer commits the
+target cache first, then stores a capsule for the DSpark projected-history rings
+and scalar state at the same frontier. Restore follows the same order. A
+compatible pair continues speculative decoding from the suffix. If the
+companion is absent, unavailable, corrupt, or incompatible, the target still
+serves the suffix with plain decoding.
+
 The restore is transparent to clients. A chat-completions client that resends its
 full conversation history sends a prompt whose leading tokens match a stored
 checkpoint; the server restores that prefix and generates from the new suffix. No
 protocol change is needed.
+
+An exact whole-prompt hit has no suffix token from which to compute next-token
+logits, and disk payloads do not store those logits. The server therefore does
+not attempt a companion restore for that case. It performs a full prompt prefill
+and reports `exact_fallback`.
 
 ---
 
@@ -55,14 +76,17 @@ be overridden through environment variables read once at startup.
   time prefill reaches a multiple of the stride. Checkpoints are written
   only during prefill and only for frontiers not already on disk, so the
   write cost lands once, in the first request that covers a new prefix
-  region, and is reported in that request's usage block. Decode never
-  writes. A smaller stride shortens the re-prefilled tail after a restore
+  region. The request usage block reports confirmed write counts, and the
+  blocking work remains included in both generation-local first-token latency
+  and ready-to-first-token latency. Decode never writes.
+  A smaller stride shortens the re-prefilled tail after a restore
   (at most one stride, for divergence points within the write-depth cap;
   past the cap the unsaved tail re-prefills whole) at the cost of more
   first-time writes.
 - `MOESPRESSO_DISK_KV_BYTES`: the byte budget for stored payloads, per
   root, not machine-wide: every package fingerprint has its own root and
-  its own budget, and quarantined payloads sit outside it. Default 8 GiB
+  its own budget, and quarantined payloads sit outside it. Target payloads
+  and optional model-state companions share this budget. Default 8 GiB
   when serving (a checkpoint set covering one long agent prompt runs to a
   few GiB, so the default holds a handful of hot prefix regions); the
   literal `unlimited` disables eviction. A positive value caps the
@@ -80,8 +104,9 @@ be overridden through environment variables read once at startup.
   written bytes grow quadratically with region depth, while cross-session
   restores land in the shallow shared-prefix region (an agent client's
   system prompt and tools). The cap keeps the whole shared-prefix benefit
-  and drops the deep-tail write traffic of a long conversation. Restores
-  are unaffected: the read path serves whatever checkpoints exist.
+  and drops the deep-tail write traffic of a long conversation. The same
+  frontiers gate target and DSpark-companion capture. Restores are
+  unaffected: the read path serves whatever checkpoints exist.
 
 Startup failure policy: with `MOESPRESSO_DISK_KV=frontier` set, a root that
 cannot open (already locked, unwritable) refuses startup, as does any
@@ -94,12 +119,16 @@ disk KV. Malformed explicit values (a bad stride or budget) always refuse.
 
 The default location keeps everything under one directory:
 `~/.cache/moespresso`. Growth is bounded by the byte budget per package
-root (8 GiB by default), enforced by least-recently-used eviction. There is
-no free-disk-space probe: the budget is the bound, and a write that fails
-for any reason, a full disk included, is skipped and logged while the
-request completes normally. Deleting the directory (or
-any single root) at any time is safe: the server holds no assumption that a
-checkpoint survives, and a missing or mismatched entry means cold serving,
+root (8 GiB by default), enforced by least-recently-used eviction. Target
+entries retain the v1 `index.json` and `payloads/` layout. Optional companions
+use their own `attachments/index.json`, `attachments/payloads/`, and
+`attachments/quarantine/` paths. This keeps target-only roots readable and
+allows attachment faults to stay isolated. There is no free-disk-space probe:
+the budget is the bound, and a write that fails for any reason, a full disk
+included, is skipped and logged while the request completes normally. Deleting
+the directory (or any single root) at any time is safe: the server holds no
+assumption that a checkpoint survives, and a missing or mismatched entry means
+cold serving,
 never a wrong restore. Package managers do not remove user caches on
 uninstall, so after removing MoEspresso itself, `~/.cache/moespresso` is
 the one path to delete.
@@ -122,6 +151,14 @@ exactly at the frontier refuses the write, so a checkpoint that describes a toke
 count it does not hold is structurally impossible. A single uniform step cannot do
 this: it must divide gcd(first_gap, stride), which collapses to a few tokens when
 the restored prefix is not stride-aligned and makes long prefills unserviceable.
+
+DSpark uses a speculative-only prefill plan with the same absolute frontier
+allowlist. Its callback runs after the target forward, DSpark tap ingest, and
+materialization. It independently checks every target cache and the drafter
+state against the same frontier before it copies anything. The callback never
+runs during the final anchor forward, verify, or decode. A target write or
+budget refusal stops the companion write at that frontier. A companion failure
+leaves the committed target intact and does not stop later target captures.
 
 ---
 
@@ -148,9 +185,21 @@ Promised:
   empty cache to the recorded class before grafting (a stateless conversion; the
   grafted state carries the recorded offset, group size, and bits). Every other class
   disagreement still refuses.
+- A DSpark companion is accepted only after its target checkpoint restores.
+  Its content identity binds the target cache id, scope hash, token count,
+  token-prefix hash, attachment kind and schema, drafter family, sidecar artifact
+  id, capsule kind and schema, and speculative producer rail. The producer rail
+  includes the resolved draft schedule. The imported capsule and all target
+  caches must report the target frontier before speculative generation resumes.
 - A corrupt, truncated, or missing payload fails closed. The load raises before any
   cache reaches the model, the entry is quarantined, and the engine continues on cold
   serving.
+- A selected DSpark companion whose payload or model import is invalid is
+  quarantined independently. An identity-incompatible companion is not selected
+  and appears as missing for the current request. The already validated target
+  remains indexed and serves plain suffix generation. A missing companion
+  reports `missing`; a companion-index fault reports `unavailable`; a rejected
+  payload or model import reports `invalid`.
 
 Not promised:
 
@@ -158,21 +207,24 @@ Not promised:
   package and layout that wrote it.
 - No recovery of decode-time state past the last prefill frontier. Capture is
   prefill-time in this version.
-- No compression, no trim-back to an unaligned length, no cross-process sharing of a
-  root.
+- No next-token logits in an exact whole-prompt checkpoint. Exact hits cannot
+  start generation from an empty suffix and take the `exact_fallback` path.
+- No compression, no trim-back to an unaligned length, and no concurrent
+  cross-process sharing of a root.
 
 ### The cost of crossing an unwritten frontier
 
-Aligning prefill to the stride splits a prompt that a single default step would have
-prefilled in one chunk into stride-sized chunks, and each crossed frontier writes a
-payload under the serve lock inside first-token latency. On the reference audit prompt
-(3844 tokens, stride 2048) the writer fired once at token 2048, a 386 MB payload, and
-the blocking write cost 0.135 s. First-token latency with the writer on was 18.79 s
-against 16.82 s with it off; the 0.135 s write is the marginal blocking cost and the
-rest of the gap is the prefill chunk geometry that frontier capture requires. A later
-process restoring that checkpoint reaches its first token faster than a cold prefill
-of the same prompt: the restore plus the suffix prefill runs in less time than a full
-cold prefill because only the suffix is prefilled.
+Aligning prefill to the stride splits a prompt that a single default step would
+have prefilled in one chunk into stride-sized chunks. Each crossed frontier
+writes a payload under the serve lock before the first token, so both latency
+fields include it. On the reference audit prompt (3844 tokens, stride 2048),
+the writer fired once at token 2048 with a 386 MB payload, and the blocking
+write cost 0.135 s. Generation-local first-token latency with the writer on was
+18.79 s against 16.82 s with it off. The 0.135 s write is the marginal blocking
+cost; the rest of the gap is the prefill chunk geometry that frontier capture
+requires. A later process restoring that checkpoint reaches its first token
+faster than a cold prefill of the same prompt because only the suffix is
+prefilled.
 
 ---
 
@@ -183,15 +235,21 @@ cold prefill because only the suffix is prefilled.
   refused loudly at startup rather than waiting or stealing the lock. This is why the
   index is a single JSON file rewritten atomically under the lock: the store is
   single-process by contract.
-- Budget and eviction. Under a byte budget, a write that would exceed the cap first
-  evicts least-recently-used checkpoints (by last-used time, then creation time) until
-  the new payload fits. A payload that alone exceeds the whole budget is skipped and
-  logged; the store never evicts every other entry to make room for one oversized
-  payload.
+- Budget and eviction. Under a byte budget and a readable companion index, a
+  write that would exceed the cap first evicts least-recently-used DSpark
+  companions, then target checkpoints (by last-used time, then creation time)
+  until the new payload fits. Evicting a target removes its dependent
+  companions first. An incoming companion cannot evict its parent target; it is
+  skipped when the parent plus companion cannot fit. If the companion index is
+  unavailable, physical companion files still count toward the cap. Target
+  writes that fit without eviction continue; a write that would require
+  dependency-aware eviction is skipped. A payload that alone exceeds the whole
+  budget is skipped and logged.
 - Startup cleanup. After acquiring the lock the store deletes leftover temp payloads
   and orphan payloads (payload files no index entry references) left by a crashed
-  previous owner. The quarantine directory holds payloads that failed a load check;
-  its aging is left to the operator.
+  previous owner. It also removes companion entries without an exact target and
+  companion payloads without an index entry. The quarantine directories hold
+  payloads that failed a load check; their aging is left to the operator.
 - Write faults disable the writer for the request. A hard failure during a
   checkpoint write (a full or failing disk) logs one line and stops further
   write attempts for that request, because each later frontier would
@@ -216,10 +274,34 @@ cold prefill because only the suffix is prefilled.
   not an index fault: writes stay enabled and the leftover file is an
   orphan the next open cleans up. Reopening the store (a server restart)
   retries; startup cleanup removes any orphaned payloads.
-- Visibility. One operator log line prints on the serve stderr for each checkpoint
-  decision (write, skip with reason, write failure, restore, quarantine). The `/health` endpoint's
-  `prompt_cache` block carries a `disk` sub-block with the store's counters since
-  startup: enabled, root, stride, entries, payload and budget bytes, and the restore,
-  write, eviction, and quarantine counts. A request that restored from disk reports the
-  `disk_hit` event in its `usage.prompt_cache` block, and a request that wrote frontier
-  checkpoints reports how many.
+- Attachment faults stay local. Failure to open or read the companion index
+  disables companion reads and writes until restart and records
+  `attachments_unavailable_reason`. It does not disable target restores or
+  target writes that fit the conservative physical-byte accounting. Companion
+  quarantine removes only the companion index row and payload. Target eviction
+  remains authoritative and cascades removal to every dependent companion when
+  that mapping is readable.
+- Visibility. Operator logs record target and companion writes, skips, hard
+  failures, restores, and quarantines. An absent companion is reported in the
+  request without adding a log line. The `/health` endpoint's
+  `prompt_cache.disk` block reports the
+  combined `payload_bytes`, separate `target_payload_bytes` and
+  `attachment_payload_bytes`, `attachment_entries`, `attachments_available`,
+  and separate target and attachment restore, write, eviction, and quarantine
+  counters. `attachment_accounting` reports `index`, `filesystem`, or `unknown`;
+  counts or bytes that cannot be established are `null`. An attachment fault
+  adds `attachments_unavailable_reason`.
+  Request `usage.prompt_cache.event` continues to report the target outcome,
+  including `disk_hit`. `usage.prompt_cache.drafter_state.event` independently
+  reports `hit`, `missing`, `invalid`, or `unavailable` when a DSpark companion
+  was consulted. A valid target payload reports `disk_restore_seconds`; an
+  exact payload that cannot supply continuation logits still reports its
+  reconstruction cost beside the `exact_fallback` event. A successful DSpark
+  companion restore adds `drafter_state.restore_seconds`, covering disk-layer
+  load and validation plus the serve preflight import that creates usable live
+  state. Failed or absent companions omit that duration.
+  `disk_checkpoints_written` and `disk_drafter_states_written` report confirmed
+  writes separately. The
+  corresponding `disk_checkpoint_write_seconds` and
+  `disk_drafter_state_write_seconds` arrays report each blocking write duration,
+  rounded to six decimal places. Empty timing arrays are omitted.

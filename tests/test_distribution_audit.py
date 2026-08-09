@@ -42,11 +42,13 @@ EXPECTED_LICENSE_EXPRESSION = "MIT OR Apache-2.0"
 EXPECTED_RUNTIME_REQUIREMENTS = {
     "jang",
     "mlx",
+    "mlx-iqk",
     "mlx-kquant",
     "mlx-lm",
     "numpy",
     "psutil",
 }
+EXPECTED_MLX_IQK_REQUIREMENT = "mlx-iqk==0.1.2"
 README_BYTES = (REPO_ROOT / "README.md").read_bytes()
 PROJECT_METADATA = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 EXPECTED_VERSION = PROJECT_METADATA["project"]["version"]
@@ -228,6 +230,15 @@ def _audit_core_metadata(kind: str, label: str, data: bytes) -> list[str]:
             f"{kind}: {label} is missing runtime requirements "
             + ", ".join(missing_requirements)
         )
+    iqk_requirements = [
+        requirement
+        for requirement in requirements
+        if re.split(r"[\s<>=!~@;\[]", requirement, maxsplit=1)[0].lower() == "mlx-iqk"
+    ]
+    if iqk_requirements != [EXPECTED_MLX_IQK_REQUIREMENT]:
+        failures.append(
+            f"{kind}: {label} must require exactly {EXPECTED_MLX_IQK_REQUIREMENT}"
+        )
     if "compute" in values("Provides-Extra") or any(
         "extra == 'compute'" in requirement or 'extra == "compute"' in requirement
         for requirement in requirements
@@ -305,6 +316,7 @@ def _minimal_metadata() -> bytes:
         "License-File: THIRD-PARTY-NOTICES\n"
         "Requires-Dist: jang>=2.5.29\n"
         "Requires-Dist: mlx>=0.31.2\n"
+        f"Requires-Dist: {EXPECTED_MLX_IQK_REQUIREMENT}\n"
         "Requires-Dist: mlx-kquant@ git+https://example.invalid/mlx-kquant.git\n"
         "Requires-Dist: mlx-lm>=0.31.3\n"
         "Requires-Dist: numpy>=1.26\n"
@@ -412,6 +424,19 @@ def test_audit_rejects_removed_compute_extra_metadata():
     failures = audit_members("wheel", members)
 
     assert any("removed compute extra" in failure for failure in failures)
+
+
+def test_audit_rejects_an_inexact_mlx_iqk_requirement():
+    members = _minimal_members("wheel")
+    metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
+    members[metadata_name] = members[metadata_name].replace(
+        f"Requires-Dist: {EXPECTED_MLX_IQK_REQUIREMENT}\n".encode(),
+        b"Requires-Dist: mlx-iqk>=0.1.2\n",
+    )
+
+    failures = audit_members("wheel", members)
+
+    assert any("must require exactly mlx-iqk==0.1.2" in failure for failure in failures)
 
 
 def main(argv: list[str] | None = None) -> int:

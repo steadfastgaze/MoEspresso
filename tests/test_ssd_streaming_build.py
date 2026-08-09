@@ -837,6 +837,7 @@ def test_suggest_capacity_overrides_can_spend_a_byte_budget():
     assert suggest_capacity_overrides_from_layer_stats(
         rows,
         extra_byte_budget=90,
+        replacement_headroom_bytes=1_000,
     ) == {1: 7}
 
 
@@ -877,6 +878,110 @@ def test_suggest_capacity_overrides_requires_one_budget_kind():
             target="prefill",
         )
 
+    with pytest.raises(ValueError, match="replacement_headroom_bytes"):
+        suggest_capacity_overrides_from_layer_stats(
+            [{"layer": 0, "capacity": 4, "slot_bytes": 1}],
+            extra_byte_budget=1,
+        )
+
+
+def test_byte_budget_rejects_delta_when_full_replacement_does_not_fit():
+    rows = [{
+        "layer": 0,
+        "capacity": 4,
+        "spare_slots": 2,
+        "slot_bytes": 100,
+        "expert_loads": 10,
+        "expert_misses": 10,
+        "seen_experts": 5,
+        "decode_seen_experts": 5,
+        "max_unique_active_experts": 5,
+    }]
+
+    # The 100-byte delta fits, but the detached 7-row replacement needs 700.
+    assert suggest_capacity_overrides_from_layer_stats(
+        rows,
+        extra_byte_budget=100,
+        replacement_headroom_bytes=699,
+    ) == {}
+
+
+def test_byte_budget_clamps_target_to_safe_replacement_headroom():
+    rows = [{
+        "layer": 0,
+        "capacity": 4,
+        "spare_slots": 2,
+        "slot_bytes": 100,
+        "expert_loads": 10,
+        "expert_misses": 10,
+        "seen_experts": 8,
+        "decode_seen_experts": 8,
+        "max_unique_active_experts": 8,
+    }]
+
+    # Eight demand rows would need 1,000 bytes with spares. Headroom permits
+    # a six-row demand pool, so only two of the four requested rows are granted.
+    assert suggest_capacity_overrides_from_layer_stats(
+        rows,
+        extra_byte_budget=400,
+        replacement_headroom_bytes=850,
+    ) == {0: 6}
+
+
+def test_byte_budget_charges_prior_deltas_to_later_replacement_headroom():
+    rows = [
+        {
+            "layer": 1,
+            "capacity": 4,
+            "slot_bytes": 100,
+            "expert_loads": 20,
+            "expert_misses": 20,
+            "seen_experts": 5,
+            "decode_seen_experts": 5,
+            "max_unique_active_experts": 5,
+        },
+        {
+            "layer": 0,
+            "capacity": 4,
+            "slot_bytes": 100,
+            "expert_loads": 10,
+            "expert_misses": 10,
+            "seen_experts": 5,
+            "decode_seen_experts": 5,
+            "max_unique_active_experts": 5,
+        },
+    ]
+
+    # Layer 1's committed delta leaves 450 bytes. The next five-row detached
+    # replacement needs 500, even though its own 100-byte delta still fits.
+    assert suggest_capacity_overrides_from_layer_stats(
+        rows,
+        extra_byte_budget=200,
+        replacement_headroom_bytes=550,
+    ) == {1: 5}
+
+
+def test_suggest_capacity_overrides_reserves_lookahead_spare_slots():
+    rows = [{
+        "layer": 0,
+        "capacity": 200,
+        "num_experts": 256,
+        "spare_slots": 16,
+        "max_capacity": 240,
+        "slot_bytes": 1,
+        "expert_loads": 100,
+        "expert_misses": 100,
+        "seen_experts": 256,
+        "decode_seen_experts": 256,
+        "max_unique_active_experts": 8,
+    }]
+
+    assert suggest_capacity_overrides_from_layer_stats(
+        rows,
+        extra_byte_budget=1_000,
+        replacement_headroom_bytes=1_000,
+    ) == {0: 240}
+
 
 def test_grow_ssd_streaming_capacity_applies_layer_overrides(tmp_path):
     pkg = _package(tmp_path, layers=(0,))
@@ -898,6 +1003,36 @@ def test_grow_ssd_streaming_capacity_applies_layer_overrides(tmp_path):
     assert switch.gate_proj.pool.resident_ids() == {1, 2}
     assert ssd_streaming_layer_stats(model)[0]["capacity"] == 6
     assert ssd_streaming_stats(model)["capacity_overrides"] == {0: 6}
+
+
+def test_grow_ssd_streaming_capacity_preserves_planner_order(
+    tmp_path,
+    monkeypatch,
+):
+    pkg = _package(tmp_path, layers=(0, 1))
+    model = _Model(n_layers=2)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
+    )
+    switches = [
+        layer.mlp.switch_mlp
+        for layer in model.language_model.model.layers
+    ]
+    calls = []
+    for layer_idx, switch in enumerate(switches):
+        original = switch.grow_capacity
+
+        def tracked(capacity, *, _layer=layer_idx, _original=original):
+            calls.append(_layer)
+            _original(capacity)
+
+        monkeypatch.setattr(switch, "grow_capacity", tracked)
+
+    assert grow_ssd_streaming_capacity(model, {1: 5, 0: 5}) == {1: 5, 0: 5}
+    assert calls == [1, 0]
 
 
 def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
@@ -928,7 +1063,7 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
 
     result = maybe_adapt_ssd_streaming_capacity(
         model,
-        available_bytes=10_000,
+        available_bytes=100_000,
         min_available_bytes=0,
         max_extra_bytes=2 * 2304,
         seed_hot=False,
@@ -936,6 +1071,7 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
 
     assert result["applied"] == {0: 6}
     assert result["used_extra_bytes"] == 2 * 2304
+    assert result["replacement_headroom_bytes"] == 100_000
     assert result["seed_hot"] is False
     assert result["seeded_slots"] == 0
     assert result["elapsed_seconds"] >= 0.0
@@ -945,7 +1081,7 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
 
     second = maybe_adapt_ssd_streaming_capacity(
         model,
-        available_bytes=10_000,
+        available_bytes=100_000,
         min_available_bytes=0,
         max_extra_bytes=2 * 2304,
         seed_hot=False,
@@ -954,6 +1090,136 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
     assert second["extra_byte_budget"] == 0
     assert second["seeded_slots"] == 0
     assert second["elapsed_seconds"] >= 0.0
+
+
+def test_maybe_adapt_growth_failure_keeps_response_path_and_committed_prefix(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    pkg = _package(tmp_path, layers=(0, 1))
+    model = _Model(n_layers=2)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
+    )
+    object.__setattr__(model, "_moespresso_ssd_streaming_capacity", 4)
+    object.__setattr__(model, "_moespresso_ssd_streaming_capacity_overrides", {})
+    switches = [
+        layer.mlp.switch_mlp
+        for layer in model.language_model.model.layers
+    ]
+    for ordinal, switch in enumerate(switches):
+        switch.seen_experts.update({0, 1, 2, 3, 4, 5})
+        switch.decode_seen_experts.update({0, 1, 2, 3, 4, 5})
+        switch.max_unique_active_experts = 6
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            pool = getattr(switch, projection).pool
+            pool.total_loads = 20 - ordinal
+            pool.total_misses = 20 - ordinal
+
+    grow_attempts = 0
+
+    def fail_second_layer(_capacity):
+        nonlocal grow_attempts
+        grow_attempts += 1
+        raise MemoryError("synthetic second-layer allocation failure")
+
+    monkeypatch.setattr(switches[1], "grow_capacity", fail_second_layer)
+    result = maybe_adapt_ssd_streaming_capacity(
+        model,
+        available_bytes=100_000,
+        min_available_bytes=0,
+        max_extra_bytes=4 * 2304,
+        seed_hot=False,
+    )
+
+    assert result["error"] == {
+        "type": "MemoryError",
+        "message": "synthetic second-layer allocation failure",
+    }
+    assert result["enabled"] is False
+    assert result["latched"] is True
+    assert result["plan"] == {0: 6, 1: 6}
+    assert result["applied"] == {0: 6}
+    assert result["elapsed_seconds"] >= 0.0
+    assert all(
+        pool.capacity == 6
+        for pool in switches[0]._projection_pools_lockstep()
+    )
+    assert all(
+        pool.capacity == 4
+        for pool in switches[1]._projection_pools_lockstep()
+    )
+    assert model._moespresso_ssd_streaming_capacity_overrides == {0: 6}
+    assert model._moespresso_ssd_streaming_adaptive_growth == result
+    assert model._moespresso_ssd_streaming_growth_latched_failure is result
+    assert grow_attempts == 1
+    assert "serving continues at committed capacities" in capsys.readouterr().out
+
+    # Later requests return the recorded failure without repeating allocation.
+    second = maybe_adapt_ssd_streaming_capacity(
+        model,
+        available_bytes=100_000,
+        min_available_bytes=0,
+        max_extra_bytes=4 * 2304,
+        seed_hot=False,
+    )
+    assert second is result
+    assert grow_attempts == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_maybe_adapt_seed_failure_records_the_committed_capacity(
+    tmp_path,
+    monkeypatch,
+):
+    pkg = _package(tmp_path, layers=(0,))
+    model = _Model(n_layers=1)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
+    )
+    object.__setattr__(model, "_moespresso_ssd_streaming_capacity", 4)
+    object.__setattr__(model, "_moespresso_ssd_streaming_capacity_overrides", {})
+    switch = model.language_model.model.layers[0].mlp.switch_mlp
+    switch.seen_experts.update({0, 1, 2, 3, 4, 5})
+    switch.decode_seen_experts.update({0, 1, 2, 3, 4, 5})
+    switch.max_unique_active_experts = 6
+    pools = switch._projection_pools_lockstep()
+    for pool in pools:
+        pool._freq[5] = 100
+    failed_pool = pools[1]
+
+    def fail_second_projection(*, expert, slot):
+        del expert, slot
+        raise OSError("synthetic second-projection hot-seed failure")
+
+    monkeypatch.setattr(failed_pool, "_load_expert", fail_second_projection)
+    result = maybe_adapt_ssd_streaming_capacity(
+        model,
+        available_bytes=100_000,
+        min_available_bytes=0,
+        max_extra_bytes=2 * 2304,
+        seed_hot=True,
+    )
+
+    assert result["error"]["type"] == "OSError"
+    assert result["applied"] == {0: 6}
+    assert model._moespresso_ssd_streaming_capacity_overrides == {0: 6}
+    assert all(
+        pool.capacity == 6
+        for pool in pools
+    )
+    assert all(pool._slot_of == {} for pool in pools)
+    assert all(pool._expert_at == [None] * 6 for pool in pools)
+    assert all(pool._freq == {5: 100} for pool in pools)
+    assert all(pool._loads_inflight == 0 for pool in pools)
+    assert all(pool._growth_pending is False for pool in pools)
 
 
 def test_maybe_adapt_ssd_streaming_capacity_respects_memory_floor(tmp_path):
@@ -1092,8 +1358,39 @@ def test_package_hotlist_seeds_precisely_but_prior_is_capped(tmp_path):
     x = mx.random.normal((1, 64)).astype(mx.float16)
     for _ in range(9):
         mx.eval(switch(x, mx.array([[3, 3]], dtype=mx.uint32)))
-    assert freq if False else switch.gate_proj.pool._freq[3] > 8
+    assert switch.gate_proj.pool._freq[3] > 8
     assert 3 in switch.gate_proj.pool.resident_ids()
+
+
+def test_hotlist_seeding_consumes_shared_bundle_rows_in_cache_windows(tmp_path):
+    import json as _json
+
+    from moespresso.runtime.ssd_streaming_build import load_expert_hotlist
+
+    pkg = _package(tmp_path, n_experts=8, layers=(0,))
+    index = build_expert_index(pkg)
+    model = _Model(n_layers=1, n_experts=8)
+    install_pooled_switchglus(
+        model, package_dir=pkg, index=index, capacity_per_layer=4)
+    switch = model.language_model.model.layers[0].mlp.switch_mlp
+    row_cache = switch.gate_proj.pool.row_cache
+    row_cache.max_rows = 2
+    hot = tmp_path / "expert_hotlist.json"
+    hot.write_text(_json.dumps({
+        "version": 1,
+        "kind": "expert_hotlist",
+        "layers": {"0": {str(expert): 8 - expert for expert in range(8)}},
+    }))
+
+    seeded = load_expert_hotlist(model, hot)
+
+    pools = switch._projection_pools_lockstep()
+    assert seeded == 12
+    assert all(pool.resident_ids() == {0, 1, 2, 3} for pool in pools)
+    assert all(pool._slot_of == pools[0]._slot_of for pool in pools[1:])
+    assert row_cache.total_preads == 4
+    assert row_cache.total_cached_takes == 8
+    assert not row_cache._rows
 
 
 def _hotlist_payload(layers):
@@ -1214,6 +1511,30 @@ def test_seed_expert_residency_default_prewarms_all_at_full_capacity(
     assert info["seeded"] == 12
     assert switch.gate_proj.pool.resident_ids() == {0, 1, 2, 3}
     assert switch.down_proj.pool.resident_ids() == {0, 1, 2, 3}
+
+
+def test_full_pool_residency_requires_rows_not_only_capacity(tmp_path):
+    from moespresso.runtime.ssd_streaming_build import (
+        _all_pools_at_full_capacity,
+        _all_pools_fully_resident,
+    )
+
+    pkg = _package(tmp_path, n_experts=4, layers=(0,))
+    model = _Model(n_layers=1, n_experts=4)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
+    )
+
+    assert _all_pools_at_full_capacity(model) is True
+    assert _all_pools_fully_resident(model) is False
+
+    switch = model.language_model.model.layers[0].mlp.switch_mlp
+    for pool in switch._projection_pools_lockstep():
+        pool.ensure(range(4))
+    assert _all_pools_fully_resident(model) is True
 
 
 def test_seed_expert_residency_default_prewarm_needs_full_capacity(
@@ -1527,7 +1848,7 @@ def _fake_kquant_module(
         return mx.zeros(
             (*x.shape[:-1], rhs.shape[-1], 1, weight.shape[1]), dtype=x.dtype)
 
-    def fake_dequantize(w2, s2, codec, dtype=None):
+    def fake_dequantize(w2, _s2, codec, dtype=None):
         qmm_calls.append((codec, int(w2.shape[0]), dtype))
         # One block per row in the test package: 256 weights per row.
         return mx.zeros((w2.shape[0], 256), dtype=dtype)
@@ -1758,6 +2079,35 @@ def test_barrier_free_prefill_requires_full_capacity(tmp_path, monkeypatch):
     assert switch.barrier_free_prefill_calls == 0
     assert switch.segmented_prefill_calls >= 1
     assert switch.index_resync_calls >= 1
+
+
+def test_barrier_free_prefill_rechecks_a_cold_full_capacity_pool(
+    tmp_path,
+    monkeypatch,
+):
+    import sys
+
+    import moespresso.runtime.pooled_switchglu as psg
+
+    switch = _full_resident_kquant_switch(tmp_path, capacity=4)
+    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
+    monkeypatch.setitem(sys.modules, "mlx_kquant", _fake_kquant_module([], [], []))
+
+    evicted_by_pool = []
+    for pool in switch._projection_pools_lockstep():
+        expert = pool._expert_at[3]
+        del pool._slot_of[expert]
+        pool._expert_at[3] = None
+        pool._slot_table_dirty = True
+        evicted_by_pool.append((pool, expert))
+    switch._barrier_free_ready_cached = None
+
+    assert switch._barrier_free_ready() is False
+    assert switch._barrier_free_ready_cached is False
+    for pool, expert in evicted_by_pool:
+        pool.ensure([expert])
+    assert switch._barrier_free_ready() is True
+    assert switch._barrier_free_ready_cached is True
 
 
 def test_barrier_free_non_identity_slots_keep_per_pool_remap(
@@ -3267,6 +3617,14 @@ def test_qwen_decode_barrier_free_forced_miss_serves_rail_identical(
     # path selects the same slots the barrier-free reference did and the shared
     # value-fake kernel returns the same routed output.
     np.testing.assert_allclose(y, ref, rtol=1e-6, atol=1e-6)
+
+    # The full-capacity pool is resident again. A cached negative certificate
+    # must be revisited so the optimized route re-engages on the next token.
+    y2 = np.array(block(x))
+    mx.eval(mx.array(y2))
+    assert switch.barrier_free_decode_calls == 2
+    assert switch.pipelined_layers == 1
+    np.testing.assert_allclose(y2, ref, rtol=1e-6, atol=1e-6)
 
 
 # --- K-quant dense install on the streaming build path -----------------------

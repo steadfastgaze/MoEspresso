@@ -4,56 +4,65 @@
 
 Run large Mixture-of-Experts language models well on the memory you have.
 
-MoEspresso is a manifest-driven inference engine for a deliberately small set
+MoEspresso is an inference engine for a deliberately small set
 of large MoE models on Apple Silicon. A package says exactly what it contains
-and how it must run; the engine keeps routed experts resident when they fit and
-streams them from SSD when they do not. The priority is model quality, explicit
-contracts, and measured behavior.
+and how it must run, and the runtime builds the model from those declared
+facts. The priority is model quality, explicit contracts, and measured
+behavior.
 
 ## What makes MoEspresso different
 
-- **SSD streaming is a first-class execution mode.** Routed expert rows are
-  stored contiguously for one-read fetches, and the same expert pool covers
-  both fully resident and SSD-backed execution. The package and runtime are
-  designed around streaming from the beginning.
+- **Routed experts keep their own quantization format inside MLX.** The
+  DeepSeek-V4-Flash package stores its routed experts in the IQ_K formats and
+  decodes them through [`mlx-iqk`](#mlx-iqk-acknowledgement); its dense side is
+  q6_K through [`mlx-kquant`](#mlx-kquant-acknowledgement), which also carries
+  the K-quant routed experts of the Ornith package. A TurboQuant path is
+  implemented as well, though no published package uses it. None of this is
+  limited to the affine-only MLX weight path.
+- **SSD expert streaming is an execution mode of the pooled routed runtime.**
+  Routed expert rows are stored contiguously for one-read fetches, and one
+  expert pool covers both fully resident and SSD-backed execution. Streaming
+  covers the K-quant, TurboQuant, and IQ_K routed formats.
 - **Defaults favor quality at long context.** A package fixes a quality-gated
   quantization recipe. Serving defaults to a broadly usable 128K context
-  window. When memory cannot keep every routed expert resident,
-  MoEspresso streams those experts instead of shrinking the context window.
-- **K-quants and IQ-quants run inside MLX.** The public packages use
-  GGML-family quantization formats through [`mlx-kquant`](#mlx-kquant-acknowledgement),
-  rather than being limited to the usual affine-only MLX weight path.
-
-**Why no MTP or DFlash?** Not yet. MoEspresso is designed as a dependable
-workhorse on memory-constrained Macs. Drafting and speculative-decoding paths
-consume additional unified memory that is often better spent on a
-higher-quality weight mix, more usable context, or expert residency. They
-remain possible future options when they demonstrate a measured net benefit
-without weakening those priorities.
+  window, and on the pooled runtime a memory shortfall streams routed experts
+  instead of shrinking that window.
+- **Speculative decoding ships and engages on its own.** A package can declare
+  a bundled drafter. The DeepSeek-V4-Flash package carries one, and serving
+  enables it when the memory budget covers it. See
+  [speculative decoding](#speculative-decoding).
 
 ## In numbers
 
-The charts show full-resident runs on an M3 Max with 40 GPU cores and 128 GB
-unified memory. See [accuracy](#accuracy-focus) and [performance](#performance-focus).
+**DeepSeek-V4-Flash**, on the shipping 2.37 bpw package at a 3,844-token
+prompt: median decode 32.627 tok/s with the bundled drafter and 26.591 tok/s
+without it on the full-capacity pooled runtime. Its WikiText test-split
+perplexity is 6.4774 over 32 windows,
+against a bf16 teacher's 4.8886 on the same windows. See
+[accuracy](#accuracy-focus) and [performance](#performance-focus).
 
-**DeepSeek-V4-Flash**
-
-<img src="docs/assets/deepseek-benchmarks.svg" alt="DeepSeek comparison: at 15,406 tokens, MoEspresso decodes at 23.17 tokens per second, oMLX at 21.56, DwarfStar at 20.70, and llama.cpp at 5.67; perplexity on the official API continuations is 1.4597 for DwarfStar, 1.4598 for MoEspresso, and 1.4723 for oMLX" width="100%">
-
-**Ornith 1.0 35B**
+**Ornith 1.0 35B**, full-resident on an M3 Max with 40 GPU cores and 128 GB
+unified memory:
 
 <img src="docs/assets/ornith-benchmarks.svg" alt="Ornith comparison: at 37,000 tokens with Q8 KV, MoEspresso decodes at 67.31 tokens per second, mlx-lm at 48.09, and llama.cpp at 43.52; perplexity for the compared Q4_K_M and oQ4e artifacts is 6.2442 for llama.cpp, 6.2661 for MoEspresso, and 6.2897 for mlx-lm" width="100%">
 
 ## Supported models
 
-| Model | Public package | Current boundary |
+| Model | Public package | Serving mode |
 |---|---|---|
-| DeepSeek-V4-Flash | [IQ2_XXS MoEspresso package](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso) | Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 64 GB memory configuration on a 128 GB host. |
-| Ornith 1.0 35B | [Q4_K_M MoEspresso package](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso) | Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 32 GB memory configuration on a 128 GB host. |
+| DeepSeek-V4-Flash-0731 | [DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2) | Built from the 0731 release. 84.35 GB (78.56 GiB) of model shards, 90.74 GB (84.51 GiB) with the bundled DSpark drafter. IQ_K routed experts use the pooled runtime in full-resident or SSD-streaming mode. |
+| Ornith 1.0 35B | [Ornith-1.0-35B-Q4_K_M-MoEspresso](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso) | K-quant routed experts on the pooled routed runtime. Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 32 GB memory configuration on a 128 GB host. |
+
+The DeepSeek-V4-Flash package is a whole-model 2.37 bits per weight over the
+served model's 284.335e9 parameters, with the drafter excluded from both sides
+of that ratio. Its routed experts average 2.2491 bits per weight as a mix of
+IQ2_KS on 89 of the 129 routed-expert tensors and IQ2_K on the other 40, and
+they hold 77.88 GB of the model shards. The remaining 6.47 GB is the dense
+side, stored in q6_K.
 
 ## Install
 
-MoEspresso 1.1.0 requires an arm64 Apple Silicon Mac running macOS 26.2
+MoEspresso 2.0.0 requires an arm64 Apple Silicon Mac running macOS 26.2
 (Tahoe) or later.
 
 Install MoEspresso with Homebrew. The formula installs its required Python
@@ -81,7 +90,7 @@ hf download steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso \
 Or download the DeepSeek-V4-Flash package:
 
 ```bash
-hf download steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso \
+hf download steadfastgaze/DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2 \
   --local-dir ./models/deepseek-v4-flash
 ```
 
@@ -150,19 +159,27 @@ The main serving controls are:
 - `--max-context-tokens` selects any positive context limit up to the package's
   architecture limit. The default is 128K or the package limit, whichever is
   smaller.
-- `--min-resident-experts` requires a minimum routed-expert capacity per layer
-  and fails at startup when the loaded capacity is smaller.
+- `--min-resident-experts` sets a floor on the pooled routed runtime's
+  per-layer expert capacity and fails at startup when the loaded capacity is
+  smaller. A package whose runtime reports no expert pool refuses to start
+  under this flag.
 
-## Memory policy and SSD expert streaming
+## Memory policy and expert residency
 
 MoEspresso keeps attention, norms, routers, shared experts, and other
-non-routed weights resident. At startup it reserves a fixed allowance for KV
-and activations, then spends the remaining planned budget on routed-expert
-slots. If all experts fit, full-capacity execution is the zero-miss,
-zero-on-demand-I/O case of the same pooled routed runtime after startup. If they
-do not, missing experts are read into persistent slots as routing selects them.
+non-routed weights resident. What happens to the routed side depends on the
+package's routed format.
 
-To run either current package without on-demand expert reads during inference,
+The pooled routed runtime carries the K-quant, TurboQuant, and IQ_K routed
+formats. The DeepSeek-V4-Flash package uses it for IQ_K experts, while the
+Ornith package and the earlier DeepSeek K-quant packages use it for K-quant
+experts. At startup it reserves a fixed allowance for KV and activations, then
+spends the remaining planned budget on routed-expert slots. If all 256 experts
+fit, the default startup policy loads every row and full-capacity execution is
+the zero-miss, zero-on-demand-I/O case of the same pooled graph. If they do not,
+missing experts are read into persistent slots as routing selects them.
+
+To run a pooled package without on-demand expert reads during inference,
 require the startup report to show full expert capacity (`capacity=256`). That
 is selected automatically when the budget admits every expert row; it is not a
 separate, lower- or higher-quality model graph.
@@ -185,17 +202,53 @@ is accounted for before extra expert residency, and the planner does not infer
 future context growth from incoming requests.
 
 `--max-memory-gb` caps the input to that startup capacity calculation. It is
-**not an RSS limit**. It selects a smaller or larger fixed expert pool after
-subtracting the resident base, the configured fixed KV/activation allowance,
-and a safety margin. The pool does not dynamically shrink as context grows, so
-operators must choose the ceiling and allowance for the context workload they
-intend to serve. `MOESPRESSO_SSD_KV_ALLOWANCE_GB` sets that fixed allowance
-(default: 1 GiB) before startup. A capacity-capped run on a larger Mac
-reproduces pool geometry and hit behavior, but its SSD miss cost can be
-optimistic because macOS may retain the whole package in page cache.
+**not an RSS limit**. It selects a smaller or larger base expert-pool capacity
+after subtracting the resident base, the configured fixed KV/activation
+allowance, and a safety margin. Serving can grow selected layers after a
+completed request when the adaptive-growth and replacement-memory budgets
+allow it. Pools never shrink as context grows, so operators must choose the
+ceiling and allowance for the context workload they intend to serve.
+`MOESPRESSO_SSD_KV_ALLOWANCE_GB` sets that fixed allowance (default: 1 GiB)
+before startup. A capacity-capped run on a larger Mac reproduces pool geometry
+and hit behavior, but its SSD miss cost can be optimistic because macOS may
+retain the whole package in page cache.
 
 See [SSD streaming](docs/ssd_streaming.md) for the capacity formula, runtime
 controls, direct-read path, and measurement caveats.
+
+## Speculative decoding
+
+A DeepSeek-V4-Flash package can declare a draft model as an optional bundled
+component. The published package carries DeepSeek's DSpark drafter, and
+serving enables it when the package is fully resident, every declared
+component file is present, and the wired-memory budget covers the weights, the
+drafter, cache state at the served context limit, and the per-request working
+set. When one of those does not hold, serving stays plain and prints the
+reason; automatic selection never refuses startup. The loop is lossless by
+rule: a proposed token is kept only when the target model's own verification
+accepts it, so no unverified token is ever emitted.
+
+```bash
+MOESPRESSO_DS4_DRAFTER=off moespresso-serve ./models/deepseek-v4-flash  # no drafting
+```
+
+`MOESPRESSO_DS4_DRAFTER` also selects a sidecar explicitly, as
+`dspark:<sidecar-dir>`, `mtp:<sidecar-dir>`, or `dflash:<sidecar-dir>`. Three
+drafter families are implemented. DSpark is the bundled family and the only
+one automatic selection reaches. DFlash is explicit-selection only and
+greedy-only, so a request with temperature above 0 takes the plain path. MTP
+is retained for future checkpoints and is not a supported path on the current
+weights.
+
+DSpark requests keep the in-memory prefix cache and the disk checkpoint tier
+described below, so a follow-up turn over a shared prefix resumes speculation
+instead of prefilling that prefix again. When the stored drafter state cannot
+be reused, the validated prompt cache still serves the request plainly. The
+other two families serve from a fresh per-request cache.
+
+See [speculative decoding](docs/speculative_decoding.md) for the drafter
+protocol, the families and their sidecars, the adaptive scheduler, the memory
+each sidecar costs, and the correctness contract.
 
 ## Disk KV for restart-warm and cross-session resume
 
@@ -217,7 +270,8 @@ MOESPRESSO_DISK_KV=off moespresso-serve ./models/ornith-35b   # memory-only
 `MOESPRESSO_DISK_KV_BYTES` (`unlimited` disables eviction), and
 `MOESPRESSO_DISK_KV_WRITE_DEPTH` (`unlimited` snapshots any depth) override
 the defaults. A root has one process owner, restores are package/render/KV-policy
-scoped, and every mismatch fails closed to cold prefill. Deleting
+scoped, and a prompt-cache checkpoint that does not match fails closed to cold
+prefill. Deleting
 `~/.cache/moespresso` is always safe. See the
 [disk KV contract](docs/disk_kv.md) for the full guarantees.
 
@@ -238,10 +292,11 @@ A package is more than a collection of quantized weights:
    weight data.
 
 That layout is an engine/package co-design: the runtime knows exactly how to
-keep the all-resident case fast and how to turn the same rows into SSD-backed
-expert slots. A package meant only as a generic weight container would not
-provide that contract. Direct GGUF loading or a more interchangeable package
-form may be supported in the future, but neither is the current runtime input.
+keep the all-resident case fast and, on the pooled routed formats, how to turn
+the same rows into SSD-backed expert slots. A package meant only as a generic
+weight container would not provide that contract. Direct GGUF loading or a more
+interchangeable package form may be supported in the future, but neither is the
+current runtime input.
 
 The full contract is in [package format](docs/package_format.md).
 
@@ -254,22 +309,25 @@ DwarfStar suite.
 Provider-derived Q2 continuations and top-logprob captures remain private by
 design.
 
-The DeepSeek comparison uses the same 100 thinking-off official API
-continuations, containing 2,290 target tokens, as the textual oracle for all
-three local artifacts:
+The DeepSeek-V4-Flash results below were measured on the published artifact
+against the DeepSeek-V4-Flash 0731 release, at full residency with the drafter
+off:
 
-| DeepSeek artifact / engine | Perplexity (lower is better) |
-|---|---:|
-| MoEspresso IQ2_XXS / MoEspresso 1.0.0 | 1.4598 |
-| DwarfStar IQ2_XXS / DwarfStar `80ebbc3` | 1.4597 |
-| Jundot oQ2.5e / oMLX 0.5.1 | 1.4723 |
+| Check | Scope | Result |
+|---|---|---|
+| Renderer and tokenizer goldens | 34 fixed cases | 34/34 |
+| Greedy selected-token identity | 14 greedy decisions across five fixed prompts, against the official API | 9/14 |
+| Official continuation loss | 100 prompts, 2,313 target tokens, teacher-forced | average NLL 0.3963 |
+| Step-level agreement | the same 100 prompts | 87.42 percent |
+| First token | the same 100 prompts | 66/100 |
+| Long-context fact recall | 16 facts in a 30,000-token-class prompt | 16/16 |
+| Served KL panels | calibration, held-out, and WikiText-test probes against the bf16 reference | valid, 0 findings |
+| WikiText test-split perplexity | 32 test windows | 6.4774 |
 
-The DwarfStar and MoEspresso packages share the
-GGUF's routed-expert wire bytes, while dense tensors, runtime graphs, and
-logit reductions differ. Their perplexities nevertheless coincide to three
-decimals. Across the 100 cases, the lower-loss result split 52/48 between them,
-which is not a defensible quality ranking.
-The provider returned `0.0` for every selected-token logprob in this capture.
+Two reference points frame those numbers. The official API's own pass-to-pass
+step-level agreement on the same 100 prompts is 89.67 percent, so the package
+sits about 2.3 points under the provider's run-to-run noise. The bf16 teacher's
+perplexity on the same 32 WikiText windows is 4.8886.
 
 Ornith has a separate nine-item served gate spanning reasoning,
 agentic coding, and long-context recall.
@@ -294,20 +352,32 @@ Further guarantees and limitations are documented in
 
 ## Performance focus
 
-The comparison matrix was measured on an M3 Max with 40 GPU cores and 128 GB
-unified memory. Every cell is the median of three fresh-process runs with an
-8-token prewarm and 256 measured output tokens. Engines were left-rotated
-between rounds; AC power, normal thermal state, greedy decoding, temperature
-0, vision off, and MTP/DFlash/speculation off were enforced. Runs used the
-memory-only cache path: the disk KV tier, now on by default when serving,
-was disabled (`MOESPRESSO_DISK_KV=off`). Values are
-**decode throughput / TTFT-derived prompt throughput**, in tokens per second.
+The DeepSeek-V4-Flash rows were measured on the published artifact, on a
+128 GB unified-memory configuration: ten alternating fresh-process arms at a
+3,844-token prompt, greedy decoding, the disk KV tier off
+(`MOESPRESSO_DISK_KV=off`), thermal gating before and after every arm, an
+8-token warmup request ahead of each measured request, and every arm exact
+against the package's 38-token reference rail. The target used the pooled
+runtime at capacity 256 with all 129 projection pools identity-mapped and no
+request-time expert I/O.
 
-| DeepSeek context | MoEspresso | DwarfStar | llama.cpp | oMLX |
-|---:|---:|---:|---:|---:|
-| 3,844 | 24.73 / 263.55 | 24.63 / 281.30 | 6.03 / 180.79 | 22.67 / 226.51 |
-| 7,698 | 23.82 / 223.85 | 21.08 / 256.08 | 5.87 / 170.30 | 22.66 / 219.33 |
-| 15,406 | 23.17 / 215.78 | 20.70 / 258.66 | 5.67 / 148.93 | 21.56 / 183.73 |
+| DeepSeek-V4-Flash, 2.37 bpw package | Drafter off | Drafter on |
+|---|---|---|
+| Decode | 26.473-27.562 tok/s, median 26.591 | 32.479-32.724 tok/s, median 32.627 |
+| Request peak | 86.75 GiB (93.15 GB) | 92.63 GiB (99.46 GB) |
+| Load | 23.0-23.2 s | 29.6-30.2 s |
+
+Every drafter-on arm read above every drafter-off arm, and the smallest gap
+between the two sets is 4.92 tok/s. The median gain is 22.70 percent.
+
+The Ornith comparison matrix was measured on an M3 Max with 40 GPU cores and
+128 GB unified memory. Every cell is the median of three fresh-process runs
+with an 8-token prewarm and 256 measured output tokens. Engines were
+left-rotated between rounds; AC power, normal thermal state, greedy decoding,
+temperature 0, vision off, and speculation off were enforced. Runs used the
+memory-only cache path: the disk KV tier, on by default when serving, was
+disabled (`MOESPRESSO_DISK_KV=off`). Values are
+**decode throughput / TTFT-derived prompt throughput**, in tokens per second.
 
 | Ornith context | MoEspresso Q8 KV | mlx-lm Q8 KV | llama.cpp Q8 KV |
 |---:|---:|---:|---:|
@@ -317,14 +387,13 @@ was disabled (`MOESPRESSO_DISK_KV=off`). Values are
 
 MoEspresso and mlx-lm use affine Q8 with group size 64. llama.cpp uses `q8_0` K
 and V with group size 32. MoEspresso and llama.cpp use Q4_K_M weights from the
-same GGUF lineage. mlx-lm uses Jundot oQ4e weights.
+same GGUF lineage. mlx-lm uses Jundot oQ4e weights. The MoEspresso column was
+produced by engine `1.0.0`; the compared engines are mlx-lm `0.31.3` and
+llama.cpp at commit `6eddde0`.
 
 A separate matched mlx-lm diagnostic at 8,191 tokens measured 69.96 tok/s with
 raw BF16 KV and 63.33 tok/s with affine Q8 KV. Raw BF16 uses substantially more
 attention-cache storage, so Q8 remains the product comparison.
-
-Engine versions are MoEspresso `1.0.0`, mlx-lm `0.31.3`, oMLX `0.5.1`,
-DwarfStar at commit `80ebbc3`, and llama.cpp at commit `6eddde0`.
 
 Read
 [DeepSeek speed](docs/deepseek_v4_speed.md),
@@ -345,38 +414,79 @@ thermal, timing, repeat, and evidence protocol in
 - [Resident runtime](docs/runtime_resident.md),
   [SSD streaming](docs/ssd_streaming.md), and
   [package format](docs/package_format.md): the core implementation contracts.
+- [Speculative decoding](docs/speculative_decoding.md): drafter families and
+  sidecars, the draft/verify loop, the scheduler, cache reuse, and memory.
 
 ## Acknowledgements
 
 MoEspresso would not exist without the ideas, code, measurements, and examples
-of a large community. This list cannot be exhaustive, but these influences were
-fundamental:
+of a large community. This list cannot be exhaustive, but these debts are
+concrete:
 
+- <a id="mlx-iqk-acknowledgement"></a>[Iwan Kawrakow](https://github.com/ikawrakow)
+  wrote the quantization formats MoEspresso serves. The
+  DeepSeek-V4-Flash package stores its routed experts in his IQ_K formats, and
+  the bytes are produced by his quantization algorithms, published in
+  [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and vendored at a
+  pinned commit with their upstream notices in
+  [mlx-iqk](https://github.com/steadfastgaze/mlx-iqk), which the release
+  installs from PyPI at `0.1.2` and which carries the Metal decode kernels and
+  the k-contiguous relayout the routed path reads. The Ornith package and the
+  earlier DeepSeek packages ship the k-quants, which he designed and
+  implemented in llama.cpp. MoEspresso's
+  Metal serving of the IQ_K formats is this project's own implementation, and
+  its correctness target is his: the served bytes reconstruct bit for bit what
+  his CPU dequantizers produce.
+- [Georgi Gerganov](https://github.com/ggerganov)'s
+  [ggml](https://github.com/ggml-org/ggml) and
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) built the ground this work
+  stands on: the GGUF container MoEspresso's recipe importers read, the
+  block-quantization ecosystem the served formats belong to, and a reference
+  engine that anchors the published speed and perplexity comparisons.
+- <a id="mlx-kquant-acknowledgement"></a>[Asher Feldman](https://github.com/asher)'s
+  [mlx-kquant](https://github.com/asher/mlx-kquant) made K-quant wire formats
+  practical inside MLX. Finding that work was a turning point: after the model
+  graph had been checked seam by seam but low-bit native weights still failed
+  behavior gates, this extension raised the quantization quality on MLX. The
+  release installs `0.3.0` from the fork at
+  [steadfastgaze/mlx-kquant](https://github.com/steadfastgaze/mlx-kquant),
+  revision `6fbfd4f5`, which carries the kernel work this project's serving
+  paths depend on; the revision behind the published Ornith rows is recorded in
+  [benchmark reproduction](docs/benchmark_reproduction.md).
+- [Bartowski](https://github.com/bartowski1182)'s `calibration_datav5` corpus
+  (pinned gist `82ae9b520227f57d79ba04add13d0d0d`, raw commit `14543ac`) is the
+  training spine of the DeepSeek-V4-Flash calibration set; his gist in turn
+  credits Dampf, Kalomaze, and edaddario's datasets. His published GGUF
+  quantizations also serve as external baselines in the benchmark
+  documentation.
+- [turboderp](https://github.com/turboderp-org)'s
+  [exllamav3](https://github.com/turboderp-org/exllamav3) (pinned at commit
+  `0b9745c`) contributes the `technical.utf8` calibration file and the held-out
+  `c4.utf8` and `code.utf8` probes.
+- [DeepSeek](https://huggingface.co/deepseek-ai) trained and released
+  DeepSeek-V4-Flash and its DSpark drafter checkpoint under the MIT license.
+  The package repackages those weights, and the prompt renderer adapts the
+  upstream encoding module, as recorded in `THIRD-PARTY-NOTICES`.
+- [froggeric](https://huggingface.co/froggeric)'s Qwen-Fixed-Chat-Templates
+  (Apache-2.0, pinned at v19) provides the vendored Ornith chat template;
+  MoEspresso's modifications are described in `THIRD-PARTY-NOTICES`.
+- [Jinho Jang](https://github.com/jjang-ai)'s
+  [JANG](https://github.com/jjang-ai/jangq) (Apache-2.0) was a rich source of
+  ideas, especially in its willingness to explore new quantization schemes.
+  MoEspresso supports a distinct manifest-driven TurboQuant path built with
+  JANG's codec components, and JANG remains part of the live
+  DeepSeek-V4-Flash path through its MLX model graph and cache primitives.
+  Several MoEspresso kernels adapt JANG kernel sources, as recorded in
+  `THIRD-PARTY-NOTICES`.
 - [antirez](https://github.com/antirez)'s
   [DwarfStar](https://github.com/antirez/ds4) was more than a reference engine.
   MoEspresso began independently, but adding DeepSeek-V4-Flash against a
   serious, narrow, quality-and-speed-focused baseline gave the project a
   product signal and a standard worth refining toward.
-- <a id="mlx-kquant-acknowledgement"></a>[Asher Feldman](https://github.com/asher)'s
-  [mlx-kquant](https://github.com/asher/mlx-kquant) made K-quant wire formats
-  practical inside MLX. Finding that work was a turning point: after the model
-  graph had been checked seam by seam but low-bit native weights still failed
-  behavior gates, this extension raised the quantization quality on MLX.
-- Two projects from the broader MLX inference community shaped MoEspresso in
-  different ways. [Jinho Jang](https://github.com/jjang-ai)'s
-  [JANG](https://github.com/jjang-ai/jangq) was a rich source of ideas,
-  especially in its willingness to explore new quantization schemes.
-  MoEspresso still supports a distinct manifest-driven TurboQuant path built
-  with JANG's codec components, although neither current public package uses
-  it. JANG also remains part of the live DeepSeek-V4-Flash path through its MLX
-  model graph and cache primitives. [Jundot](https://github.com/jundot)'s
+- [Jundot](https://github.com/jundot)'s
   [oMLX](https://github.com/jundot/omlx) brings continuous batching, tiered KV
   caching, and oQ mixed-precision work. It provided an important performance
-  reference for Ornith and may influence this project further.
-- [Iwan Kawrakow](https://github.com/ikawrakow) and
-  [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) pushed IQ
-  quantization and specialized inference far enough to show how much codec and
-  kernel design can matter beyond a nominal bit count.
+  reference and may influence this project further.
 - Apple and the [MLX](https://github.com/ml-explore/mlx) and
   [mlx-lm](https://github.com/ml-explore/mlx-lm) communities provided the array
   framework, unified-memory model, graph runtime, model components, and
@@ -384,4 +494,10 @@ fundamental:
 
 ## License
 
-Dual-licensed under Apache 2.0 (`LICENSE-APACHE-2.0`) or MIT (`LICENSE-MIT`).
+Dual-licensed under Apache 2.0 (`LICENSE-APACHE-2.0`) or MIT (`LICENSE-MIT`),
+at your option.
+
+`THIRD-PARTY-NOTICES` is the per-file attribution record for third-party code
+that ships inside this repository, with the upstream revision each derivation
+was taken from. It travels with the source, the wheel, and the source
+distribution, and a redistribution must keep all three files together.

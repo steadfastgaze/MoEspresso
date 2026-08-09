@@ -2,16 +2,20 @@
 
 The README tables compare complete engine, artifact, and cache stacks. This
 document defines the controls and evidence required for an independent
-repetition. MoEspresso does not ship a cross-project benchmark framework,
-copies of third-party runners, exact prompt-token fixtures, or benchmark-only
-measurement adapters.
+repetition. The cross-engine sections that follow, from artifact pinning
+through engine seams, cover Ornith. The DeepSeek-V4-Flash release package is
+served and scored by MoEspresso alone, under the separate serving protocol and
+quality protocol further down. MoEspresso does not ship a cross-project
+benchmark framework, copies of third-party runners, exact prompt-token
+fixtures, or benchmark-only measurement adapters.
 
 Keep raw results and any temporary adapters in a separate work directory. Large
 downloads happen before the measurement session and run one at a time.
 
 ## Versions and artifacts
 
-The published matrix used these engine versions:
+The Ornith cross-engine matrix in this document was measured with these engine
+versions:
 
 | Engine | Version |
 |---|---|
@@ -19,37 +23,34 @@ The published matrix used these engine versions:
 | mlx-kquant | `0.3.0` at `e165cafafa149493d298871c610e29e95ffa8f10` |
 | mlx-lm | `0.31.3` with MLX `0.31.2`, source `15b522f593b7ca5fbc0cac6f7572d40859d2d8fe` |
 | oMLX | `0.5.1` |
-| DwarfStar | `80ebbc396aee40eedc1d829222f3362d10fa4c6c` |
 | llama.cpp | `6eddde06a4f25d55d538b5d15628dcc2b6882147` |
 
 The mlx-kquant revision is the public commit whose source tree matches the
 benchmark build.
 
-The model inputs were pinned to immutable Hugging Face revisions:
+The current release pins `mlx-kquant` 0.3.0 in `pyproject.toml` and `uv.lock`,
+from `https://github.com/steadfastgaze/mlx-kquant.git` at
+`6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089`. That extension serves the K-quant
+tensors of the Ornith package. The row above is a different commit of the same
+0.3.0 line, recorded because it is the tree the measured build used.
 
-| Family and engine | Artifact |
+The model inputs of the matrix were pinned to immutable Hugging Face revisions:
+
+| Engine | Artifact |
 |---|---|
-| DeepSeek, MoEspresso | `steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso@777b4488782afcb52327197aee13df9dddd31249` |
-| DeepSeek, DwarfStar and llama.cpp | `antirez/deepseek-v4-gguf@9170bf42beb77f38006e016503ecace31f2bd9a0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf` |
-| DeepSeek, oMLX | `Jundot/DeepSeek-V4-Flash-oQ2.5e-mtp@11eb2531c878e6c58405b7ddedb6909d64203ee2` |
-| Ornith, MoEspresso | `steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso@c67d34262a258f815789a2018341317c755c45a6` |
-| Ornith, llama.cpp | `bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF@f9403b4da6306eb72fde0af1fe2df07cab1f88ce/deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf` |
-| Ornith NLL baseline, llama.cpp | `bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF@f9403b4da6306eb72fde0af1fe2df07cab1f88ce/deepreinforce-ai_Ornith-1.0-35B-Q8_0.gguf` |
-| Ornith, mlx-lm and oMLX | `Jundot/Ornith-1.0-35B-oQ4e@1e505ab782d47aeb87a43eebe357d65d8efe9cb7` |
+| MoEspresso | `steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso@c67d34262a258f815789a2018341317c755c45a6` |
+| llama.cpp | `bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF@f9403b4da6306eb72fde0af1fe2df07cab1f88ce/deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf` |
+| llama.cpp, NLL baseline | `bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF@f9403b4da6306eb72fde0af1fe2df07cab1f88ce/deepreinforce-ai_Ornith-1.0-35B-Q8_0.gguf` |
+| mlx-lm and oMLX | `Jundot/Ornith-1.0-35B-oQ4e@1e505ab782d47aeb87a43eebe357d65d8efe9cb7` |
 
-Download each artifact into a stable local location. For the two MoEspresso
-packages, verification is part of acquisition:
+Download each artifact into a stable local location. For the MoEspresso
+package, verification is part of acquisition:
 
 ```bash
-hf download steadfastgaze/DeepSeek-V4-Flash-IQ2_XXS-MoEspresso \
-  --revision 777b4488782afcb52327197aee13df9dddd31249 \
-  --local-dir <deepseek-package>
-
 hf download steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso \
   --revision c67d34262a258f815789a2018341317c755c45a6 \
   --local-dir <ornith-package>
 
-uv run --locked moespresso-verify <deepseek-package>
 uv run --locked moespresso-verify <ornith-package>
 ```
 
@@ -62,10 +63,15 @@ host, so finish it before thermal conditioning.
 The published speed rows were measured on an M3 Max with 40 GPU cores and
 128 GB unified memory. Each table cell follows the same sequence:
 
-The published rows were measured with the disk KV tier off, before it became
-the serving default; disable it for a like-for-like run
-(`MOESPRESSO_DISK_KV=off moespresso-serve <package>`), or first-request
-checkpoint writes and later restores skew TTFT in both directions.
+Every speed or latency measurement runs with the disk KV tier off
+(`MOESPRESSO_DISK_KV=off`), unless the disk KV tier is itself the subject of
+the measurement. The tier writes checkpoints on the first request over a
+prompt and skips or restores on later ones, so it makes request timing depend
+on store state that persists across requests and across processes:
+first-request writes inflate TTFT, warm-store runs omit that cost, and any
+estimator that compares two requests absorbs the difference into its result.
+The published rows were measured with the tier off, before it became the
+serving default.
 
 1. Start a fresh engine process and load one model.
 2. Run an unmeasured eight-token generation on the selected prompt to compile
@@ -78,25 +84,19 @@ checkpoint writes and later restores skew TTFT in both directions.
 6. Exit the model process.
 
 Run three valid repeats for every cell. Interleave engines by round and rotate
-the starting engine one position to the left in each round. For example, a
-DeepSeek order of MoEspresso, DwarfStar, llama.cpp, oMLX starts the second round
-with DwarfStar and the third with llama.cpp. The Ornith order is MoEspresso,
-mlx-lm, llama.cpp, followed by the same left rotation. Report the median; retain
-all three raw values.
+the starting engine one position to the left in each round. The order is
+MoEspresso, mlx-lm, llama.cpp, so the second round starts with mlx-lm and the
+third with llama.cpp. Report the median; retain all three raw values.
 
-The measured context points are:
+The measured context points are 3,969 prompt tokens for the short cell, 8,191
+for the medium cell, and 37,000 for the long cell.
 
-| Family | Short | Medium | Long |
-|---|---:|---:|---:|
-| DeepSeek-V4-Flash | 3,844 | 7,698 | 15,406 |
-| Ornith | 3,969 | 8,191 | 37,000 |
-
-Prepare one complete rendered prompt per family and context point with the
-MoEspresso package tokenizer. Record its numeric token IDs and SHA-256 in the
-external evidence directory, then feed the same IDs to every engine that
-supports numeric prompt input. If an engine requires text, verify that its
-tokenizer reproduces the exact ID sequence before accepting its row. Tokenizing
-or rendering during the timed interval invalidates the measurement.
+Prepare one complete rendered prompt per context point with the MoEspresso
+package tokenizer. Record its numeric token IDs and SHA-256 in the external
+evidence directory, then feed the same IDs to every engine that supports
+numeric prompt input. If an engine requires text, verify that its tokenizer
+reproduces the exact ID sequence before accepting its row. Tokenizing or
+rendering during the timed interval invalidates the measurement.
 
 ### Matched controls
 
@@ -104,8 +104,7 @@ All arms used:
 
 - greedy selection with temperature 0;
 - exactly 256 generated tokens after the eight-token prewarm;
-- the same family-specific EOG exclusions at the logits for the fixed-length
-  timing boundary;
+- the same EOG exclusions at the logits for the fixed-length timing boundary;
 - thinking disabled;
 - vision disabled and a text-only model graph;
 - MTP, DFlash, draft models, speculative prefill, and speculative decoding
@@ -115,16 +114,14 @@ All arms used:
 - AC power, Low Power Mode disabled, nominal macOS thermal state, and no
   competing model process or sustained GPU workload.
 
-The oMLX DeepSeek repository contains MTP weights, but the run did not load or
-execute them. The Ornith mlx-lm run used its stock text graph through an
-in-process numeric-token adapter. llama.cpp used `--no-mmproj`. DwarfStar used
-its ordinary non-MTP graph.
+The mlx-lm run used its stock text graph through an in-process numeric-token
+adapter. llama.cpp used `--no-mmproj`.
 
-KV formats were part of each product stack. Ornith used affine Q8 KV with group
-size 64 for MoEspresso and mlx-lm. llama.cpp used `q8_0` K and V with group size
-32. These policies quantized the ten full-attention caches; the thirty recurrent
-state caches retained their normal representation. DeepSeek used each engine's
-native latent-cache representation. Record these choices with every result.
+KV formats were part of each product stack. MoEspresso and mlx-lm used affine
+Q8 KV with group size 64. llama.cpp used `q8_0` K and V with group size 32.
+These policies quantized the ten full-attention caches; the thirty recurrent
+state caches retained their normal representation. Record these choices with
+every result.
 
 ### Timing and aggregation
 
@@ -192,24 +189,55 @@ server response:
   disabled, `--no-mmproj`, `--cache-type-k q8_0`, `--cache-type-v q8_0`, and no
   speculative options. The startup log had to confirm both effective cache
   types before timing began.
-- DwarfStar used its public evaluation/session API on the pinned DeepSeek GGUF.
-- oMLX used version 0.5.1 and its `BatchedEngine` text path for DeepSeek, with
-  paged SSD cache, TurboQuant KV, prefix cache, vision, and speculative features
-  disabled.
 
 Keep measurement adapters with the raw benchmark record instead of adding them
 to the MoEspresso source or test tree. They apply the recorded controls and
 serialize evidence. They must not introduce engine-specific model or sampler
 changes.
 
+## Serving protocol for the DeepSeek-V4-Flash release package
+
+No cross-engine matrix has been measured on the release package
+`DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2`: no other engine loads a
+MoEspresso package, and the public third-party DeepSeek artifacts are built from
+a different checkpoint. Its published serving numbers are MoEspresso-only
+certifications, and they follow a different protocol from the cross-engine
+matrix above:
+
+- ten fresh-process arms at one 3,844-token prompt, five per side and
+  alternating, drafter off first;
+- greedy selection at temperature 0, thinking disabled;
+- `MOESPRESSO_DISK_KV=off` on every arm;
+- `MOESPRESSO_DS4_DRAFTER` pinned per arm rather than left to automatic
+  selection, and the resolved state recorded with the arm. Automatic selection
+  reads the host's wired budget, so two unpinned arms can differ by more than
+  the thing under test;
+- a bounded eight-token warmup request ahead of each measured request, with the
+  measured request timed on its own single-call boundaries;
+- a thermal and headroom check before every arm;
+- every arm's generated text checked digest-exact against the package's own
+  reference rail, so a timing number that came from a different token stream
+  cannot be accepted.
+
+The readings are in [`deepseek_v4_speed.md`](deepseek_v4_speed.md), and the
+quality ladder for the same artifact is in
+[`deepseek_v4_quality.md`](deepseek_v4_quality.md).
+
 ## Quality protocol
 
 ### DeepSeek-V4-Flash
 
-The comparison uses a private capture of 100 official API continuations,
-containing 2,290 target tokens. The provider returned unusable selected-token
-log probabilities, so the API continuations serve as a textual oracle. No API
-perplexity is claimed.
+The earlier DeepSeek cross-engine comparison uses a private capture of 100
+official API continuations, containing 2,290 target tokens. The provider
+returned unusable selected-token log probabilities, so the API continuations
+serve as a textual oracle. No API perplexity is claimed.
+
+The release package is scored against a later capture of the same 100 prompts
+from the checkpoint it was built from, containing 2,313 target tokens, and
+against a second capture pass that supplies the provider's own step-level
+self-noise. Those two references hold different continuations, so their scores
+are not a before and after. The release ladder and its readings are in
+[`deepseek_v4_quality.md`](deepseek_v4_quality.md).
 
 Holders of the private capture can run MoEspresso Q0, Q2, and Q3 with explicit
 paths and retain each JSON report:
@@ -226,18 +254,22 @@ uv run --locked moespresso-ds4-quality \
   q3 --package <deepseek-package> --json-out <q3.json>
 ```
 
-Score the same rendered prompts and exact continuation texts with the pinned
-DwarfStar GGUF and the pinned oMLX artifact. For every target position, compute
-full-vocabulary log-softmax and retain the negative log probability of the
-reference token. Aggregate all 2,290 values with `math.fsum`, divide by 2,290
-for mean NLL, and exponentiate that mean for perplexity. Q3 uses the same
-deterministic story, thinking-off render, greedy selection, and 256-token cap in
-all three engines.
+The scoring method, for any engine scoring these fixtures: for every target
+position, compute full-vocabulary log-softmax and retain the negative log
+probability of the reference token. Aggregate all 2,290 values with `math.fsum`,
+divide by 2,290 for mean NLL, and exponentiate that mean for perplexity. Q3 uses
+the same deterministic story, thinking-off render, greedy selection, and
+256-token cap in every engine it runs in.
 
-DwarfStar also runs its upstream public official-vector gate: four vectors and
-13 next-token decisions. Its upstream suite excludes `long_memory_archive`
-because the captured API vector and official graph disagree. This is why the
-README labels that cell as a native token gate rather than MoEspresso Q0.
+The private capture is validated by scoring the same rendered prompts and exact
+continuation texts through independent reference implementations alongside
+MoEspresso, so a result cannot rest on one scorer. Those readings are not
+published.
+
+The upstream public official-vector gate is four vectors and 13 next-token
+decisions, and its suite excludes `long_memory_archive` because the captured API
+vector and official graph disagree. This is why the README labels that cell as a
+native token gate rather than MoEspresso Q0.
 
 The private capture, local target IDs, per-token losses, continuations, and
 per-case records stay outside the repository. Public evidence may contain the

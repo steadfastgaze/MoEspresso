@@ -334,9 +334,22 @@ wheels = [
 ]
 
 [[package]]
+name = "mlx-iqk"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mlx" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/77/7e/eae00a5b059c4de5985507acab5ed720914871ef2674c3e04579fa9ab73f/mlx_iqk-0.1.2.tar.gz", hash = "sha256:97d2a5c59fecbcc60b88a28f00b65e8907fd416b277806be7062e7a8bdf8fa62", size = 145081, upload-time = "2026-08-08T21:46:20.286Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/7b/9c8fe25e49571cc9ce58a820a547a91ad7f275ee5c8d9ddc424227de775a/mlx_iqk-0.1.2-py3-none-any.whl", hash = "sha256:97f130dcaabf0e2c913ff6b2186799996739cbfb402d29c2eaa67c64914066b3", size = 78947, upload-time = "2026-08-08T21:46:18.949Z" },
+]
+
+[[package]]
 name = "mlx-kquant"
 version = "0.3.0"
-source = { git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=e165cafafa149493d298871c610e29e95ffa8f10#e165cafafa149493d298871c610e29e95ffa8f10" }
+source = { git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089#6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089" }
 dependencies = [
     { name = "mlx" },
 ]
@@ -371,11 +384,12 @@ wheels = [
 
 [[package]]
 name = "moespresso"
-version = "1.1.0"
+version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "jang" },
     { name = "mlx" },
+    { name = "mlx-iqk" },
     { name = "mlx-kquant" },
     { name = "mlx-lm" },
     { name = "numpy" },
@@ -391,6 +405,7 @@ build = [
 dev = [
     { name = "pytest" },
     { name = "ruff" },
+    { name = "vulture" },
 ]
 native = [
     { name = "nanobind" },
@@ -400,7 +415,8 @@ native = [
 requires-dist = [
     { name = "jang", specifier = ">=2.5.29" },
     { name = "mlx", specifier = ">=0.31.2" },
-    { name = "mlx-kquant", git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=e165cafafa149493d298871c610e29e95ffa8f10" },
+    { name = "mlx-iqk", specifier = "==0.1.2" },
+    { name = "mlx-kquant", git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089" },
     { name = "mlx-lm", specifier = "==0.31.3" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "psutil", specifier = ">=7.0.0" },
@@ -412,6 +428,7 @@ provides-extras = ["build"]
 dev = [
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "ruff", specifier = ">=0.1.0" },
+    { name = "vulture", specifier = ">=2.11" },
 ]
 native = [{ name = "nanobind", specifier = "==2.12.0" }]
 
@@ -1013,4 +1030,13 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "vulture"
+version = "2.16"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/3e/4d08c5903b2c0c70cad583c170cc4a663fc6a61e2ad00b711fcda61358cd/vulture-2.16.tar.gz", hash = "sha256:f8d9f6e2af03011664a3c6c240c9765b3f392917d3135fddca6d6a68d359f717", size = 52680, upload-time = "2026-03-25T14:41:27.141Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/be/f935130312330614811dae2ea9df3f395f6d63889eb6c2e68c14507152ee/vulture-2.16-py3-none-any.whl", hash = "sha256:6e0f1c312cef1c87856957e5c2ca9608834a7c794c2180477f30bf0e4cc58eee", size = 26993, upload-time = "2026-03-25T14:41:26.21Z" },
 ]

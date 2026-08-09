@@ -27,7 +27,9 @@ IDs.
 The measured stacks were MoEspresso 1.0.0 with its Q4_K_M package, mlx-lm 0.31.3
 with MLX 0.31.2 and Jundot oQ4e, and llama.cpp at `6eddde0` with the Q4_K_M
 GGUF. The table compares complete products, so weight artifacts and Q8 cache
-codecs are recorded for each arm.
+codecs are recorded for each arm. The MoEspresso version belongs to the cells:
+these rows are the record of that engine build and have not been re-measured on
+a later one.
 
 The 32 GB-class result is a capacity-capped run on that 128 GB host. It proves
 fit and bounded-residency behavior, while SSD stall time remains a lower bound

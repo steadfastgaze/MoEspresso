@@ -85,16 +85,34 @@ apply only to the named helpers.
 
 ## DeepSeek-V4-Flash
 
-Source: [deepseek-ai/DeepSeek-V4-Flash at
-`a7aaed80dd2df27620eb534454253ea25eb11c7a`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/a7aaed80dd2df27620eb534454253ea25eb11c7a).
+Sources:
+
+- [deepseek-ai/DeepSeek-V4-Flash at
+  `a7aaed80dd2df27620eb534454253ea25eb11c7a`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/a7aaed80dd2df27620eb534454253ea25eb11c7a)
+- [deepseek-ai/DeepSeek-V4-Flash-DSpark at
+  `62af8fffb2f7030cac4de2f0169f5b8d1101b646`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/tree/62af8fffb2f7030cac4de2f0169f5b8d1101b646)
+  (the DSpark drafter reference implementation)
 
 License: MIT. The complete terms are in `LICENSE-MIT`. The upstream copyright
 notice is:
 
 > Copyright (c) 2023 DeepSeek
 
-`src/moespresso/runtime/deepseek_v4/renderer.py` adapts the prompt construction
-implemented by `encoding/encoding_dsv4.py`.
+Mapped material:
+
+- `src/moespresso/runtime/deepseek_v4/renderer.py` adapts the prompt
+  construction implemented by `encoding/encoding_dsv4.py`.
+- `src/moespresso/runtime/deepseek_v4/mtp_model.py` adapts the
+  multi-token-prediction block implemented by `inference/model.py`
+  (class `MTPBlock`).
+- `src/moespresso/runtime/deepseek_v4/dspark_model.py` adapts the
+  semi-autoregressive drafter implemented by the DSpark checkpoint's
+  `inference/model.py` (classes `DSparkAttention`, `DSparkBlock`,
+  `DSparkMarkovHead`, `DSparkConfidenceHead`, and
+  `Transformer.forward_spec`).
+
+The two draft models are MLX implementations written against those reference
+modules, and their comments quote short reference expressions.
 
 ## Apple MLX and MLX LM
 

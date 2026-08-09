@@ -4,7 +4,7 @@ The DS4 build imatrix is the legacy .dat format, which stores per-tensor
 activation sums with a single call counter and carries no per-expert routing
 counts, so the standard imatrix-counts hotlist cannot be built from it. The
 ranking vendored here was extracted once from a GGUF-format community imatrix
-whose expert counts align exactly with the byte-faithful package layout
+whose expert counts align exactly with the DeepSeek-V4 routed layout
 (43 routed layers, 256 experts per layer); provenance (source name and
 sha256) is recorded in the payload itself. That imatrix contributes nothing
 else: quantization decisions, calibration vectors, and fit checks all keep

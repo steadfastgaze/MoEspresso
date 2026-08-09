@@ -299,6 +299,77 @@ def test_tokenizer_and_agentic_profile_identities_are_hashed(tmp_path):
     )
 
 
+def _drafter_manifest(tmp_path, *, optional=True):
+    """A manifest declaring a two-file drafter component with real files."""
+    man, _ = _manifest(tmp_path)
+    sidecar_json = tmp_path / "dspark_sidecar.json"
+    sidecar_json.write_text('{"artifact_id":"art:x"}')
+    shard = tmp_path / "model-dspark-00001-of-00001.safetensors"
+    shard.write_bytes(b"\x01" * 32)
+    component = {
+        "family": "dspark",
+        "manifest_path": "dspark_sidecar.json",
+        "files": [file_identity(sidecar_json), file_identity(shard)],
+    }
+    if optional:
+        component["optional"] = True
+    return _restamp({**man, "drafter": component}), sidecar_json, shard
+
+
+def test_present_drafter_component_identities_are_hashed(tmp_path):
+    man, sidecar_json, shard = _drafter_manifest(tmp_path)
+    assert verify_package(man, tmp_path) == []
+
+    shard.write_bytes(b"\x02" * 32)  # same byte length
+    issues = verify_package(man, tmp_path)
+    assert any(
+        issue.code == "runtime.sha256_mismatch"
+        and issue.path == "/model-dspark-00001-of-00001.safetensors"
+        for issue in issues
+    )
+
+
+def test_absent_optional_drafter_component_verifies_clean(tmp_path):
+    man, sidecar_json, shard = _drafter_manifest(tmp_path)
+    sidecar_json.unlink()
+    shard.unlink()
+    issues = verify_package(man, tmp_path)
+    assert not any(issue.blocking for issue in issues)
+    assert [issue.code for issue in issues] == [
+        "runtime.drafter_component_absent"]
+    assert issues[0].severity == "info"
+
+
+def test_absent_non_optional_drafter_component_blocks(tmp_path):
+    man, sidecar_json, shard = _drafter_manifest(tmp_path, optional=False)
+    sidecar_json.unlink()
+    shard.unlink()
+    issues = verify_package(man, tmp_path)
+    assert any(
+        issue.code == "runtime.missing_drafter_component" and issue.blocking
+        for issue in issues
+    )
+
+
+def test_partial_drafter_component_blocks_as_corruption(tmp_path):
+    man, _sidecar_json, shard = _drafter_manifest(tmp_path)
+    shard.unlink()
+    issues = verify_package(man, tmp_path)
+    partial = [i for i in issues if i.code == "runtime.partial_drafter_component"]
+    assert partial and partial[0].blocking
+    assert "model-dspark-00001-of-00001.safetensors" in partial[0].message
+
+
+def test_drafter_component_without_files_blocks(tmp_path):
+    man, _ = _manifest(tmp_path)
+    man = _restamp({**man, "drafter": {"family": "dspark", "files": []}})
+    issues = verify_package(man, tmp_path)
+    assert any(
+        issue.code == "runtime.invalid_drafter_component" and issue.blocking
+        for issue in issues
+    )
+
+
 def test_unsafe_declared_identity_path_is_rejected(tmp_path):
     man, _ = _manifest(tmp_path)
     unsafe = {

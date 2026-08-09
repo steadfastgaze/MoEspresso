@@ -86,6 +86,7 @@ def _match_texts(alloc: dict) -> list[str]:
             "format",
             "codec",
             "kquant_codec",
+            "iqk_codec",
             "gguf_tensor",
             "module_path",
             "module_weight_key",
@@ -136,6 +137,11 @@ def _apply_target(alloc: dict, override: ForceOverride, target_fields: dict) -> 
         alloc["kquant_codec"] = target_fields["kquant_codec"]
     else:
         alloc.pop("kquant_codec", None)
+    # No override target produces IQ_K bytes: the member is chosen by the
+    # conversion that encoded them. Forcing a row off IQ_K therefore drops the
+    # member and layout fields with it rather than leaving a stale pair behind.
+    alloc.pop("iqk_codec", None)
+    alloc.pop("layout", None)
     alloc["forced_format"] = {
         "pattern": override.pattern,
         "target": override.target,
@@ -205,7 +211,7 @@ def force_override_preview_lines(plan: dict, *, limit: int = 20) -> list[str]:
     return lines
 
 
-PRODUCER = {"tool": "moespresso.package.plan", "version": "1.1.0"}
+PRODUCER = {"tool": "moespresso.package.plan", "version": "2.0.0"}
 
 
 def make_package_plan(

@@ -21,7 +21,9 @@ import numpy as np
 from moespresso.runtime.expert_index import ExpertIndex
 from moespresso.runtime.expert_slot_pool import ExpertCapacityExceeded
 from moespresso.runtime.expert_slot_pool import ExpertSlotPool
-from moespresso.package.bundle import KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.runtime.expert_slot_pool import grow_expert_slot_pools
+from moespresso.runtime.expert_slot_pool import seed_hot_expert_slot_pools
+from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
 
 _PROJECTION_LOAD_EXECUTOR = ThreadPoolExecutor(
     max_workers=3,
@@ -215,10 +217,10 @@ _UNIFIED_SORTED_PREFILL = (
 # ring export kernel, the event gate, the worker submit, and the per-layer
 # kick, and consumes router indices on device (identity slot tables on the
 # prewarm-all fill order, else one on-device slot-table gather per pool).
-# The routed math is the same combined gate/up gather, activation, and down
-# gather the pipelined builder emits, so the route is bit-identical to the
-# ring path by construction; only the scheduling changes. The token graph
-# queues lazily and _DECODE_FLUSH_LAYERS controls the intermediate commits.
+# The routed math uses the same codec-native gate, up, activation, and down
+# operations as the pipelined builder, so only scheduling and the index source
+# change. K-quant uses _DECODE_FLUSH_LAYERS for intermediate commits; IQ_K uses
+# its shared decode and verify cadence.
 # Default ON; MOESPRESSO_SSD_BARRIER_FREE_DECODE=0 is the kill switch back
 # to the ring/native-gate decode, which also remains the product path for
 # any partial-residency session (the certificate fails closed).
@@ -721,6 +723,66 @@ class PooledMxfp4SwitchLinear(nn.Module):
         )
 
 
+class PooledIqkSwitchLinear(nn.Module):
+    """An IQ_K routed projection backed by an ``ExpertSlotPool``."""
+
+    def __init__(
+        self,
+        *,
+        package_dir,
+        index: ExpertIndex,
+        layer: int,
+        projection: str,
+        capacity: int,
+        eviction_policy: str = "lfu",
+        row_cache=None,
+        spare_slots: int = 0,
+    ):
+        super().__init__()
+        self.pool = ExpertSlotPool(
+            package_dir=package_dir,
+            index=index,
+            layer=layer,
+            projection=projection,
+            capacity=capacity,
+            eviction_policy=eviction_policy,
+            row_cache=row_cache,
+            spare_slots=spare_slots,
+        )
+        if self.pool.codec != IQK_CODEC or self.pool.iqk is None:
+            raise ValueError(
+                f"{projection} declares codec {self.pool.codec!r}, expected 'iqk'")
+        self.codec = IQK_CODEC
+        self.bits = self.pool.bits
+        self.member = self.pool.geometry.iqk_codec
+        self.num_experts = self.pool.num_experts
+        self.out_features = self.pool.geometry.out_features
+        self.in_features = int(self.pool.geometry.in_features or 0)
+        self.matmul_slot_calls = 0
+        self.matmul_slot_elements = 0
+
+    def __call__(self, x, indices, *, sorted_indices: bool = False):
+        remapped = self.pool.remap(indices)
+        return self.matmul_slots(x, remapped, sorted_indices=sorted_indices)
+
+    def matmul_slots(self, x, remapped_indices, *, sorted_indices: bool = False):
+        self.matmul_slot_calls += 1
+        self.matmul_slot_elements += int(remapped_indices.size)
+        if sorted_indices:
+            return self.pool.iqk(x, remapped_indices, sorted_indices=True)
+        return self.pool.iqk.gemv(x, remapped_indices)
+
+    def sorted_matmul_range(self, x, remapped_indices, start: int, rows: int):
+        self.matmul_slot_calls += 1
+        self.matmul_slot_elements += int(remapped_indices.size)
+        return self.pool.iqk.sorted_matmul_range(
+            x,
+            remapped_indices,
+            start,
+            rows,
+        )
+
+
 class PooledKQuantSwitchLinear(nn.Module):
     """A routed K-quant projection backed by an `ExpertSlotPool`."""
 
@@ -968,6 +1030,29 @@ class PooledSwitchGLU(nn.Module):
             and getattr(up_proj, "codec", None) == TQ_CODEC
             and getattr(down_proj, "codec", None) == TQ_CODEC
         )
+        self._all_iqk = (
+            getattr(gate_proj, "codec", None) == IQK_CODEC
+            and getattr(up_proj, "codec", None) == IQK_CODEC
+            and getattr(down_proj, "codec", None) == IQK_CODEC
+        )
+        # The cross-call prefetch has measured wins for K-quant prompt chunks,
+        # but an IQ_K miss also splits each stored row into kernel streams. On
+        # a terminal one-chunk prefill that work cannot be consumed and instead
+        # evicts the demand residency needed by decode. Keep the proven
+        # K-quant policy; IQ_K stays demand-driven until a multi-chunk served
+        # arm establishes a codec-specific win.
+        self._prefill_prefetch_enabled = _PREFILL_PREFETCH and not self._all_iqk
+        self.layer = int(gate_proj.pool.layer)
+        self.iqk_ordinal = 0
+        self.members = (
+            {
+                "gate_proj": gate_proj.member,
+                "up_proj": up_proj.member,
+                "down_proj": down_proj.member,
+            }
+            if self._all_iqk
+            else {}
+        )
         self._gate_up_tq = (
             getattr(gate_proj, "codec", None) == TQ_CODEC
             and getattr(up_proj, "codec", None) == TQ_CODEC
@@ -998,6 +1083,14 @@ class PooledSwitchGLU(nn.Module):
         self.barrier_free_fused_swiglu_calls = 0
         self.barrier_free_decode_calls = 0
         self.barrier_free_decode_flush_calls = 0
+        self.gemv_calls = 0
+        self.gemv_pairs = 0
+        self.sorted_prefill_calls = 0
+        self.sorted_prefill_pairs = 0
+        self.sorted_nsplit_calls = 0
+        self.sorted_nsplit_parts = 0
+        self.iqk_decode_flush_calls = 0
+        self.iqk_verify_flush_calls = 0
         self.decode_routed_fused_calls = 0
         self.pipelined_decode_fused_calls = 0
         # One-shot eligibility verdict for the barrier-free prefill route
@@ -1006,6 +1099,7 @@ class PooledSwitchGLU(nn.Module):
         # One-shot eligibility verdict for the barrier-free decode route
         # (None until the first decode-shaped call decides it).
         self._barrier_free_decode_ready_cached: bool | None = None
+        self._iqk_decode_identity_cached: bool | None = None
         # One-shot eligibility verdict for the fused decode routed matvec
         # family (None until the first engagement check decides it).
         self._decode_routed_fused_ready_cached: bool | None = None
@@ -1098,14 +1192,21 @@ class PooledSwitchGLU(nn.Module):
         self.decode_seen_experts: set[int] = set()
 
     def grow_capacity(self, capacity: int) -> None:
-        for pool in self._unique_projection_pools(lockstep=True):
-            pool.grow(capacity)
+        def reset_route_certificates() -> None:
+            self._barrier_free_ready_cached = None
+            self._barrier_free_decode_ready_cached = None
+            self._iqk_decode_identity_cached = None
+
+        grow_expert_slot_pools(
+            self._unique_projection_pools(lockstep=True),
+            capacity,
+            after_publish=reset_route_certificates,
+        )
 
     def seed_hot_free_slots(self) -> int:
-        seeded = 0
-        for pool in self._unique_projection_pools(lockstep=True):
-            seeded += len(pool.seed_hot())
-        return seeded
+        return seed_hot_expert_slot_pools(
+            self._unique_projection_pools(lockstep=True),
+        )
 
     def _unique_projection_pools(self, *, lockstep: bool = False):
         pools = (
@@ -1128,6 +1229,169 @@ class PooledSwitchGLU(nn.Module):
 
     def _projection_pools_lockstep(self):
         return self._unique_projection_pools(lockstep=True)
+
+    @staticmethod
+    def _iqk_sorted_threshold() -> int:
+        from moespresso.runtime.deepseek_v4.iqk_experts import (
+            sorted_prefill_min_pairs,
+        )
+
+        return sorted_prefill_min_pairs()
+
+    @staticmethod
+    def _iqk_sorted_parts() -> int:
+        from moespresso.runtime.deepseek_v4.iqk_experts import (
+            sorted_prefill_nsplit,
+        )
+
+        return sorted_prefill_nsplit()
+
+    def _record_iqk_route(self, pairs: int) -> bool:
+        """Record and return the incumbent IQ_K sorted-route decision."""
+        if pairs < self._iqk_sorted_threshold():
+            self.gemv_calls += 1
+            self.gemv_pairs += pairs
+            return False
+        self.sorted_prefill_calls += 1
+        self.sorted_prefill_pairs += pairs
+        parts = self._iqk_sorted_parts()
+        if parts > 1:
+            self.sorted_nsplit_calls += 1
+            self.sorted_nsplit_parts = parts
+        return True
+
+    def commit_iqk_output(self, output, *, rows: int) -> bool:
+        """Apply the incumbent IQ_K decode/verify commit cadence."""
+        if not self._all_iqk:
+            return False
+        from moespresso.runtime.deepseek_v4.iqk_experts import (
+            _VERIFY_FLUSH_MAX_ROWS,
+            iqk_decode_flush_layers,
+        )
+
+        cadence = iqk_decode_flush_layers()
+        if cadence < 1 or (self.iqk_ordinal + 1) % cadence:
+            return False
+        if rows == 1:
+            mx.async_eval(output)
+            self.iqk_decode_flush_calls += 1
+            return True
+        if rows <= _VERIFY_FLUSH_MAX_ROWS:
+            mx.async_eval(output)
+            self.iqk_verify_flush_calls += 1
+            return True
+        return False
+
+    def _iqk_sorted_projection(self, projection, x_rows, slot_ids):
+        """Project pairwise rows after sorting by the projection's slot ids."""
+        rows = int(slot_ids.size)
+        flat_slots = slot_ids.reshape(-1)
+        order = mx.argsort(flat_slots)
+        sorted_slots = flat_slots[order]
+        operand = x_rows.reshape(rows, projection.in_features)[order]
+        operand = operand.reshape(rows, 1, projection.in_features).astype(mx.float16)
+        parts = self._iqk_sorted_parts()
+        step = projection.out_features // parts
+        out = mx.concatenate(
+            [
+                projection.sorted_matmul_range(
+                    operand,
+                    sorted_slots,
+                    part * step,
+                    step,
+                )
+                for part in range(parts)
+            ],
+            axis=-1,
+        )
+        return out.reshape(rows, projection.out_features)[mx.argsort(order)]
+
+    def _iqk_sorted_triplet(self, x_rows, gate_slots, up_slots, down_slots):
+        gate = self._iqk_sorted_projection(self.gate_proj, x_rows, gate_slots)
+        up = self._iqk_sorted_projection(self.up_proj, x_rows, up_slots)
+        activated = self.activation(up, gate)
+        return self._iqk_sorted_projection(
+            self.down_proj,
+            activated,
+            down_slots,
+        )
+
+    def _call_iqk_full_resident(self, x, indices) -> mx.array:
+        """IQ_K compute with full-resident routing kept entirely on device."""
+        pairs = int(indices.size)
+        identity = all(
+            pool.slot_table_is_identity()
+            for pool in self._projection_pools_lockstep()
+        )
+        if identity:
+            gate_slots = up_slots = down_slots = indices
+        else:
+            gate_slots = self.gate_proj.pool.remap_ondevice(indices)
+            up_slots = self.up_proj.pool.remap_ondevice(indices)
+            down_slots = self.down_proj.pool.remap_ondevice(indices)
+        if pairs < self._iqk_sorted_threshold():
+            x4 = mx.expand_dims(x, (-2, -3))
+            up = self.up_proj.matmul_slots(x4, up_slots, sorted_indices=False)
+            gate = self.gate_proj.matmul_slots(x4, gate_slots, sorted_indices=False)
+            out = self.down_proj.matmul_slots(
+                self.activation(up, gate),
+                down_slots,
+                sorted_indices=False,
+            )
+            return out.squeeze(-2)
+
+        top_k = int(indices.shape[-1])
+        flat = indices.reshape(-1)
+        if identity:
+            order = mx.argsort(flat)
+            sorted_ids = flat[order]
+            rows = int(flat.size)
+            gathered = x.reshape(-1, self.gate_proj.in_features)[order // top_k]
+            # Match IqkDeepseekV4SwitchGLU._call_sorted: the kernel-facing
+            # activation is fp16 even when the trunk hidden state is bf16.
+            # Leaving it bf16 promotes the large sorted matmuls to fp32,
+            # increasing both prefill wall time and transient memory.
+            xg = gathered.reshape(
+                rows, 1, self.gate_proj.in_features).astype(mx.float16)
+            parts = self._iqk_sorted_parts()
+            step = self.gate_proj.out_features // parts
+            up = mx.concatenate(
+                [
+                    self.up_proj.sorted_matmul_range(
+                        xg, sorted_ids, part * step, step)
+                    for part in range(parts)
+                ],
+                axis=-1,
+            )
+            gate = mx.concatenate(
+                [
+                    self.gate_proj.sorted_matmul_range(
+                        xg, sorted_ids, part * step, step)
+                    for part in range(parts)
+                ],
+                axis=-1,
+            )
+            activated = self.activation(up, gate)
+            down_step = self.down_proj.out_features // parts
+            down = mx.concatenate(
+                [
+                    self.down_proj.sorted_matmul_range(
+                        activated, sorted_ids, part * down_step, down_step)
+                    for part in range(parts)
+                ],
+                axis=-1,
+            )
+            out = down.reshape(rows, -1)[mx.argsort(order)]
+        else:
+            pair_rows = x.reshape(-1, self.gate_proj.in_features)[
+                mx.arange(pairs) // top_k]
+            out = self._iqk_sorted_triplet(
+                pair_rows,
+                gate_slots,
+                up_slots,
+                down_slots,
+            )
+        return mx.unflatten(out, 0, tuple(indices.shape))
 
     def _touch_projection_pools_if_resident(self, active: set[int]) -> bool:
         """Fail-closed all-resident certificate for decode.
@@ -1237,7 +1501,7 @@ class PooledSwitchGLU(nn.Module):
         active: set[int],
         load_ticket: _ProjectionLoadTicket | None = None,
     ) -> None:
-        if _PREFILL_PREFETCH and self._prefetch_ticket is not None:
+        if self._prefill_prefetch_enabled and self._prefetch_ticket is not None:
             # A prefetch the previous over-capacity call submitted is still in
             # flight, and this call reached the demand path instead of the
             # sorted-chunked consume point (the layer's next call was not
@@ -1479,6 +1743,16 @@ class PooledSwitchGLU(nn.Module):
             gate_idx = self.gate_proj.pool.remap_loaded(idx_host, idx_shape)
             down_idx = self.down_proj.pool.remap_loaded(idx_host, idx_shape)
 
+        if self._all_iqk and sorted_indices:
+            rows = int(idx.size)
+            out = self._iqk_sorted_triplet(
+                x.reshape(rows, self.gate_proj.in_features),
+                gate_idx,
+                up_idx,
+                down_idx,
+            )
+            return out.reshape(*idx_shape, 1, self.down_proj.out_features)
+
         if self._combined_gate_up_kquant:
             x_gate, x_up = self.gate_proj.matmul_gate_up_slots(
                 x,
@@ -1629,24 +1903,27 @@ class PooledSwitchGLU(nn.Module):
         Mirrors the sorted-path gate (>= 64 routed pairs) and the segmented
         row threshold; indices is [..., top_k], so token rows x top_k is
         exactly indices.size. Shape-only: never touches index values."""
+        if self._all_iqk:
+            return bool(indices.size)
         return bool(
             indices.size >= 64
             and indices.size >= _SEGMENTED_PREFILL_MIN_ROWS
         )
 
     def _barrier_free_ready(self) -> bool:
-        """One-shot fail-closed eligibility check for barrier-free prefill.
+        """Fail-closed eligibility check for barrier-free prefill.
 
-        The verdict is decided once and cached: at capacity == num_experts a
-        fully resident pool never evicts (ensure can never miss), so a True
-        verdict is stable for the process; a False verdict (partial residency,
-        smaller capacity, non-K-quant projections, or a kernel-less
-        mlx_kquant) keeps the route off for the process, which is the
-        fail-closed direction. Serving reaches the first bulk prefill only
-        after the build-time prewarm, so full residency is already
-        established when the verdict is taken."""
+        A successful verdict is stable because a fully resident full-capacity
+        pool cannot evict. A negative verdict at smaller capacity is stable
+        until growth resets the cache. At full capacity, however, an explicit
+        no-prewarm setting can leave the pool cold; revisit that negative
+        verdict so demand loading can eventually earn the optimized route."""
         ready = self._barrier_free_ready_cached
-        if ready is None:
+        full_capacity = all(
+            pool.capacity == pool.num_experts
+            for pool in self._projection_pools_lockstep()
+        )
+        if ready is None or (ready is False and full_capacity):
             ready = self._barrier_free_eligible()
             self._barrier_free_ready_cached = ready
         return ready
@@ -1654,16 +1931,17 @@ class PooledSwitchGLU(nn.Module):
     def _barrier_free_eligible(self) -> bool:
         if not _BARRIER_FREE_PREFILL:
             return False
-        if not self._combined_gate_up_kquant:
-            return False
-        if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
-            return False
-        try:
-            import mlx_kquant as kq
-        except ImportError:
-            return False
-        if getattr(kq, "gather_qmm_sorted", None) is None:
-            return False
+        if not self._all_iqk:
+            if not self._combined_gate_up_kquant:
+                return False
+            if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
+                return False
+            try:
+                import mlx_kquant as kq
+            except ImportError:
+                return False
+            if getattr(kq, "gather_qmm_sorted", None) is None:
+                return False
         for pool in self._projection_pools_lockstep():
             if pool.capacity != pool.num_experts:
                 return False
@@ -1695,6 +1973,9 @@ class PooledSwitchGLU(nn.Module):
         Per-row math is unchanged, so the identity route is bit-identical to
         the general one; pools filled in any other order keep the general
         per-pool remap."""
+        if self._all_iqk:
+            return self._call_iqk_full_resident(x, indices)
+
         import mlx_kquant as kq
 
         top_k = int(indices.shape[-1])
@@ -1773,17 +2054,18 @@ class PooledSwitchGLU(nn.Module):
         return mx.unflatten(out, 0, indices.shape)
 
     def _barrier_free_decode_ready(self) -> bool:
-        """One-shot fail-closed eligibility check for barrier-free decode.
+        """Fail-closed eligibility check for barrier-free decode.
 
-        Decode analog of `_barrier_free_ready`: the verdict is decided once
-        and cached. At capacity == num_experts a fully resident pool never
-        evicts, so a True verdict is stable for the process; a False verdict
-        (partial residency, smaller capacity, non-K-quant projections, or a
-        kernel-less mlx_kquant) keeps the ring/native-gate decode path for
-        the process, which is the fail-closed direction. The ring path stays
-        the product path for every partial-residency session."""
+        Decode analog of `_barrier_free_ready`: successful and bounded-capacity
+        verdicts are stable, while a cold full-capacity pool rechecks after the
+        ring path loads more experts. The ring path stays the product path for
+        every partial-capacity session."""
         ready = self._barrier_free_decode_ready_cached
-        if ready is None:
+        full_capacity = all(
+            pool.capacity == pool.num_experts
+            for pool in self._projection_pools_lockstep()
+        )
+        if ready is None or (ready is False and full_capacity):
             ready = self._barrier_free_decode_eligible()
             self._barrier_free_decode_ready_cached = ready
         return ready
@@ -1791,16 +2073,17 @@ class PooledSwitchGLU(nn.Module):
     def _barrier_free_decode_eligible(self) -> bool:
         if not _BARRIER_FREE_DECODE:
             return False
-        if not self._combined_gate_up_kquant:
-            return False
-        if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
-            return False
-        try:
-            import mlx_kquant as kq
-        except ImportError:
-            return False
-        if getattr(kq, "gather_qmm", None) is None:
-            return False
+        if not self._all_iqk:
+            if not self._combined_gate_up_kquant:
+                return False
+            if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
+                return False
+            try:
+                import mlx_kquant as kq
+            except ImportError:
+                return False
+            if getattr(kq, "gather_qmm", None) is None:
+                return False
         # Residency is read under the pool bookkeeping locks (same acquire
         # order as _touch_projection_pools_if_resident) so the verdict
         # cannot race a concurrent load or eviction mid-check.
@@ -1814,6 +2097,12 @@ class PooledSwitchGLU(nn.Module):
                     return False
                 if len(pool._slot_of) != pool.num_experts:
                     return False
+            if self._all_iqk:
+                self._iqk_decode_identity_cached = all(
+                    all(pool._slot_of.get(expert) == expert
+                        for expert in range(pool.num_experts))
+                    for pool in pools
+                )
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -1835,6 +2124,30 @@ class PooledSwitchGLU(nn.Module):
         path. LFU touch accounting is skipped: a full pool never evicts,
         matching the barrier-free prefill counter policy."""
         self.barrier_free_decode_calls += 1
+        if self._all_iqk:
+            self._record_iqk_route(int(idx.size))
+            if self._iqk_decode_identity_cached:
+                gate_idx = up_idx = down_idx = idx
+            else:
+                gate_idx = self.gate_proj.pool.remap_ondevice(idx)
+                up_idx = self.up_proj.pool.remap_ondevice(idx)
+                down_idx = self.down_proj.pool.remap_ondevice(idx)
+            elements = int(idx.size)
+            for projection in (
+                self.up_proj,
+                self.gate_proj,
+                self.down_proj,
+            ):
+                projection.matmul_slot_calls += 1
+                projection.matmul_slot_elements += elements
+            x4 = mx.expand_dims(x, (-2, -3))
+            x_up = self.up_proj.pool.iqk.gemv(x4, up_idx)
+            x_gate = self.gate_proj.pool.iqk.gemv(x4, gate_idx)
+            out = self.down_proj.pool.iqk.gemv(
+                self.activation(x_up, x_gate),
+                down_idx,
+            )
+            return out.squeeze(-2)
         if (
             self.gate_proj.pool.slot_table_is_identity()
             and self.down_proj.pool.slot_table_is_identity()
@@ -1989,6 +2302,11 @@ class PooledSwitchGLU(nn.Module):
         bulk_rows = 1
         for dim in indices.shape[:-1]:
             bulk_rows *= int(dim)
+        iqk_sorted = (
+            self._record_iqk_route(int(indices.size))
+            if self._all_iqk
+            else False
+        )
         # Barrier-free full-resident bulk prefill: leaves before the blocking
         # np.asarray(indices) below, so index_sync/index_resync stay untouched
         # on this route (their absence in the stats is the engagement
@@ -1997,7 +2315,10 @@ class PooledSwitchGLU(nn.Module):
         # need the very host read the route removes.
         if self._barrier_free_bulk_shape(indices) and self._barrier_free_ready():
             self.total_calls += 1
-            self.prefill_calls += 1
+            if bulk_rows == 1:
+                self.decode_calls += 1
+            else:
+                self.prefill_calls += 1
             self.total_token_layers += bulk_rows
             self.barrier_free_prefill_calls += 1
             return self._call_barrier_free(x, indices)
@@ -2027,7 +2348,7 @@ class PooledSwitchGLU(nn.Module):
             self.prefill_seen_experts.update(active)
         if len(active) > capacity:
             self.over_capacity_calls += 1
-            if indices.size >= 64:
+            if iqk_sorted or (not self._all_iqk and indices.size >= 64):
                 self.sorted_chunked_calls += 1
                 return self._call_sorted_chunked(x, indices, capacity)
             self.row_chunked_calls += 1
@@ -2188,7 +2509,7 @@ class PooledSwitchGLU(nn.Module):
         self.total_chunks += len(chunks)
 
         call_active = {int(e) for e in idx_host.tolist()}
-        if _PREFILL_PREFETCH:
+        if self._prefill_prefetch_enabled:
             # Consume before any pool touch this call: await the ticket the
             # previous over-capacity call submitted, so its prefetch is quiesced
             # before the chunk-ahead ensures run.
@@ -2210,7 +2531,7 @@ class PooledSwitchGLU(nn.Module):
             out = _scatter_unsort(out, inv_order, indices.shape)
             # Every chunk's output is evaluated above, so the pool is quiesced;
             # submit the next-chunk prefetch for this layer's next call.
-            if _PREFILL_PREFETCH:
+            if self._prefill_prefetch_enabled:
                 self._submit_prefetch_ticket(call_active)
             return out.squeeze(-2)
 
@@ -2270,7 +2591,7 @@ class PooledSwitchGLU(nn.Module):
         # knife-edge token flips across processes at the 64 GB budgets).
         # The final chunk stays async: its set rides as the explicit
         # protect, so its slots are never victims.
-        if _PREFILL_PREFETCH:
+        if self._prefill_prefetch_enabled:
             if len(outputs) >= 2:
                 mx.eval(outputs[-2])
             self._submit_prefetch_ticket(call_active, protect=chunk_sets[-1])
@@ -2289,7 +2610,11 @@ class PooledSwitchGLU(nn.Module):
         from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = _should_sort_routed_indices(indices)
+        do_sort = (
+            indices.size >= self._iqk_sorted_threshold()
+            if self._all_iqk
+            else _should_sort_routed_indices(indices)
+        )
         idx = indices
         inv_order = None
         if do_sort:
@@ -2380,6 +2705,8 @@ class PooledSwitchGLU(nn.Module):
         K = int(idx.shape[-1])
         gate_buf, _gv, down_buf, _dv = self._pipe_bufs(K)
         self.pipelined_layers += 1
+        if self._all_iqk:
+            self._record_iqk_route(int(idx.size))
         x4 = mx.expand_dims(x, (-2, -3))
         if event_gate is not None:
             gate_mod, token, seq = event_gate
@@ -2476,6 +2803,8 @@ class PooledSwitchGLU(nn.Module):
         K = int(idx.shape[-1])
         gate_buf, _gv, down_buf, _dv = self._pipe_bufs(K)
         self.pipelined_layers += 1
+        if self._all_iqk:
+            self._record_iqk_route(int(idx.size))
         self.pipelined_decode_fused_calls += 1
         x_flat = x.reshape(1, self.gate_proj.in_features)
         if event_gate is not None:
@@ -3083,7 +3412,10 @@ class PooledDeepseekV4MoEBlock(nn.Module):
                     for future in pending:
                         future.result()
                 switch.pipeline_join_seconds += time.perf_counter() - t0
-            if (
+            if bool(getattr(switch, "_all_iqk", False)):
+                if switch.commit_iqk_output(y, rows=1):
+                    switch.barrier_free_decode_flush_calls += 1
+            elif (
                 _DECODE_FLUSH_LAYERS > 0
                 and (int(switch.gate_proj.pool.layer) + 1)
                 % _DECODE_FLUSH_LAYERS == 0
@@ -3281,6 +3613,12 @@ class PooledDeepseekV4MoEBlock(nn.Module):
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        if bool(getattr(switch, "_all_iqk", False)) and block_t0 is None:
+            rows = 1
+            for dim in x.shape[:-1]:
+                rows *= int(dim)
+            switch.commit_iqk_output(y, rows=rows)
 
         if block_t0 is not None:
             # Block-exit kick: commit the finished block so the GPU runs layer

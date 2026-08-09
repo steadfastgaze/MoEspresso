@@ -26,9 +26,15 @@ from pathlib import Path
 
 from moespresso.core.artifact import Validation, make_artifact
 from moespresso.inventory.architecture_profile import deepseek_v4_flash_profile, family_of
+from moespresso.package.iqk_format import (
+    IQK_DENSE_MEMBERS,
+    IQK_GEOMETRY,
+    IQK_LAYOUT_IK_WIRE,
+    IQK_LAYOUTS,
+)
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
 
-PRODUCER = {"tool": "moespresso.package", "version": "1.1.0"}
+PRODUCER = {"tool": "moespresso.package", "version": "2.0.0"}
 
 # The package format. MJTQ = "MoEspresso Jang TurboQuant": it reuses jang's TurboQuant codec
 # + tensor conventions (.tq_packed/.tq_norms/.tq_bits) for compression, but adds
@@ -243,6 +249,33 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
                 })
             if alloc.get("imatrix_key") is not None:
                 entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
+        elif fmt == "iqk":
+            # Every routed cell names its own member, so a mixed allocation is
+            # a normal package rather than a special case: the per-(layer,
+            # role) entry is what a reader consults, never a package-wide bit
+            # width. `layout` says which wire the stored bytes are on, so a
+            # relayout build step can be recorded without re-encoding.
+            icodec = alloc.get("iqk_codec") or alloc.get("codec")
+            geometry = IQK_GEOMETRY.get(icodec)
+            entry["format"] = "iqk"
+            entry["format_params"] = {
+                "iqk_codec": icodec,
+                "layout": alloc.get("layout", IQK_LAYOUT_IK_WIRE),
+            }
+            if geometry is not None:
+                entry["format_params"].update({
+                    "bits": geometry.bits,
+                    "ggml_type": geometry.ggml_type,
+                    "weights_per_block": geometry.weights_per_block,
+                    "bytes_per_block": geometry.bytes_per_block,
+                    "row_meta_bytes": geometry.row_meta_bytes,
+                })
+            if alloc.get("imatrix_key") is not None:
+                entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
+            if alloc.get("module_weight_key") is not None:
+                entry["module_weight_key"] = alloc["module_weight_key"]
+            if alloc.get("module_path") is not None:
+                entry["module_path"] = alloc["module_path"]
         else:
             entry["format"] = fmt
             entry["format_params"] = {}
@@ -279,6 +312,31 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
                 })
             if alloc.get("imatrix_key") is not None:
                 entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
+        elif fmt == "iqk":
+            # A dense IQ_K tensor mirrors the dense kquant entry: the member
+            # and wire layout are per-tensor facts, and the module keys are
+            # what the runtime installer consumes. Validation below restricts
+            # the member to the dense allow-list.
+            icodec = alloc.get("iqk_codec") or alloc.get("codec")
+            geometry = IQK_GEOMETRY.get(icodec)
+            entry["format_params"] = {
+                "iqk_codec": icodec,
+                "layout": alloc.get("layout", IQK_LAYOUT_IK_WIRE),
+            }
+            if geometry is not None:
+                entry["format_params"].update({
+                    "bits": geometry.bits,
+                    "ggml_type": geometry.ggml_type,
+                    "weights_per_block": geometry.weights_per_block,
+                    "bytes_per_block": geometry.bytes_per_block,
+                    "row_meta_bytes": geometry.row_meta_bytes,
+                })
+            if alloc.get("imatrix_key") is not None:
+                entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
+            if alloc.get("module_weight_key") is not None:
+                entry["module_weight_key"] = alloc["module_weight_key"]
+            if alloc.get("module_path") is not None:
+                entry["module_path"] = alloc["module_path"]
         else:
             entry["format_params"] = {}
     elif kind == "fp16_passthrough":
@@ -320,6 +378,7 @@ def build_package_manifest(
     passthrough_located: dict[str, dict] | None = None,
     tokenizer: dict | None = None,
     agentic_profile: dict | None = None,
+    drafter: dict | None = None,
     max_experts: int | None = None,
 ) -> dict:
     """Assemble a package_manifest artifact (pure).
@@ -332,6 +391,11 @@ def build_package_manifest(
     directly from the inventory, preserving optimizer purity.
     `agentic_profile` is the identity block of the agentic profile sidecar
     (package/agentic_profile.py); families without one omit the key.
+    `drafter` is the declared draft-model component for packages that bundle a
+    speculative-decoding sidecar (package/deepseek_v4/dspark_bundle.py): its
+    `files` list carries the identity of every sidecar file so verification
+    covers them, and its provenance names the sidecar artifact. Packages
+    without a bundled drafter omit the key.
     """
     if package_plan.get("artifact_kind") != "package_plan":
         raise ValueError("build_package_manifest requires a package_plan artifact")
@@ -355,13 +419,31 @@ def build_package_manifest(
                 path=f"/{name}", phase="package", blocking=True))
             continue
         entry = _tensor_entry(alloc, loc, seed)
-        if entry["kind"] == "expert" and entry["format"] not in {"tq", "mxfp4", "kquant"}:
+        if entry["kind"] == "expert" and entry["format"] not in {
+            "tq", "mxfp4", "kquant", "iqk",
+        }:
             validation.append(Validation(
                 "error", "package.unsupported_expert_format",
                 f"{name} declares expert format {entry['format']!r}; routed experts "
-                "support only TQ, source-mxfp4, or K-quant",
+                "support only TQ, source-mxfp4, K-quant, or IQ_K",
                 path=f"/{name}", phase="package", blocking=True,
-                expected=["tq", "mxfp4", "kquant"], actual=entry["format"]))
+                expected=["tq", "mxfp4", "kquant", "iqk"],
+                actual=entry["format"]))
+        if entry["format"] == "iqk":
+            icodec = entry["format_params"].get("iqk_codec")
+            if icodec not in IQK_GEOMETRY:
+                validation.append(Validation(
+                    "error", "package.unsupported_iqk_codec",
+                    f"{name} declares unsupported IQ_K codec {icodec!r}",
+                    path=f"/{name}", phase="package", blocking=True,
+                    expected=sorted(IQK_GEOMETRY), actual=icodec))
+            layout = entry["format_params"].get("layout")
+            if layout not in IQK_LAYOUTS:
+                validation.append(Validation(
+                    "error", "package.unsupported_iqk_layout",
+                    f"{name} declares unsupported IQ_K wire layout {layout!r}",
+                    path=f"/{name}", phase="package", blocking=True,
+                    expected=list(IQK_LAYOUTS), actual=layout))
         if entry["format"] == "kquant":
             kcodec = entry["format_params"].get("kquant_codec")
             if kcodec not in KQUANT_GEOMETRY:
@@ -377,15 +459,30 @@ def build_package_manifest(
                     "mlx-kquant installer",
                     path=f"/{name}", phase="package", blocking=True))
         if entry["kind"] == "affine" and entry["format"] not in {
-            "affine", "mxfp4", "mxfp8", "kquant",
+            "affine", "mxfp4", "mxfp8", "kquant", "iqk",
         }:
             validation.append(Validation(
                 "error", "package.unsupported_dense_format",
                 f"{name} declares dense format {entry['format']!r}; dense tensors "
-                "support affine, mxfp4, mxfp8, or K-quant",
+                "support affine, mxfp4, mxfp8, K-quant, or IQ_K",
                 path=f"/{name}", phase="package", blocking=True,
-                expected=["affine", "mxfp4", "mxfp8", "kquant"],
+                expected=["affine", "mxfp4", "mxfp8", "kquant", "iqk"],
                 actual=entry["format"]))
+        if entry["kind"] == "affine" and entry["format"] == "iqk":
+            icodec = entry["format_params"].get("iqk_codec")
+            if icodec not in IQK_DENSE_MEMBERS:
+                validation.append(Validation(
+                    "error", "package.unsupported_dense_iqk_member",
+                    f"{name} declares IQ_K member {icodec!r} on a dense tensor; "
+                    "dense tensors support only the 4-6 bit members",
+                    path=f"/{name}", phase="package", blocking=True,
+                    expected=list(IQK_DENSE_MEMBERS), actual=icodec))
+            if not isinstance(entry.get("module_weight_key"), str):
+                validation.append(Validation(
+                    "error", "package.missing_iqk_module_weight_key",
+                    f"{name} declares dense IQ_K but no module_weight_key for "
+                    "the runtime installer",
+                    path=f"/{name}", phase="package", blocking=True))
         tensors.append(entry)
 
     pt_located = passthrough_located or {}
@@ -423,6 +520,7 @@ def build_package_manifest(
         "tq": "tq_dequant",
         "mxfp4": "mxfp4_dequant",
         "kquant": "kquant_dequant",
+        "iqk": "iqk_dequant",
         "mxfp8": "mxfp8_dequant",
         "affine": "affine_dequant",
         "fp16": "fp16_passthrough",
@@ -467,12 +565,15 @@ def build_package_manifest(
     }
     if agentic_profile is not None:
         manifest_fields["agentic_profile"] = agentic_profile
+    if drafter is not None:
+        manifest_fields["drafter"] = drafter
     diagnostic = (package_plan.get("source_constraints") or {}).get("diagnostic")
     if diagnostic is not None:
         manifest_fields["provenance"]["diagnostic"] = diagnostic
     if (
         any(
-            t["format"] in {"tq", "mxfp4", "kquant"} and t.get("kind") == "expert"
+            t["format"] in {"tq", "mxfp4", "kquant", "iqk"}
+            and t.get("kind") == "expert"
             for t in tensors
         )
         or expert_layout is not None

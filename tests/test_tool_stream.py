@@ -7,6 +7,10 @@ independence (every split of the same text yields the same calls and the
 same visible content), strict-parse-first with repair only on failure,
 malformed text flushing back as content, the truncation guard, and the
 line-start marker rule.
+
+A block that never leaves the reasoning channel never reaches this streamer,
+so those arms live in tests/test_chat_stream.py beside the splitter that
+decides the routing.
 """
 
 from __future__ import annotations
@@ -31,6 +35,17 @@ SCHEMAS = {
             "filePath": {"type": "string"},
             "limit": {"type": "integer"},
         },
+    },
+    "write": {
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string"},
+            "content": {"type": "string"},
+        },
+    },
+    "bash": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
     },
 }
 
@@ -375,3 +390,499 @@ def test_finish_is_idempotent():
     calls = list(streamer.calls)
     streamer.finish()
     assert streamer.calls == calls
+
+
+# --- DSML emission failures under large parameter values ---------------------
+#
+# Three ways a served DSML tool call fails to become a tool call, observed
+# through an OpenAI-compatible client. The defects are structural and
+# reproduce from a short fixture; the multi-kilobyte parameter values that
+# provoke the model into emitting them are not needed to pin the handling.
+# Each test asserts the behavior the current implementation has, including
+# where that behavior is the defect itself.
+
+HTML_BODY = (
+    "<!DOCTYPE html>\n<html>\n<head>\n<title>Demo</title>\n</head>\n"
+    "<body>\n<h1>Demo</h1>\n</body>\n</html>"
+)
+
+DSML_NAKED_INVOKE = (
+    f'<{T}invoke name="bash">\n'
+    f'<{T}parameter name="command" string="true">ls</{T}parameter>\n'
+    f"</{T}invoke>"
+)
+
+DSML_BASH_BLOCK = f"<{T}tool_calls>\n{DSML_NAKED_INVOKE}\n</{T}tool_calls>"
+
+# The traced shape: the closing quote of the name attribute is dropped, no
+# interior parameter close is emitted, and only one of the tool's two
+# parameters appears.
+DSML_ALL_THREE_DEFECTS = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="write">\n'
+    f'<{T}parameter name="content string="true">{HTML_BODY}\n'
+    f"</{T}invoke>\n"
+    f"</{T}tool_calls>"
+)
+
+# Only the missing interior parameter close.
+DSML_MISSING_PARAM_CLOSE = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="write">\n'
+    f'<{T}parameter name="content" string="true">{HTML_BODY}\n'
+    f"</{T}invoke>\n"
+    f"</{T}tool_calls>"
+)
+
+# Only the unclosed name-attribute quote.
+DSML_UNCLOSED_NAME_ONLY = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="write">\n'
+    f'<{T}parameter name="content string="true">{HTML_BODY}</{T}parameter>\n'
+    f"</{T}invoke>\n"
+    f"</{T}tool_calls>"
+)
+
+# The same defects on a block that never closed, which is what generation
+# stopping at the token limit produces.
+DSML_CUT_MID_VALUE = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="write">\n'
+    f'<{T}parameter name="content string="true"><!DOCTYPE html>\n'
+    f"<html>\n<head>\n<title>De"
+)
+
+
+def _finish_with(text, *, dialects=(DSML_DIALECT,), truncated):
+    """Push one text and finish, choosing the truncation branch explicitly."""
+    content_deltas: list[str] = []
+    streamer = ToolCallStreamer(
+        dialects,
+        parameter_schemas=SCHEMAS,
+        emit_content=content_deltas.append,
+    )
+    streamer.push(text)
+    streamer.finish(truncated=truncated)
+    return streamer, content_deltas
+
+
+# --- A close marker with no matching open ------------------------------------
+
+def test_dsml_orphan_close_after_naked_invoke_still_fires_the_call():
+    # The wrapper open is dropped and the wrapper close is kept. The naked
+    # invoke buffers as an attempt and repair salvages the call. The
+    # orphaned close has no open to anchor to, so it is ordinary prose and
+    # currently leaks the marker text into visible content.
+    streamer, content_deltas, _ = _run(
+        DSML_NAKED_INVOKE + f"\n</{T}tool_calls>", dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
+    assert streamer.content == f"\n</{T}tool_calls>"
+    assert "".join(content_deltas) == f"\n</{T}tool_calls>"
+    assert streamer.telemetry.as_dict() == {
+        "fires": 1, "salvaged": 1, "failed": 0}
+
+
+def test_dsml_orphan_close_duplicated_after_block_still_fires_the_call():
+    # A well-formed block followed by a second close marker: the block parses
+    # strictly and the surplus close leaks the same way.
+    streamer, _, _ = _run(
+        DSML_BASH_BLOCK + f"\n</{T}tool_calls>", dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
+    assert streamer.content == f"\n</{T}tool_calls>"
+    assert streamer.telemetry.fires == 0
+
+
+def test_dsml_orphan_close_control_block_leaves_no_content():
+    # The control arm: the same call with no surplus marker. A change that
+    # suppresses the leaked marker by suppressing the call fails here.
+    streamer, _, _ = _run(DSML_BASH_BLOCK, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
+    assert streamer.content == ""
+    assert streamer.telemetry.fires == 0
+
+
+def test_dsml_orphan_close_invoke_marker_stays_prose():
+    text = f"Done reading.\n</{T}invoke>"
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.fires == 0
+
+
+def test_dsml_orphan_close_indented_stays_prose():
+    # The line-start rule applies to opens only, so an indented close is
+    # prose for the same reason a column-zero one is: nothing opened.
+    text = f"Done reading.\n  </{T}tool_calls>"
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+
+
+def test_dsml_orphan_close_quoted_mid_sentence_stays_prose():
+    text = f"The block ends with </{T}tool_calls> on its own line."
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+
+
+# --- Failure C: the interior parameter close is missing ----------------------
+
+def test_dsml_interior_missing_param_close_loses_the_call():
+    # The traced block. Repair restores the name-attribute quote but has no
+    # transformation that inserts a closer inside an invoke body, so the
+    # strict parse fails a second time and the whole block, markers
+    # included, flushes as visible content.
+    streamer, content_deltas, _ = _run(
+        DSML_ALL_THREE_DEFECTS, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == DSML_ALL_THREE_DEFECTS
+    assert "".join(content_deltas) == DSML_ALL_THREE_DEFECTS
+    assert streamer.telemetry.as_dict() == {
+        "fires": 1, "salvaged": 0, "failed": 1}
+
+
+def test_dsml_interior_missing_param_close_alone_is_fatal():
+    # Isolating defect two: a well-formed name attribute and a well-formed
+    # wrapper are not enough. The missing interior closer alone loses it.
+    streamer, _, _ = _run(DSML_MISSING_PARAM_CLOSE, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == DSML_MISSING_PARAM_CLOSE
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_interior_missing_param_close_unclosed_name_alone_survives():
+    # Isolating defect one: the unclosed name quote is already repaired, so
+    # the call fires with the value byte-identical to the emission.
+    streamer, _, _ = _run(DSML_UNCLOSED_NAME_ONLY, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("write", {"content": HTML_BODY})]
+    assert streamer.content == ""
+    assert streamer.telemetry.salvaged == 1
+
+
+def test_dsml_interior_missing_param_close_truncated_never_repairs():
+    # The truncation branch is reached only by a block that never closed.
+    # Closing a half-emitted value would fabricate a plausible but wrong
+    # argument, so a truncated turn flushes without ever calling repair.
+    truncated, deltas = _finish_with(DSML_CUT_MID_VALUE, truncated=True)
+    assert truncated.calls == []
+    assert truncated.content == DSML_CUT_MID_VALUE
+    assert "".join(deltas) == DSML_CUT_MID_VALUE
+    assert truncated.telemetry.fires == 0
+
+    # The same text finished normally proves the two arms differ: repair
+    # closes the dangling elements and ships the partial value as a call.
+    complete, _ = _finish_with(DSML_CUT_MID_VALUE, truncated=False)
+    names = _names_and_arguments(complete)
+    assert [name for name, _ in names] == ["write"]
+    assert names[0][1]["content"].startswith("<!DOCTYPE html>")
+    assert complete.telemetry.salvaged == 1
+
+    # A block whose wrapper close did arrive never reaches the truncation
+    # branch at all: it is handled during push, so the flush comes from the
+    # repair failure and the truncation flag changes nothing. This shape is
+    # a visual lookalike of the branch above, not the same code path.
+    lookalike, _ = _finish_with(DSML_ALL_THREE_DEFECTS, truncated=True)
+    assert lookalike.calls == []
+    assert lookalike.content == DSML_ALL_THREE_DEFECTS
+    assert lookalike.telemetry.failed == 1
+
+
+# --- adjacent structural shapes ----------------------------------------------
+
+def test_dsml_interior_missing_invoke_close_loses_the_call():
+    # The parameter closes but the invoke does not. The dangling-closer pass
+    # appends the invoke close after the wrapper close, outside the block,
+    # so the invoke grammar still finds nothing to match.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read">\n'
+        f'<{T}parameter name="filePath" string="true">README.md'
+        f"</{T}parameter>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_interior_both_closers_missing_loses_the_call():
+    # Both interior closers gone on a turn that was not truncated: repair
+    # must not invent a value boundary, and it does not.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read">\n'
+        f'<{T}parameter name="filePath" string="true">README.md\n'
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_second_parameter_before_first_close_loses_the_call():
+    # A second parameter opened before the first closes is rejected rather
+    # than merged: the non-greedy value grammar would swallow the second
+    # parameter's markup into the first value and ship a one-argument call
+    # that no counter records. The rejection routes the block through repair,
+    # which declines to invent the value boundary, so the block flushes as
+    # visible content and the failure is counted.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="filePath" string="true">/proj/page.html\n'
+        f'<{T}parameter name="content" string="true">{HTML_BODY}'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, content_deltas, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert "".join(content_deltas) == text
+    assert streamer.telemetry.as_dict() == {
+        "fires": 1, "salvaged": 0, "failed": 1}
+
+
+def test_dsml_parameter_open_quoted_mid_line_stays_in_the_value():
+    # The discriminator: a parameter open marker that does not begin a line
+    # is value text, so a value documenting the dialect mid-sentence still
+    # ships both arguments byte-for-byte.
+    quoted = f'A parameter opens with <{T}parameter name="k" string="true">.'
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="filePath" string="true">/proj/dsml.md'
+        f"</{T}parameter>\n"
+        f'<{T}parameter name="content" string="true">{quoted}'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [
+        ("write", {"filePath": "/proj/dsml.md", "content": quoted}),
+    ]
+    assert streamer.telemetry.fires == 0
+
+
+def test_qwenxml_second_parameter_before_first_close_loses_the_call():
+    # The native dialect carries the same value grammar, so it gets the same
+    # rejection, the same declined repair, and the same visible flush.
+    text = (
+        "<tool_call>\n<function=write>\n"
+        "<parameter=filePath>\n/proj/page.html\n"
+        f"<parameter=content>\n{HTML_BODY}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    streamer, content_deltas, _ = _run(text)
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert "".join(content_deltas) == text
+    assert streamer.telemetry.as_dict() == {
+        "fires": 1, "salvaged": 0, "failed": 1}
+
+
+def test_dsml_string_attribute_quote_dropped_loses_the_call():
+    # The mirror of the repaired defect: the dropped quote belongs to the
+    # string attribute rather than the name attribute, and no repair
+    # transformation covers that side.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read">\n'
+        f'<{T}parameter name="filePath" string="true>README.md'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_literal_parameter_close_inside_value_loses_the_call():
+    # A value that documents the dialect terminates itself early: the first
+    # closer ends the parameter and the rest of the value becomes unparsed
+    # text inside the invoke.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="content" string="true">A value ends at '
+        f"</{T}parameter> in the docs.</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_indented_markers_never_reach_the_tool_streamer():
+    # Markers count only at the start of a line, so an indented block never
+    # buffers. The text the strict parser would accept prints verbatim
+    # instead, and the repair counters stay at zero because repair is never
+    # reached.
+    text = (
+        f"  <{T}tool_calls>\n"
+        f'  <{T}invoke name="read">\n'
+        f'  <{T}parameter name="filePath" string="true">README.md'
+        f"</{T}parameter>\n"
+        f"  </{T}invoke>\n"
+        f"  </{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.fires == 0
+
+
+def test_dsml_duplicate_name_attribute_loses_the_call():
+    # Two name attributes on one invoke: the grammar rejects rather than
+    # picking one, and no repair transformation drops the surplus.
+    text = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read" name="write">\n'
+        f'<{T}parameter name="filePath" string="true">README.md'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    streamer, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_dsml_crlf_and_trailing_space_marker_variants_still_parse():
+    # Marker matching is exact-string, but neither a carriage return before
+    # the newline nor a trailing space after a marker sits inside a marker,
+    # so both variants parse strictly and fire the call.
+    crlf, _, _ = _run(
+        DSML_BASH_BLOCK.replace("\n", "\r\n"), dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(crlf) == [("bash", {"command": "ls"})]
+    assert crlf.content == ""
+
+    spaced = (
+        f"<{T}tool_calls> \n"
+        f'<{T}invoke name="bash"> \n'
+        f'<{T}parameter name="command" string="true">ls</{T}parameter> \n'
+        f"</{T}invoke> \n"
+        f"</{T}tool_calls> "
+    )
+    streamer, _, _ = _run(spaced, dialects=(DSML_DIALECT,))
+    assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
+    assert streamer.content == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [DSML_ALL_THREE_DEFECTS, DSML_NAKED_INVOKE + f"\n</{T}tool_calls>"],
+    ids=["all-three-defects", "orphan-close"],
+)
+def test_dsml_chunk_splits_near_marker_boundaries_match_one_shot(text):
+    # Chunk-split invariance on the malformed shapes. An every-cut sweep of a
+    # real multi-kilobyte value is expensive, so the cuts are sampled around
+    # each marker occurrence, which is where the resumable scan and the
+    # held-tail logic can differ.
+    markers = (
+        f"<{T}tool_calls>", f"</{T}tool_calls>", f"<{T}invoke",
+        f"</{T}invoke>", f"<{T}parameter", f"</{T}parameter>",
+    )
+    cuts: set[int] = set()
+    for marker in markers:
+        start = 0
+        while True:
+            at = text.find(marker, start)
+            if at < 0:
+                break
+            cuts.update(
+                cut for cut in range(at - 2, at + len(marker) + 3)
+                if 0 <= cut <= len(text)
+            )
+            start = at + 1
+    assert cuts, "the fixture must contain markers to sample around"
+    reference, _, _ = _run(text, dialects=(DSML_DIALECT,))
+    for cut in sorted(cuts):
+        streamer, _, _ = _run(
+            [text[:cut], text[cut:]], dialects=(DSML_DIALECT,))
+        assert streamer.calls == reference.calls, f"cut={cut}"
+        assert streamer.content == reference.content, f"cut={cut}"
+
+
+# --- the same failure classes in the Qwen XML dialect -------------------------
+#
+# The dialect Ornith is served with carries the same three structural risks:
+# a close marker anchors nothing, an interior closer has no repair, and a
+# truncated block must never be closed by guesswork.
+
+QWEN_NAKED_FUNCTION = (
+    "<function=read>\n<parameter=filePath>\nREADME.md\n</parameter>\n"
+    "</function>"
+)
+QWEN_ONE_CALL = f"<tool_call>\n{QWEN_NAKED_FUNCTION}\n</tool_call>"
+
+
+def test_qwenxml_orphan_close_after_naked_function_still_fires_the_call():
+    streamer, _, _ = _run(QWEN_NAKED_FUNCTION + "\n</tool_call>")
+    assert _names_and_arguments(streamer) == [("read", {"filePath": "README.md"})]
+    # The orphaned close leaks into visible content, as in the DSML dialect.
+    assert streamer.content == "\n</tool_call>"
+    assert streamer.telemetry.salvaged == 1
+
+
+def test_qwenxml_orphan_close_duplicated_after_block_still_fires_the_call():
+    streamer, _, _ = _run(QWEN_ONE_CALL + "\n</tool_call>")
+    assert _names_and_arguments(streamer) == [("read", {"filePath": "README.md"})]
+    assert streamer.content == "\n</tool_call>"
+    assert streamer.telemetry.fires == 0
+
+
+def test_qwenxml_orphan_close_control_block_leaves_no_content():
+    streamer, _, _ = _run(QWEN_ONE_CALL)
+    assert _names_and_arguments(streamer) == [("read", {"filePath": "README.md"})]
+    assert streamer.content == ""
+    assert streamer.telemetry.fires == 0
+
+
+def test_qwenxml_interior_missing_param_close_loses_the_call():
+    text = (
+        "<tool_call>\n<function=read>\n<parameter=filePath>\nREADME.md\n"
+        "</function>\n</tool_call>"
+    )
+    streamer, _, _ = _run(text)
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_qwenxml_interior_missing_function_close_loses_the_call():
+    text = (
+        "<tool_call>\n<function=read>\n<parameter=filePath>\nREADME.md\n"
+        "</parameter>\n</tool_call>"
+    )
+    streamer, _, _ = _run(text)
+    assert streamer.calls == []
+    assert streamer.content == text
+    assert streamer.telemetry.failed == 1
+
+
+def test_qwenxml_interior_missing_param_close_truncated_never_repairs():
+    # The unterminated form is what the token limit produces, and it is the
+    # only form that reaches the truncation branch.
+    text = "<tool_call>\n<function=read>\n<parameter=filePath>\n/proj/REA"
+    truncated, _ = _finish_with(
+        text, dialects=(QWENXML_DIALECT,), truncated=True)
+    assert truncated.calls == []
+    assert truncated.content == text
+    assert truncated.telemetry.fires == 0
+
+    # Finished normally the same text repairs into a call carrying the
+    # half-emitted path, which is exactly what the truncation guard exists
+    # to prevent from reaching a client.
+    complete, _ = _finish_with(
+        text, dialects=(QWENXML_DIALECT,), truncated=False)
+    assert _names_and_arguments(complete) == [("read", {"filePath": "/proj/REA"})]
+    assert complete.telemetry.salvaged == 1

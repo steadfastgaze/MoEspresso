@@ -321,6 +321,126 @@ def test_dsml_unclosed_name_quote_is_restored():
     assert calls[0].arguments == {"path": "VERSION"}
 
 
+# The interior-closer class: a parameter or invoke element that never closes
+# inside an otherwise well-bounded block. The dangling-closer pass only
+# appends at the end of the text, so a synthesized closer lands outside the
+# element it was meant to close and the strict parse fails again. These tests
+# pin that limit; a fix that inserts closers in place flips them.
+
+_DSML_HTML = "<!DOCTYPE html>\n<html>\n<body>\n<h1>Demo</h1>\n</body>\n</html>"
+
+
+def test_dsml_interior_missing_param_close_stays_unrepairable():
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="content" string="true">{_DSML_HTML}\n'
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    with pytest.raises(ToolCallParseError):
+        parse_dsml_tool_calls(content)
+    with pytest.raises(ToolCallParseError, match="unrepairable"):
+        repair_dsml_tool_calls(content)
+
+
+def test_dsml_interior_missing_param_close_with_unclosed_name_stays_unrepairable():
+    # The traced block: the name-attribute quote is restored by repair and
+    # the missing interior closer still loses the call, so the surviving
+    # error names the repaired attribute spelling.
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="content string="true">{_DSML_HTML}\n'
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    with pytest.raises(ToolCallParseError) as excinfo:
+        repair_dsml_tool_calls(content)
+    assert 'name="content" string="true"' in str(excinfo.value)
+
+
+def test_dsml_close_dangling_appends_the_closer_outside_the_invoke_body():
+    from moespresso.toolcalls import dsml
+    from moespresso.toolcalls.repair import _close_dangling
+
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="content" string="true">{_DSML_HTML}\n'
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    closed = _close_dangling(content, [
+        (f"<{T}parameter", f"</{T}parameter>"),
+        (f"<{T}invoke", f"</{T}invoke>"),
+        (dsml.TOOL_CALLS_OPEN, dsml.TOOL_CALLS_CLOSE),
+    ])
+    # The synthesized parameter close lands after the wrapper close, where
+    # the parameter grammar cannot reach it.
+    assert closed.endswith(f"</{T}parameter>")
+    assert closed.index(f"</{T}parameter>") > closed.index(
+        dsml.TOOL_CALLS_CLOSE)
+
+
+def test_dsml_interior_missing_invoke_close_stays_unrepairable():
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read_file">\n'
+        f'<{T}parameter name="path" string="true">VERSION</{T}parameter>\n'
+        f"</{T}tool_calls>"
+    )
+    with pytest.raises(ToolCallParseError, match="unrepairable"):
+        repair_dsml_tool_calls(content)
+
+
+def test_dsml_duplicate_name_attribute_stays_unrepairable():
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="read_file" name="bash">\n'
+        f'<{T}parameter name="path" string="true">VERSION</{T}parameter>\n'
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    with pytest.raises(ToolCallParseError, match="unrepairable"):
+        repair_dsml_tool_calls(content)
+
+
+def test_dsml_second_parameter_before_first_close_stays_unrepairable():
+    # A second parameter opened before the first closes is rejected by the
+    # strict parser: the non-greedy value grammar would otherwise run to the
+    # only closer present and ship one merged argument in place of two, with
+    # nothing reporting the loss. Repair declines it for the same reason it
+    # declines a missing interior closer, so the block reaches the caller as
+    # a counted failure.
+    content = (
+        f"<{T}tool_calls>\n"
+        f'<{T}invoke name="write">\n'
+        f'<{T}parameter name="path" string="true">page.html\n'
+        f'<{T}parameter name="content" string="true">{_DSML_HTML}'
+        f"</{T}parameter>\n"
+        f"</{T}invoke>\n"
+        f"</{T}tool_calls>"
+    )
+    # The strict rejection itself is pinned in tests/test_toolcalls_dsml.py.
+    with pytest.raises(ToolCallParseError, match="unrepairable"):
+        repair_dsml_tool_calls(content)
+
+
+def test_qwenxml_second_parameter_before_first_close_stays_unrepairable():
+    # The same hole in the native dialect: the value grammar is the same
+    # non-greedy shape, so the rejection and the repair verdict match.
+    content = (
+        "<tool_call>\n<function=edit>\n"
+        "<parameter=path>\npage.html\n"
+        f"<parameter=new_string>\n{_DSML_HTML}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    # The strict rejection itself is pinned in tests/test_toolcalls_qwenxml.py.
+    with pytest.raises(ToolCallParseError, match="unrepairable"):
+        repair_qwenxml_tool_calls(content, SCHEMAS)
+
+
 def test_dsml_wellformed_name_attribute_is_untouched_by_repair_regex():
     from moespresso.toolcalls.repair import _DSML_UNCLOSED_NAME_RE
     good = f'<{T}parameter name="path" string="true">VERSION</{T}parameter>'

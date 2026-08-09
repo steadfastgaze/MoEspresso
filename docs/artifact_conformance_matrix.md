@@ -3,15 +3,30 @@
 What each durable artifact actually carries, mapped against the core contract.
 Scope is the five pipeline artifacts (`source_inventory`, `probe_evidence`,
 `optimizer_decision`, `package_plan`, `package_manifest`) plus the base contract
-every artifact shares. Speculation, KV-state, backend-pipeline, and residency
-contracts are out of scope until those phases exist. Their absence here is
-expected.
+every artifact shares.
+
+Two shipped subsystems write durable state outside that pipeline and are not
+mapped here. Speculative decoding loads drafters from standalone sidecar
+folders whose manifests are content-hashed through `core/artifact.py` in three
+kinds (`deepseek_v4_dspark_sidecar`, `deepseek_v4_mtp_sidecar`,
+`deepseek_v4_dflash_sidecar`), and a package that bundles one declares a
+`drafter` component in its own manifest; the format is in
+[`package_format.md`](package_format.md). The disk KV tier keeps checkpoints
+and speculative companions under its own versioned on-disk schemas
+(`moespresso-disk-kv-v1`, `moespresso-disk-kv-attachment-v1`), documented in
+[`disk_kv.md`](disk_kv.md). Neither is a phase of the conversion pipeline, so
+neither gets a row.
+
+The cells below that read **n/a** are contracts the pipeline artifacts do not
+carry: the manifest declares no KV storage format, no lazy-load grouping, and
+no backend-pipeline description, and residency follows from the runtime
+adapter kind rather than from a manifest field.
 
 Status words used in the tables:
 - **yes**: present and conformant.
 - **partial**: present but incomplete, or carried in a different shape than the contract names.
 - **no**: required by the contract but not emitted.
-- **n/a**: not yet in scope (future phase).
+- **n/a**: not a contract this artifact carries.
 
 ## Base contract (every artifact)
 
@@ -94,14 +109,15 @@ An infeasible run is recorded as a valid artifact describing infeasibility
 
 ## package_plan
 
-Built by `package/plan.py` (`make_package_plan`); produced by both the
-probe/optimizer route (`package_plan_from_decision`) and the GGUF recipe builders.
-The manifest builder refuses anything whose `artifact_kind` is not
-`package_plan`, so every written package passes through this artifact.
+Built by `package/plan.py` (`make_package_plan`); produced by the
+probe/optimizer route (`package_plan_from_decision`), the GGUF recipe builders,
+and the converted-artifact IQ_K builder. The manifest builder refuses anything
+whose `artifact_kind` is not `package_plan`, so every written package passes
+through this artifact.
 
 | Contract field | Status | Note |
 |---|---|---|
-| producer identity | yes | `producer_kind` (optimizer vs recipe) + `producer_reference` (e.g. the recipe GGUF identity). |
+| producer identity | yes | `producer_kind` (`probe_optimizer`, `gguf_recipe`, `iqk_converted_artifacts`) + `producer_reference` (e.g. the recipe GGUF identity). |
 | allocation | yes | `allocation[]`: the normalized per-tensor rows the writer consumes. |
 | force overrides | yes | `force_overrides[]` (`pattern`/`target` pairs); overrides fail closed on unknown formats and unmatched patterns unless explicitly allowed, and support a dry-run preview. |
 | kernel promotion flag | yes | `optimized_kernels_expected` (default false); copied into the manifest. |
@@ -121,12 +137,13 @@ Built by `package/manifest.py` (`build_package_manifest`); tokenizer block by
 | plan / decision id | yes | `provenance.source_plan_id` is the primary key; `source_decision_id` and `source_probe_id` are copied through the plan (null on the recipe route). A nested `provenance.package_plan` block records `producer_kind`, `producer_reference`, `optimized_kernels_expected`, and `force_overrides`. |
 | tokenizer / rendering identity | yes | `tokenizer` block: installed tokenizer file identities + `rendering_id` (sha256 over the installed tokenizer files, including the chat template) + `chat_template_source`. Runtime cache keys additionally fold in resolved chat-template kwargs via `runtime.http.rendering_identity(...)`. |
 | tensor files + layouts | yes | `files[]` with path/size/sha256; each `tensors[]` entry carries `shard` + `key_prefix`. |
-| weight formats + transforms + rotation | yes | Per-tensor `format` + `format_params` across the eight on-disk formats (tq: tq_version/bits/seed; affine: bits/group_size; mxfp4/mxfp8: group 32 + ue8m0 scale identity; kquant: codec + block geometry + module keys for the mlx-kquant installer; fp16 / f32_passthrough / raw_dtype_passthrough: none). |
-| KV formats / lazy-load groups / residency / KV schemas | n/a | Future phases. |
+| weight formats + transforms + rotation | yes | Per-tensor `format` + `format_params` across the nine on-disk formats (tq: tq_version/bits/seed; affine: bits/group_size; mxfp4/mxfp8: group 32 + ue8m0 scale identity; kquant: codec + block geometry + module keys for the mlx-kquant installer; iqk: member + wire layout + block geometry + module keys for the mlx-iqk installer; fp16 / f32_passthrough / raw_dtype_passthrough: none). |
+| KV formats / lazy-load groups / residency / KV schemas | n/a | The manifest declares none of these. Residency follows from the runtime adapter kind, and the disk KV tier versions its own storage outside the manifest. |
 | expert-selection capabilities | partial | `expert_layout` declares stacked/bundled/fused + key suffixes + row order; no selection/offload capability. |
-| required backend operations | yes | `required_ops` derived from the tensor formats: `tq_dequant`, `affine_dequant`, `mxfp4_dequant`, `mxfp8_dequant`, `kquant_dequant`, `fp16_passthrough`, `f32_passthrough`, `raw_dtype_passthrough`. |
+| required backend operations | yes | `required_ops` derived from the tensor formats: `tq_dequant`, `affine_dequant`, `mxfp4_dequant`, `mxfp8_dequant`, `kquant_dequant`, `iqk_dequant`, `fp16_passthrough`, `f32_passthrough`, `raw_dtype_passthrough`. |
 | kernel promotion flag | yes | Top-level `optimized_kernels_expected`, copied from the plan; runtime fast paths still validate actual tensor formats and shapes before use. |
 | agentic profile identity | partial | Optional `agentic_profile` block (path/sha256/size/family) when the family ships an `agentic_profile.json` sidecar; families without one omit the key. |
+| draft-model component identity | partial | Optional `drafter` block when a package bundles a speculative-decoding sidecar: per-file identities, the sidecar's artifact id, and the source package's manifest id. Declared optional under an all-or-nothing contract, so verification covers the drafter bytes when they are present and reports their absence otherwise. |
 | load-time validation checks | yes | Manifest fails closed on unwritten tensors / missing shards / an empty plan (`package.empty_plan`) / unsupported or downcast formats; the package verifier checks presence + size + sha256 + declared keys at load. |
 
 ## Summary
@@ -137,8 +154,9 @@ No open contract violations. The remaining `partial`/`no` rows are either:
   `producer.revision`);
 - phase-local absences by design (source_inventory and probe_evidence do not own
   token rendering. That identity is established at packaging/runtime); or
-- correctly-deferred future phases (KV-state, residency, speculation,
-  backend-pipeline), which the contract says to add when they become real.
+- contracts no pipeline artifact carries (KV storage format, lazy-load groups,
+  residency, backend pipeline), which the contract says to add if a pipeline
+  artifact ever declares them.
 
 Single-family coverage: the core is exercised against MoE (stacked experts,
 shared experts, router gate), dense (`ffn.*` roles + a whole-dense-model inventory

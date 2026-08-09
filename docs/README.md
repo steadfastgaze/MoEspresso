@@ -15,6 +15,9 @@ not need private investigation logs to understand the supported paths.
   commands, acceptance evidence, and the public/private fixture boundary.
 - [`deepseek_v4_speed.md`](deepseek_v4_speed.md): benchmark protocol, current
   resident and streamed records, context envelope, and known gaps.
+- [`speculative_decoding.md`](speculative_decoding.md): drafter families and
+  sidecars, the draft/verify loop, the adaptive scheduler, producer-scoped
+  cache reuse, memory, and the correctness contract.
 
 ### Ornith
 
@@ -56,8 +59,8 @@ GGUF recipe import -------------/
 - [`ssd_streaming.md`](ssd_streaming.md): bounded expert residency, direct
   reads, slot pools, routed decode, and runtime controls.
 - [`disk_kv.md`](disk_kv.md): the default-on disk prefix-checkpoint tier
-  (restart-warm and cross-session resume) and its fail-closed restore
-  contract.
+  (restart-warm and cross-session resume), optional DSpark-state companions,
+  and the fail-closed restore contract.
 
 ## Correctness and performance work
 

@@ -395,6 +395,7 @@ def _runtime_adapter_kind(manifest: dict) -> str:
         "f32_passthrough",
     }
     qwen_kquant_ops = dense_affine_ops | {"kquant_dequant"}
+    qwen_tq_ops = qwen_kquant_ops | {"tq_dequant"}
     dsv4_ops = {
         "affine_dequant",
         "fp16_passthrough",
@@ -404,6 +405,11 @@ def _runtime_adapter_kind(manifest: dict) -> str:
         "mxfp4_dequant",
         "mxfp8_dequant",
         "kquant_dequant",
+        # IQ_K routed experts serve through the mlx-iqk decode kernels, which
+        # read the `iqk_relayout` bundle layout only. A package still on the
+        # quantizer's own wire carries the same op and is refused at install
+        # by layout, where the reason can be stated.
+        "iqk_dequant",
     }
 
     if family == "deepseek_v4_flash":
@@ -422,7 +428,11 @@ def _runtime_adapter_kind(manifest: dict) -> str:
         and required_ops <= qwen_kquant_ops
     ):
         return "qwen_kquant_moe"
-    if "tq_dequant" in required_ops and family != "qwen3_5_dense":
+    if (
+        family == "qwen3_5_moe"
+        and required_ops <= qwen_tq_ops
+        and "tq_dequant" in required_ops
+    ):
         return "jangtq_moe"
 
     raise UnsupportedRuntimeAdapter(
@@ -483,7 +493,7 @@ def build_model(
         if tensor_map:
             _apply_tensor_map(model, tensor_map)
     if index is not None:
-        # bundle packages: jang's loader cannot hydrate routed experts (no
+        # Bundle packages: jang's loader cannot hydrate routed experts (no
         # stacked keys on disk); install them from the bundles, fail-loud.
         _install_routed_experts_from_bundles(
             model, package_dir, index, seed=int(jcfg.get("mxtq_seed", 42)))

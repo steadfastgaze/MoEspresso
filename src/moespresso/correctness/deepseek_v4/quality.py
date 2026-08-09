@@ -20,6 +20,7 @@ from moespresso.correctness.deepseek_v4.q2 import (
     Q2_REFERENCE_PATH,
     capture_q2_official_reference,
     compare_q2_score_tables,
+    default_q2_capture_path,
     encode_no_special,
     load_openrouter_token,
     make_deepseek_v4_q2_evidence,
@@ -133,9 +134,12 @@ def _q1_step_evidence(
         if expected_token_id in candidate_top_ids
         else None
     )
+    # Recorded, never gated: the provider returns sentinel logprobs for every
+    # non-selected candidate, so the overlap count carries no signal.
     overlap = sorted(set(official_top_ids) & set(candidate_top_ids))
     return {
         "step": int(official_step["step"]),
+        "comparable": expected_token_id is not None,
         "official_selected": {
             "token_id": expected_token_id,
             "text": expected_text,
@@ -166,26 +170,36 @@ def _q1_step_evidence(
     }
 
 
-def q1_deepseek_v4_official_top20_parity(
+def q1_deepseek_v4_selected_token_identity(
     package_dir: Path,
     *,
     fixture_root: Path | None = None,
+    vectors_root: Path | None = None,
     subject: dict | None = None,
 ) -> dict:
+    """Score greedy selected-token identity against a captured reference.
+
+    `fixture_root` holds the prompt files. `vectors_root` holds the reference
+    manifest and its official records, and defaults to `fixture_root`. They are
+    separate because a self-captured reference is oracle material that lives
+    outside the committed tree while the prompts it was captured on stay public:
+    scoring reads the same public prompt bytes and a private reference.
+    """
     from moespresso.runtime.deepseek_v4.renderer import DEEPSEEK_V4_PROMPT_RENDERER
     from moespresso.runtime.http import render_prompt
     from moespresso.runtime.serve import generate_with_metadata, load_served_model
 
     package_dir = Path(package_dir)
     fixture_root = Path(fixture_root or DS4_TEST_VECTOR_FIXTURE_ROOT)
-    vector_manifest = _read_json(fixture_root / "manifest.json")
+    vectors_root = Path(vectors_root or fixture_root)
+    vector_manifest = _read_json(vectors_root / "manifest.json")
     pin_full_expert_residency()
     model, tokenizer, manifest = load_served_model(package_dir)
 
     prompt_rows = []
     for prompt_spec in vector_manifest["prompts"]:
         prompt_path = fixture_root / prompt_spec["prompt_file"]
-        official_path = fixture_root / prompt_spec["official_file"]
+        official_path = vectors_root / prompt_spec["official_file"]
         prompt_text = prompt_path.read_text(encoding="utf-8")
         official = _read_json(official_path)
         official_steps = official["steps"]
@@ -233,6 +247,10 @@ def q1_deepseek_v4_official_top20_parity(
             "kind": prompt_spec["kind"],
             "prompt_file": prompt_spec["prompt_file"],
             "official_file": prompt_spec["official_file"],
+            # The reference decides how many steps exist. Recording the
+            # manifest's own count beside the scored count makes a mismatch a
+            # finding instead of a silently shorter run.
+            "declared_steps": prompt_spec.get("steps"),
             "prompt_chars": len(prompt_text),
             "prompt_tokens": result.prompt_tokens,
             "official_message": official.get("message", {}),
@@ -262,6 +280,10 @@ def q1_deepseek_v4_official_top20_parity(
             "endpoint": vector_manifest["endpoint"],
             "logprob_policy": "skip_sentinel_non_selected",
             "fixture_root": str(fixture_root),
+            "vectors_root": str(vectors_root),
+            "declared_steps": sum(
+                int(p.get("steps", 0)) for p in vector_manifest["prompts"]
+            ),
         },
         "candidate": {
             "kind": "moespresso_mlx_package",
@@ -271,7 +293,7 @@ def q1_deepseek_v4_official_top20_parity(
         },
         "thresholds": dict(DEEPSEEK_V4_Q1_DEFAULT_THRESHOLDS),
         "inputs": [
-            {"path": str(fixture_root / "manifest.json"), "role": "official_manifest"},
+            {"path": str(vectors_root / "manifest.json"), "role": "official_manifest"},
             {"path": str(package_dir / "package_manifest.json"), "role": "candidate_package"},
         ],
         "prompts": prompt_rows,
@@ -395,9 +417,14 @@ def main(argv: list[str] | None = None) -> int:
     q0.add_argument("--fixture-root", type=Path, help="override committed Q0 fixture root")
     q0.add_argument("--json-out", type=Path, help="write full correctness_evidence JSON")
 
-    q1 = sub.add_parser("q1", help="official top-20 parity over committed vectors")
+    q1 = sub.add_parser("q1", help="greedy selected-token identity over captured vectors")
     q1.add_argument("--package", help=f"DS4 package path, or {PACKAGE_ENV}")
-    q1.add_argument("--fixture-root", type=Path, help="override committed Q1 fixture root")
+    q1.add_argument("--fixture-root", type=Path, help="override the Q1 prompt fixture root")
+    q1.add_argument(
+        "--vectors-root",
+        type=Path,
+        help="reference manifest and official records root; defaults to --fixture-root",
+    )
     q1.add_argument("--json-out", type=Path, help="write full correctness_evidence JSON")
 
     q2_capture = sub.add_parser(
@@ -405,7 +432,20 @@ def main(argv: list[str] | None = None) -> int:
         help="capture official Q2 continuations through OpenRouter",
     )
     q2_capture.add_argument("--prompts", type=Path, default=Q2_PROMPTS_PATH)
-    q2_capture.add_argument("--out", type=Path, default=Q2_REFERENCE_PATH)
+    q2_capture.add_argument(
+        "--out",
+        type=Path,
+        help=(
+            "reference output path; defaults to a new timestamped file under "
+            "the private capture root. A capture never lands on an existing "
+            "reference without --force."
+        ),
+    )
+    q2_capture.add_argument(
+        "--force",
+        action="store_true",
+        help="allow overwriting an existing reference file",
+    )
     q2_capture.add_argument("--endpoint", default=OPENROUTER_ENDPOINT)
     q2_capture.add_argument("--model", default=OPENROUTER_DS4_FLASH_MODEL)
     q2_capture.add_argument("--count", type=int, default=100)
@@ -414,7 +454,16 @@ def main(argv: list[str] | None = None) -> int:
 
     q2 = sub.add_parser("q2", help="target-token NLL over official continuations")
     q2.add_argument("--package", help=f"DS4 package path, or {PACKAGE_ENV}")
-    q2.add_argument("--reference", type=Path, default=Q2_REFERENCE_PATH)
+    q2.add_argument(
+        "--reference",
+        type=Path,
+        default=Q2_REFERENCE_PATH,
+        help=(
+            "reference of record by default; pass an earlier reference "
+            "explicitly to reproduce a historical score, and do not compare "
+            "the two numbers"
+        ),
+    )
     q2.add_argument("--max-cases", type=int, default=None)
     q2.add_argument("--json-out", type=Path, help="write full correctness_evidence JSON")
 
@@ -442,32 +491,35 @@ def main(argv: list[str] | None = None) -> int:
         _emit(evidence, args.json_out)
         return 0 if evidence["status"] == "valid" else 1
     if args.gate == "q1":
-        evidence = q1_deepseek_v4_official_top20_parity(
+        evidence = q1_deepseek_v4_selected_token_identity(
             _package_arg(args.package),
             fixture_root=args.fixture_root,
+            vectors_root=args.vectors_root,
         )
         _emit(evidence, args.json_out)
         return 0 if evidence["status"] == "valid" else 1
     if args.gate == "q2-capture":
+        out_path = args.out if args.out is not None else default_q2_capture_path()
         token = load_openrouter_token()
         if not token:
             print("SKIPPED: OPENROUTER_TOKEN is not set in the environment or .env")
             return 0
         reference = capture_q2_official_reference(
             prompts_path=args.prompts,
-            out_path=args.out,
+            out_path=out_path,
             api_key=token,
             endpoint=args.endpoint,
             model=args.model,
             count=args.count,
             max_tokens=args.max_tokens,
             top_logprobs=args.top_logprobs,
+            force=args.force,
         )
         print(json.dumps({
             "schema": reference["schema"],
             "source": reference["source"],
             "cases": len(reference["cases"]),
-            "out": str(args.out),
+            "out": str(out_path),
         }, indent=2, sort_keys=True))
         return 0
     if args.gate == "q2":

@@ -573,6 +573,25 @@ def test_manifest_is_deterministic(tmp_path):
     assert a["artifact_id"] == b["artifact_id"] == compute_artifact_id(a)
 
 
+def test_manifest_threads_the_drafter_component(tmp_path):
+    dec = _decision()
+    loc, files = _located(dec), _files(tmp_path)
+    component = {
+        "family": "dspark",
+        "optional": True,
+        "manifest_path": "dspark_sidecar.json",
+        "sidecar_artifact_id": "art:abc",
+        "files": [{"path": "dspark_sidecar.json", "size_bytes": 4,
+                   "sha256": "0" * 64}],
+    }
+    without = build_package_manifest(dec, ARCH, loc, files)
+    with_drafter = build_package_manifest(dec, ARCH, loc, files,
+                                          drafter=component)
+    assert "drafter" not in without
+    assert with_drafter["drafter"] == component
+    assert with_drafter["artifact_id"] != without["artifact_id"]
+
+
 def test_changed_file_changes_id(tmp_path):
     dec = _decision()
     loc = _located(dec)

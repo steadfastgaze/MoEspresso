@@ -1,8 +1,29 @@
-"""DeepSeek-V4 Q1 official top-20 parity evidence contract.
+"""DeepSeek-V4 Q1 greedy selected-token identity evidence contract.
 
 The old decoded-weight M21 contract required a full official PyTorch reference with
 decoded FP4/FP8 weights. Q1 is deliberately cheaper and checks the real MoEspresso
-serve path against committed official DeepSeek-V4-Flash top-20 test vectors.
+serve path against captured official DeepSeek-V4-Flash generation vectors.
+
+**The bar is selected-token identity.** Every comparable reference step must be
+the local rank-0 token. A step is comparable when the reference's selected token
+resolves to exactly one token under the package tokenizer; a candidate that stops
+before the reference ran out of steps fails those steps rather than skipping them,
+so the bar cannot be lowered by generating less.
+
+**The top-20 overlap clause is retired.** The provider stack accepts
+`top_logprobs: 20` and returns sentinel values: the selected entry carries a real
+number and every other candidate sits at `-9999`, degrading to token-id-ordered
+filler. An overlap of at least one is therefore satisfied by the selected token
+alone and measures nothing. The candidate and reference top-20 id sets and their
+overlap are still recorded in the evidence, because they are what the fixture
+holds and they cost nothing to persist, but no threshold reads them. Calibrated
+distribution questions belong to the KL panel in `q4.py`, which scores against
+locally streamed teacher logits instead of provider logprobs.
+
+**The step count comes from the fixture.** It is not a constant: the same five
+prompts yield different step totals on different checkpoints, because a
+checkpoint that selects an end-of-sequence token earlier simply records fewer
+steps at the same `max_tokens`.
 """
 
 from __future__ import annotations
@@ -29,8 +50,22 @@ DEEPSEEK_V4_Q1_TOP_LOGPROBS = 20
 DEEPSEEK_V4_VOCAB_SIZE = 129280
 DEEPSEEK_V4_Q1_DEFAULT_THRESHOLDS = {
     "selected_rank_max": 0,
-    "top20_overlap_min": 1,
+    "selected_identity_over_comparable_steps": True,
 }
+# Retired threshold keys. Evidence written before the redesign still carries
+# them; they are reported once and never gate.
+DEEPSEEK_V4_Q1_RETIRED_THRESHOLDS = ("top20_overlap_min",)
+# Reference identities the gate accepts. Upstream's published suite names the
+# undated model. A self-captured reference names the dated slug it sent, and the
+# provider's own generation record reads back the canonical dated id; the three
+# are different naming conventions for a reference of record, not different
+# contracts. The undated slug is not a checkpoint identity and must never be
+# used to *capture* a reference.
+DEEPSEEK_V4_Q1_REFERENCE_MODELS = (
+    "deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-0731",
+    "deepseek/deepseek-v4-flash-20260731",
+)
 
 
 def _blocking(code: str, message: str, *, path: str, expected=None, actual=None) -> Validation:
@@ -41,6 +76,19 @@ def _blocking(code: str, message: str, *, path: str, expected=None, actual=None)
         path=path,
         phase="Q1",
         blocking=True,
+        expected=_json_safe(expected),
+        actual=_json_safe(actual),
+    )
+
+
+def _note(code: str, message: str, *, path: str, expected=None, actual=None) -> Validation:
+    return Validation(
+        "info",
+        code,
+        message,
+        path=path,
+        phase="Q1",
+        blocking=False,
         expected=_json_safe(expected),
         actual=_json_safe(actual),
     )
@@ -136,7 +184,6 @@ def _validate_reference(evidence: dict) -> list[Validation]:
     expected = {
         "kind": "deepseek_official_api_top20",
         "schema": "ds4-official-logprobs-v1",
-        "model": "deepseek-v4-flash",
         "source": "deepseek-official-api",
     }
     for key, value in expected.items():
@@ -148,6 +195,14 @@ def _validate_reference(evidence: dict) -> list[Validation]:
                 expected=value,
                 actual=reference.get(key),
             ))
+    if reference.get("model") not in DEEPSEEK_V4_Q1_REFERENCE_MODELS:
+        out.append(_blocking(
+            "deepseek_v4.q1.reference_model",
+            "Q1 reference must name an accepted DeepSeek-V4-Flash reference identity",
+            path="/reference/model",
+            expected=list(DEEPSEEK_V4_Q1_REFERENCE_MODELS),
+            actual=reference.get("model"),
+        ))
     if reference.get("logprob_policy") != "skip_sentinel_non_selected":
         out.append(_blocking(
             "deepseek_v4.q1.reference_logprob_policy",
@@ -270,9 +325,19 @@ def _validate_prompt_row(row: Any, *, index: int, thresholds: dict) -> list[Vali
     selected_rank_max = _int_value(thresholds.get("selected_rank_max"))
     if selected_rank_max is None:
         selected_rank_max = DEEPSEEK_V4_Q1_DEFAULT_THRESHOLDS["selected_rank_max"]
-    top20_overlap_min = _int_value(thresholds.get("top20_overlap_min"))
-    if top20_overlap_min is None:
-        top20_overlap_min = DEEPSEEK_V4_Q1_DEFAULT_THRESHOLDS["top20_overlap_min"]
+
+    # The reference declares how many steps it holds. A run that scored a
+    # different number scored a different fixture, so the two are cross-checked
+    # rather than trusting whichever one the summary happened to read.
+    declared_steps = _int_value(row.get("declared_steps"))
+    if declared_steps is not None and declared_steps != len(steps):
+        out.append(_blocking(
+            "deepseek_v4.q1.step_count_mismatch",
+            "Q1 scored a different number of steps than the reference declares",
+            path=f"{path}/steps",
+            expected=declared_steps,
+            actual=len(steps),
+        ))
 
     for step_index, step in enumerate(steps):
         step_path = f"{path}/steps/{step_index}"
@@ -283,6 +348,21 @@ def _validate_prompt_row(row: Any, *, index: int, thresholds: dict) -> list[Vali
                 path=step_path,
                 expected="object",
                 actual=type(step).__name__,
+            ))
+            continue
+        # Comparability is a property of the reference alone: a reference step
+        # whose selected token does not resolve to exactly one token under the
+        # package tokenizer cannot be scored as identity. Q0 pins that every
+        # reference token does resolve, so a non-comparable step means the
+        # package tokenizer is not the checkpoint tokenizer and the gate fails
+        # closed instead of quietly scoring fewer steps.
+        if step.get("comparable") is False:
+            out.append(_blocking(
+                "deepseek_v4.q1.reference_step_not_comparable",
+                "reference selected token does not resolve to one package token",
+                path=f"{step_path}/comparable",
+                expected=True,
+                actual=step.get("comparable"),
             ))
             continue
         if step.get("selected_match") is not True:
@@ -301,15 +381,6 @@ def _validate_prompt_row(row: Any, *, index: int, thresholds: dict) -> list[Vali
                 path=f"{step_path}/selected_rank",
                 expected=f"<= {selected_rank_max}",
                 actual=step.get("selected_rank"),
-            ))
-        overlap = _int_value(step.get("top20_overlap_count"))
-        if overlap is None or overlap < top20_overlap_min:
-            out.append(_blocking(
-                "deepseek_v4.q1.top20_overlap_too_low",
-                "candidate top-20 must overlap the official top-20 candidate set",
-                path=f"{step_path}/top20_overlap_count",
-                expected=f">= {top20_overlap_min}",
-                actual=step.get("top20_overlap_count"),
             ))
         if step.get("official_logprob_delta_policy") != "skipped_sentinel_non_selected":
             out.append(_blocking(
@@ -384,6 +455,18 @@ def validate_deepseek_v4_q1_evidence(evidence: dict) -> list[Validation]:
     out.extend(_validate_reference(evidence))
     out.extend(_validate_candidate(evidence))
     out.extend(_validate_prompts(evidence))
+    thresholds = evidence.get("thresholds")
+    if isinstance(thresholds, dict):
+        for key in DEEPSEEK_V4_Q1_RETIRED_THRESHOLDS:
+            if key in thresholds:
+                out.append(_note(
+                    "deepseek_v4.q1.retired_threshold",
+                    f"Q1 no longer gates on {key}; the provider's non-selected "
+                    "candidate logprobs are sentinel values",
+                    path=f"/thresholds/{key}",
+                    expected="absent",
+                    actual=thresholds.get(key),
+                ))
     return out
 
 
@@ -408,6 +491,25 @@ def _selected_matches(evidence: dict) -> int:
     return total
 
 
+def _comparable_steps(evidence: dict) -> int:
+    """Count reference steps whose selected token is scoreable as identity.
+
+    A step without an explicit `comparable` field counts as comparable, so
+    evidence written before the field existed reads the same way it always did.
+    """
+    prompts = evidence.get("prompts")
+    if not isinstance(prompts, list):
+        return 0
+    total = 0
+    for prompt in prompts:
+        if not isinstance(prompt, dict):
+            continue
+        for step in prompt.get("steps", []):
+            if isinstance(step, dict) and step.get("comparable") is not False:
+                total += 1
+    return total
+
+
 def make_deepseek_v4_q1_evidence(subject: dict, external_evidence: dict) -> dict:
     """Wrap Q1 run results as a correctness_evidence artifact."""
     external_evidence = _json_safe(external_evidence)
@@ -415,6 +517,7 @@ def make_deepseek_v4_q1_evidence(subject: dict, external_evidence: dict) -> dict
     blocking = any(f.blocking for f in findings)
     inputs = external_evidence.get("inputs", []) if isinstance(external_evidence, dict) else []
     steps = _step_count(external_evidence)
+    comparable_steps = _comparable_steps(external_evidence)
     selected_matches = _selected_matches(external_evidence)
     return make_artifact(
         "correctness_evidence",
@@ -430,8 +533,13 @@ def make_deepseek_v4_q1_evidence(subject: dict, external_evidence: dict) -> dict
             "prompts": len(external_evidence.get("prompts", []))
             if isinstance(external_evidence.get("prompts"), list) else 0,
             "steps": steps,
+            "comparable_steps": comparable_steps,
             "selected_matches": selected_matches,
+            # Named in the artifact so a reader never has to infer which Q1 bar
+            # produced the status.
+            "bar": "greedy_selected_token_identity_rank0_all_comparable_steps",
             "top_logprobs": DEEPSEEK_V4_Q1_TOP_LOGPROBS,
+            "top20_overlap_gated": False,
             "logprob_delta_policy": "skipped_sentinel_non_selected",
             # The wheel variant keys the quality lattice; record it so a
             # silent reinstall flip is attributable from the artifact alone.
@@ -444,7 +552,7 @@ def make_deepseek_v4_q1_evidence(subject: dict, external_evidence: dict) -> dict
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="moespresso-ds4-q1-validate",
-        description="Validate DeepSeek-V4 Q1 official top-20 parity evidence.",
+        description="Validate DeepSeek-V4 Q1 greedy selected-token identity evidence.",
     )
     parser.add_argument("evidence", help="external Q1 evidence JSON")
     parser.add_argument("--out", help="write correctness_evidence artifact JSON")

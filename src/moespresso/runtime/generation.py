@@ -39,18 +39,38 @@ class GenerationResult:
     cached_tokens: int | None = None
     generated_token_ids: tuple[int, ...] = ()
     prompt_cache: Any = None
+    # A speculative candidate stays separate until PrefixCacheGenerator can
+    # consume the target, frontier, and companion atomically on its own rail.
+    # `prompt_cache` remains the legacy plain-rail publication field.
+    speculative_prompt_cache: Any = None
+    cache_frontier: int | None = None
+    cache_companion: Any = None
     token_logprobs: tuple[float, ...] = ()
     top_logprobs: tuple[tuple[dict, ...], ...] = ()
     cache_event: str | None = None
     cache_entries: int | None = None
     cache_bytes: int | None = None
-    # first-token latency is the serve lane's headline metric
+    # generation-local first-token latency retained for compatibility
     first_token_seconds: float | None = None
     generation_seconds: float | None = None
     # disk frontier checkpoints written during this call (None when the writer is off)
     disk_checkpoints_written: int | None = None
     # per-checkpoint blocking write cost in seconds, measured under the serve lock
     disk_checkpoint_write_seconds: tuple[float, ...] = ()
+    # optional disk companion outcome for a restored speculative target
+    disk_attachment_event: str | None = None
+    # confirmed companion payload commits during speculative prefill
+    disk_attachments_written: int | None = None
+    disk_attachment_write_seconds: tuple[float, ...] = ()
+    # speculative-decoding stats (drafter family, rounds, acceptance, fallbacks,
+    # submit-length histogram) when a drafter served the request; None otherwise
+    speculative: dict | None = None
+    # elapsed time from the cache-routing ready seam to the first committed token
+    ready_to_first_token_seconds: float | None = None
+    # valid target payload reconstruction, including an unusable exact hit
+    disk_restore_seconds: float | None = None
+    # successful companion restore through usable live drafter state
+    disk_attachment_restore_seconds: float | None = None
 
 
 def as_generation_result(value: str | GenerationResult) -> GenerationResult:

@@ -1,19 +1,17 @@
-# Runtime: the non-streaming serve path
+# Runtime: the manifest-driven serve path
 
-How MoEspresso turns a `mjtq` package on disk into served tokens, for the
-resident (non-streaming) path in `src/moespresso/runtime/`. The artifact-centered
-design comes down to one thing here: the engine builds the model from the
-manifest. It never sniffs marker files, never infers bit-widths from array
-shapes, never reads the source checkpoint. Model-specific execution code is fine;
-what is ruled out is model-specific detection and conversion at load.
+How MoEspresso turns a package on disk into served tokens through
+`src/moespresso/runtime/`. The engine builds the model from the manifest. It
+never sniffs marker files, infers bit widths from array shapes, or reads the
+source checkpoint. Model-specific execution code is allowed; model detection
+and conversion at load are not.
 
-> Scope note. SSD streaming is the primary MoE runtime; the fully-dense
-> package is the explicit non-streaming exception (no routed experts to stream).
-> `build_manifest_runtime` (`serve.py`) dispatches: a non-dense package whose
-> `required_ops` include `tq_dequant` goes to the streaming builder; everything
-> else builds resident via `runtime/build.build_model`. This document covers the
-> resident path. Where serve code reaches into streaming state (the truth line,
-> hotlist persistence), it is called out but not detailed.
+> Scope note. `build_manifest_runtime` (`serve.py`) dispatches on the resolved
+> runtime adapter kind. `jangtq_moe` and `qwen_kquant_moe` enter the top-level
+> pooled builder. Other kinds enter `runtime/build.py`. The DeepSeek-V4 loader
+> then installs supported routed bundles into pooled slots, including IQ_K. The
+> outer builder branch therefore does not determine routed-expert residency.
+> `docs/ssd_streaming.md` defines the shared pool contract.
 
 ---
 
@@ -29,9 +27,10 @@ produces it:
 2. Build the model straight from the manifest via the injectable
    `build_fn(manifest, package_dir)` seam. The default is
    `_manifest_driven_backend`, which calls `build_manifest_runtime`.
-3. Print one honest **runtime truth line** stating which runtime the user
-   actually got (`_runtime_truth_line`) (`runtime=resident` for this path)
-   so nobody has to guess whether they got the resident or streaming engine.
+3. Print one honest **runtime truth line** stating whether the loaded model has
+   a routed-expert pool, its startup capacity and seed source, and whether a
+   drafter engaged. Runtime statistics carry any later per-layer capacity
+   overrides.
 
 ### The build (`runtime/build.py`): the proven jang loader, no dequant at load
 
@@ -48,7 +47,8 @@ affine+TQ, driven entirely by the manifest:
   - `qwen_kquant_moe`: `qwen3_5_moe` with `kquant_dequant` experts (and no
     `tq_dequant`).
   - `jangtq_moe`: any other non-dense family with `tq_dequant` → jang's
-    `load_jangtq_model`. (Unknown combinations raise `UnsupportedRuntimeAdapter`.)
+    `load_jangtq_model`. (Unknown combinations raise
+    `UnsupportedRuntimeAdapter`.)
 - The package carries jang-compatible **sidecars** (`config.json`,
   `jang_config.json`) that convert *generated from the manifest*: a compat view
   for the loader, with the manifest staying the source of truth. The loader
@@ -66,7 +66,59 @@ affine+TQ, driven entirely by the manifest:
   geometry, and replaces each projection with a `TurboQuantSwitchLinear`
   carrying the exact packed/norms bytes (filled by byte-copy into persistent MLX
   buffers, no numpy on the engine path). Anything missing raises
-  `RoutedExpertInstallError` rather than serving a quietly-wrong model.
+  `RoutedExpertInstallError` rather than serving a quietly-wrong model. The
+  byte-copy installer knows the TQ and K-quant codecs. DeepSeek-V4 installs
+  supported target bundles through its pooled adapter.
+- **IQ_K target experts.** DeepSeek-V4 installs routed IQ_K bundles through
+  `install_pooled_switchglus`. Each projection is a
+  `PooledIqkSwitchLinear` backed by an `ExpertSlotPool`. A miss reads the
+  layer's contiguous expert row through the shared row cache, splits the
+  projection's `blocks` payload into the streams declared by `mlx_iqk`, and
+  publishes the slot only after every stream has landed. Only
+  `iqk_relayout` serves; packages carrying `ik_wire` are refused.
+
+  At capacity 256, startup prewarms every expert and the full-residency
+  certificate selects the host-sync-free route. Smaller capacities use the
+  same `PooledSwitchGLU` graph with slot loading, eviction, and chunking. Both
+  cases keep the IQ_K GEMV/sorted crossover at 4,096 routed pairs, the default
+  16-way sorted split, and the decode and speculative-verify commit cadence.
+  `MOESPRESSO_DSV4_IQK_DECODE_FLUSH_LAYERS=0` disables those commits. Their
+  engagement is visible through `iqk_decode_flush_calls` and
+  `iqk_verify_flush_calls`. The Q8 shared-FFN hC-post fusion installs only when
+  the target pool holds every expert; bounded pools retain the stock block.
+
+  `runtime/deepseek_v4/iqk_experts.py` retains the resident IQ_K switch used by
+  DSpark sidecars and by reference measurements. It shares the member, layout,
+  kernel-route, activation, and validation contracts with the target pool but
+  is not the default target installer.
+- **Adaptive pool growth.** `PrefixCacheGenerator` invokes
+  `maybe_adapt_ssd_streaming_capacity` after generated target cache state has
+  been published. The planner can grow selected hot layers while retaining a
+  4 GiB live-memory floor and a separate cap on committed extra slot bytes.
+  Each layer replaces its distinct gate, up, and down pools as one transaction;
+  pre-publication failure leaves that layer unchanged. A hard growth or hot-seed
+  failure is recorded and latched instead of turning the completed response
+  into an HTTP or SSE error. `docs/ssd_streaming.md` defines the transaction and
+  replacement-headroom contract.
+- **`MOESPRESSO_DSV4_KQUANT_BULK_ROUTE`** selects the route for non-q8_0
+  dense bulk multi-row matmul calls: `auto` (default) serves the direct
+  kernel only for verify-shaped tiny multi-row calls, and only when the
+  strided-bulk probe verifies the installed mlx-kquant against the recorded
+  defect pair; prefill- and scorer-width calls keep the dequant bridge. The
+  kernel op emits on the bfloat16 lattice where the bridge computes in
+  float32, and routing every bulk width through the kernel measured Q2 avg
+  NLL 0.40094 on the ship artifact against 0.39634 through the bridge, above
+  the 0.3990 dense-gate band, so the width gate confines the math change to
+  the verify forwards that own the round wall. `kernel` forces the kernel at
+  every bulk width (the instrument arm, still probe-gated); `bridge` forces
+  the bridge regardless of the probe (the A/B and the kill lever). Unknown
+  values refuse rather than guess.
+- **`MOESPRESSO_DSV4_IQK_DENSE_QMV`** is the kill switch for the dense IQ_K
+  serving routes, default on; `0` sends every dense call to the counted
+  dequant bridge. The dense members reach no serving default today (no
+  package declares them and the dense relayout step does not exist), so the
+  switch guards an unproven path rather than a measured one. Counters
+  `iqk_dense_*` export through all three census surfaces.
 - **Mixed gate/up bits** (`_wrap_mixed_bit_switchglus` + `owned_switchglu.py`):
   jang monkeypatches `SwitchGLU.__call__` at the class level with a fused
   gate+up kernel that has *one* bit-width parameter. For layers whose routed
@@ -91,11 +143,21 @@ non-Mistral tokenizers loaded from a mixed dir is filtered out by
 
 Generation runs over an **already-rendered** prompt (a string or token ids). It
 never templates (see §4). It drives mlx_lm's `stream_generate` with an injected
-sampler, accumulating text and token ids, timing **first-token latency** and
-total generation time, and returns a `GenerationResult` (`generation.py`): text,
+sampler, accumulating text and token ids, timing first-token latency and total
+generation time, and returns a `GenerationResult` (`generation.py`): text,
 `finish_reason`, prompt/completion/cached token counts, the generated token ids,
 the (mutated) `prompt_cache`, and the latency fields. The `stream_generate`/
 `sampler` functions are injectable so the contract is testable without MLX.
+The existing `first_token_seconds` remains local to the generation seam.
+Server requests also report `ready_to_first_token_seconds`, measured from the
+cache-routing ready seam through the first committed token. When a transport
+callback is present, the clock starts immediately after it returns. It includes
+the selected memory-cache claim or disk restore, drafter-state restore,
+generation setup, blocking prefill checkpoint writes, and model work after the
+ready seam. For a streaming HTTP request, the callback commits and flushes the
+response headers before the clock starts. Non-streaming requests use the same
+internal seam without a transport callback. The read-only route probe and
+request validation happen before this clock starts.
 
 `generate_once` is the thin string-in/string-out wrapper the CLI uses;
 `PrefixCacheGenerator.__call__` is the server's path (§6). Both feed the same
@@ -330,6 +392,13 @@ miss; serving enables it by default under a per-package root
 (`MOESPRESSO_DISK_KV=off` disables it) and it is documented separately in
 `docs/disk_kv.md`.
 
+Resumable DeepSeek-V4 DSpark entries pair the target cache with a portable
+drafter-state companion, and plain and speculative producers occupy separate
+rails in the store. The target and companion bytes share the in-memory cache
+limits. Other speculative drafter paths remain non-resumable and bypass both
+cache tiers for that request. `docs/speculative_decoding.md` states which
+drafter families are resumable and the provenance a rail identity covers.
+
 `PrefixCacheGenerator.__call__` per request:
 
 1. **Encode** the rendered prompt to token ids with the same BOS/special-token
@@ -353,15 +422,21 @@ miss; serving enables it by default under a per-package root
    cache built under one render policy is never reused under another. Sampling
    knobs deliberately stay out of this key: they are generation-only, so a
    client may vary them turn over turn on one session without losing its
-   prefix.
-4. **Fetch nearest** prefix from the store → `(prompt_cache, suffix_tokens)`;
-   `cached_tokens = full − suffix`. A hit generates only the suffix over the
-   reused KV (the append-only template makes follow-up turns extend the prefix).
-   Empty-suffix exact hits and misses fall back to a fresh `make_prompt_cache`
-   (`exact_fallback`/`miss`), since MLX needs at least one prompt token.
-5. **Generate** through `generate_with_metadata` (which MLX mutates the cache
-   object in place), then **insert** the cache back under the full token sequence
-   (prompt + generated) so the next turn can reuse it.
+   prefix. A producer rail is an additional store dimension. The ordinary
+   target path uses `plain`; resumable DSpark uses its provenance-bound rail.
+4. **Fetch nearest** prefix from the store. Ordinary requests receive
+   `(prompt_cache, suffix_tokens)`. Eligible DSpark requests first probe plain
+   and speculative rails without moving either entry, then claim the deepest
+   reusable target. A compatible companion resumes speculation. A target-only
+   entry serves the suffix through plain generation. On an in-memory miss, disk
+   restore validates the target first and then consults its optional DSpark
+   companion. `cached_tokens = full − suffix` in every hit case.
+5. **Generate** through `generate_with_metadata`, which mutates the target cache
+   in place, then publish the generated-through cache on its producer rail.
+   Speculative publication accepts only a committed public frontier and a
+   companion with matching provenance. Empty-suffix exact hits fall back to a
+   fresh prompt prefill (`exact_fallback`), since the cache does not persist the
+   next-token logits needed to start generation.
 
 A client may send `metadata.moespresso_cache_key` on a request to group its
 requests as one session chain for disk-cache eviction preference. It is an
@@ -371,10 +446,12 @@ behaves exactly as before.
 
 `cache_stats()` exposes a small snapshot (default/supported live-KV formats,
 entry count, byte count) for `/health`, plus a `disk` sub-block when the
-disk KV cache is enabled (`docs/disk_kv.md`). Prefix reuse is in-memory
-first; the disk KV cache is the one durable prompt-cache tier, on by
-default when serving (`MOESPRESSO_DISK_KV=off` disables it). The only
-durable artifact otherwise is the package itself.
+disk KV cache is enabled (`docs/disk_kv.md`). The disk block reports combined
+and target/attachment payload bytes, companion availability, and separate
+target and attachment counters. Prefix reuse is in-memory first; the disk KV
+cache is the one durable prompt-cache tier, on by default when serving
+(`MOESPRESSO_DISK_KV=off` disables it). The only durable artifact otherwise is
+the package itself.
 
 ---
 
@@ -391,9 +468,18 @@ testable without a socket, MLX, or jang:
   `chat.completion` dict. A `ContextLimitError` from the generator (§6) maps to
   a 400 client error. Usage includes `prompt_tokens_details.cached_tokens`, a
   `prompt_cache` block (the cache event, entry/byte counts, and, when disk KV
-  is on, the `disk_hit` event and a `disk_checkpoints_written` count), and a
-  `moespresso` block with first-token latency / generation seconds / tokens-per-
-  second (the headline serve metric surfaced on every response).
+  is on, the `disk_hit` event and a `disk_checkpoints_written` count). DSpark
+  disk use adds an independent `drafter_state.event` (`hit`, `missing`,
+  `invalid`, or `unavailable`) and a `disk_drafter_states_written` count.
+  `disk_checkpoint_write_seconds` and `disk_drafter_state_write_seconds` carry
+  the per-write blocking durations, rounded to six decimal places, when their
+  respective timing arrays are non-empty. A valid disk payload adds
+  `disk_restore_seconds`; a successful drafter-state restore adds
+  `drafter_state.restore_seconds`. The target event remains `disk_hit` when the
+  optional drafter state cannot be used. Usage also carries a
+  `moespresso` block with generation-local first-token latency,
+  ready-to-first-token latency,
+  generation seconds, and tokens per second.
   The `created` timestamp and the `generate` callable are injected: no
   wall-clock read, no model dependency in the core.
 - **Sampling pass-through.** Beyond `temperature`/`top_p`/`max_tokens`, a
@@ -449,9 +535,12 @@ build the in-memory cache generator (`build_cache_generator` →
 `PrefixCacheGenerator`), expose `/health` stats, and run until interrupted
 (clean shutdown closes the server and the cache generator). `/health` reports
 status and model id, the `prompt_cache` block (formats, entry and byte counts,
-plus the `disk` sub-block with the disk store's counters when disk KV is on),
-and an `ssd_streaming` block with the streaming runtime's counters when the
-package streams.
+plus the `disk` sub-block with target and optional-companion storage and
+counters when disk KV is on),
+and an `ssd_streaming` block whenever the pooled runtime is installed. That
+block covers bounded execution and the zero-miss capacity-256 case, including
+the startup capacity, per-layer overrides, adaptive-growth result, residency,
+and expert-I/O counters.
 
 ---
 
@@ -467,11 +556,11 @@ package streams.
 | `verify.py` | Pure, fail-closed manifest, identity, tensor-key, and sidecar gate; off the hot path. |
 | `thinking.py` | Per-family thinking on/off resolution; refuse loudly. |
 | `kv_policy.py` | Pure live-KV policy parse/validate → mlx_lm kwargs (in-memory). |
-| `prefix_cache.py` | In-memory prefix reuse: `PromptCacheStore`, one live timeline per chain; declared-context-limit refusal. |
-| `disk_kv.py` | The disk KV checkpoint tier, on by default when serving (`docs/disk_kv.md`). |
+| `prefix_cache.py` | In-memory prefix reuse: `PromptCacheStore`, producer rails, one live timeline per chain; declared-context-limit refusal; target-first memory and disk routing. |
+| `disk_kv.py` | The disk KV target-checkpoint tier and optional companion store, on by default when serving (`docs/disk_kv.md`). |
 | `kquant_install.py` | Manifest-driven swap of constructed MLX modules to mlx-kquant module classes before K-quant wire bytes load. |
 | `owned_switchglu.py` | `OwnedSwitchGLU` forward immune to jang's class-level fused patch (mixed gate/up bits). |
-| `deepseek_v4/` | DeepSeek-V4 runtime graph adapter, cache contract, native/helper probes, and speed replay tools. |
+| `deepseek_v4/` | DeepSeek-V4 runtime graph adapter, cache contract, DSpark continuation and disk-companion bridge, native/helper probes, and speed replay tools. |
 | `qwen/` | Qwen-family runtime kernels: flash-style q8 full attention, prefill chunk planning, sorted SwitchGLU. |
 
 Packages that carry an `agentic_profile.json` sidecar expose recorded

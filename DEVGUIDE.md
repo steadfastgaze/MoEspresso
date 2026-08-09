@@ -10,16 +10,20 @@ third public product.
 
 ## The lifecycle
 
-MoEspresso has two planning routes that converge before writing a package.
+MoEspresso has three planning routes that converge before writing a package.
 The research route measures a source model and optimizes an allocation. The
-recipe route imports an existing GGUF allocation. Both must emit the same
-internal `package_plan`, and the writer/runtime must not care which route
-produced it.
+recipe route imports an existing GGUF allocation. The converted-artifact route
+imports routed-expert bytes that a separate conversion stage already encoded,
+together with the allocation that chose each cell's codec. All three must emit
+the same internal `package_plan`, and the writer/runtime must not care which
+route produced it.
 
 ```
-inventory  ->  probe  ->  optimize  --\
-                                      package_plan  ->  package  ->  runtime
-GGUF recipe import  -----------------/
+inventory  ->  probe  ->  optimize  ---\
+                                        \
+GGUF recipe import  ---------------------+->  package_plan  ->  package  ->  runtime
+                                        /
+converted expert artifacts  -----------/
 ```
 
 | Phase | Reads | Writes | What it does |
@@ -28,9 +32,10 @@ GGUF recipe import  -----------------/
 | probe | `source_inventory` + weights + calibration | `probe_evidence` | measure activation-weighted reconstruction quality per (bits, group-size) |
 | optimize | `probe_evidence` + constraints | `optimizer_decision` | allocate bits per tensor under a size/quality/tail constraint |
 | recipe import | GGUF metadata + source inventory | recipe allocation | copy an external tensor-by-tensor format recipe without copying GGUF weights |
-| package plan | `optimizer_decision` or recipe allocation | `package_plan` | normalize allocation, provenance, and explicit force overrides into the writer IR |
+| artifact import | staged expert artifacts + source inventory | converted allocation | adopt already-encoded routed-expert bytes and the per-cell codec choice that produced them |
+| package plan | `optimizer_decision`, recipe allocation, or converted allocation | `package_plan` | normalize allocation, provenance, and explicit force overrides into the writer IR |
 | package | `package_plan` + weights | `package_manifest` | quantize, write shards, emit the package's self-description |
-| runtime | a package | (generation) | build the model from the manifest, verify, serve |
+| runtime | a package | (generation) | build the model from the manifest and serve; integrity verification is the separate `moespresso-verify` gate, kept off the serve path |
 
 Every artifact carries a content-hashed id and a fail-closed version. The
 contract is one file: `src/moespresso/core/artifact.py`. It registers seven
@@ -47,17 +52,29 @@ each produced artifact actually carries.
 | `inventory/` | `roles.py`, `build.py`, `architecture_profile.py`, `safetensors_header.py`, `hf_inspect.py`, `deepseek_v4/` | header-only inventory; shared/Qwen-style name-to-role resolver helpers; model-specific naming contracts and static source validators; the family correctness contract | `docs/source_inventory.md` |
 | `probe/` | `build.py`, `calibration.py`, `quality.py`, `roundtrip.py`, `weight_io.py`, `gguf_parse.py`, `deepseek_v4/` | streamed quality measurement; the GGUF/legacy imatrix calibration provider; model-specific probe adapters | `docs/probe_evidence.md` |
 | `optimize/` | `allocate.py`, `decide.py`, `aggregate.py`, `health.py`, `monotone.py`, `sizes.py`, `affine_elasticity.py` | the bit-allocation core, the decision artifact, the allocation health gate | `docs/optimizer_decision.md` |
-| `package/` | `convert.py`, `plan.py`, `manifest.py`, `write.py`, `bundle.py`, `hotlist.py`, `tokenizer.py`, `templates.py`, `templates/` (vendored chat templates), `sidecars.py`, `agentic_profile.py`, `constants.py`, `tq.py`, `kquant_format.py`, `kquant_recipe.py`, `kquant_backend.py`, `kquant_bundle.py`, `kquant_cache.py`, `kquant_gguf.py`, `deepseek_v4/`, `qwen/` | build-time orchestration, the common package-plan IR, the byte-deterministic writer, the manifest, tokenizer/template packaging, sidecar and agentic-profile generation, shared MJTQ/K-quant format contracts, shared GGUF K-quant parsing, encode cache, and model-specific GGUF recipe/package builders | `docs/package_format.md` |
-| `correctness/` | `ladder.py`, `gate.py`, `goldens.py`, `reconstruct.py`, `tq_reference.py`, `environment.py`, `deepseek_v4/`, `qwen35/`, `ornith/` | the general correctness ladder, the convert-time gate, environment gating for measured runs, and model-specific quality gates and debug tools | `docs/correctness_ladder.md` |
+| `package/` | `convert.py`, `plan.py`, `manifest.py`, `write.py`, `bundle.py`, `hotlist.py`, `tokenizer.py`, `templates.py`, `templates/` (vendored chat templates), `sidecars.py`, `agentic_profile.py`, `constants.py`, `tq.py`, `kquant_format.py`, `kquant_recipe.py`, `kquant_backend.py`, `kquant_bundle.py`, `kquant_cache.py`, `kquant_gguf.py`, `iqk_format.py`, `iqk_relayout.py`, `deepseek_v4/` (with the vendored cold-start expert ranking under `deepseek_v4/data/`), `qwen/` | build-time orchestration, the common package-plan IR, the byte-deterministic writer, the manifest, tokenizer/template packaging, sidecar and agentic-profile generation, shared MJTQ/K-quant/IQ_K format contracts, shared GGUF K-quant parsing, encode cache, and model-specific recipe/package builders | `docs/package_format.md` |
+| `correctness/` | `ladder.py`, `gate.py`, `goldens.py`, `reconstruct.py`, `tq_reference.py`, `environment.py`, `fixtures/`, `deepseek_v4/`, `qwen35/`, `ornith/` | the general correctness ladder, the convert-time gate, environment gating for measured runs, the committed evaluation fixtures with their public/private boundary, and model-specific quality gates and debug tools | `docs/correctness_ladder.md` |
 | `toolcalls/` | `types.py`, `qwenxml.py`, `dsml.py`, `envelope.py`, `repair.py` | tool-call dialects as pure stdlib code: the `ToolCall` type, strict per-dialect parsers, the DSML grammar and serializers, and the bounded repair layer. Shared by the serve layer (parse side) and agentlib (client side) | `docs/tool_calls.md` |
-| `runtime/` | `serve.py`, `build.py`, `http.py`, `chat_stream.py`, `tool_stream.py`, `generation.py`, `verify.py`, `thinking.py`, `kv_policy.py`, `prefix_cache.py`, `disk_kv.py`, `kquant_install.py`, `owned_switchglu.py`, `deepseek_v4/`, `qwen/` | serve a package from its manifest; one-shot and HTTP entry points with SSE streaming; served tool-call extraction into OpenAI `tool_calls`; in-memory KV and prefix reuse; declared-context-limit refusal; the default-on disk KV checkpoint tier; K-quant module installation; model-specific runtime adapters, kernels, and probes | `docs/runtime_resident.md`, `docs/tool_calls.md`, `docs/disk_kv.md` |
-| `runtime/` (streaming) | `ssd_streaming_build.py`, `streaming_capacity.py`, `expert_index.py`, `expert_loader.py`, `expert_pool.py`, `expert_slot_pool.py`, `expert_locality.py`, `pooled_switchglu.py`, `routed_decode_kernel.py`, `gather_tq_split_norms.py`, `pread_into.py`, `native_gate.py`, `streaming_run_lock.py` | stream routed experts from disk within a memory budget | `docs/ssd_streaming.md` |
+| `runtime/` | `serve.py`, `build.py`, `http.py`, `chat_stream.py`, `tool_stream.py`, `generation.py`, `verify.py`, `thinking.py`, `kv_policy.py`, `prefix_cache.py`, `disk_kv.py`, `kquant_install.py`, `owned_switchglu.py`, `raw_greedy.py`, `deepseek_v4/`, `qwen/` | serve a package from its manifest; one-shot and HTTP entry points with SSE streaming; served tool-call extraction into OpenAI `tool_calls`; producer-scoped in-memory KV and prefix reuse; declared-context-limit refusal; the default-on disk KV checkpoint tier with optional model-state companions; K-quant module installation; the deterministic greedy decode path that selects the next token from processed logits without building a log-probability vector; model-specific runtime adapters, kernels, and probes | `docs/runtime_resident.md`, `docs/tool_calls.md`, `docs/disk_kv.md` |
+| `runtime/` (pooled routed) | `ssd_streaming_build.py`, `streaming_capacity.py`, `expert_index.py`, `expert_loader.py`, `expert_pool.py`, `expert_slot_pool.py`, `expert_locality.py`, `pooled_switchglu.py`, `routed_decode_kernel.py`, `gather_tq_split_norms.py`, `pread_into.py`, `native_gate.py`, `streaming_run_lock.py` | build persistent routed-expert pools for K-quant, TurboQuant, and IQ_K packages; capacity equal to the expert count is the full-resident case, bounded capacities stream missing rows from disk, and selected layers can grow transactionally after requests | `docs/ssd_streaming.md` |
 | `agentlib/` | `client.py`, `conversation.py`, `sse.py`, `loop_policy.py`, `profile.py`, `sandbox.py`, `subagent.py`, `tools.py`, `execution.py`, `roadtest/`, `dialect_study/` | an agent loop over the served HTTP surface: SSE consumption, loop policy, agentic-profile resolution, sandboxed tool execution, and the served road-test harness. Dialect parsing and repair come from `toolcalls/`. It speaks to the server over HTTP and reads the package's `agentic_profile.json`; it imports no runtime internals | `docs/package_format.md` (agentic profile) |
+
+Two MLX extensions carry the quantized kernel surface. `mlx-kquant` supplies
+the GGML K-quant wire formats and the module swap in `runtime/kquant_install.py`
+installs them. `mlx-iqk` supplies the IQ_K kernels. Target-model routed experts
+use the slot storage in `runtime/expert_slot_pool.py` and the pooled dispatch in
+`runtime/pooled_switchglu.py`; `runtime/deepseek_v4/iqk_experts.py` retains the
+resident switch used by DSpark sidecars and the shared engagement counters.
+`runtime/deepseek_v4/iqk_dense.py` installs dense IQ_K tensors. Both extensions
+are pinned runtime dependencies in `pyproject.toml`.
 
 Native Metal primitives live under `native/` (`gate/` for the MTLSharedEvent
 decode gate, `ds4_moe/` for the DeepSeek-V4 MoE kernels) and are built
 separately via `native/build.sh`; the runtime loads them if present and falls
 back transparently if not.
+
+`tests/` sits outside the package and mirrors it module by module. Those tests
+are the behavior specification for each subsystem.
 
 `docs/optimization_methodology.md` records the measurement discipline for
 serving-optimization work.
@@ -68,18 +85,18 @@ A package is a directory of safetensors shards plus a
 `package_manifest.json`. The manifest is the contract: architecture facts copied
 from the source config, the package-plan provenance, the on-disk format per
 tensor with its parameters, every file's path/size/sha256, the required backend
-operations, and the tokenizer/rendering identity. Eight on-disk tensor formats
-exist: `tq`, `affine`, `mxfp4`, `mxfp8`, `kquant`, and the passthrough trio
-`fp16`, `f32_passthrough`, `raw_dtype_passthrough`. Routed experts are stored as
-a per-layer bundle so a streamed expert miss costs one contiguous read. Shard
-writing is byte-deterministic: identical inputs produce identical shard files
-and hashes. Families with recorded agent-loop evidence also carry an
-`agentic_profile.json` sidecar recorded in the manifest. See
+operations, and the tokenizer/rendering identity. Nine on-disk tensor formats
+exist: `tq`, `affine`, `mxfp4`, `mxfp8`, `kquant`, `iqk`, and the
+passthrough trio `fp16`, `f32_passthrough`, `raw_dtype_passthrough`. Routed
+experts are stored as a per-layer bundle so a streamed expert miss costs one
+contiguous read. Shard writing is byte-deterministic: identical inputs produce
+identical shard files and hashes. Families with recorded agent-loop evidence
+also carry an `agentic_profile.json` sidecar recorded in the manifest. See
 `docs/package_format.md`.
 
 The runtime consumes only the manifest and tensor formats. It must not import
-probe/optimizer code or GGUF recipe readers, and it must not branch on whether a
-package came from the probe/optimizer route or the GGUF recipe route.
+probe/optimizer code, GGUF recipe readers, or conversion-stage artifact
+readers, and it must not branch on which planning route produced the package.
 
 ## Serving surface
 
@@ -93,8 +110,41 @@ whichever is smaller; `--max-context-tokens` selects any positive limit up to
 that architecture limit. The server warms generation before announcing
 readiness. Prefix reuse is in-memory first, with the disk KV checkpoint
 tier on by default under a per-package root in the user cache directory
-(`MOESPRESSO_DISK_KV=off` disables it). Details: `docs/runtime_resident.md`
-and `docs/disk_kv.md`.
+(`MOESPRESSO_DISK_KV=off` disables it). Speculative decoding is on by default
+where the package supports it: a package that declares a bundled drafter
+component engages it only when every routed expert is resident, every declared
+component file is present, and the wired-budget capacity check passes. A miss
+serves plain and prints the reason; it never refuses startup.
+`MOESPRESSO_DS4_DRAFTER` selects a drafter explicitly and
+`MOESPRESSO_DS4_DRAFTER=off` is the kill switch;
+`docs/speculative_decoding.md` carries the capacity rule. Resumable DSpark
+requests keep plain and speculative cache producers separate in memory. Their
+disk checkpoints store the target cache as the authoritative entry and may
+carry a compatible DSpark-state companion. Details:
+`docs/runtime_resident.md` and `docs/disk_kv.md`.
+
+## Speculative decoding (DeepSeek-V4)
+
+The DeepSeek-V4 runtime carries a drafter-based speculative decoding loop.
+`runtime/deepseek_v4/spec_decode.py` defines the drafter protocol, the
+draft/verify loop, and the adaptive verify-length scheduler;
+`dspark_model.py`, `mtp_model.py`, and `dflash_model.py` implement the
+DSpark, MTP, and DFlash drafter families; `dspark_load.py`, `mtp_load.py`,
+and `dflash_load.py` load their sidecars; and `dspark_rollback.py` restores
+the target caches bit-exactly after a rejected verify. `spec_serve.py` is the
+served-path glue: it resolves the selection, loads the sidecar once at model
+load, and admits a request to the speculative path only when the effective
+sampler is one the acceptance rules reproduce exactly. `drafter_policy.py` is
+the load-time wired-budget capacity policy behind automatic selection.
+`spec_disk_kv.py` binds resumable DSpark state to aligned target checkpoints
+without making the target depend on that optional state. The sidecar builders
+are `package/deepseek_v4/dspark_sidecar.py`, `mtp_sidecar.py`, and
+`dflash_sidecar.py`; `package/deepseek_v4/dspark_bundle.py` bundles a built
+DSpark sidecar into a package as the declared optional drafter component,
+which is what lets a package select a drafter automatically.
+`correctness/deepseek_v4/spec_replay.py` is the speculative-versus-plain A/B
+harness and `spec_battery.py` is the multi-prompt measurement battery over one
+target load and every available sidecar. See `docs/speculative_decoding.md`.
 
 ## Entry points
 
@@ -107,9 +157,26 @@ Declared in `pyproject.toml`:
 - `moespresso-hf-inspect` (alias `hf-model-inspect`): remote HF model header
   inspection without downloading.
 - `moespresso-ds4-kquant-package`: manual DeepSeek-V4 package builder from a GGUF K-quant recipe.
+- `moespresso-ds4-iqk-package`: manual DeepSeek-V4 package builder from
+  converted IQ_K routed-expert artifacts.
+- `moespresso-ds4-iqk-relayout`: rearrange a built IQ_K package's routed
+  bundles onto the decode kernels' wire without re-encoding a byte.
 - `moespresso-qwen-kquant-package`: technical Qwen-architecture package builder
   used by the Ornith path.
+- `moespresso-ds4-dspark-sidecar`, `moespresso-ds4-mtp-sidecar`,
+  `moespresso-ds4-dflash-sidecar`: DeepSeek-V4 drafter sidecar builders for
+  speculative decoding.
+- `moespresso-ds4-dspark-bundle`: bundle a built DSpark sidecar into a
+  DeepSeek-V4 package as its declared optional drafter component.
+- `moespresso-ds4-dspark-replay`: speculative-versus-plain A/B replay with
+  identity and acceptance reporting.
+- `moespresso-ds4-spec-battery`: multi-prompt speculative-decoding measurement
+  battery over one target load and every available drafter sidecar.
 - `moespresso-ds4-quality`: manual-only DeepSeek-V4 Q0/Q1/Q2/Q3 quality gates.
+- `moespresso-ds4-q4`: manual-only DeepSeek-V4 Q4 KL panel over teacher and
+  candidate logit dumps.
+- `moespresso-ds4-wikitext-ppl`: manual-only teacher-forced WikiText
+  perplexity gate, the natural-text arm of the acceptance bar.
 - `moespresso-ds4-q1-validate`: validate external DeepSeek-V4 Q1 parity evidence.
 - `moespresso-ornith-gate`: manual Ornith quality gate v2 (reasoning, agentic
   coding, long-context recall).
@@ -127,12 +194,15 @@ Declared in `pyproject.toml`:
 test` and `make lint` run lock-strict (`uv run --locked`), so an unlocked
 dependency edit fails fast; `make lock` is the deliberate re-resolve step and
 `make lock-check` is the read-only staleness gate. `make fmt` formats. `make
-roadtest` runs the agentlib road-test harness against a served package. Tests
-run through `python -m pytest` in that locked environment.
+roadtest` runs the agentlib road-test harness against a served package: it
+drives a scripted cumulative session with the disk KV store enabled across two
+full server restarts, so it is the opt-in gate for disk KV, checkpoint, and
+restart-resume changes. Tests run through `python -m pytest` in that locked
+environment.
 
 Run the full suite for changes touching conversion, package writing, runtime
-serving, MLX/Jang/mlx-kquant paths, or model-specific quality gates. `make
-dist-check` builds and audits the
+serving, MLX/Jang/mlx-kquant/mlx-iqk paths, or model-specific quality gates.
+`make dist-check` builds and audits the
 wheel and source distribution for the public/private boundary, licenses, and
 required product surfaces.
 
@@ -150,10 +220,11 @@ The command above is the public Ornith gate. Adding `hard_reasoning` requires
 the ignored private benchmark questions and answer key. Public source-release
 tests use synthetic injected fixtures and never depend on those local files.
 
+Evaluation fixtures live under `src/moespresso/correctness/fixtures/`.
 DeepSeek-V4 Q0/Q1 prompts and provider vectors are committed public fixtures
 matching antirez/ds4. Q2 provider captures and the unpublished Ornith benchmark
 questions, keys, and verification programs stay in ignored `*/private/`
-directories and never enter release artifacts.
+subdirectories of that tree and never enter release artifacts.
 
 Any change to runtime math or package formats must clear the touched family's
 gates before landing; `docs/correctness_ladder.md` covers the build-time rungs

@@ -1,9 +1,10 @@
 """Build the SSD-streaming MoE runtime.
 
-This is the product-shaped builder for BRIDGE-B: instantiate the MLX model
-skeleton, replace routed SwitchGLU experts with persistent SSD-backed pools, then
-load only non-routed tensors resident. It deliberately does not call JANG's
-resident `load_jangtq_model`, because that materializes the routed expert stacks.
+The builder instantiates the MLX model skeleton, replaces routed SwitchGLU
+experts with codec-aware persistent pools, then loads only non-routed tensors
+as regular model parameters. Full pool capacity is the all-resident subcase;
+smaller pools load bundle rows on demand. Resident loaders that materialize a
+separate routed stack are not used here.
 """
 
 from __future__ import annotations
@@ -21,13 +22,14 @@ from moespresso.runtime.expert_slot_pool import BundleRowCache
 from moespresso.runtime.pooled_switchglu import (
     PooledDeepseekV4MoEBlock,
     PooledCombinedGateUpKQuantLinear,
+    PooledIqkSwitchLinear,
     PooledKQuantSwitchLinear,
     PooledMxfp4SwitchLinear,
     PooledSparseMoeBlock,
     PooledSwitchGLU,
     PooledTurboQuantSwitchLinear,
 )
-from moespresso.package.bundle import KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
 from moespresso.runtime.streaming_capacity import (
     available_memory_bytes,
     choose_capacity,
@@ -99,7 +101,12 @@ def _pooled_projection(
     eviction_policy: str,
     row_cache=None,
     spare_slots: int = 0,
-) -> PooledTurboQuantSwitchLinear | PooledMxfp4SwitchLinear | PooledKQuantSwitchLinear:
+) -> (
+    PooledTurboQuantSwitchLinear
+    | PooledMxfp4SwitchLinear
+    | PooledKQuantSwitchLinear
+    | PooledIqkSwitchLinear
+):
     geometry = index.geometry(layer=layer, projection=projection)
     bits = geometry.bits
     if geometry.codec == KQUANT_CODEC:
@@ -113,6 +120,8 @@ def _pooled_projection(
                 f"layer {layer} {projection}: K-quant bytes_per_row "
                 f"{geometry.packed_cols} is not divisible by {bytes_per_block}")
         packed_in_features = geometry.packed_cols // bytes_per_block * weights_per_block
+    elif geometry.codec == IQK_CODEC:
+        packed_in_features = int(geometry.in_features or 0)
     else:
         packed_in_features = geometry.packed_cols * (32 // bits)
     if packed_in_features != in_features:
@@ -137,6 +146,17 @@ def _pooled_projection(
         )
     if geometry.codec == KQUANT_CODEC:
         return PooledKQuantSwitchLinear(
+            package_dir=package_dir,
+            index=index,
+            layer=layer,
+            projection=projection,
+            capacity=capacity_per_layer,
+            eviction_policy=eviction_policy,
+            row_cache=row_cache,
+            spare_slots=spare_slots,
+        )
+    if geometry.codec == IQK_CODEC:
+        return PooledIqkSwitchLinear(
             package_dir=package_dir,
             index=index,
             layer=layer,
@@ -304,12 +324,15 @@ def install_pooled_switchglus(
                     row_cache=row_cache,
                     spare_slots=spare_slots,
                 )
-        setattr(mlp, "switch_mlp", PooledSwitchGLU(
+        pooled_switch = PooledSwitchGLU(
             gate_proj=projections["gate_proj"],
             up_proj=projections["up_proj"],
             down_proj=projections["down_proj"],
             activation=sw.activation,
-        ))
+        )
+        if pooled_switch._all_iqk:
+            pooled_switch.iqk_ordinal = installed
+        setattr(mlp, "switch_mlp", pooled_switch)
         if all(hasattr(mlp, name) for name in (
             "gate",
             "shared_expert",
@@ -481,7 +504,7 @@ def _maybe_install_kquant_dense(model, manifest: dict | None) -> int:
 
 
 def _load_non_routed_resident(model, package_dir: str | Path) -> None:
-    """Load every tensor except routed-expert TQ stacks, then materialize resident."""
+    """Load every tensor except routed-expert bundles, then materialize it."""
     from jang_tools.ssm_layout import sanitize_grouped_conv1d_layout
 
     package_dir = Path(package_dir)
@@ -832,6 +855,11 @@ def ssd_streaming_stats(model) -> dict:
     bundle_row_preads = bundle_cached_takes = 0
     routed_matmul_calls = routed_matmul_slot_elements = 0
     q6_down_qmv_calls = 0
+    iqk_decode_flush_calls = 0
+    iqk_verify_flush_calls = 0
+    iqk_gemv_calls = iqk_gemv_pairs = 0
+    iqk_sorted_prefill_calls = iqk_sorted_prefill_pairs = 0
+    iqk_sorted_nsplit_calls = iqk_sorted_nsplit_parts = 0
     routed_projection_matmul_calls = {
         projection: 0 for projection in _SWITCH_PROJECTIONS
     }
@@ -849,7 +877,35 @@ def ssd_streaming_stats(model) -> dict:
             layer, "_moespresso_dsv4_hc_fused_pre_tail_decode_calls", 0) or 0)
         hc_fused_post_decode_calls += int(getattr(
             layer, "_moespresso_dsv4_hc_fused_post_decode_calls", 0) or 0)
-        switch = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+        mlp = getattr(layer, "mlp", None)
+        # Block-level IQ_K decode and verify commits; zero on other codecs.
+        iqk_decode_flush_calls += int(getattr(
+            mlp, "iqk_decode_flush_calls", 0) or 0)
+        iqk_verify_flush_calls += int(getattr(
+            mlp, "iqk_verify_flush_calls", 0) or 0)
+        switch = getattr(mlp, "switch_mlp", None)
+        # IQ_K routed seam counters. Resident reference switches and pooled
+        # target switches expose the same fields. `nsplit_parts` is a setting,
+        # so it takes the maximum.
+        if (
+            type(switch).__name__ == "IqkDeepseekV4SwitchGLU"
+            or bool(getattr(switch, "_all_iqk", False))
+        ):
+            iqk_gemv_calls += int(getattr(switch, "gemv_calls", 0) or 0)
+            iqk_gemv_pairs += int(getattr(switch, "gemv_pairs", 0) or 0)
+            iqk_sorted_prefill_calls += int(getattr(
+                switch, "sorted_prefill_calls", 0) or 0)
+            iqk_sorted_prefill_pairs += int(getattr(
+                switch, "sorted_prefill_pairs", 0) or 0)
+            iqk_sorted_nsplit_calls += int(getattr(
+                switch, "sorted_nsplit_calls", 0) or 0)
+            iqk_sorted_nsplit_parts = max(
+                iqk_sorted_nsplit_parts,
+                int(getattr(switch, "sorted_nsplit_parts", 0) or 0))
+            iqk_decode_flush_calls += int(getattr(
+                switch, "iqk_decode_flush_calls", 0) or 0)
+            iqk_verify_flush_calls += int(getattr(
+                switch, "iqk_verify_flush_calls", 0) or 0)
         if not isinstance(switch, PooledSwitchGLU):
             continue
         modules += 1
@@ -978,19 +1034,35 @@ def ssd_streaming_stats(model) -> dict:
         affine_wo_fp32_call_counts,
         attention_seam_rope_call_counts,
         banded_prefill_call_counts,
+        kquant_bulk_route_call_counts,
         q8_dense_matmul_call_counts,
+        q8_ffn_hc_post_call_counts,
+        q8_hc_post_call_counts,
         router_gate_trim_call_counts,
         wo_a_projection_call_counts,
     )
 
+    from moespresso.runtime.deepseek_v4.iqk_dense import (
+        iqk_dense_matmul_call_counts,
+    )
+
+    # `iqk_engagement` reports the built dequant-range kernel keys as a list;
+    # the count surfaces carry the registry size, which the phase splitter can
+    # subtract, so a nonzero delta names a kernel build the phase paid for.
+    from mlx_iqk.kernels import built_dequant_range_kernels
+
     consumer_counts = prefill_consumer_call_counts()
     scores_counts = indexer_scores_call_counts()
+    iqk_dense_counts = iqk_dense_matmul_call_counts()
     wo_a_counts = wo_a_projection_call_counts()
     banded_counts = banded_prefill_call_counts()
     seam_rope_counts = attention_seam_rope_call_counts()
     router_trim_counts = router_gate_trim_call_counts()
     q8_dense_counts = q8_dense_matmul_call_counts()
+    q8_hc_post_counts = q8_hc_post_call_counts()
+    q8_ffn_hc_post_counts = q8_ffn_hc_post_call_counts()
     affine_wo_counts = affine_wo_fp32_call_counts()
+    kquant_bulk_counts = kquant_bulk_route_call_counts()
 
     # Flash D=256 prefill engagement, the same route the resident build installs;
     # the streamed build wraps the identical `self_attn` modules. Reachable on
@@ -1009,6 +1081,14 @@ def ssd_streaming_stats(model) -> dict:
     from moespresso.runtime.qwen.router_gemv import router_bf16_f32_stats
 
     router_gemv_counts = router_bf16_f32_stats(model)
+
+    # The load-time drafter decision, attested beside the engagement
+    # counters so served arms can prove which way the policy went
+    # (runtime/deepseek_v4/drafter_policy.py; exported on all three census
+    # surfaces).
+    drafter_policy = getattr(model, "_moespresso_ds4_drafter_policy", None)
+    policy_mode = (drafter_policy or {}).get("mode")
+    policy_decision = (drafter_policy or {}).get("decision")
 
     total = hits + misses
     return {
@@ -1070,6 +1150,7 @@ def ssd_streaming_stats(model) -> dict:
         "r4_prefill_scores_f16_calls": scores_counts["f16"],
         "r4_prefill_scores_f32_calls": scores_counts["f32"],
         "wo_a_batched_decode_calls": wo_a_counts["batched_decode"],
+        "wo_a_batched_tiny_m_calls": wo_a_counts["batched_tiny_m"],
         "wo_a_gather_decode_calls": wo_a_counts["gather_decode"],
         "wo_a_loop_projection_calls": wo_a_counts["loop"],
         "q8_dense_decode_qmv_calls": q8_dense_counts["decode_qmv"],
@@ -1077,7 +1158,29 @@ def ssd_streaming_stats(model) -> dict:
             q8_dense_counts["decode_wire_qmv_wo_b"]),
         "q8_dense_decode_wire_qmv_lm_head_calls": (
             q8_dense_counts["decode_wire_qmv_lm_head"]),
+        "q8_dense_tiny_m_qmm_wo_b_calls": (
+            q8_dense_counts["tiny_m_qmm_wo_b"]),
         "q8_dense_prefill_dequant_calls": q8_dense_counts["prefill_dequant"],
+        "kquant_bulk_kernel_calls": kquant_bulk_counts["kernel"],
+        "kquant_bulk_bridge_calls": kquant_bulk_counts["bridge"],
+        "q8_hc_post_engaged_calls": q8_hc_post_counts["engaged"],
+        "q8_hc_post_fallback_calls": q8_hc_post_counts["fallback"],
+        "q8_hc_post_delegated_calls": q8_hc_post_counts["delegated"],
+        "q8_ffn_hc_post_engaged_calls": q8_ffn_hc_post_counts["engaged"],
+        "q8_ffn_hc_post_fallback_calls": q8_ffn_hc_post_counts["fallback"],
+        "q8_ffn_hc_post_delegated_calls": q8_ffn_hc_post_counts["delegated"],
+        "iqk_dense_decode_gemv_calls": iqk_dense_counts["decode_gemv"],
+        "iqk_dense_decode_gemv_wo_b_calls": (
+            iqk_dense_counts["decode_gemv_wo_b"]),
+        "iqk_dense_decode_gemv_lm_head_calls": (
+            iqk_dense_counts["decode_gemv_lm_head"]),
+        "iqk_dense_decode_gemv_w2_calls": (
+            iqk_dense_counts["decode_gemv_w2"]),
+        "iqk_dense_prefill_dequant_calls": (
+            iqk_dense_counts["prefill_dequant"]),
+        "iqk_dense_wo_a_gather_calls": iqk_dense_counts["wo_a_gather"],
+        "iqk_dense_wo_a_bulk_calls": iqk_dense_counts["wo_a_bulk"],
+        "iqk_dense_delegated_calls": iqk_dense_counts["delegated"],
         "affine_wo_fp32_wo_a_calls": affine_wo_counts["wo_a"],
         "affine_wo_fp32_wo_b_calls": affine_wo_counts["wo_b"],
         "affine_wo_fp32_delegated_calls": affine_wo_counts["delegated"],
@@ -1123,6 +1226,21 @@ def ssd_streaming_stats(model) -> dict:
         "barrier_free_decode_flush_calls": barrier_free_decode_flush_calls,
         "decode_routed_fused_calls": decode_routed_fused_calls,
         "pipelined_decode_fused_calls": pipelined_decode_fused_calls,
+        "iqk_decode_flush_calls": iqk_decode_flush_calls,
+        "iqk_verify_flush_calls": iqk_verify_flush_calls,
+        "iqk_gemv_calls": iqk_gemv_calls,
+        "iqk_gemv_pairs": iqk_gemv_pairs,
+        "iqk_sorted_prefill_calls": iqk_sorted_prefill_calls,
+        "iqk_sorted_prefill_pairs": iqk_sorted_prefill_pairs,
+        "iqk_sorted_nsplit_calls": iqk_sorted_nsplit_calls,
+        "iqk_sorted_nsplit_parts": iqk_sorted_nsplit_parts,
+        "built_dequant_range_kernel_count": len(built_dequant_range_kernels()),
+        "drafter_policy": drafter_policy,
+        "ds4_drafter_policy_auto_on": int(
+            policy_mode == "auto" and policy_decision == "on"),
+        "ds4_drafter_policy_auto_off": int(
+            policy_mode == "auto" and policy_decision == "off"),
+        "ds4_drafter_policy_override": int(policy_mode == "override"),
         "hc_fused_pre_calls": hc_fused_pre_calls,
         "hc_fused_post_calls": hc_fused_post_calls,
         "hc_fused_pre_decode_calls": hc_fused_pre_decode_calls,
@@ -1215,12 +1333,25 @@ def suggest_capacity_overrides_from_layer_stats(
     *,
     extra_slot_budget: int | None = None,
     extra_byte_budget: int | None = None,
+    replacement_headroom_bytes: int | None = None,
     target: str = "all",
 ) -> dict[int, int]:
-    """Greedily spend extra residency budget where observed churn is highest."""
+    """Greedily spend extra residency budget where observed churn is highest.
+
+    Byte-budget planning also reserves enough live headroom for the complete
+    detached replacement of each layer. Once a layer commits, its old storage
+    can back the next transaction, so only the capacity delta remains charged
+    against subsequent replacement headroom.
+    """
     if (extra_slot_budget is None) == (extra_byte_budget is None):
         raise ValueError(
             "pass exactly one of extra_slot_budget or extra_byte_budget")
+    if extra_byte_budget is not None and replacement_headroom_bytes is None:
+        raise ValueError(
+            "extra_byte_budget requires replacement_headroom_bytes")
+    if extra_slot_budget is not None and replacement_headroom_bytes is not None:
+        raise ValueError(
+            "replacement_headroom_bytes is only valid with extra_byte_budget")
     if target not in {"all", "decode"}:
         raise ValueError("target must be 'all' or 'decode'")
 
@@ -1232,6 +1363,11 @@ def suggest_capacity_overrides_from_layer_stats(
     remaining_bytes = (
         int(extra_byte_budget)
         if extra_byte_budget is not None
+        else None
+    )
+    remaining_replacement_headroom = (
+        int(replacement_headroom_bytes)
+        if replacement_headroom_bytes is not None
         else None
     )
     if remaining_slots is not None and remaining_slots <= 0:
@@ -1259,6 +1395,11 @@ def suggest_capacity_overrides_from_layer_stats(
                 int(row.get("max_unique_active_experts", 0)),
             )
         )
+        max_capacity = int(row.get(
+            "max_capacity",
+            row.get("num_experts", target_capacity),
+        ))
+        target_capacity = min(target_capacity, max_capacity)
         need = target_capacity - current
         if need <= 0:
             continue
@@ -1270,23 +1411,41 @@ def suggest_capacity_overrides_from_layer_stats(
             current,
             need,
             _row_cost(row) if remaining_bytes is not None else 1,
+            max(0, int(row.get("spare_slots", 0))),
         ))
 
     overrides: dict[int, int] = {}
-    for _loads, _misses, _target, layer, current, need, slot_bytes in sorted(
-        candidates,
-        reverse=True,
-    ):
+    for (
+        _loads,
+        _misses,
+        _target,
+        layer,
+        current,
+        need,
+        slot_bytes,
+        spare_slots,
+    ) in sorted(candidates, reverse=True):
         if remaining_slots is not None:
             if remaining_slots <= 0:
                 break
             grant = min(need, remaining_slots)
             remaining_slots -= grant
         elif remaining_bytes is not None:
-            if remaining_bytes < slot_bytes:
+            assert remaining_replacement_headroom is not None
+            max_grant_for_replacement = (
+                remaining_replacement_headroom // slot_bytes
+                - spare_slots
+                - current
+            )
+            if remaining_bytes < slot_bytes or max_grant_for_replacement <= 0:
                 continue
-            grant = min(need, remaining_bytes // slot_bytes)
+            grant = min(
+                need,
+                remaining_bytes // slot_bytes,
+                max_grant_for_replacement,
+            )
             remaining_bytes -= grant * slot_bytes
+            remaining_replacement_headroom -= grant * slot_bytes
         else:  # pragma: no cover - guarded above
             break
         overrides[layer] = current + grant
@@ -1302,35 +1461,40 @@ def grow_ssd_streaming_capacity(
     """Grow selected routed-layer pools and return applied capacities."""
     requested = {int(layer): int(capacity) for layer, capacity in overrides.items()}
     applied: dict[int, int] = {}
-    for layer_idx, layer in enumerate(_layers(model)):
+    current_overrides = dict(getattr(
+        model,
+        "_moespresso_ssd_streaming_capacity_overrides",
+        {},
+    ))
+    layers = _layers(model)
+    # Preserve the planner's insertion order. Replacement-headroom accounting
+    # is sequential because each committed layer releases its old allocation
+    # for reuse by the next transaction.
+    for layer_idx, capacity in requested.items():
+        if layer_idx < 0 or layer_idx >= len(layers):
+            continue
+        layer = layers[layer_idx]
         switch = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if not isinstance(switch, PooledSwitchGLU):
             continue
-        if layer_idx not in requested:
-            continue
-        capacity = requested[layer_idx]
         current = min(
             pool.capacity for pool in _unique_projection_pools_for_switch(switch)
         )
         if capacity <= current:
             continue
         switch.grow_capacity(capacity)
-        if seed_hot:
-            switch.seed_hot_free_slots()
+        # The switch transaction has committed. Record it before optional
+        # seeding or a later layer can fail, so runtime metadata never reports
+        # the old capacity over already-published storage.
         applied[layer_idx] = capacity
-
-    if applied:
-        current_overrides = dict(getattr(
-            model,
-            "_moespresso_ssd_streaming_capacity_overrides",
-            {},
-        ))
-        current_overrides.update(applied)
+        current_overrides[layer_idx] = capacity
         object.__setattr__(
             model,
             "_moespresso_ssd_streaming_capacity_overrides",
-            current_overrides,
+            dict(current_overrides),
         )
+        if seed_hot:
+            switch.seed_hot_free_slots()
     return applied
 
 
@@ -1374,6 +1538,13 @@ def maybe_adapt_ssd_streaming_capacity(
     seed_hot: bool = True,
 ) -> dict:
     """Conservatively grow hot routed layers after real request evidence exists."""
+    latched_failure = getattr(
+        model,
+        "_moespresso_ssd_streaming_growth_latched_failure",
+        None,
+    )
+    if latched_failure is not None:
+        return latched_failure
     if max_extra_bytes is None:
         max_extra_bytes = _growth_max_extra_bytes_default()
     t0 = time.perf_counter()
@@ -1399,6 +1570,7 @@ def maybe_adapt_ssd_streaming_capacity(
             "max_extra_bytes": int(max_extra_bytes),
             "used_extra_bytes": used_extra_bytes,
             "extra_byte_budget": 0,
+            "replacement_headroom_bytes": free_above_floor,
             "plan": {},
             "applied": {},
             "seed_hot": bool(seed_hot),
@@ -1415,11 +1587,88 @@ def maybe_adapt_ssd_streaming_capacity(
     resident_before = sum(int(row["resident_slots"]) for row in rows)
     plan = suggest_capacity_overrides_from_layer_stats(
         rows,
-        extra_byte_budget=extra_byte_budget,
+        extra_byte_budget=remaining_extra_bytes,
+        replacement_headroom_bytes=free_above_floor,
         target="all",
     )
-    applied = grow_ssd_streaming_capacity(model, plan, seed_hot=seed_hot)
-    after_rows = ssd_streaming_layer_stats(model)
+    try:
+        applied = grow_ssd_streaming_capacity(model, plan, seed_hot=seed_hot)
+        after_rows = ssd_streaming_layer_stats(model)
+    except Exception as exc:
+        # Adaptive residency is an optimization after generation and cache
+        # publication. A failed allocation, copy, or hot seed must not turn a
+        # completed response into an HTTP/SSE failure. Each successfully grown
+        # layer records its override at commit, so recover that truthful prefix
+        # for diagnostics while the failed switch transaction remains unchanged.
+        try:
+            after_rows = ssd_streaming_layer_stats(model)
+        except Exception:
+            after_rows = rows
+        committed_overrides = dict(getattr(
+            model,
+            "_moespresso_ssd_streaming_capacity_overrides",
+            {},
+        ))
+        prior_capacity = {
+            int(row["layer"]): int(row["capacity"])
+            for row in rows
+        }
+        applied = {
+            int(layer): int(capacity)
+            for layer, capacity in plan.items()
+            if int(capacity) > prior_capacity.get(int(layer), int(capacity))
+            and int(committed_overrides.get(int(layer), -1)) == int(capacity)
+        }
+        resident_after = sum(int(row["resident_slots"]) for row in after_rows)
+        result = {
+            "enabled": False,
+            "latched": True,
+            "available_bytes": int(available_bytes),
+            "min_available_bytes": int(min_available_bytes),
+            "max_extra_bytes": int(max_extra_bytes),
+            "used_extra_bytes": _adaptive_extra_bytes(model, after_rows),
+            "extra_byte_budget": extra_byte_budget,
+            "replacement_headroom_bytes": free_above_floor,
+            "plan": plan,
+            "applied": applied,
+            "seed_hot": bool(seed_hot),
+            "seeded_slots": max(0, resident_after - resident_before),
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+            "elapsed_seconds": time.perf_counter() - t0,
+        }
+        object.__setattr__(
+            model,
+            "_moespresso_ssd_streaming_adaptive_growth",
+            result,
+        )
+        # A failed replacement allocation/copy or hot seed is unlikely to
+        # become cheaper on the next request. Keep completed responses fast by
+        # returning this recorded failure directly on later adaptation calls.
+        object.__setattr__(
+            model,
+            "_moespresso_ssd_streaming_growth_latched_failure",
+            result,
+        )
+        if not getattr(
+            model,
+            "_moespresso_ssd_streaming_growth_error_logged",
+            False,
+        ):
+            print(
+                "[ssd-streaming] adaptive expert-pool growth failed; "
+                f"serving continues at committed capacities ({type(exc).__name__}: "
+                f"{exc})",
+                flush=True,
+            )
+            object.__setattr__(
+                model,
+                "_moespresso_ssd_streaming_growth_error_logged",
+                True,
+            )
+        return result
     resident_after = sum(int(row["resident_slots"]) for row in after_rows)
     result = {
         "enabled": True,
@@ -1431,6 +1680,7 @@ def maybe_adapt_ssd_streaming_capacity(
             after_rows,
         ),
         "extra_byte_budget": extra_byte_budget,
+        "replacement_headroom_bytes": free_above_floor,
         "plan": plan,
         "applied": applied,
         "seed_hot": bool(seed_hot),
@@ -1484,6 +1734,23 @@ def _all_pools_at_full_capacity(model) -> bool:
     return pools_seen
 
 
+def _all_pools_fully_resident(model) -> bool:
+    """True when every routed projection pool currently holds every expert."""
+    pools_seen = False
+    for layer in _layers(model):
+        switch = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+        if not isinstance(switch, PooledSwitchGLU):
+            continue
+        for pool in _unique_projection_pools_for_switch(switch):
+            pools_seen = True
+            with pool._bk_lock:
+                if pool.capacity < pool.num_experts:
+                    return False
+                if len(pool._slot_of) != pool.num_experts:
+                    return False
+    return pools_seen
+
+
 def seed_expert_residency(model, package_dir: str | Path) -> dict:
     """Layered cold-start seeding.
 
@@ -1497,9 +1764,8 @@ def seed_expert_residency(model, package_dir: str | Path) -> dict:
     segmented numerics until the pools fill and diverge from the
     gate-certified barrier-free path at knife-edge tokens; prewarming at load
     pins serving to the gate-certified numerics and removes the cold
-    first-request SSD reads. Measured on the byte-faithful DS4 package, the
-    prewarm costs ~14 s of load time (2.9 s lazy vs 16.9 s prewarm-all) and
-    loads faster than saved-hotlist seeding of the same expert set (24.5 s).
+    first-request SSD reads. The prewarm trades load time for that guarantee and
+    measured faster than saved-hotlist seeding of the same expert set.
 
     Below full capacity the hotlist tiers apply, kill switch
     MOESPRESSO_SSD_HOTLIST=0. Source precedence, measured on real demand
@@ -1599,7 +1865,7 @@ def save_expert_hotlist(model, path: str | Path) -> int:
         switch = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if not isinstance(switch, PooledSwitchGLU):
             continue
-        freq = switch.gate_proj.pool._freq
+        freq = switch.gate_proj.pool.hotness_snapshot()
         if freq:
             hotlist[str(layer_idx)] = {
                 str(expert): int(count) for expert, count in freq.items()
@@ -1708,10 +1974,20 @@ def ssd_streaming_layer_stats(model) -> list[dict]:
         )
         projection_pool_count = len(_unique_projection_pools_for_switch(switch))
         num_experts = switch.gate_proj.pool.num_experts
+        spare_slots = max(
+            pool.spare_slots
+            for pool in _unique_projection_pools_for_switch(switch)
+        )
+        max_capacity = min(
+            pool.num_experts - pool.spare_slots
+            for pool in _unique_projection_pools_for_switch(switch)
+        )
         rows.append({
             "layer": layer_idx,
             "capacity": capacity,
             "num_experts": num_experts,
+            "spare_slots": spare_slots,
+            "max_capacity": max_capacity,
             "projection_pool_count": projection_pool_count,
             "slot_bytes": slot_bytes,
             "resident_slots": resident_slots,

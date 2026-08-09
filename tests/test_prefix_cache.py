@@ -1,18 +1,29 @@
-"""Raw in-memory prefix reuse.
+"""Memory and disk prefix routing, publication, and fallback.
 
 The cache manager is tested with fake tokenizers/cache stores/generators. That keeps the
 logic exercisable without a GPU/model and proves the dangerous parts before MLX is involved:
-exact token slicing, cache-key identity, miss/hit behavior, and insert under prompt+generated
-tokens.
+exact token slicing, cache-key identity, producer rails, DSpark companions, disk arbitration,
+miss/hit behavior, and publication under prompt plus generated tokens.
 """
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
+from moespresso.runtime.deepseek_v4.spec_serve import (
+    ServedDrafter,
+    SpecCacheCompanion,
+    SpecContinuationError,
+    spec_cache_producer_rail,
+)
 from moespresso.runtime.generation import GenerationResult
 from moespresso.runtime.kv_policy import KVPolicyError, parse_kv_policy
 from moespresso.runtime.prefix_cache import (
+    CacheProbe,
     PrefixCacheGenerator,
     PromptCacheStore,
     cache_payload_kind,
@@ -338,7 +349,7 @@ def test_exactly_at_limit_request_passes():
     assert result.text == "ok"
 
 
-def test_under_limit_request_keeps_the_generate_call_unchanged():
+def test_under_limit_request_threads_internal_first_token_callback():
     seen = {}
     gen = _context_limit_generator(
         list(range(10)), context_limit=100_000, seen=seen)
@@ -347,7 +358,7 @@ def test_under_limit_request_keeps_the_generate_call_unchanged():
         effective_rendering_id="r", max_tokens=10)
     assert set(seen) == {
         "prompt_cache", "cached_tokens", "kv_policy", "max_tokens",
-        "temperature", "top_p",
+        "temperature", "top_p", "first_token_callback",
     }
 
 
@@ -427,6 +438,17 @@ class _FakeLayerCache:
     def __init__(self, nbytes=8, trimmable=False):
         self.nbytes = nbytes
         self.trimmable = trimmable
+
+
+class _OffsetLayerCache(_FakeLayerCache):
+    def __init__(self, offset, nbytes=8):
+        super().__init__(nbytes=nbytes, trimmable=False)
+        self.offset = offset
+
+
+class _FakeCompanion:
+    def __init__(self, nbytes):
+        self.nbytes = nbytes
 
 
 def _fake_cache(nbytes=8, *, trimmable=False, layers=2):
@@ -604,11 +626,800 @@ def test_store_model_keys_partition_entries():
     assert suffix == [1, 2, 3]
 
 
+def test_store_exact_probe_is_immutable_and_does_not_move_the_entry():
+    store = _make_store()
+    cache = _fake_cache(nbytes=7)
+    companion = _FakeCompanion(5)
+    rail = ("spec", "dspark", "sidecar-a")
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3],
+        cache,
+        producer_rail=rail,
+        companion=companion,
+    )
+
+    probe = store.probe_nearest_cache(
+        MODEL,
+        [1, 2, 3],
+        producer_rail=rail,
+    )
+
+    assert probe == CacheProbe("exact", 3, True)
+    with pytest.raises(FrozenInstanceError):
+        probe.cached_tokens = 2
+    assert len(store) == 1
+    assert store.nbytes == 19
+    fetched, suffix, fetched_companion = (
+        store.fetch_nearest_cache_with_companion(
+            MODEL,
+            [1, 2, 3],
+            producer_rail=rail,
+        )
+    )
+    assert fetched is cache
+    assert suffix == []
+    assert fetched_companion is companion
+
+
+def test_store_shorter_probe_reports_companion_without_moving_it():
+    store = _make_store()
+    cache = _fake_cache()
+    companion = _FakeCompanion(9)
+    rail = ("spec", "dspark", "sidecar-a")
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3],
+        cache,
+        producer_rail=rail,
+        companion=companion,
+    )
+
+    probe = store.probe_nearest_cache(
+        MODEL,
+        [1, 2, 3, 4, 5],
+        producer_rail=rail,
+    )
+
+    assert probe == CacheProbe("shorter", 3, True)
+    assert len(store) == 1
+    assert store.nbytes == 25
+
+
+def test_store_longer_trim_probe_does_not_copy_trim_or_remove():
+    copies = []
+    trims = []
+
+    class _CopyTrackedLayer(_FakeLayerCache):
+        def __deepcopy__(self, _memo):
+            copies.append(self)
+            return type(self)(self.nbytes, self.trimmable)
+
+    store = _make_store(trim_fn=lambda cache, n: trims.append(n))
+    cache = [_CopyTrackedLayer(trimmable=True) for _ in range(2)]
+    store.insert_cache(MODEL, [1, 2, 3, 4, 5], cache)
+
+    probe = store.probe_nearest_cache(MODEL, [1, 2, 3, 9])
+
+    assert probe == CacheProbe("trim", 3, False)
+    assert copies == []
+    assert trims == []
+    assert len(store) == 1
+    fetched, suffix = store.fetch_nearest_cache(MODEL, [1, 2, 3, 9])
+    assert fetched is not cache
+    assert len(copies) == 2
+    assert trims == [2]
+    assert suffix == [9]
+
+
+def test_store_probe_is_rail_local():
+    store = _make_store()
+    rail_a = ("spec", "dspark", "sidecar-a")
+    rail_b = ("spec", "dspark", "sidecar-b")
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3],
+        _fake_cache(),
+        producer_rail=rail_a,
+    )
+
+    assert store.probe_nearest_cache(
+        MODEL,
+        [1, 2, 3, 4],
+        producer_rail=rail_b,
+    ) == CacheProbe("miss", 0, False)
+    assert len(store) == 1
+
+
+def test_store_probes_allow_comparing_reusable_depth_across_rails():
+    store = _make_store()
+    spec_rail = ("spec", "dspark", "sidecar-a")
+    store.insert_cache(MODEL, [1, 2, 3, 4, 5], _fake_cache())
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3],
+        _fake_cache(),
+        producer_rail=spec_rail,
+        companion=_FakeCompanion(9),
+    )
+
+    tokens = [1, 2, 3, 4, 5, 6]
+    plain = store.probe_nearest_cache(MODEL, tokens)
+    speculative = store.probe_nearest_cache(
+        MODEL,
+        tokens,
+        producer_rail=spec_rail,
+    )
+
+    assert plain == CacheProbe("shorter", 5, False)
+    assert speculative == CacheProbe("shorter", 3, True)
+    assert plain.cached_tokens > speculative.cached_tokens
+    assert len(store) == 2
+
+
+def test_store_enhanced_insert_reports_oversized_self_eviction_exactly():
+    store = _make_store(max_bytes=12)
+    rail = ("spec", "dspark", "sidecar-a")
+
+    retained = store.insert_cache_with_companion(
+        MODEL,
+        [1, 2],
+        _fake_cache(nbytes=4),
+        producer_rail=rail,
+        companion=_FakeCompanion(5),
+    )
+
+    assert retained is False
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert store.insert_cache(MODEL, [9], _fake_cache(nbytes=3)) is None
+    assert len(store) == 1
+    assert store.nbytes == 6
+
+
+def test_store_old_api_remains_plain_rail_and_cannot_move_spec_entries():
+    store = _make_store()
+    plain_cache = _fake_cache(nbytes=3)
+    spec_cache = _fake_cache(nbytes=5)
+    companion = _FakeCompanion(11)
+    spec_rail = ("spec", "dspark", "sidecar-a")
+
+    store.insert_cache(MODEL, [1, 2], plain_cache)
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2],
+        spec_cache,
+        producer_rail=spec_rail,
+        companion=companion,
+    )
+
+    fetched, suffix = store.fetch_nearest_cache(MODEL, [1, 2, 3])
+    assert fetched is plain_cache
+    assert suffix == [3]
+
+    fetched, suffix, fetched_companion = (
+        store.fetch_nearest_cache_with_companion(
+            MODEL,
+            [1, 2, 4],
+            producer_rail=spec_rail,
+        )
+    )
+    assert fetched is spec_cache
+    assert suffix == [4]
+    assert fetched_companion is companion
+
+
+def test_store_companion_moves_with_target_and_accounts_bytes():
+    store = _make_store()
+    cache = _fake_cache(nbytes=7, layers=3)
+    companion = _FakeCompanion(13)
+    rail = ("spec", "dspark", "sidecar-a")
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2],
+        cache,
+        producer_rail=rail,
+        companion=companion,
+    )
+    assert store.nbytes == 34
+
+    fetched, suffix, fetched_companion = (
+        store.fetch_nearest_cache_with_companion(
+            MODEL,
+            [1, 2, 3],
+            producer_rail=rail,
+        )
+    )
+    assert fetched is cache
+    assert suffix == [3]
+    assert fetched_companion is companion
+    assert len(store) == 0
+    assert store.nbytes == 0
+
+
+def test_store_strict_prefix_supersession_is_scoped_to_producer_rail():
+    store = _make_store()
+    rail_a = ("spec", "dspark", "sidecar-a")
+    rail_b = ("spec", "dspark", "sidecar-b")
+    cache_a_short = _fake_cache()
+    cache_a_long = _fake_cache()
+    cache_b_short = _fake_cache()
+
+    store.insert_cache_with_companion(
+        MODEL, [1, 2], cache_a_short, producer_rail=rail_a
+    )
+    store.insert_cache_with_companion(
+        MODEL, [1, 2], cache_b_short, producer_rail=rail_b
+    )
+    store.insert_cache_with_companion(
+        MODEL, [1, 2, 3], cache_a_long, producer_rail=rail_a
+    )
+    assert len(store) == 2
+
+    fetched, suffix, _ = store.fetch_nearest_cache_with_companion(
+        MODEL, [1, 2, 9], producer_rail=rail_a
+    )
+    assert fetched is None
+    assert suffix == [1, 2, 9]
+    fetched, suffix, _ = store.fetch_nearest_cache_with_companion(
+        MODEL, [1, 2, 9], producer_rail=rail_b
+    )
+    assert fetched is cache_b_short
+    assert suffix == [9]
+
+
+def test_store_longer_trim_search_stays_on_rail_and_leaves_companion_stored():
+    trims = []
+    store = _make_store(trim_fn=lambda cache, n: trims.append((cache, n)))
+    rail_a = ("spec", "dspark", "sidecar-a")
+    rail_b = ("spec", "dspark", "sidecar-b")
+    cache_a = _fake_cache(trimmable=True)
+    cache_b = _fake_cache(trimmable=True)
+    companion_a = _FakeCompanion(9)
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3, 4, 5],
+        cache_a,
+        producer_rail=rail_a,
+        companion=companion_a,
+    )
+    store.insert_cache_with_companion(
+        MODEL,
+        [1, 2, 3, 9, 10],
+        cache_b,
+        producer_rail=rail_b,
+    )
+
+    fetched, suffix, companion = store.fetch_nearest_cache_with_companion(
+        MODEL, [1, 2, 3, 8], producer_rail=rail_a
+    )
+    assert fetched is not cache_a
+    assert suffix == [8]
+    assert companion is None
+    assert trims == [(fetched, 2)]
+    assert len(store) == 2
+
+    fetched, suffix, companion = store.fetch_nearest_cache_with_companion(
+        MODEL, [1, 2, 3, 4, 5], producer_rail=rail_a
+    )
+    assert fetched is cache_a
+    assert suffix == []
+    assert companion is companion_a
+
+
+def test_store_companion_bytes_participate_in_global_eviction():
+    store = _make_store(max_bytes=30)
+    plain_cache = _fake_cache(nbytes=4)  # 8 bytes
+    spec_cache = _fake_cache(nbytes=5)   # 10 bytes
+    spec_rail = ("spec", "dspark", "sidecar-a")
+    store.insert_cache(MODEL, [1], plain_cache)
+    store.insert_cache_with_companion(
+        MODEL,
+        [2],
+        spec_cache,
+        producer_rail=spec_rail,
+        companion=object(),
+        companion_nbytes=20,
+    )
+
+    # The 38-byte total exceeds the global bound. The oldest plain entry is
+    # evicted and the speculative target plus declared companion occupy 30.
+    assert len(store) == 1
+    assert store.nbytes == 30
+    fetched, suffix = store.fetch_nearest_cache(MODEL, [1, 3])
+    assert fetched is None
+    assert suffix == [1, 3]
+    fetched, suffix, companion = store.fetch_nearest_cache_with_companion(
+        MODEL, [2, 4], producer_rail=spec_rail
+    )
+    assert fetched is spec_cache
+    assert suffix == [4]
+    assert companion is not None
+
+
+def test_store_plain_rail_refuses_a_companion_that_legacy_fetch_would_drop():
+    store = _make_store()
+    with pytest.raises(ValueError, match="plain cache rail"):
+        store.insert_cache_with_companion(
+            MODEL,
+            [1, 2],
+            _fake_cache(),
+            companion=_FakeCompanion(9),
+        )
+
+
 def test_store_refuses_nonpositive_bounds():
     with pytest.raises(ValueError, match="max_size"):
         PromptCacheStore(max_size=0)
     with pytest.raises(ValueError, match="max_bytes"):
         PromptCacheStore(max_bytes=0)
+
+
+class _ResumeDrafter:
+    greedy_only = False
+    state_capsule_kind = "deepseek_v4_dspark_window_state"
+    state_capsule_schema_major = 1
+    state_capsule_schema_minor = 0
+
+    def state_frontier(self, state):
+        return state.frontier
+
+    def state_nbytes(self, state):
+        return state.nbytes
+
+    def export_state(self, state):
+        return state
+
+    def import_state(self, capsule):
+        return capsule
+
+
+def _resume_model():
+    served = ServedDrafter(
+        family="dspark",
+        sidecar_dir=Path("/side"),
+        drafter=_ResumeDrafter(),
+        tap="tap",
+        artifact_id="art:side",
+    )
+    return SimpleNamespace(_moespresso_ds4_drafter=served), served
+
+
+def _resume_companion(frontier):
+    return SpecCacheCompanion(
+        family="dspark",
+        artifact_id="art:side",
+        schedule="fixed:3",
+        frontier=frontier,
+        capsule=SimpleNamespace(frontier=frontier, nbytes=16),
+    )
+
+
+def _resume_generator(tokens, store, generate_fn, *, disk_store=None, ready=None):
+    model, served = _resume_model()
+    generator = PrefixCacheGenerator(
+        model,
+        _FakeTokenizer(tokens),
+        {"artifact_id": "pkg", "architecture": {"family": "deepseek_v4_flash"}},
+        store,
+        make_prompt_cache_fn=lambda _model: [_OffsetLayerCache(0)],
+        generate_fn=generate_fn,
+        disk_store=disk_store,
+    )
+    return generator, served
+
+
+def _raw_policy():
+    return parse_kv_policy({"live_kv_format": "raw"})
+
+
+def test_resumable_dspark_cold_miss_publishes_frontier_pair_on_spec_rail(
+    monkeypatch,
+):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    target = [_OffsetLayerCache(4)]
+    companion = _resume_companion(4)
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        return GenerationResult(
+            text="s",
+            generated_token_ids=(9, 10),
+            prompt_cache=None,
+            speculative_prompt_cache=target,
+            cache_frontier=4,
+            cache_companion=companion,
+            speculative={"drafter": "dspark", "cache_publication": {"status": "ready"}},
+        )
+
+    generator, served = _resume_generator([1, 2, 3, 4], store, fake_generate)
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert seen["prompt"] == [1, 2, 3, 4]
+    assert seen["prompt_cache"] is None
+    assert "spec_continuation" not in seen
+    assert result.cache_event == "miss"
+    assert result.speculative["cache_publication"] == {"status": "published"}
+    rail = spec_cache_producer_rail(served)
+    probe = store.probe_nearest_cache(
+        cache_model_key(generator.manifest, "r", _raw_policy()),
+        [1, 2, 3, 4],
+        producer_rail=rail,
+    )
+    assert probe == CacheProbe("exact", 4, True)
+    assert store.probe_nearest_cache(
+        cache_model_key(generator.manifest, "r", _raw_policy()),
+        [1, 2, 3, 4],
+    ) == CacheProbe("miss", 0, False)
+
+
+def test_resumable_dspark_quantized_live_kv_uses_plain_cache_rail(monkeypatch):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        return GenerationResult(
+            text="p",
+            generated_token_ids=(9,),
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    policy = parse_kv_policy({"live_kv_format": "mlx_affine_q8"})
+    generator, served = _resume_generator([1, 2, 3, 4], store, fake_generate)
+    result = generator(
+        "prompt",
+        kv_policy=policy,
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert seen["prompt"] == [1, 2, 3, 4]
+    assert seen["prompt_cache"][0].offset == 0
+    assert "spec_continuation" not in seen
+    assert not any(key.startswith("spec_prefill_") for key in seen)
+    assert result.cache_event == "miss"
+    model_key = cache_model_key(generator.manifest, "r", policy)
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 9],
+    ) == CacheProbe("exact", 5, False)
+    rail = spec_cache_producer_rail(served)
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 9],
+        producer_rail=rail,
+    ) == CacheProbe("miss", 0, False)
+
+
+def test_resumable_dspark_hit_uses_suffix_and_republishes_at_live_frontier(
+    monkeypatch,
+):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        continuation = kwargs["spec_continuation"]
+        continuation.target_cache[0].offset = 5
+        return GenerationResult(
+            text="s",
+            generated_token_ids=(9,),
+            prompt_cache=None,
+            speculative_prompt_cache=continuation.target_cache,
+            cache_frontier=5,
+            cache_companion=_resume_companion(5),
+            speculative={"drafter": "dspark", "cache_publication": {"status": "ready"}},
+        )
+
+    generator, served = _resume_generator([1, 2, 3, 4, 5], store, fake_generate)
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    rail = spec_cache_producer_rail(served)
+    target = [_OffsetLayerCache(3)]
+    store.insert_cache_with_companion(
+        model_key,
+        [1, 2, 3],
+        target,
+        producer_rail=rail,
+        companion=_resume_companion(3),
+    )
+
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert seen["prompt"] == [4, 5]
+    assert seen["prompt_cache"] is None
+    assert seen["cached_tokens"] == 3
+    assert seen["spec_continuation"].target_cache is target
+    assert result.cache_event == "hit"
+    assert result.speculative["cache_resume"] == {"status": "hit", "frontier": 3}
+    assert result.speculative["cache_publication"] == {"status": "published"}
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 5, 9],
+        producer_rail=rail,
+    ) == CacheProbe("shorter", 5, True)
+
+
+def test_deeper_plain_cache_beats_shallower_dspark_and_leaves_it_resident(
+    monkeypatch,
+):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        return GenerationResult(
+            text="p",
+            generated_token_ids=(9,),
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    generator, served = _resume_generator([1, 2, 3, 4, 5], store, fake_generate)
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    rail = spec_cache_producer_rail(served)
+    plain_target = _fake_cache()
+    spec_target = [_OffsetLayerCache(3)]
+    store.insert_cache(model_key, [1, 2, 3, 4], plain_target)
+    store.insert_cache_with_companion(
+        model_key,
+        [1, 2, 3],
+        spec_target,
+        producer_rail=rail,
+        companion=_resume_companion(3),
+    )
+
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert seen["prompt"] == [5]
+    assert seen["prompt_cache"] is plain_target
+    assert "spec_continuation" not in seen
+    assert result.cache_event == "hit"
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 8],
+        producer_rail=rail,
+    ) == CacheProbe("shorter", 3, True)
+
+
+def test_ready_failure_after_probe_moves_neither_cache_rail(monkeypatch):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    generator, served = _resume_generator(
+        [1, 2, 3, 4],
+        store,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generation must not start")
+        ),
+    )
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    rail = spec_cache_producer_rail(served)
+    store.insert_cache_with_companion(
+        model_key,
+        [1, 2, 3],
+        [_OffsetLayerCache(3)],
+        producer_rail=rail,
+        companion=_resume_companion(3),
+    )
+
+    with pytest.raises(RuntimeError, match="socket refused"):
+        generator(
+            "prompt",
+            kv_policy=_raw_policy(),
+            effective_rendering_id="r",
+            temperature=0.0,
+            ready_callback=lambda: (_ for _ in ()).throw(
+                RuntimeError("socket refused")
+            ),
+        )
+
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4],
+        producer_rail=rail,
+    ) == CacheProbe("shorter", 3, True)
+
+
+def test_bad_dspark_companion_falls_back_to_plain_on_same_rail(monkeypatch):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    calls = []
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        calls.append((list(prompt), dict(kwargs)))
+        if "spec_continuation" in kwargs:
+            raise SpecContinuationError("bad capsule")
+        kwargs["first_token_callback"]()
+        target = kwargs["prompt_cache"]
+        target[0].offset = 5
+        return GenerationResult(
+            text="p",
+            generated_token_ids=(9,),
+            prompt_cache=target,
+        )
+
+    generator, served = _resume_generator([1, 2, 3, 4, 5], store, fake_generate)
+    times = iter([10.0, 20.0, 30.0])
+    generator.clock = times.__next__
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    rail = spec_cache_producer_rail(served)
+    target = [_OffsetLayerCache(3)]
+    store.insert_cache_with_companion(
+        model_key,
+        [1, 2, 3],
+        target,
+        producer_rail=rail,
+        companion=_resume_companion(3),
+    )
+
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0] == calls[1][0] == [4, 5]
+    assert calls[1][1]["prompt_cache"] is target
+    assert "spec_continuation" not in calls[1][1]
+    assert result.cache_event == "hit"
+    assert result.ready_to_first_token_seconds == 10.0
+    assert result.prompt_cache is None
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 5, 9],
+        producer_rail=rail,
+    ) == CacheProbe("shorter", 5, False)
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 5, 9],
+    ) == CacheProbe("miss", 0, False)
+
+
+def test_valid_spec_target_survives_companion_export_failure(monkeypatch):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    target = [_OffsetLayerCache(4)]
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        return GenerationResult(
+            text="s",
+            generated_token_ids=(9,),
+            prompt_cache=None,
+            speculative_prompt_cache=target,
+            cache_frontier=4,
+            cache_companion=None,
+            speculative={
+                "drafter": "dspark",
+                "cache_publication": {
+                    "status": "skipped",
+                    "reason": "drafter_export_failed",
+                },
+            },
+        )
+
+    generator, served = _resume_generator([1, 2, 3, 4], store, fake_generate)
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert result.speculative["cache_publication"] == {
+        "status": "published_target_only",
+        "reason": "drafter_export_failed",
+    }
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4],
+        producer_rail=spec_cache_producer_rail(served),
+    ) == CacheProbe("exact", 4, False)
+
+
+def test_exact_spec_entry_stays_resident_while_disk_target_serves_plain(
+    monkeypatch,
+):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+
+    class _RestoringDisk:
+        stride = None
+
+        def __init__(self, target):
+            self.target = target
+            self.restore_calls = 0
+
+        def restore(self, scope, tokens, **kwargs):
+            self.restore_calls += 1
+            return SimpleNamespace(
+                prompt_cache=self.target,
+                suffix_tokens=[tokens[-1]],
+                cached_tokens=len(tokens) - 1,
+            )
+
+        def stats(self):
+            return {"enabled": True}
+
+    store = _make_store()
+    disk_target = [_OffsetLayerCache(3)]
+    disk = _RestoringDisk(disk_target)
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        return GenerationResult(
+            text="p",
+            generated_token_ids=(9,),
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    generator, served = _resume_generator(
+        [1, 2, 3, 4], store, fake_generate, disk_store=disk
+    )
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    rail = spec_cache_producer_rail(served)
+    store.insert_cache_with_companion(
+        model_key,
+        [1, 2, 3, 4],
+        [_OffsetLayerCache(4)],
+        producer_rail=rail,
+        companion=_resume_companion(4),
+    )
+
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+    )
+
+    assert disk.restore_calls == 1
+    assert seen["prompt"] == [4]
+    assert seen["prompt_cache"] is disk_target
+    assert "spec_continuation" not in seen
+    assert result.cache_event == "disk_hit"
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4],
+        producer_rail=rail,
+    ) == CacheProbe("exact", 4, True)
 
 
 class _FakeDiskStore:
@@ -622,6 +1433,55 @@ class _FakeDiskStore:
 
     def stats(self):
         return {"enabled": True}
+
+
+def test_plain_disk_restore_and_ready_to_first_token_are_timed():
+    full = [1, 2, 3, 4]
+    disk_cache = [SimpleNamespace(offset=3, nbytes=8)]
+
+    class _RestoringDiskStore:
+        stride = None
+
+        def restore(self, _scope, tokens, **_kwargs):
+            return SimpleNamespace(
+                prompt_cache=disk_cache,
+                suffix_tokens=[tokens[-1]],
+                cached_tokens=len(tokens) - 1,
+            )
+
+        def stats(self):
+            return {"enabled": True}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        kwargs["first_token_callback"]()
+        return GenerationResult(
+            text="ok",
+            cached_tokens=kwargs["cached_tokens"],
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    gen = PrefixCacheGenerator(
+        "MODEL",
+        _FakeTokenizer(full),
+        {"artifact_id": "pkg"},
+        _FakeStore(),
+        make_prompt_cache_fn=lambda model: [SimpleNamespace(offset=0)],
+        generate_fn=fake_generate,
+        disk_store=_RestoringDiskStore(),
+    )
+    times = iter([10.0, 11.0, 13.0, 20.0])
+    gen.clock = times.__next__
+
+    result = gen(
+        "rendered prompt",
+        kv_policy=parse_kv_policy({"live_kv_format": "raw"}),
+        effective_rendering_id="render-id",
+    )
+
+    assert result.cache_event == "disk_hit"
+    assert result.cached_tokens == 3
+    assert result.disk_restore_seconds == 2.0
+    assert result.ready_to_first_token_seconds == 10.0
 
 
 def test_a_raising_disk_store_cold_serves_instead_of_surfacing():

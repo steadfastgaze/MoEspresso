@@ -1,10 +1,12 @@
-"""Disk prompt-cache codec, fail-closed loads, and the generator disk-hit path.
+"""Disk target and attachment codecs, fail-closed loads, and restore routing.
 
 These run the real safetensors payload codec (leaf schema plus non-empty arrays)
-and drive ``PrefixCacheGenerator`` through a disk restore on a tiny MLX model.
+and drive ``PrefixCacheGenerator`` through disk restores on a tiny MLX model.
 """
 
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pytest
@@ -17,18 +19,27 @@ from mlx_lm.generate import generate_step  # noqa: E402
 from mlx_lm.models.cache import make_prompt_cache  # noqa: E402
 
 from moespresso.runtime.disk_kv import (  # noqa: E402
+    ATTACHMENT_STATUS_HIT,
+    ATTACHMENT_STATUS_INVALID,
     DiskCheckpointStore,
+    DiskKVAttachmentEntry,
+    DiskKVAttachmentEnvelope,
+    DiskKVAttachmentIdentity,
+    DiskKVEntry,
     DiskKVError,
     DiskKVInvalidPayload,
     DiskKVMetadataMismatch,
     FrontierTracker,
     FrontierWriter,
+    build_attachment_safety_metadata,
     build_cache_scope,
     caches_all_at_offset,
     decode_cache_payload,
     default_cache_registry,
     encode_cache_payload,
+    load_attachment_payload,
     load_prompt_cache_payload,
+    save_attachment_payload,
     save_prompt_cache_payload,
 )
 from moespresso.runtime.generation import GenerationResult  # noqa: E402
@@ -115,6 +126,179 @@ def test_load_truncated_payload_fails_closed(tmp_path):
 
 def _model_key():
     return ("pkg", "render", "raw", 64, 0, "mlx_prompt_cache")
+
+
+def _disk_attachment_identity(target):
+    return DiskKVAttachmentIdentity.from_target(
+        target,
+        attachment_kind="drafter_state",
+        envelope_schema="deepseek_v4_spec_cache_v1",
+        drafter_family="dspark",
+        artifact_id="artifact-a",
+        capsule_kind="deepseek_v4_dspark_state",
+        capsule_schema_major=1,
+        capsule_schema_minor=0,
+        producer_rail=("spec", "dspark", "artifact-a"),
+    )
+
+
+def _disk_attachment_envelope(identity):
+    return DiskKVAttachmentEnvelope(
+        identity=identity,
+        frontier=identity.target_token_count,
+        metadata=(("dtype", "float16"), ("window", 64)),
+        tensors=(
+            mx.array(np.array([0.0, -0.0, 1.5, -2.25], dtype=np.float32)),
+            mx.zeros((0, 8), dtype=mx.float16),
+        ),
+    )
+
+
+def test_attachment_payload_round_trips_opaque_capsule_and_identity(tmp_path):
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    target = DiskKVEntry.from_tokens(
+        scope,
+        list(range(8)),
+        payload_path="payloads/target.safetensors",
+        payload_bytes=1,
+        cache_class_names=("KVCache",),
+    )
+    identity = _disk_attachment_identity(target)
+    envelope = _disk_attachment_envelope(identity)
+    entry = DiskKVAttachmentEntry.from_identity(
+        identity, payload_path="", payload_bytes=0)
+
+    rel, size = save_attachment_payload(
+        tmp_path,
+        identity.attachment_id,
+        envelope=envelope,
+        safety_metadata=build_attachment_safety_metadata(entry),
+    )
+    loaded, metadata = load_attachment_payload(tmp_path, rel)
+    assert rel.startswith("attachments/payloads/")
+    assert size > 0
+    assert loaded.identity == identity
+    assert loaded.frontier == target.token_count
+    assert loaded.metadata == envelope.metadata
+    source_bits = np.array(envelope.tensors[0]).view(np.uint32)
+    loaded_bits = np.array(loaded.tensors[0]).view(np.uint32)
+    assert np.array_equal(loaded_bits, source_bits)
+    assert np.signbit(np.array(loaded.tensors[0])[1])
+    assert loaded.tensors[1].shape == (0, 8)
+    assert metadata["target_cache_id"] == target.cache_id
+    assert metadata["producer_rail"]
+
+
+def test_attachment_empty_tensor_unknown_dtype_fails_closed(tmp_path):
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    target = DiskKVEntry.from_tokens(
+        scope,
+        list(range(8)),
+        payload_path="payloads/target.safetensors",
+        payload_bytes=1,
+        cache_class_names=("KVCache",),
+    )
+    identity = _disk_attachment_identity(target)
+    envelope = _disk_attachment_envelope(identity)
+    entry = DiskKVAttachmentEntry.from_identity(
+        identity, payload_path="", payload_bytes=0)
+    rel, _ = save_attachment_payload(
+        tmp_path,
+        identity.attachment_id,
+        envelope=envelope,
+        safety_metadata=build_attachment_safety_metadata(entry),
+    )
+
+    def unknown_dtype_load(path, *, return_metadata):
+        arrays, metadata = mx.load(path, return_metadata=return_metadata)
+        schema = json.loads(metadata["tensor_schema"])
+        schema["tensors"][1][3] = "unknown-dtype"
+        metadata["tensor_schema"] = json.dumps(schema)
+        return arrays, metadata
+
+    with pytest.raises(DiskKVInvalidPayload, match="unknown attachment tensor dtype"):
+        load_attachment_payload(tmp_path, rel, load_fn=unknown_dtype_load)
+
+
+def test_truncated_attachment_isolated_while_target_restores(tmp_path):
+    store = DiskCheckpointStore(tmp_path, log_fn=lambda line: None)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    tokens = list(range(32))
+    target = _write_kv_checkpoint(store, scope, tokens, length=len(tokens))
+    identity = _disk_attachment_identity(target)
+    attachment = store.write_attachment(
+        target, _disk_attachment_envelope(identity))
+    attachment_path = tmp_path / attachment.payload_path
+    with open(attachment_path, "r+b") as fh:
+        fh.truncate(max(1, attachment_path.stat().st_size // 2))
+
+    hit = store.restore(
+        scope,
+        tokens + [99],
+        make_cache_fn=lambda: [_kv_cache_empty()],
+        registry=default_cache_registry(),
+    )
+    assert hit is not None and hit.cached_tokens == len(tokens)
+    result = store.restore_attachment(hit.entry, identity)
+    assert result.status == ATTACHMENT_STATUS_INVALID
+    assert store.find_exact(scope, tokens) is not None
+    assert (tmp_path / target.payload_path).exists()
+    assert list((tmp_path / "attachments" / "quarantine").glob("*.safetensors"))
+    # Companion quarantine does not poison another target restore.
+    assert store.restore(
+        scope,
+        tokens + [100],
+        make_cache_fn=lambda: [_kv_cache_empty()],
+        registry=default_cache_registry(),
+    ) is not None
+
+
+def test_valid_attachment_restore_reports_hit_without_model_import(tmp_path):
+    store = DiskCheckpointStore(tmp_path, log_fn=lambda line: None)
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    tokens = list(range(16))
+    target = _write_kv_checkpoint(store, scope, tokens, length=len(tokens))
+    identity = _disk_attachment_identity(target)
+    expected = _disk_attachment_envelope(identity)
+    store.write_attachment(target, expected)
+
+    result = store.restore_attachment(target, identity)
+    assert result.status == ATTACHMENT_STATUS_HIT
+    assert result.payload.identity == identity
+    assert np.array_equal(
+        np.array(result.payload.tensors[0]), np.array(expected.tensors[0]))
+
+
+def test_attachment_payload_rename_fsyncs_its_parent(tmp_path, monkeypatch):
+    import moespresso.runtime.disk_kv as disk_kv
+
+    scope = build_cache_scope(_model_key(), ("KVCache",))
+    target = DiskKVEntry.from_tokens(
+        scope,
+        list(range(8)),
+        payload_path="payloads/target.safetensors",
+        payload_bytes=1,
+        cache_class_names=("KVCache",),
+    )
+    identity = _disk_attachment_identity(target)
+    envelope = _disk_attachment_envelope(identity)
+    entry = DiskKVAttachmentEntry.from_identity(
+        identity, payload_path="", payload_bytes=0)
+    calls = []
+    real_fsync_directory = disk_kv._fsync_directory
+
+    def recording_fsync(path):
+        calls.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(disk_kv, "_fsync_directory", recording_fsync)
+    rel, _ = save_attachment_payload(
+        tmp_path,
+        identity.attachment_id,
+        envelope=envelope,
+        safety_metadata=build_attachment_safety_metadata(entry),
+    )
+    assert (tmp_path / rel).parent in calls
 
 
 def _write_kv_checkpoint(store, scope, tokens, *, length):

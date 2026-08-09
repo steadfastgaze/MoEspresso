@@ -239,7 +239,7 @@ class _StagePatch:
         )
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
         while self._restore:
             self._restore.pop()()
 

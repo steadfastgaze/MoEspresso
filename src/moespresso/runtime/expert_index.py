@@ -1,12 +1,12 @@
 """Expert byte-offset index for SSD-streamed MoE inference (bundle format).
 
-Maps (layer, expert, projection, component) -> an exact byte range in a package
-shard, so the miss-loader can `pread` expert bytes without faulting whole
-tensors. In the current format, one routed layer stores ONE bundle tensor
-(`...switch_mlp.experts.tq_bundle`, uint8 `[n_experts, row_bytes]`) whose row e
-concatenates expert e's full payload, so the index can also hand out the WHOLE
-row as a single range (`locate_row`): one pread per missed expert instead of
-six.
+Maps (layer, expert, projection, component) to an exact byte range in a package
+shard, so the miss loader can read expert bytes without faulting whole tensors.
+One routed layer stores a uint8 bundle tensor with one contiguous row per
+expert. The historical `.tq_bundle` suffix names this shared container; bundle
+metadata declares the actual codec of each projection, including TQ, K-quant,
+MXFP4, and IQ_K. The index can also return the whole row through `locate_row`,
+allowing one read to feed all three projection pools.
 
 The within-row geometry travels in each shard's safetensors `__metadata__`
 (package/bundle.py is the schema's single source of truth), so this stays
@@ -29,7 +29,7 @@ from moespresso.inventory.safetensors_header import (
     read_shard_metadata,
 )
 from moespresso.package.bundle import (
-    COMPONENTS,
+    IQK_CODEC,
     KQUANT_CODEC,
     METADATA_KEY,
     MXFP4_CODEC,
@@ -41,14 +41,14 @@ from moespresso.package.bundle import (
 )
 
 __all__ = [
-    "PROJECTIONS", "COMPONENTS", "ExpertByteRange", "ProjectionGeometry",
+    "PROJECTIONS", "ExpertByteRange", "ProjectionGeometry",
     "ExpertIndex", "StackedLayoutError", "build_expert_index",
 ]
 
 # bundle key: prefixed MoE layers or DS4 root `layers.<L>.ffn.experts.tq_bundle`
 _BUNDLE_KEY = re.compile(
     r"(?:^|\.)layers\.(?P<layer>\d+)\..*experts\.tq_bundle$")
-# future routed bundle suffixes that must not be ignored by the TQ-only index.
+# Routed bundle suffixes outside the shared `.tq_bundle` container contract.
 _UNSUPPORTED_BUNDLE_KEY = re.compile(
     r"(?:^|\.)layers\.\d+\..*experts\.(?P<suffix>mxfp4_bundle)$")
 # legacy stacked keys, matched only to fail loud with a useful message.
@@ -85,6 +85,10 @@ class ProjectionGeometry:
     group_size: int | None = None
     bytes_per_block: int | None = None
     weights_per_block: int | None = None
+    in_features: int | None = None
+    iqk_codec: str | None = None
+    layout: str | None = None
+    row_meta_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,8 @@ class ExpertIndex:
     def geometry(self, *, layer: int, projection: str) -> ProjectionGeometry:
         b = self._bundle(layer)
         codec = self.codec(layer=layer, projection=projection)
+        if codec == IQK_CODEC:
+            return self._iqk_geometry(b, layer, projection)
         weight_component = "weight" if codec == KQUANT_CODEC else "packed"
         packed = b.components[(projection, weight_component)]
         if len(packed["shape"]) != 2:
@@ -260,6 +266,35 @@ class ExpertIndex:
             group_size=group_size,
             bytes_per_block=bytes_per_block,
             weights_per_block=weights_per_block,
+        )
+
+    def _iqk_geometry(
+        self, b: "_LayerBundle", layer: int, projection: str
+    ) -> ProjectionGeometry:
+        blocks = b.components[(projection, "blocks")]
+        if len(blocks["shape"]) != 2:
+            raise ValueError(
+                f"layer={layer} {projection}.blocks: expected per-expert 2D, "
+                f"got {blocks['shape']}")
+        proj_geo = b.projections[projection]
+        out_features, bytes_per_row = blocks["shape"]
+        if proj_geo.get("bytes_per_row") != bytes_per_row:
+            raise ValueError(
+                f"layer={layer} {projection}: declared bytes_per_row "
+                f"{proj_geo.get('bytes_per_row')!r} != stored row width "
+                f"{bytes_per_row}")
+        return ProjectionGeometry(
+            codec=IQK_CODEC,
+            out_features=out_features,
+            packed_cols=bytes_per_row,
+            bits=self.bits(layer=layer, projection=projection),
+            packed_dtype=blocks["dtype"],
+            bytes_per_block=proj_geo.get("bytes_per_block"),
+            weights_per_block=proj_geo.get("weights_per_block"),
+            in_features=proj_geo.get("in_features"),
+            iqk_codec=proj_geo.get("iqk_codec"),
+            layout=proj_geo.get("layout"),
+            row_meta_bytes=proj_geo.get("row_meta_bytes"),
         )
 
     def num_layers_indexed(self) -> int:

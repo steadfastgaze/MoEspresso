@@ -7,11 +7,16 @@ import pytest
 from moespresso.core.artifact import compute_artifact_id, validate_base
 from moespresso.correctness.environment import mlx_wheel_tag
 from moespresso.correctness.deepseek_v4.q2 import (
+    OPENROUTER_DS4_FLASH_MODEL,
+    Q2_FROZEN_PREVIEW_REFERENCE_PATH,
+    Q2_NOISE_FLOOR_REFERENCE_PATH,
     Q2_PROMPTS_PATH,
     Q2_REFERENCE_SCHEMA,
     Q2_REFERENCE_PATH,
     aggregate_q2_scores,
+    check_q2_capture_output_path,
     compare_q2_score_tables,
+    default_q2_capture_path,
     load_q2_prompts,
     make_deepseek_v4_q2_evidence,
     score_q2_token_sequence,
@@ -93,8 +98,53 @@ def test_q2_prompt_fixture_has_100_unique_cases():
     assert prompts[0].id == "case_000"
     assert prompts[-1].id == "case_099"
     assert len({p.id for p in prompts}) == 100
-    assert "private" not in Q2_PROMPTS_PATH.parts
-    assert "private" in Q2_REFERENCE_PATH.parts
+    assert Q2_PROMPTS_PATH.parent.parent.name == "deepseek_v4"
+    assert Q2_REFERENCE_PATH.parent.parent.name == "private"
+
+
+def test_q2_reference_of_record_and_its_witnesses_stay_private():
+    """Every reference path is oracle material and lives outside the tree."""
+    for path in (
+        Q2_REFERENCE_PATH,
+        Q2_NOISE_FLOOR_REFERENCE_PATH,
+        Q2_FROZEN_PREVIEW_REFERENCE_PATH,
+        default_q2_capture_path(),
+    ):
+        assert path.parent.parent.name == "private", path
+    # The reference of record and the earlier frozen reference are different
+    # captures of different checkpoints; scoring one against the other's number
+    # is meaningless, so they are never the same file.
+    assert Q2_REFERENCE_PATH != Q2_FROZEN_PREVIEW_REFERENCE_PATH
+    assert Q2_REFERENCE_PATH.parent != Q2_FROZEN_PREVIEW_REFERENCE_PATH.parent
+
+
+def test_q2_capture_defaults_to_a_new_timestamped_path():
+    from datetime import UTC, datetime
+
+    first = default_q2_capture_path(datetime(2026, 8, 2, 3, 4, 5, tzinfo=UTC))
+    second = default_q2_capture_path(datetime(2026, 8, 2, 3, 4, 6, tzinfo=UTC))
+
+    assert first.name == "capture_20260802T030405Z.json"
+    assert first != second
+    assert first != Q2_REFERENCE_PATH
+    assert first != Q2_FROZEN_PREVIEW_REFERENCE_PATH
+
+
+def test_q2_capture_refuses_to_overwrite_an_existing_reference(tmp_path):
+    existing = tmp_path / "pass1.json"
+    existing.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileExistsError) as excinfo:
+        check_q2_capture_output_path(existing)
+
+    assert "pass1.json" in str(excinfo.value)
+    assert check_q2_capture_output_path(existing, force=True) == existing
+    assert check_q2_capture_output_path(tmp_path / "new.json") == tmp_path / "new.json"
+
+
+def test_q2_capture_model_default_is_the_dated_slug():
+    """An undated slug is not a checkpoint identity, so it cannot be a default."""
+    assert OPENROUTER_DS4_FLASH_MODEL.endswith("-0731")
 
 
 def test_q2_reference_allows_non_selected_sentinel_top_logprobs():

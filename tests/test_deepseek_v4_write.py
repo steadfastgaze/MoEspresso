@@ -459,3 +459,126 @@ def test_write_package_streams_deepseek_v4_fp8_affine_output(tmp_path, monkeypat
     assert "layers.0.attn.wq_a.weight" in arrays
     assert "layers.0.attn.wq_a.scales" in arrays
     assert "layers.0.attn.wq_a.biases" in arrays
+
+
+def _ds4_iqk_source(path, *, out_features=4, in_features=256, num_experts=2):
+    """A DS4 source whose routed rows are wide enough for a 256-weight block."""
+    tensors = {
+        "layers.0.attn.wq_a.weight": (
+            "F8_E4M3",
+            np.full((128, 128), 0x38, dtype=np.uint8),
+        ),
+        "layers.0.attn.wq_a.scale": ("F8_E8M0", np.array([[127]], dtype=np.uint8)),
+        "layers.0.attn.attn_sink": ("F32", np.arange(64, dtype=np.float32)),
+    }
+    packed = np.arange(
+        out_features * in_features // 2, dtype=np.uint8
+    ).reshape(out_features, in_features // 2).view(np.int8)
+    scale = np.full((out_features, in_features // 32), 127, dtype=np.uint8)
+    for expert in range(num_experts):
+        for source_projection in ("w1", "w3", "w2"):
+            key = f"layers.0.ffn.experts.{expert}.{source_projection}"
+            tensors[f"{key}.weight"] = ("I8", packed)
+            tensors[f"{key}.scale"] = ("F8_E8M0", scale)
+    _write_safetensors(path / "model-00001.safetensors", tensors)
+    (path / "config.json").write_text(json.dumps(DS4_ARCH))
+
+
+def test_write_package_writes_a_mixed_member_deepseek_v4_iqk_expert_bundle(tmp_path):
+    from moespresso.package.deepseek_v4.iqk_package import IQKRoutedArtifacts
+    from moespresso.package.deepseek_v4.recipe import (
+        build_ds4_iqk_expert_allocations,
+        build_ds4_iqk_plan,
+    )
+    from moespresso.package.iqk_format import IQK_LAYOUT_IK_WIRE, iqk_geometry
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _ds4_iqk_source(src)
+    out = tmp_path / "out"
+    out_features, in_features, num_experts = 4, 256, 2
+    members = {0: {"gate": "iq2_ks", "up": "iq2_k", "down": "iq2_ks"}}
+
+    artifacts_dir = tmp_path / "tensors"
+    artifacts_dir.mkdir()
+    written = {}
+    for projection, codec in members[0].items():
+        row = iqk_geometry(codec).bytes_per_row(in_features)
+        rng = np.random.default_rng(len(projection))
+        payload = rng.integers(
+            0, 256, size=(num_experts, out_features, row), dtype=np.uint8)
+        (artifacts_dir / f"layer00_{projection}.{codec}").write_bytes(payload.tobytes())
+        written[projection] = payload
+
+    inv = build_inventory(src, family="deepseek_v4_flash")
+    group = DecodedExpertGroup.from_inventory(inv, src, fp4_block=32)
+    shapes = {0: {p: (out_features, in_features) for p in ("gate", "up", "down")}}
+    artifacts = IQKRoutedArtifacts(artifacts_dir, members, shapes, num_experts)
+    plan = build_ds4_iqk_plan(
+        inv["subject"],
+        build_ds4_iqk_expert_allocations(members, layout=IQK_LAYOUT_IK_WIRE),
+        allocation_source="candidates_test.json",
+        extra_allocation=[{
+            "source_name": "layers.0.attn.wq_a.weight",
+            "kind": "affine",
+            "role": "attn.wq_a",
+            "layer_index": 0,
+            "bits": 8,
+            "group_size": 32,
+            "format": "kquant",
+            "codec": "q8_0",
+            "kquant_codec": "q8_0",
+            "gguf_tensor": "blk.0.attn_q_a.weight",
+            "imatrix_key": "blk.0.attn_q_a.weight",
+            "module_path": "model.layers.0.self_attn.wq_a",
+            "module_weight_key": "model.layers.0.self_attn.wq_a.weight",
+        }],
+    )
+
+    def fake_encoder(weight, target, imatrix_vectors):
+        geometry = KQUANT_GEOMETRY[target.codec]
+        blocks = weight.shape[1] // geometry.weights_per_block
+        return KQuantEncodedWeight(
+            codec=target.codec,
+            weight=np.full(
+                (weight.shape[0], blocks * geometry.bytes_per_block), 3, dtype=np.uint8),
+            scales=np.zeros((1,), dtype=np.uint8),
+        )
+
+    man = write_package(
+        plan,
+        src,
+        DS4_ARCH,
+        out,
+        passthrough=[e for e in inv["tensors"] if e["kind"] == "passthrough"],
+        deepseek_v4_expert_group=group,
+        kquant_encoder=fake_encoder,
+        iqk_expert_loader=artifacts.expert_blocks,
+    )
+    artifacts.close()
+
+    assert man["status"] == "valid"
+    assert not verify_package(man, out)
+    assert "iqk_dequant" in man["required_ops"]
+    expert_entries = {
+        t["projection"]: t for t in man["tensors"]
+        if t["kind"] == "expert" and t["format"] == "iqk"
+    }
+    assert {p: t["format_params"]["iqk_codec"] for p, t in expert_entries.items()} == (
+        members[0])
+    assert {t["format_params"]["layout"] for t in expert_entries.values()} == {
+        IQK_LAYOUT_IK_WIRE}
+
+    arrays = _load_package_arrays(out, man)
+    bundle = arrays["layers.0.ffn.experts.tq_bundle"]
+    assert bundle.shape[0] == num_experts
+    idx = build_expert_index(out)
+    for projection, codec in members[0].items():
+        geometry = idx.geometry(layer=0, projection=f"{projection}_proj")
+        assert geometry.codec == "iqk"
+        assert geometry.iqk_codec == codec
+        assert geometry.layout == IQK_LAYOUT_IK_WIRE
+        assert geometry.in_features == in_features
+        assert geometry.out_features == out_features
+        component = idx._bundle(0).components[(f"{projection}_proj", "blocks")]
+        assert np.array_equal(component_array(bundle, component), written[projection])

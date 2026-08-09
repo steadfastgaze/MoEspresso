@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from moespresso.core.artifact import make_artifact
 
-PRODUCER = {"tool": "moespresso.architecture_profile", "version": "1.1.0"}
+PRODUCER = {"tool": "moespresso.architecture_profile", "version": "2.0.0"}
 
 
 def _profile(subject: dict, **fields) -> dict:

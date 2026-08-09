@@ -24,6 +24,10 @@ Boundaries this module keeps explicit:
   the registry does not know, and refuses a corrupt or truncated payload before
   any cache reaches the model. A refusal quarantines the entry and returns the
   engine to cold serving.
+- Optional companion capsules live in a separate attachment-v1 index and
+  payload tree. Their identity binds the validated target frontier and the
+  companion provenance. Attachment misses and failures return an independent
+  status, so they never change whether the target checkpoint can serve.
 
 The frontier writer runs during prefill only: token accounting proposes
 aligned frontiers, every positional cache must independently report exactly
@@ -39,6 +43,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import shutil
 import struct
@@ -46,9 +51,16 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 SCHEMA_VERSION = "moespresso-disk-kv-v1"
+ATTACHMENT_SCHEMA_VERSION = "moespresso-disk-kv-attachment-v1"
+
+ATTACHMENT_STATUS_HIT = "hit"
+ATTACHMENT_STATUS_MISSING = "missing"
+ATTACHMENT_STATUS_INVALID = "invalid"
+ATTACHMENT_STATUS_UNAVAILABLE = "unavailable"
+AttachmentStatus = Literal["hit", "missing", "invalid", "unavailable"]
 
 # The safetensors metadata leaf kinds. A payload leaf is either a real array (its
 # bytes are in the file), an empty array (zero-size, shape and dtype recorded so
@@ -319,6 +331,282 @@ class DiskKVEntry:
         return cls(**raw)
 
 
+def _require_non_empty_string(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise DiskKVMetadataMismatch(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_non_negative_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DiskKVMetadataMismatch(f"{name} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True)
+class DiskKVAttachmentIdentity:
+    """Content identity for one optional payload bound to a target checkpoint.
+
+    Attachments are independently disposable. Their identity nevertheless binds
+    every target-prefix fact and every companion provenance fact needed to decide
+    whether an opaque capsule can be offered to its model-owned import codec.
+    """
+
+    target_cache_id: str
+    target_scope_hash: str
+    target_token_count: int
+    target_token_prefix_hash: str
+    attachment_kind: str
+    envelope_schema: str
+    drafter_family: str
+    artifact_id: str
+    capsule_kind: str
+    capsule_schema_major: int
+    capsule_schema_minor: int
+    producer_rail: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "target_cache_id",
+            "target_scope_hash",
+            "target_token_prefix_hash",
+            "attachment_kind",
+            "envelope_schema",
+            "drafter_family",
+            "artifact_id",
+            "capsule_kind",
+        ):
+            _require_non_empty_string(name, getattr(self, name))
+        _require_non_negative_int("target_token_count", self.target_token_count)
+        _require_non_negative_int("capsule_schema_major", self.capsule_schema_major)
+        _require_non_negative_int("capsule_schema_minor", self.capsule_schema_minor)
+        rail = tuple(self.producer_rail)
+        if not rail or any(not isinstance(part, str) or not part for part in rail):
+            raise DiskKVMetadataMismatch(
+                "producer_rail must contain non-empty strings")
+        object.__setattr__(self, "producer_rail", rail)
+
+    @classmethod
+    def from_target(
+        cls,
+        target: DiskKVEntry,
+        *,
+        attachment_kind: str,
+        envelope_schema: str,
+        drafter_family: str,
+        artifact_id: str,
+        capsule_kind: str,
+        capsule_schema_major: int,
+        capsule_schema_minor: int,
+        producer_rail: tuple[str, ...],
+    ) -> "DiskKVAttachmentIdentity":
+        """Bind companion provenance to one already validated target entry."""
+        if not isinstance(target, DiskKVEntry):
+            raise TypeError("attachment identity requires a DiskKVEntry target")
+        return cls(
+            target_cache_id=target.cache_id,
+            target_scope_hash=target.scope_hash,
+            target_token_count=target.token_count,
+            target_token_prefix_hash=target.token_prefix_hash,
+            attachment_kind=attachment_kind,
+            envelope_schema=envelope_schema,
+            drafter_family=drafter_family,
+            artifact_id=artifact_id,
+            capsule_kind=capsule_kind,
+            capsule_schema_major=capsule_schema_major,
+            capsule_schema_minor=capsule_schema_minor,
+            producer_rail=producer_rail,
+        )
+
+    @property
+    def attachment_id(self) -> str:
+        """Stable payload id over the complete target and companion identity."""
+        return _hash_json(
+            "moespresso.disk-kv.attachment-id.v1", self.to_json_obj())
+
+    @property
+    def sidecar_artifact_id(self) -> str:
+        """Explicit alias for the companion sidecar artifact identifier."""
+        return self.artifact_id
+
+    def to_json_obj(self) -> dict:
+        data = asdict(self)
+        data["producer_rail"] = list(self.producer_rail)
+        return data
+
+    @classmethod
+    def from_json_obj(cls, raw: dict) -> "DiskKVAttachmentIdentity":
+        data = dict(raw)
+        data["producer_rail"] = tuple(data["producer_rail"])
+        return cls(**data)
+
+
+def validate_attachment_identity(
+    target: DiskKVEntry,
+    identity: DiskKVAttachmentIdentity,
+) -> None:
+    """Refuse an attachment identity that does not name ``target`` exactly."""
+    expected = {
+        "target_cache_id": target.cache_id,
+        "target_scope_hash": target.scope_hash,
+        "target_token_count": target.token_count,
+        "target_token_prefix_hash": target.token_prefix_hash,
+    }
+    for name, value in expected.items():
+        if getattr(identity, name) != value:
+            raise DiskKVMetadataMismatch(
+                f"attachment identity mismatch for {name}: "
+                f"expected {value!r}, got {getattr(identity, name)!r}")
+
+
+@dataclass(frozen=True)
+class DiskKVAttachmentEnvelope:
+    """Opaque companion capsule plus the disk identity that authorizes it.
+
+    The disk tier only knows the capsule's portable scalar and tensor fields.
+    The drafter remains responsible for reconstructing and validating its live
+    state through :meth:`to_capsule` and its own import codec.
+    """
+
+    identity: DiskKVAttachmentIdentity
+    frontier: int
+    metadata: tuple[tuple[str, str | int | float | bool | None], ...]
+    tensors: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, DiskKVAttachmentIdentity):
+            raise TypeError("attachment envelope requires a typed identity")
+        frontier = _require_non_negative_int("capsule frontier", self.frontier)
+        if frontier != self.identity.target_token_count:
+            raise DiskKVMetadataMismatch(
+                "attachment capsule frontier does not match target token count: "
+                f"{frontier} != {self.identity.target_token_count}")
+        seen: set[str] = set()
+        normalized_metadata = []
+        for item in self.metadata:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise DiskKVMetadataMismatch(
+                    "attachment capsule metadata entries must be key/value pairs")
+            key, value = item
+            _require_non_empty_string("capsule metadata key", key)
+            if key in seen:
+                raise DiskKVMetadataMismatch(
+                    f"duplicate attachment capsule metadata key: {key!r}")
+            seen.add(key)
+            if value is not None and type(value) not in (str, int, float, bool):
+                raise DiskKVMetadataMismatch(
+                    "attachment capsule metadata values must be JSON scalar types")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise DiskKVMetadataMismatch(
+                    "attachment capsule float metadata must be finite")
+            normalized_metadata.append((key, value))
+        object.__setattr__(self, "metadata", tuple(normalized_metadata))
+        object.__setattr__(self, "tensors", tuple(self.tensors))
+
+    @classmethod
+    def from_capsule(
+        cls,
+        identity: DiskKVAttachmentIdentity,
+        capsule: Any,
+    ) -> "DiskKVAttachmentEnvelope":
+        """Copy a model-owned capsule's portable fields into the disk envelope."""
+        if getattr(capsule, "kind", None) != identity.capsule_kind:
+            raise DiskKVMetadataMismatch(
+                "attachment capsule kind does not match its identity")
+        if getattr(capsule, "schema_major", None) != identity.capsule_schema_major:
+            raise DiskKVMetadataMismatch(
+                "attachment capsule schema major does not match its identity")
+        if getattr(capsule, "schema_minor", None) != identity.capsule_schema_minor:
+            raise DiskKVMetadataMismatch(
+                "attachment capsule schema minor does not match its identity")
+        try:
+            return cls(
+                identity=identity,
+                frontier=capsule.frontier,
+                metadata=tuple(capsule.metadata),
+                tensors=tuple(capsule.tensors),
+            )
+        except AttributeError as e:
+            raise DiskKVMetadataMismatch(
+                "attachment capsule does not expose the portable envelope fields"
+            ) from e
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(getattr(tensor, "nbytes", 0)) for tensor in self.tensors)
+
+    def to_capsule(self, factory: Callable[..., Any]) -> Any:
+        """Rebuild the model-owned capsule after disk validation succeeds."""
+        return factory(
+            kind=self.identity.capsule_kind,
+            schema_major=self.identity.capsule_schema_major,
+            schema_minor=self.identity.capsule_schema_minor,
+            frontier=self.frontier,
+            metadata=self.metadata,
+            tensors=self.tensors,
+        )
+
+
+@dataclass(frozen=True)
+class DiskKVAttachmentEntry:
+    """Attachment-v1 index metadata, separate from ``DiskKVEntry``."""
+
+    schema_version: str
+    attachment_id: str
+    identity: DiskKVAttachmentIdentity
+    payload_path: str
+    payload_bytes: int
+    created_at: int
+    last_used_at: int
+    hit_count: int
+
+    @classmethod
+    def from_identity(
+        cls,
+        identity: DiskKVAttachmentIdentity,
+        *,
+        payload_path: str,
+        payload_bytes: int,
+        now: int = 0,
+    ) -> "DiskKVAttachmentEntry":
+        return cls(
+            schema_version=ATTACHMENT_SCHEMA_VERSION,
+            attachment_id=identity.attachment_id,
+            identity=identity,
+            payload_path=payload_path,
+            payload_bytes=int(payload_bytes),
+            created_at=int(now),
+            last_used_at=int(now),
+            hit_count=0,
+        )
+
+    def to_json_obj(self) -> dict:
+        data = asdict(self)
+        data["identity"] = self.identity.to_json_obj()
+        return data
+
+    @classmethod
+    def from_json_obj(cls, raw: dict) -> "DiskKVAttachmentEntry":
+        data = dict(raw)
+        data["identity"] = DiskKVAttachmentIdentity.from_json_obj(data["identity"])
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class DiskKVAttachmentLookup:
+    """Non-throwing attachment lookup result, independent of target reuse."""
+
+    status: AttachmentStatus
+    entry: DiskKVAttachmentEntry | None = None
+    envelope: DiskKVAttachmentEnvelope | None = None
+    reason: str | None = None
+
+    @property
+    def payload(self) -> DiskKVAttachmentEnvelope | None:
+        """Alias used by consumers that treat the envelope as opaque payload."""
+        return self.envelope
+
+
 # --- JSON index --------------------------------------------------------------
 
 
@@ -401,6 +689,27 @@ class DiskKVIndex:
                 return entry
         return None
 
+    def find_exact(
+        self,
+        scope: dict,
+        tokens: list[int],
+        *,
+        exclude: set[str] | None = None,
+    ) -> DiskKVEntry | None:
+        """Return only the checkpoint at this exact target frontier."""
+        sid = scope_hash(scope)
+        prefix_hash = token_prefix_hash(tokens)
+        for entry in self.entries():
+            if exclude and entry.cache_id in exclude:
+                continue
+            if (
+                entry.scope_hash == sid
+                and entry.token_count == len(tokens)
+                and entry.token_prefix_hash == prefix_hash
+            ):
+                return entry
+        return None
+
     def mark_used(self, entry: DiskKVEntry, *, now: int | None = None) -> DiskKVEntry:
         now = int(time.time()) if now is None else int(now)
         updated = replace(entry, last_used_at=now, hit_count=entry.hit_count + 1)
@@ -413,6 +722,121 @@ class DiskKVIndex:
         data["entries"] = [
             obj for obj in data.get("entries", [])
             if self._entry_identity(DiskKVEntry.from_json_obj(obj)) != identity
+        ]
+        self._write(data)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory-entry mutation after an atomic rename or unlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _ensure_directory(path: Path) -> None:
+    """Create one directory and persist its name in the existing parent."""
+    if path.exists():
+        return
+    path.mkdir()
+    _fsync_directory(path.parent)
+
+
+class DiskKVAttachmentIndex:
+    """Attachment-v1 JSON index below ``attachments/``.
+
+    This file is never folded into the target-v1 index. Older runtimes keep
+    reading the original root unchanged, and an attachment-index fault can be
+    isolated without changing target checkpoint availability.
+    """
+
+    INDEX_NAME = "index.json"
+
+    def __init__(self, root: Path | str):
+        self.store_root = Path(root)
+        self.store_root.mkdir(parents=True, exist_ok=True)
+        self.root = self.store_root / "attachments"
+        _ensure_directory(self.root)
+        _ensure_directory(self.root / "payloads")
+        _ensure_directory(self.root / "quarantine")
+        self.path = self.root / self.INDEX_NAME
+        if not self.path.exists():
+            self._write({
+                "schema_version": ATTACHMENT_SCHEMA_VERSION,
+                "entries": [],
+            })
+        else:
+            data = self._read()
+            stored = data.get("schema_version")
+            if stored != ATTACHMENT_SCHEMA_VERSION:
+                raise DiskKVError(
+                    f"unsupported disk KV attachment index schema {stored!r}")
+
+    def close(self) -> None:
+        return None
+
+    def _read(self) -> dict:
+        with open(self.path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _write(self, data: dict) -> None:
+        tmp = self.path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(_json_dumps(data))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        _fsync_directory(self.path.parent)
+
+    def entries(self) -> list[DiskKVAttachmentEntry]:
+        data = self._read()
+        return [
+            DiskKVAttachmentEntry.from_json_obj(obj)
+            for obj in data.get("entries", [])
+        ]
+
+    def put(self, entry: DiskKVAttachmentEntry) -> None:
+        data = self._read()
+        kept = [
+            obj for obj in data.get("entries", [])
+            if obj.get("attachment_id") != entry.attachment_id
+        ]
+        kept.append(entry.to_json_obj())
+        data["entries"] = kept
+        self._write(data)
+
+    def find(
+        self,
+        identity: DiskKVAttachmentIdentity,
+        *,
+        exclude: set[str] | None = None,
+    ) -> DiskKVAttachmentEntry | None:
+        wanted = identity.attachment_id
+        for entry in self.entries():
+            if exclude and entry.attachment_id in exclude:
+                continue
+            if entry.attachment_id == wanted:
+                return entry
+        return None
+
+    def mark_used(
+        self,
+        entry: DiskKVAttachmentEntry,
+        *,
+        now: int | None = None,
+    ) -> DiskKVAttachmentEntry:
+        now = int(time.time()) if now is None else int(now)
+        updated = replace(entry, last_used_at=now, hit_count=entry.hit_count + 1)
+        self.put(updated)
+        return updated
+
+    def remove(self, entry: DiskKVAttachmentEntry) -> None:
+        data = self._read()
+        data["entries"] = [
+            obj for obj in data.get("entries", [])
+            if obj.get("attachment_id") != entry.attachment_id
         ]
         self._write(data)
 
@@ -633,6 +1057,194 @@ def load_prompt_cache_payload(
     return state_trees, meta_state_trees, metadata
 
 
+def build_attachment_safety_metadata(
+    entry: DiskKVAttachmentEntry,
+) -> dict[str, str]:
+    """Identity metadata mirrored by an attachment index entry and payload."""
+    identity = entry.identity
+    return {
+        "attachment_schema_version": entry.schema_version,
+        "attachment_id": entry.attachment_id,
+        "attachment_identity": _json_dumps(identity.to_json_obj()),
+        "target_cache_id": identity.target_cache_id,
+        "target_scope_hash": identity.target_scope_hash,
+        "target_token_count": str(identity.target_token_count),
+        "target_token_prefix_hash": identity.target_token_prefix_hash,
+        "attachment_kind": identity.attachment_kind,
+        "envelope_schema": identity.envelope_schema,
+        "drafter_family": identity.drafter_family,
+        "artifact_id": identity.artifact_id,
+        "capsule_kind": identity.capsule_kind,
+        "capsule_schema_major": str(identity.capsule_schema_major),
+        "capsule_schema_minor": str(identity.capsule_schema_minor),
+        "producer_rail": _json_dumps({"rail": list(identity.producer_rail)}),
+    }
+
+
+def validate_attachment_entry(
+    target: DiskKVEntry,
+    expected: DiskKVAttachmentIdentity,
+    entry: DiskKVAttachmentEntry,
+) -> None:
+    """Validate an attachment index row against its target and requested rail."""
+    validate_attachment_identity(target, expected)
+    if entry.schema_version != ATTACHMENT_SCHEMA_VERSION:
+        raise DiskKVMetadataMismatch(
+            f"unsupported attachment entry schema {entry.schema_version!r}")
+    if entry.attachment_id != entry.identity.attachment_id:
+        raise DiskKVMetadataMismatch(
+            "attachment index id does not match its stored identity")
+    if entry.attachment_id != expected.attachment_id:
+        raise DiskKVMetadataMismatch(
+            "attachment index id does not match requested identity")
+    if entry.identity != expected:
+        raise DiskKVMetadataMismatch(
+            "attachment index identity does not match requested identity")
+    validate_attachment_identity(target, entry.identity)
+    if entry.payload_bytes < 0:
+        raise DiskKVMetadataMismatch(
+            "attachment payload byte count must be non-negative")
+
+
+def validate_attachment_payload_metadata(
+    entry: DiskKVAttachmentEntry,
+    metadata: dict[str, Any],
+) -> None:
+    """Re-check every attachment identity field embedded in the payload."""
+    expected = build_attachment_safety_metadata(entry)
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise DiskKVMetadataMismatch(
+                f"attachment payload metadata mismatch for {key}: "
+                f"expected {value!r}, got {metadata.get(key)!r}")
+
+
+def _attachment_payload_path(root: Path | str, payload_path: str) -> Path:
+    """Resolve only payload paths below the attachment payload tree."""
+    root = Path(root).resolve()
+    rel = Path(payload_path)
+    if rel.is_absolute() or not rel.parts or rel.parts[:2] != (
+        "attachments", "payloads",
+    ):
+        raise DiskKVInvalidPayload(
+            f"invalid disk KV attachment payload path: {payload_path!r}")
+    resolved = (root / rel).resolve()
+    payload_root = (root / "attachments" / "payloads").resolve()
+    if not resolved.is_relative_to(payload_root):
+        raise DiskKVInvalidPayload(
+            f"invalid disk KV attachment payload path: {payload_path!r}")
+    return resolved
+
+
+def save_attachment_payload(
+    root: Path | str,
+    attachment_id: str,
+    *,
+    envelope: DiskKVAttachmentEnvelope,
+    safety_metadata: dict[str, str],
+    save_fn: Callable | None = None,
+) -> tuple[str, int]:
+    """Write one opaque capsule as a direct safetensors attachment payload."""
+    import mlx.core as mx
+
+    root = Path(root)
+    rel_path = (
+        Path("attachments") / "payloads" / attachment_id[:2]
+        / f"{attachment_id}.safetensors"
+    )
+    final_path = root / rel_path
+    tmp_path = final_path.with_suffix(".tmp.safetensors")
+    _ensure_directory(root / "attachments")
+    _ensure_directory(root / "attachments" / "payloads")
+    _ensure_directory(final_path.parent)
+
+    arrays: dict[str, Any] = {}
+    tensor_schema: list[list[Any]] = []
+    for index, tensor in enumerate(envelope.tensors):
+        if not isinstance(tensor, mx.array):
+            raise DiskKVInvalidPayload(
+                f"attachment capsule tensor {index} is not an MLX array")
+        key = f"tensor.{index}"
+        if tensor.size == 0:
+            tensor_schema.append(
+                [key, _LEAF_EMPTY, list(tensor.shape), str(tensor.dtype)])
+        else:
+            arrays[key] = tensor
+            tensor_schema.append(
+                [key, _LEAF_ARRAY, list(tensor.shape), str(tensor.dtype)])
+
+    metadata = dict(safety_metadata)
+    metadata["capsule_frontier"] = str(envelope.frontier)
+    metadata["capsule_metadata"] = _json_dumps({
+        "items": [list(item) for item in envelope.metadata],
+    })
+    metadata["tensor_schema"] = _json_dumps({"tensors": tensor_schema})
+    if save_fn is None:
+        save_fn = mx.save_safetensors
+    try:
+        save_fn(str(tmp_path), arrays, metadata)
+        with open(tmp_path, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final_path)
+        _fsync_directory(final_path.parent)
+    except Exception:
+        _delete_file(tmp_path)
+        raise
+    return rel_path.as_posix(), final_path.stat().st_size
+
+
+def load_attachment_payload(
+    root: Path | str,
+    payload_path: str,
+    *,
+    load_fn: Callable | None = None,
+) -> tuple[DiskKVAttachmentEnvelope, dict[str, Any]]:
+    """Load an opaque attachment envelope without importing its model codec."""
+    import mlx.core as mx
+
+    path = _attachment_payload_path(root, payload_path)
+    if not path.exists():
+        raise DiskKVInvalidPayload(
+            f"missing disk KV attachment payload: {payload_path}")
+    if load_fn is None:
+        load_fn = mx.load
+    try:
+        arrays, metadata = load_fn(str(path), return_metadata=True)
+        identity = DiskKVAttachmentIdentity.from_json_obj(
+            json.loads(metadata["attachment_identity"]))
+        tensor_schema = json.loads(metadata["tensor_schema"])["tensors"]
+        dtype_map = _dtype_map()
+        tensors = []
+        for key, kind, shape, dtype in tensor_schema:
+            if kind == _LEAF_ARRAY:
+                tensors.append(arrays[key])
+            elif kind == _LEAF_EMPTY:
+                if dtype not in dtype_map:
+                    raise DiskKVInvalidPayload(
+                        f"unknown attachment tensor dtype: {dtype!r}")
+                tensors.append(
+                    mx.zeros(tuple(shape), dtype=dtype_map[dtype]))
+            else:
+                raise DiskKVInvalidPayload(
+                    f"unknown attachment tensor kind: {kind!r}")
+        capsule_metadata = tuple(
+            tuple(item)
+            for item in json.loads(metadata["capsule_metadata"])["items"]
+        )
+        envelope = DiskKVAttachmentEnvelope(
+            identity=identity,
+            frontier=int(metadata["capsule_frontier"]),
+            metadata=capsule_metadata,
+            tensors=tuple(tensors),
+        )
+    except DiskKVError:
+        raise
+    except Exception as e:
+        raise DiskKVInvalidPayload(
+            f"corrupt disk KV attachment payload: {payload_path}") from e
+    return envelope, metadata
+
+
 # --- safety-key metadata gate ------------------------------------------------
 
 
@@ -697,13 +1309,15 @@ class DiskKVHit:
 
 
 class DiskCheckpointStore:
-    """JSON metadata index plus direct safetensors payloads, read path only.
+    """Durable target checkpoints plus optional target-bound attachments.
 
     ``find_longest`` selects the longest exact token-prefix checkpoint in scope.
     ``restore`` loads and validates one, reconstructs the live caches through the
     model's own ``make_cache`` (the explicit registry), grafts the state, and
     returns the suffix to prefill. Any validation failure quarantines the entry
-    and raises, and the caller falls back to cold serving.
+    and raises, and the caller falls back to cold serving. Attachment reads and
+    writes use a separate index and quarantine path, so an optional companion
+    failure cannot invalidate a target checkpoint.
     """
 
     def __init__(
@@ -711,8 +1325,11 @@ class DiskCheckpointStore:
         root: Path | str,
         *,
         index: DiskKVIndex | None = None,
+        attachment_index: DiskKVAttachmentIndex | None = None,
         load_payload_fn: Callable | None = None,
         save_payload_fn: Callable | None = None,
+        load_attachment_payload_fn: Callable | None = None,
+        save_attachment_payload_fn: Callable | None = None,
         root_lock: DiskKVRootLock | None = None,
         stride: int | None = None,
         budget_bytes: int | None = None,
@@ -721,9 +1338,28 @@ class DiskCheckpointStore:
     ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._log = log_fn or _default_log
         self.index = index if index is not None else DiskKVIndex(self.root)
         self.load_payload_fn = load_payload_fn or load_prompt_cache_payload
         self.save_payload_fn = save_payload_fn or save_prompt_cache_payload
+        self.load_attachment_payload_fn = (
+            load_attachment_payload_fn or load_attachment_payload)
+        self.save_attachment_payload_fn = (
+            save_attachment_payload_fn or save_attachment_payload)
+        self.attachment_index: DiskKVAttachmentIndex | None = None
+        self.attachments_available = True
+        self._attachments_unavailable_reason: str | None = None
+        try:
+            self.attachment_index = (
+                attachment_index
+                if attachment_index is not None
+                else DiskKVAttachmentIndex(self.root)
+            )
+        except Exception as e:  # noqa: BLE001 - target v1 remains usable
+            self.attachments_available = False
+            self._attachments_unavailable_reason = f"attachment index unavailable: {e!r}"
+            self._log(
+                f"[disk_kv] attachments unavailable; target store remains active: {e!r}")
         self.root_lock = root_lock
         # The frontier writer reads the stride to place checkpoints and the
         # write-depth cap to bound them; the read path never uses either.
@@ -735,12 +1371,15 @@ class DiskCheckpointStore:
         if budget_bytes is not None and budget_bytes <= 0:
             raise DiskKVError("disk KV byte budget must be positive when set")
         self.budget_bytes = budget_bytes
-        self._log = log_fn or _default_log
         # Session counters since store open, surfaced on /health.
         self.restores = 0
         self.writes = 0
         self.evictions = 0
         self.quarantines = 0
+        self.attachment_restores = 0
+        self.attachment_writes = 0
+        self.attachment_evictions = 0
+        self.attachment_quarantines = 0
         # Set on a confirmed index fault; the writer precheck consults it so
         # a corrupt index cannot trigger one payload serialization per
         # request until the store reopens. Restores keep their own
@@ -750,6 +1389,8 @@ class DiskCheckpointStore:
         self.writes_disabled = False
         self._writes_disabled_reason: str | None = None
         self._dead_cache_ids: set[str] = set()
+        self._dead_attachment_ids: set[str] = set()
+        self._attachment_accounting_failure_logged = False
         self._closed = False
 
     def close(self) -> None:
@@ -757,10 +1398,54 @@ class DiskCheckpointStore:
             return
         self._closed = True
         try:
-            self.index.close()
+            try:
+                self.index.close()
+            finally:
+                if self.attachment_index is not None:
+                    self.attachment_index.close()
         finally:
             if self.root_lock is not None:
                 self.root_lock.close()
+
+    def disable_attachments(self, reason: str) -> None:
+        """Disable only optional attachment reads and writes until reopen."""
+        if not self.attachments_available:
+            return
+        self.attachments_available = False
+        self._attachments_unavailable_reason = reason
+        self._log(
+            f"[disk_kv] attachments unavailable; target store remains active: {reason}")
+
+    def _attachment_entries_or_none(
+        self,
+    ) -> list[DiskKVAttachmentEntry] | None:
+        """Read attachment rows without treating an unavailable index as empty."""
+        if not self.attachments_available or self.attachment_index is None:
+            return None
+        try:
+            return self.attachment_index.entries()
+        except Exception as e:  # noqa: BLE001 - attachment faults stay isolated
+            self.disable_attachments(f"attachment index unreadable: {e!r}")
+            return None
+
+    def _attachment_payload_bytes_on_disk(self) -> int | None:
+        """Measure companion payload bytes when their index cannot be trusted."""
+        payload_root = self.root / "attachments" / "payloads"
+        if not payload_root.exists():
+            return 0
+        try:
+            return sum(
+                path.stat().st_size
+                for path in payload_root.rglob("*")
+                if path.is_file()
+            )
+        except Exception as e:  # noqa: BLE001 - target reads remain available
+            if not self._attachment_accounting_failure_logged:
+                self._attachment_accounting_failure_logged = True
+                self._log(
+                    "[disk_kv] attachment payload accounting unavailable; "
+                    f"bounded target writes will skip: {e!r}")
+            return None
 
     def disable_writes(self, reason: str) -> None:
         """Stop checkpoint writes until the store reopens, logging once.
@@ -789,19 +1474,51 @@ class DiskCheckpointStore:
                 "writes": self.writes,
                 "evictions": self.evictions,
                 "quarantines": self.quarantines,
+                "attachments_available": self.attachments_available,
+                "attachments_unavailable_reason": self._attachments_unavailable_reason,
+                "attachment_restores": self.attachment_restores,
+                "attachment_writes": self.attachment_writes,
+                "attachment_evictions": self.attachment_evictions,
+                "attachment_quarantines": self.attachment_quarantines,
             }
+        attachment_entries = self._attachment_entries_or_none()
+        target_payload_bytes = sum(entry.payload_bytes for entry in entries)
+        if attachment_entries is None:
+            attachment_payload_bytes = self._attachment_payload_bytes_on_disk()
+            attachment_entry_count = None
+            attachment_accounting = (
+                "filesystem" if attachment_payload_bytes is not None else "unknown")
+        else:
+            attachment_payload_bytes = sum(
+                entry.payload_bytes for entry in attachment_entries)
+            attachment_entry_count = len(attachment_entries)
+            attachment_accounting = "index"
+        payload_bytes = (
+            None
+            if attachment_payload_bytes is None
+            else target_payload_bytes + attachment_payload_bytes
+        )
         out = {
             "enabled": True,
             "root": str(self.root),
             "stride": self.stride,
             "entries": len(entries),
-            "payload_bytes": sum(entry.payload_bytes for entry in entries),
+            "payload_bytes": payload_bytes,
+            "target_payload_bytes": target_payload_bytes,
+            "attachment_entries": attachment_entry_count,
+            "attachment_payload_bytes": attachment_payload_bytes,
+            "attachment_accounting": attachment_accounting,
             "budget_bytes": self.budget_bytes,
             "writes_disabled": self.writes_disabled,
             "restores": self.restores,
             "writes": self.writes,
             "evictions": self.evictions,
             "quarantines": self.quarantines,
+            "attachments_available": self.attachments_available,
+            "attachment_restores": self.attachment_restores,
+            "attachment_writes": self.attachment_writes,
+            "attachment_evictions": self.attachment_evictions,
+            "attachment_quarantines": self.attachment_quarantines,
             "lock_active": bool(
                 self.root_lock is not None and getattr(self.root_lock, "locked", False)
             ),
@@ -809,10 +1526,22 @@ class DiskCheckpointStore:
         }
         if self.writes_disabled:
             out["writes_disabled_reason"] = self._writes_disabled_reason
+        if not self.attachments_available:
+            out["attachments_unavailable_reason"] = (
+                self._attachments_unavailable_reason)
         return out
 
     def find_longest(self, scope: dict, tokens: list[int]) -> DiskKVEntry | None:
         return self.index.find_longest(scope, tokens)
+
+    def find_exact(self, scope: dict, tokens: list[int]) -> DiskKVEntry | None:
+        """Return only an exact target checkpoint, without touching its LRU."""
+        try:
+            return self.index.find_exact(
+                scope, tokens, exclude=self._dead_cache_ids)
+        except Exception as e:  # noqa: BLE001 - pair planning is advisory
+            self.disable_writes(f"index unreadable: {e!r}")
+            return None
 
     def restore(
         self,
@@ -885,6 +1614,280 @@ class DiskCheckpointStore:
             cached_tokens=entry.token_count,
         )
 
+    @staticmethod
+    def _same_target_entry(left: DiskKVEntry, right: DiskKVEntry) -> bool:
+        return (
+            left.cache_id == right.cache_id
+            and left.scope_hash == right.scope_hash
+            and left.token_count == right.token_count
+            and left.token_prefix_hash == right.token_prefix_hash
+        )
+
+    def _target_entry_exists(self, target: DiskKVEntry) -> bool:
+        try:
+            return any(
+                self._same_target_entry(target, candidate)
+                for candidate in self.index.entries()
+            )
+        except Exception as e:  # noqa: BLE001 - target use must stay independent
+            self.disable_attachments(
+                f"target index unavailable during attachment lookup: {e!r}")
+            return False
+
+    def has_attachment(
+        self,
+        target: DiskKVEntry,
+        identity: DiskKVAttachmentIdentity,
+    ) -> bool:
+        """Whether an exact target-plus-attachment pair is already indexed."""
+        try:
+            validate_attachment_identity(target, identity)
+        except (DiskKVError, TypeError, ValueError):
+            return False
+        if not self.attachments_available or self.attachment_index is None:
+            return False
+        if not self._target_entry_exists(target):
+            return False
+        entry = None
+        try:
+            entry = self.attachment_index.find(
+                identity, exclude=self._dead_attachment_ids)
+            if entry is None:
+                return False
+            validate_attachment_entry(target, identity, entry)
+            path = _attachment_payload_path(self.root, entry.payload_path)
+            if path.exists():
+                return True
+            self.quarantine_attachment(entry, reason="missing_payload")
+            return False
+        except DiskKVError:
+            if entry is not None:
+                self.quarantine_attachment(entry, reason="invalid_dedupe_entry")
+            return False
+        except Exception as e:  # noqa: BLE001 - pair dedupe is advisory
+            self.disable_attachments(f"attachment dedupe lookup failed: {e!r}")
+            return False
+
+    def write_attachment(
+        self,
+        target: DiskKVEntry,
+        envelope: DiskKVAttachmentEnvelope,
+        *,
+        now: int = 0,
+    ) -> DiskKVAttachmentEntry | None:
+        """Commit an optional payload after its target entry is visible.
+
+        The safetensors payload lands first and the attachment index entry last.
+        Storage or attachment-index failures return ``None`` and never mutate the
+        target entry. Invalid caller identity still raises before any I/O.
+        """
+        if not isinstance(envelope, DiskKVAttachmentEnvelope):
+            raise TypeError("disk KV attachment write requires an envelope")
+        identity = envelope.identity
+        validate_attachment_identity(target, identity)
+        if not self.attachments_available or self.attachment_index is None:
+            return None
+        if not self._target_entry_exists(target):
+            self._log(
+                "[disk_kv] attachment skip reason=target_missing "
+                f"target_cache_id={target.cache_id}")
+            return None
+        try:
+            existing = self.attachment_index.find(
+                identity, exclude=self._dead_attachment_ids)
+        except Exception as e:  # noqa: BLE001 - attachment fault stays local
+            self.disable_attachments(f"attachment index lookup failed: {e!r}")
+            return None
+        if existing is not None:
+            try:
+                validate_attachment_entry(target, identity, existing)
+                path = _attachment_payload_path(self.root, existing.payload_path)
+                if path.exists():
+                    return existing
+            except DiskKVError:
+                pass
+            self.quarantine_attachment(existing, reason="invalid_dedupe_entry")
+            if not self.attachments_available or self.attachment_index is None:
+                return None
+
+        attachment_id = identity.attachment_id
+        entry = DiskKVAttachmentEntry.from_identity(
+            identity, payload_path="", payload_bytes=0, now=now)
+        try:
+            payload_path, payload_bytes = self.save_attachment_payload_fn(
+                self.root,
+                attachment_id,
+                envelope=envelope,
+                safety_metadata=build_attachment_safety_metadata(entry),
+            )
+        except Exception as e:  # noqa: BLE001 - optional capture must not surface
+            self._log(
+                "[disk_kv] attachment write failed before index commit: "
+                f"{e!r}")
+            return None
+        saved_path = None
+        try:
+            expected_payload_path = (
+                Path("attachments") / "payloads" / attachment_id[:2]
+                / f"{attachment_id}.safetensors"
+            )
+            if Path(payload_path) != expected_payload_path:
+                raise DiskKVInvalidPayload(
+                    "attachment writer returned a path outside its content id")
+            saved_path = _attachment_payload_path(self.root, payload_path)
+            actual_bytes = saved_path.stat().st_size
+            if int(payload_bytes) != actual_bytes:
+                raise DiskKVInvalidPayload(
+                    "attachment writer byte count does not match its payload: "
+                    f"{payload_bytes} != {actual_bytes}")
+        except Exception as e:  # noqa: BLE001 - never delete an untrusted path
+            if saved_path is not None:
+                _delete_file(saved_path)
+            self._log(
+                "[disk_kv] attachment write returned an invalid payload: "
+                f"{e!r}")
+            return None
+        entry = replace(
+            entry, payload_path=payload_path, payload_bytes=int(payload_bytes))
+        try:
+            if not self._evict_to_fit(
+                payload_bytes,
+                keep_id=attachment_id,
+                keep_target_cache_id=target.cache_id,
+                incoming_is_attachment=True,
+            ):
+                _delete_file(saved_path)
+                self._log(
+                    "[disk_kv] attachment skip reason=budget "
+                    f"target_cache_id={target.cache_id} bytes={payload_bytes} "
+                    f"budget={self.budget_bytes}")
+                return None
+            self.attachment_index.put(entry)
+        except Exception as e:  # noqa: BLE001 - target remains independently valid
+            _delete_file(saved_path)
+            self.disable_attachments(f"attachment index fault during write: {e!r}")
+            return None
+        self.attachment_writes += 1
+        self._log(
+            "[disk_kv] attachment write "
+            f"target_cache_id={target.cache_id} bytes={payload_bytes}")
+        return entry
+
+    def restore_attachment(
+        self,
+        target: DiskKVEntry,
+        identity: DiskKVAttachmentIdentity,
+    ) -> DiskKVAttachmentLookup:
+        """Restore an optional companion without changing target hit status."""
+        try:
+            validate_attachment_identity(target, identity)
+        except Exception as e:  # noqa: BLE001 - lookup status carries the refusal
+            return DiskKVAttachmentLookup(
+                status=ATTACHMENT_STATUS_INVALID, reason=str(e))
+        if not self.attachments_available or self.attachment_index is None:
+            return DiskKVAttachmentLookup(
+                status=ATTACHMENT_STATUS_UNAVAILABLE,
+                reason=self._attachments_unavailable_reason,
+            )
+        try:
+            entry = self.attachment_index.find(
+                identity, exclude=self._dead_attachment_ids)
+        except Exception as e:  # noqa: BLE001 - attachment fault stays local
+            self.disable_attachments(f"attachment index lookup failed: {e!r}")
+            return DiskKVAttachmentLookup(
+                status=ATTACHMENT_STATUS_UNAVAILABLE,
+                reason=self._attachments_unavailable_reason,
+            )
+        if entry is None:
+            return DiskKVAttachmentLookup(status=ATTACHMENT_STATUS_MISSING)
+        if not self._target_entry_exists(target):
+            if not self.attachments_available:
+                return DiskKVAttachmentLookup(
+                    status=ATTACHMENT_STATUS_UNAVAILABLE,
+                    reason=self._attachments_unavailable_reason,
+                )
+            self.quarantine_attachment(entry, reason="dangling_target")
+            return DiskKVAttachmentLookup(
+                status=ATTACHMENT_STATUS_INVALID,
+                entry=entry,
+                reason="attachment target entry is no longer indexed",
+            )
+        try:
+            validate_attachment_entry(target, identity, entry)
+            envelope, metadata = self.load_attachment_payload_fn(
+                self.root, entry.payload_path)
+            validate_attachment_payload_metadata(entry, metadata)
+            if envelope.identity != identity:
+                raise DiskKVMetadataMismatch(
+                    "attachment envelope identity does not match requested identity")
+            if envelope.frontier != target.token_count:
+                raise DiskKVMetadataMismatch(
+                    "attachment envelope frontier does not match target token count")
+        except Exception as e:  # noqa: BLE001 - invalid companion is isolated
+            self.quarantine_attachment(entry, reason="invalid")
+            self._log(
+                "[disk_kv] attachment invalid; keeping target checkpoint: "
+                f"{e!r}")
+            return DiskKVAttachmentLookup(
+                status=ATTACHMENT_STATUS_INVALID,
+                entry=entry,
+                reason=str(e),
+            )
+        try:
+            updated = self.attachment_index.mark_used(entry)
+        except Exception as e:  # noqa: BLE001 - keep the validated envelope
+            self.disable_attachments(
+                f"attachment index fault during mark_used: {e!r}")
+            updated = entry
+        self.attachment_restores += 1
+        self._log(
+            "[disk_kv] attachment restore "
+            f"target_cache_id={target.cache_id}")
+        return DiskKVAttachmentLookup(
+            status=ATTACHMENT_STATUS_HIT,
+            entry=updated,
+            envelope=envelope,
+        )
+
+    def quarantine_attachment(
+        self,
+        entry: DiskKVAttachmentEntry,
+        *,
+        reason: str = "invalid",
+    ) -> None:
+        """Remove and quarantine only one optional attachment, best effort."""
+        if self.attachment_index is None:
+            return
+        try:
+            self.attachment_index.remove(entry)
+        except Exception as e:  # noqa: BLE001 - never touch the target entry
+            self._dead_attachment_ids.add(entry.attachment_id)
+            self.disable_attachments(
+                f"attachment index fault during quarantine: {e!r}")
+            return
+        self.attachment_quarantines += 1
+        self._log(
+            f"[disk_kv] attachment quarantine reason={reason} "
+            f"target_cache_id={entry.identity.target_cache_id}")
+        try:
+            payload = _attachment_payload_path(self.root, entry.payload_path)
+            if not payload.exists():
+                return
+            quarantine_dir = self.root / "attachments" / "quarantine"
+            _ensure_directory(quarantine_dir)
+            target_path = quarantine_dir / payload.name
+            if target_path.exists():
+                target_path = quarantine_dir / (
+                    f"{entry.attachment_id}.{int(time.time())}.safetensors")
+            source_parent = payload.parent
+            os.replace(payload, target_path)
+            _fsync_directory(source_parent)
+            _fsync_directory(target_path.parent)
+        except Exception as e:  # noqa: BLE001 - the index removal is authoritative
+            self._log(
+                "[disk_kv] attachment quarantine payload move failed; "
+                f"orphan remains until reopen: {e!r}")
+
     def _reconstruct(self, make_cache_fn, state_trees, meta_state_trees, entry):
         import mlx.core as mx
 
@@ -942,6 +1945,8 @@ class DiskCheckpointStore:
                 f"[disk_kv] quarantine failed; entry ignored until restart: "
                 f"{e!r}")
             return
+        self._drop_attachments_for_target(
+            entry.cache_id, reason="target_quarantine")
         self.quarantines += 1
         self._log(f"[disk_kv] quarantine reason={reason}")
         try:
@@ -1009,6 +2014,119 @@ class DiskCheckpointStore:
             deleted.append(rel)
         return deleted
 
+    def cleanup_stale_attachment_temps(self) -> list[str]:
+        """Delete attachment temp payloads left before an atomic rename."""
+        payload_root = self.root / "attachments" / "payloads"
+        deleted: list[str] = []
+        if payload_root.exists():
+            for path in sorted(payload_root.rglob("*.tmp.safetensors")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(self.root).as_posix()
+                path.unlink()
+                _fsync_directory(path.parent)
+                deleted.append(rel)
+        index_tmp = self.root / "attachments" / "index.json.tmp"
+        if index_tmp.is_file():
+            rel = index_tmp.relative_to(self.root).as_posix()
+            index_tmp.unlink()
+            _fsync_directory(index_tmp.parent)
+            deleted.append(rel)
+        return deleted
+
+    def cleanup_dangling_attachments(self) -> list[str]:
+        """Remove attachment entries with no exact target or no payload."""
+        if not self.attachments_available or self.attachment_index is None:
+            return []
+        try:
+            targets = self.index.entries()
+            entries = self.attachment_index.entries()
+        except Exception as e:  # noqa: BLE001 - target store remains available
+            self.disable_attachments(
+                f"attachment reconciliation could not read an index: {e!r}")
+            return []
+        targets_by_id: dict[str, list[DiskKVEntry]] = {}
+        for target in targets:
+            targets_by_id.setdefault(target.cache_id, []).append(target)
+        removed: list[str] = []
+        for entry in entries:
+            entry_valid = (
+                entry.schema_version == ATTACHMENT_SCHEMA_VERSION
+                and entry.attachment_id == entry.identity.attachment_id
+                and entry.payload_bytes >= 0
+            )
+            candidates = targets_by_id.get(entry.identity.target_cache_id, [])
+            target = next(
+                (
+                    candidate for candidate in candidates
+                    if candidate.scope_hash == entry.identity.target_scope_hash
+                    and candidate.token_count == entry.identity.target_token_count
+                    and candidate.token_prefix_hash
+                    == entry.identity.target_token_prefix_hash
+                ),
+                None,
+            )
+            payload_exists = False
+            try:
+                payload = _attachment_payload_path(self.root, entry.payload_path)
+                payload_exists = payload.exists()
+            except DiskKVError:
+                payload = None
+            if entry_valid and target is not None and payload_exists:
+                continue
+            try:
+                self.attachment_index.remove(entry)
+            except Exception as e:  # noqa: BLE001 - isolate the attachment index
+                self.disable_attachments(
+                    f"attachment reconciliation index fault: {e!r}")
+                return removed
+            if payload is not None:
+                _delete_file(payload)
+                if payload.parent.exists():
+                    _fsync_directory(payload.parent)
+            removed.append(entry.attachment_id)
+        return removed
+
+    def cleanup_orphan_attachment_payloads(self) -> list[str]:
+        """Delete attachment payloads that no attachment index row references."""
+        if not self.attachments_available or self.attachment_index is None:
+            return []
+        payload_root = self.root / "attachments" / "payloads"
+        if not payload_root.exists():
+            return []
+        try:
+            referenced = {
+                _attachment_payload_path(self.root, entry.payload_path).resolve()
+                for entry in self.attachment_index.entries()
+                if entry.payload_path
+            }
+        except Exception as e:  # noqa: BLE001 - target store remains available
+            self.disable_attachments(
+                f"attachment orphan cleanup could not read index: {e!r}")
+            return []
+        deleted: list[str] = []
+        for path in sorted(payload_root.rglob("*.safetensors")):
+            if not path.is_file() or path.name.endswith(".tmp.safetensors"):
+                continue
+            if path.resolve() in referenced:
+                continue
+            rel = path.relative_to(self.root).as_posix()
+            path.unlink()
+            _fsync_directory(path.parent)
+            deleted.append(rel)
+        return deleted
+
+    def reconcile_attachments(self) -> dict[str, list[str]]:
+        """Repair attachment crash windows under the held root lock."""
+        stale_temps = self.cleanup_stale_attachment_temps()
+        dangling = self.cleanup_dangling_attachments()
+        orphans = self.cleanup_orphan_attachment_payloads()
+        return {
+            "stale_temps": stale_temps,
+            "dangling_entries": dangling,
+            "orphan_payloads": orphans,
+        }
+
     def has_entry(self, scope: dict, tokens: list[int]) -> bool:
         """Whether an index entry already covers this exact scope and token prefix.
 
@@ -1031,37 +2149,155 @@ class DiskCheckpointStore:
                 return True
         return False
 
-    def _evict_to_fit(self, incoming_bytes: int, *, keep_id: str) -> bool:
-        """Make room under the byte budget for a new payload, under the root lock.
+    def _remove_attachment_entry(
+        self,
+        entry: DiskKVAttachmentEntry,
+        *,
+        reason: str,
+    ) -> int:
+        """Remove an attachment index row before deleting its payload."""
+        if not self.attachments_available or self.attachment_index is None:
+            return 0
+        self.attachment_index.remove(entry)
+        try:
+            path = _attachment_payload_path(self.root, entry.payload_path)
+        except DiskKVError:
+            path = None
+        if path is not None:
+            _delete_file(path)
+            if path.parent.exists():
+                _fsync_directory(path.parent)
+        self.attachment_evictions += 1
+        self._log(
+            f"[disk_kv] attachment evict reason={reason} "
+            f"target_cache_id={entry.identity.target_cache_id} "
+            f"bytes={entry.payload_bytes}")
+        return entry.payload_bytes
 
-        Returns True when the store can hold ``incoming_bytes`` after evicting, and
-        False when the incoming payload alone exceeds the whole budget (the caller
-        then skips the write rather than evicting everything for one oversized
-        payload). Eviction order is least-recently-used first: ``last_used_at``,
-        then ``created_at`` as a tiebreak. The entry with ``keep_id`` (the one being
-        written) is never a candidate. Each eviction removes the index entry first,
-        then deletes the payload, so a crash mid-eviction leaves an orphan payload
-        (cleaned up at startup) rather than a dangling index reference.
+    def _drop_attachments_for_target(
+        self,
+        target_cache_id: str,
+        *,
+        reason: str,
+    ) -> int | None:
+        """Cascade attachment removal before a target entry disappears."""
+        if not self.attachments_available or self.attachment_index is None:
+            return None
+        try:
+            entries = [
+                entry for entry in self.attachment_index.entries()
+                if entry.identity.target_cache_id == target_cache_id
+            ]
+            removed_bytes = 0
+            for entry in entries:
+                removed_bytes += self._remove_attachment_entry(
+                    entry, reason=reason)
+            return removed_bytes
+        except Exception as e:  # noqa: BLE001 - target operation stays authoritative
+            self.disable_attachments(
+                f"attachment cascade failed for target {target_cache_id}: {e!r}")
+            return None
+
+    def _evict_target_entry(self, entry: DiskKVEntry) -> int | None:
+        removed = self._drop_attachments_for_target(
+            entry.cache_id, reason="target_evicted")
+        if removed is None:
+            return None
+        self.index.remove(entry)
+        _delete_file(self.root / entry.payload_path)
+        self.evictions += 1
+        self._log(
+            f"[disk_kv] evict token_count={entry.token_count} "
+            f"bytes={entry.payload_bytes}")
+        return removed + entry.payload_bytes
+
+    def _evict_to_fit(
+        self,
+        incoming_bytes: int,
+        *,
+        keep_id: str,
+        keep_target_cache_id: str | None = None,
+        incoming_is_attachment: bool = False,
+    ) -> bool:
+        """Fit a payload into the combined target-plus-attachment budget.
+
+        Optional attachments are always the first eviction class. Target victims
+        follow target LRU order and lose their dependent attachments before their
+        own index rows. An attachment write excludes its parent target from the
+        candidate set and skips if the payload cannot fit around that target.
         """
         if self.budget_bytes is None:
             return True
         if incoming_bytes > self.budget_bytes:
             return False
-        candidates = [e for e in self.index.entries() if e.cache_id != keep_id]
-        resident = sum(e.payload_bytes for e in candidates)
-        # Least-recently-used first: oldest last_used_at, then oldest created_at.
-        candidates.sort(key=lambda e: (e.last_used_at, e.created_at))
-        i = 0
-        while resident + incoming_bytes > self.budget_bytes and i < len(candidates):
-            victim = candidates[i]
-            self.index.remove(victim)
-            _delete_file(self.root / victim.payload_path)
-            resident -= victim.payload_bytes
-            self.evictions += 1
-            self._log(
-                f"[disk_kv] evict token_count={victim.token_count} "
-                f"bytes={victim.payload_bytes}")
-            i += 1
+
+        all_targets = self.index.entries()
+        target_candidates = [
+            entry for entry in all_targets
+            if entry.cache_id != (None if incoming_is_attachment else keep_id)
+            and entry.cache_id != keep_target_cache_id
+        ]
+        attachment_candidates = self._attachment_entries_or_none()
+        if attachment_candidates is None:
+            if incoming_is_attachment:
+                return False
+            attachment_payload_bytes = self._attachment_payload_bytes_on_disk()
+            if attachment_payload_bytes is None:
+                return False
+            resident = sum(
+                entry.payload_bytes
+                for entry in all_targets
+                if entry.cache_id != keep_id
+            )
+            resident += attachment_payload_bytes
+            # The byte cap can still admit a target write that needs no
+            # eviction. Without the attachment index, dependency-aware target
+            # eviction cannot prove which companion payloads must cascade.
+            return resident + incoming_bytes <= self.budget_bytes
+        if incoming_is_attachment:
+            attachment_candidates = [
+                entry for entry in attachment_candidates
+                if entry.attachment_id != keep_id
+            ]
+
+        resident_targets = [
+            entry for entry in all_targets
+            if incoming_is_attachment or entry.cache_id != keep_id
+        ]
+        resident = sum(entry.payload_bytes for entry in resident_targets)
+        resident += sum(entry.payload_bytes for entry in attachment_candidates)
+
+        if incoming_is_attachment:
+            parent_bytes = sum(
+                entry.payload_bytes for entry in all_targets
+                if entry.cache_id == keep_target_cache_id
+            )
+            if parent_bytes + incoming_bytes > self.budget_bytes:
+                return False
+
+        attachment_candidates.sort(
+            key=lambda entry: (entry.last_used_at, entry.created_at))
+        for victim in attachment_candidates:
+            if resident + incoming_bytes <= self.budget_bytes:
+                break
+            try:
+                removed = self._remove_attachment_entry(
+                    victim, reason="budget")
+            except Exception as e:  # noqa: BLE001 - do not poison target writes
+                self.disable_attachments(
+                    f"attachment eviction failed under byte budget: {e!r}")
+                return False
+            resident -= removed
+
+        target_candidates.sort(
+            key=lambda entry: (entry.last_used_at, entry.created_at))
+        for victim in target_candidates:
+            if resident + incoming_bytes <= self.budget_bytes:
+                break
+            removed = self._evict_target_entry(victim)
+            if removed is None:
+                return False
+            resident -= removed
         return resident + incoming_bytes <= self.budget_bytes
 
     def write_checkpoint(
@@ -1227,6 +2463,26 @@ def _cache_offset(cache) -> int | None:
         return None
 
 
+def caches_shared_offset(caches) -> int | None:
+    """Return the agreed positional-cache frontier, or ``None``.
+
+    Recurrent caches without an offset are ignored. At least one positional
+    cache must report a frontier, and every positional cache must agree. This
+    is useful when a live cache, rather than token accounting, must determine
+    the only safe publication key.
+    """
+    shared = None
+    for cache in caches:
+        offset = _cache_offset(cache)
+        if offset is None:
+            continue
+        if shared is None:
+            shared = offset
+        elif offset != shared:
+            return None
+    return shared
+
+
 def caches_all_at_offset(caches, expected: int) -> bool:
     """Whether the live caches confirm they are exactly at ``expected``.
 
@@ -1245,15 +2501,7 @@ def caches_all_at_offset(caches, expected: int) -> bool:
     no offset anywhere would leave the frontier resting on token accounting alone,
     which is the failure mode the writer refuses, so that case fails the gate.
     """
-    confirmed = False
-    for cache in caches:
-        offset = _cache_offset(cache)
-        if offset is None:
-            continue
-        if offset != int(expected):
-            return False
-        confirmed = True
-    return confirmed
+    return caches_shared_offset(caches) == int(expected)
 
 
 class FrontierTracker:
@@ -1861,6 +3109,7 @@ def open_disk_store(config: DiskKVConfig) -> DiskCheckpointStore | None:
         )
         store.cleanup_stale_temps()
         store.cleanup_orphan_payloads()
+        store.reconcile_attachments()
     except Exception as e:
         lock.close()
         if isinstance(e, DiskKVError):

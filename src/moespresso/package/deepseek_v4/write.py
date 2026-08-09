@@ -6,6 +6,7 @@ import numpy as np
 
 from moespresso.package.bundle import assemble_layer_bundle, ds4_source_to_mxfp4_components
 from moespresso.package.deepseek_v4.recipe import expert_target_from_allocation
+from moespresso.package.iqk_format import IQK_GEOMETRY, IQK_LAYOUT_IK_WIRE
 from moespresso.package.kquant_backend import encode_kquant_weight
 from moespresso.package.kquant_cache import KQuantEncodeCache, source_identity_from_arrays
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
@@ -60,6 +61,7 @@ def bundle_row(
     kquant_expert_loader=None,
     kquant_cache: KQuantEncodeCache | None = None,
     kquant_cache_context: dict | None = None,
+    iqk_expert_loader=None,
 ) -> tuple[np.ndarray, dict]:
     """Quantize one DS4 expert's gate/up/down payload into one bundle row."""
     import mlx.core as mx
@@ -68,11 +70,40 @@ def bundle_row(
     bits: dict[str, int] = {}
     codecs: dict[str, str] = {}
     kquant_codecs: dict[str, str] = {}
+    iqk_codecs: dict[str, str] = {}
+    iqk_layouts: set[str] = set()
     for projection in ("gate", "up", "down"):
         alloc = allocs[projection]
         proj_key = f"{projection}_proj"
         codec = alloc.get("codec", alloc.get("format", "tq"))
-        if codec == "mxfp4":
+        if alloc.get("format") == "iqk" or codec == "iqk":
+            # Already-encoded bytes: the conversion stage owns the encode, so
+            # the writer only checks that what it stores has the row geometry
+            # the declared member implies.
+            if iqk_expert_loader is None:
+                raise ValueError(
+                    f"IQ_K DS4 expert codec requires a converted-artifact expert "
+                    f"loader for layer={layer} projection={projection}")
+            icodec = alloc.get("iqk_codec") or alloc.get("codec")
+            geometry = IQK_GEOMETRY.get(icodec)
+            if geometry is None:
+                raise ValueError(
+                    f"unknown IQ_K codec {icodec!r} for layer={layer} "
+                    f"projection={projection}")
+            blocks = iqk_expert_loader(layer, expert_index, projection)
+            blocks = np.ascontiguousarray(blocks, dtype=np.uint8)
+            if blocks.ndim != 2:
+                raise ValueError(
+                    f"IQ_K expert blocks must be 2D [out_features, bytes_per_row], "
+                    f"got {blocks.ndim}D for layer={layer} projection={projection}")
+            geometry.in_features_for_row_bytes(int(blocks.shape[1]))
+            comps[(proj_key, "blocks")] = blocks[None, ...]
+            bits[proj_key] = geometry.bits
+            codecs[proj_key] = "iqk"
+            iqk_codecs[proj_key] = icodec
+            iqk_layouts.add(str(alloc.get("layout", IQK_LAYOUT_IK_WIRE)))
+            del blocks
+        elif codec == "mxfp4":
             packed_i8, scales_u8 = group.storage(
                 layer=layer,
                 expert_index=expert_index,
@@ -164,12 +195,18 @@ def bundle_row(
             raise ValueError(
                 f"unsupported DS4 expert codec {codec!r} for layer={layer} "
                 f"projection={projection}")
-    if kquant_codecs:
+    if len(iqk_layouts) > 1:
+        raise ValueError(
+            f"layer={layer} mixes IQ_K wire layouts {sorted(iqk_layouts)}; a "
+            "bundle carries one layout")
+    if kquant_codecs or iqk_codecs:
         bundle, geometry = assemble_layer_bundle(
             comps,
             bits,
             codecs=codecs,
             kquant_codecs=kquant_codecs,
+            iqk_codecs=iqk_codecs,
+            iqk_layout=next(iter(iqk_layouts), IQK_LAYOUT_IK_WIRE),
         )
     else:
         bundle, geometry = assemble_layer_bundle(comps, bits, codecs=codecs)

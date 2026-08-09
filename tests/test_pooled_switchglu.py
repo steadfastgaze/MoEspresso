@@ -1743,6 +1743,192 @@ def test_grow_preserves_spare_slots_and_remaps(tmp_path):
     assert gate._expert_at[8] == 9
 
 
+def test_switch_growth_waits_for_inflight_spare_trio(tmp_path, monkeypatch):
+    """A trio load completes and publishes before growth copies its spare row."""
+    import threading
+    import time as _time
+
+    from moespresso.runtime.expert_slot_pool import (
+        grow_expert_slot_pools,
+        place_spare_trio,
+    )
+
+    resident = _resident_switch(n_experts=16)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    projections = ("gate_proj", "up_proj", "down_proj")
+    pools = tuple(
+        ExpertSlotPool(
+            package_dir=pkg,
+            index=index,
+            layer=0,
+            projection=projection,
+            capacity=4,
+            spare_slots=2,
+        )
+        for projection in projections
+    )
+    started = threading.Event()
+    release = threading.Event()
+    loaded = set()
+    errors = []
+    original_loads = [pool._load_expert for pool in pools]
+
+    for ordinal, (pool, original) in enumerate(
+        zip(pools, original_loads, strict=True)
+    ):
+        def tracked_load(*, expert, slot, _ordinal=ordinal, _original=original):
+            if _ordinal == 0:
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release the spare load")
+            _original(expert=expert, slot=slot)
+            loaded.add(_ordinal)
+
+        monkeypatch.setattr(pool, "_load_expert", tracked_load)
+
+    def place():
+        try:
+            assert place_spare_trio(pools, 9, 0) is True
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+
+    place_thread = threading.Thread(target=place)
+    place_thread.start()
+    assert started.wait(5)
+    assert all(pool._loads_inflight == 1 for pool in pools)
+
+    original_allocate = pools[0]._allocate_growth_candidate
+
+    def checked_allocate(capacity):
+        assert loaded == {0, 1, 2}
+        assert all(pool._slot_of.get(9) == 4 for pool in pools)
+        return original_allocate(capacity)
+
+    monkeypatch.setattr(pools[0], "_allocate_growth_candidate", checked_allocate)
+
+    def release_after_growth_closes_gate():
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
+            states = []
+            for pool in pools:
+                with pool._bk_lock:
+                    states.append(pool._growth_pending)
+            if all(states):
+                release.set()
+                return
+            _time.sleep(0.001)
+        errors.append(TimeoutError("growth did not close every pool gate"))
+        release.set()
+
+    release_thread = threading.Thread(target=release_after_growth_closes_gate)
+    release_thread.start()
+    grow_expert_slot_pools(pools, 8)
+    place_thread.join(5)
+    release_thread.join(5)
+
+    assert not place_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert errors == []
+    assert all(pool.capacity == 8 for pool in pools)
+    assert all(pool._loads_inflight == 0 for pool in pools)
+    assert all(not pool._growth_pending for pool in pools)
+    assert all(pool.slot_of(9) == 8 for pool in pools)
+    for projection, pool in zip(projections, pools, strict=True):
+        source = getattr(resident, projection)
+        assert np.array_equal(
+            np.asarray(pool.packed[8]),
+            np.asarray(source.packed[9]),
+        )
+        assert np.array_equal(
+            np.asarray(pool.norms[8]),
+            np.asarray(source.norms[9]),
+        )
+
+
+def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
+    """Spare residents do not consume demand capacity after pool growth."""
+    from moespresso.runtime.expert_slot_pool import place_spare_trio
+
+    resident = _resident_switch(n_experts=16)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    projections = ("gate_proj", "up_proj", "down_proj")
+    pools = tuple(
+        ExpertSlotPool(
+            package_dir=pkg,
+            index=index,
+            layer=0,
+            projection=projection,
+            capacity=2,
+            spare_slots=2,
+        )
+        for projection in projections
+    )
+
+    # Leave experts 0 and 1 in frequency history while experts 2 and 3 fill
+    # the demand region. The two speculative residents fill the spare ring.
+    for pool in pools:
+        pool.ensure([0, 1])
+        pool.ensure([2])
+        pool.ensure([3])
+    assert place_spare_trio(pools, 8, 0)
+    assert place_spare_trio(pools, 9, 1)
+
+    for projection, pool in zip(projections, pools, strict=True):
+        source = getattr(resident, projection)
+        assert pool.free_slots() == 0
+        assert pool.resident_ids() == {2, 3, 8, 9}
+        for expert in pool.resident_ids():
+            slot = pool.slot_of(expert)
+            assert np.array_equal(
+                np.array(pool.packed[slot]),
+                np.array(source.packed[expert]),
+            )
+            assert np.array_equal(
+                np.array(pool.norms[slot]),
+                np.array(source.norms[expert]),
+            )
+
+        pool.grow(4)
+
+        assert pool.free_slots() == 2
+        assert pool.slot_of(8) == 4
+        assert pool.slot_of(9) == 5
+        assert pool._expert_at[4:] == [8, 9]
+        for expert in pool.resident_ids():
+            slot = pool.slot_of(expert)
+            assert np.array_equal(
+                np.array(pool.packed[slot]),
+                np.array(source.packed[expert]),
+            )
+            assert np.array_equal(
+                np.array(pool.norms[slot]),
+                np.array(source.norms[expert]),
+            )
+
+    seeded = [pool.seed_hot() for pool in pools]
+    assert seeded == [[0, 1], [0, 1], [0, 1]]
+    assert all(pool.free_slots() == 0 for pool in pools)
+    assert all(
+        pool.resident_ids() == {0, 1, 2, 3, 8, 9}
+        for pool in pools
+    )
+    assert all(pool._slot_of == pools[0]._slot_of for pool in pools[1:])
+    for projection, pool in zip(projections, pools, strict=True):
+        source = getattr(resident, projection)
+        for expert in pool.resident_ids():
+            slot = pool.slot_of(expert)
+            assert np.array_equal(
+                np.array(pool.packed[slot]),
+                np.array(source.packed[expert]),
+            )
+            assert np.array_equal(
+                np.array(pool.norms[slot]),
+                np.array(source.norms[expert]),
+            )
+
+
 # ---- in-session hotness decay + evict-DONTNEED page-cache hygiene ----
 
 def _gate_pool(tmp_path, *, capacity, n_experts=8, projection="gate_proj"):

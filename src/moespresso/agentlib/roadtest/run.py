@@ -25,9 +25,10 @@ A package that carries an agentic profile drives the run in profile mode:
 the resolved loop settings pick the dialect adapter (system-prompt tool
 teaching versus request-level tools), the thinking template kwargs ride on
 every request, strict parse failures route through the repair layer with
-telemetry, and the tool-nudge policy applies per session. The run fails
-when any repair fire stays unsalvaged, the alarm condition the
-repair-dependent dialect adoption is conditioned on. Sampling stays pinned
+telemetry, and the tool-nudge policy applies per session. When the profile
+records repair as required, the run fails on any repair fire that stays
+unsalvaged, the alarm condition such a dialect is viable under; a profile
+that leaves repair optional does not arm it. Sampling stays pinned
 at temperature 0 and top_p 1 in both modes because the per-request
 assertions require deterministic completions; the profile's product
 sampling table is recorded in the run record as not applied.
@@ -451,6 +452,9 @@ class RoadtestRun:
             finish_reason=completion.finish_reason,
             wall_seconds=round(wall, 3),
             first_token_seconds=perf.get("first_token_seconds"),
+            ready_to_first_token_seconds=perf.get(
+                "ready_to_first_token_seconds"
+            ),
             generation_tps=perf.get("generation_tps"),
             mem_entries=memory_cache.get("entries"),
             mem_bytes=memory_cache.get("bytes"),
@@ -851,8 +855,10 @@ class RoadtestRun:
     def _assert_repair_clean(self) -> None:
         """The repair-dependent dialect's alarm condition, checked at the end.
 
-        The dialect adoption is conditioned on the repair telemetry staying
-        at failed zero; any unsalvaged fire fails the run.
+        A profile that records repair as required is viable only while the
+        repair telemetry stays at failed zero, so any unsalvaged fire fails
+        the run. A profile that leaves repair optional does not arm this
+        check.
         """
         if self.config.loop is None or not self.config.loop.repair:
             return

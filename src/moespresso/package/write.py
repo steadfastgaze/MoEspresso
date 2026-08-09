@@ -388,6 +388,7 @@ def _write_deepseek_v4_layer_bundle_streamed(
     kquant_expert_loader=None,
     kquant_cache: KQuantEncodeCache | None = None,
     kquant_cache_context: dict | None = None,
+    iqk_expert_loader=None,
 ) -> tuple[str, str] | None:
     """Write one DS4 layer bundle directly as expert rows."""
     expert_indices = group.experts(layer)
@@ -407,6 +408,7 @@ def _write_deepseek_v4_layer_bundle_streamed(
         kquant_expert_loader=kquant_expert_loader,
         kquant_cache=kquant_cache,
         kquant_cache_context=kquant_cache_context,
+        iqk_expert_loader=iqk_expert_loader,
     )
     geometry = dict(geometry)
     geometry["num_experts"] = len(expert_indices)
@@ -426,6 +428,7 @@ def _write_deepseek_v4_layer_bundle_streamed(
                 kquant_expert_loader=kquant_expert_loader,
                 kquant_cache=kquant_cache,
                 kquant_cache_context=kquant_cache_context,
+                iqk_expert_loader=iqk_expert_loader,
             )
             if row.shape != (row_bytes,):
                 raise ValueError(
@@ -745,6 +748,8 @@ def write_package(
     kquant_expert_loader=None,
     kquant_cache: KQuantEncodeCache | None = None,
     kquant_cache_context: dict | None = None,
+    iqk_expert_loader=None,
+    iqk_dense_encoder=None,
 ) -> dict:
     """Quantize per the package plan, write shard(s), return the package_manifest.
 
@@ -855,6 +860,51 @@ def write_package(
                         f"K-quant encoder returned codec {encoded.codec!r}, expected "
                         f"{target.codec!r} for dense tensor {name}")
                 grp = {"weight": encoded.weight, "scales": encoded.scales}
+            elif fmt == "iqk":
+                # Dense IQ_K: the encode is ik's own quantizer behind an
+                # injected callable (the build harness links it; nothing in
+                # tracked source reimplements a codec). The encoder consumes
+                # the float matrix plus the target's own steering vector and
+                # returns the member's row-major wire; the byte count is
+                # checked against the member's struct arithmetic before a
+                # byte is written, so a wrong-member or truncated encode
+                # fails here rather than at serve.
+                from moespresso.package.deepseek_v4.recipe import (
+                    iqk_dense_target_from_allocation,
+                )
+                from moespresso.package.iqk_format import iqk_dense_geometry
+
+                target = iqk_dense_target_from_allocation(alloc)
+                if iqk_dense_encoder is None:
+                    raise ValueError(
+                        f"dense tensor {name} declares IQ_K member "
+                        f"{target.codec!r} but no iqk_dense_encoder was "
+                        "provided; the dense IQ_K encode requires the linked "
+                        "ik quantizer")
+                imatrix = (kquant_imatrix_vectors or {}).get(target.imatrix_key)
+                if imatrix is None:
+                    raise ValueError(
+                        f"{name}: missing imatrix vector {target.imatrix_key!r}; "
+                        "dense IQ_K encodes are always steered")
+                geometry = iqk_dense_geometry(target.codec)
+                matrix = _matrix_from_row_chunks(chunks, name)
+                if int(matrix.shape[1]) != int(np.asarray(imatrix).shape[-1]):
+                    raise ValueError(
+                        f"{name}: imatrix vector length "
+                        f"{np.asarray(imatrix).shape[-1]} does not match "
+                        f"in_features {matrix.shape[1]}")
+                wire = np.asarray(
+                    iqk_dense_encoder(matrix, target, imatrix), dtype=np.uint8)
+                expect = (
+                    int(matrix.shape[0]),
+                    geometry.bytes_per_row(int(matrix.shape[1])),
+                )
+                if tuple(int(v) for v in wire.shape) != expect:
+                    raise ValueError(
+                        f"{name}: IQ_K dense encoder returned shape "
+                        f"{tuple(wire.shape)}, expected {expect} at "
+                        f"{target.codec}")
+                grp = {"weight": np.ascontiguousarray(wire)}
             else:
                 raise ValueError(f"unsupported dense tensor format {fmt!r} for {name}")
             keyed = {f"{prefix}.{k}": v for k, v in grp.items()}
@@ -874,8 +924,9 @@ def write_package(
 
     # Routed experts: one bundle per layer (uint8 [n_experts, row_bytes], row e =
     # expert e's full gate/up/down payload) so a streamed miss is one pread
-    # instead of six scattered ones. DS4 writes rows directly; the Qwen fallback
-    # still assembles one layer's packed stack before writing its bundle.
+    # instead of six scattered ones. DS4 experts write rows directly;
+    # the Qwen K-quant/TQ fallback still assembles one layer's packed stack
+    # before writing its bundle.
     for layer in sorted(expert_allocs):
         allocs = expert_allocs[layer]
         if sorted(allocs) != ["down", "gate", "up"]:
@@ -895,6 +946,7 @@ def write_package(
                 kquant_expert_loader=kquant_expert_loader,
                 kquant_cache=kquant_cache,
                 kquant_cache_context=kquant_cache_context,
+                iqk_expert_loader=iqk_expert_loader,
             )
             if streamed is None:
                 continue

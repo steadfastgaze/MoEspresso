@@ -18,6 +18,7 @@ without them.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from functools import partial
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
@@ -33,6 +35,62 @@ from moespresso.package.constants import MANIFEST_NAME
 from moespresso.runtime.generation import GenerationResult
 from moespresso.runtime.kv_policy import KVPolicy, stream_generate_kv_kwargs, validate_runtime_policy
 from moespresso.runtime.verify import verify_generated_sidecars, verify_package
+
+
+def _install_detokenizer_clone_factory(tokenizer) -> bool:
+    """Build immutable mlx-lm token tables once and clone request state.
+
+    The pinned mlx-lm streaming detokenizers spend tens of milliseconds building
+    a vocabulary-sized lookup table in each constructor. Their ``reset`` methods
+    replace all mutable request buffers, so a shallow copy can safely share the
+    lookup table while retaining the property's fresh-instance contract. Unknown
+    wrappers and detokenizers keep their original factory unchanged.
+    """
+    try:
+        from mlx_lm.tokenizer_utils import (
+            BPEStreamingDetokenizer,
+            NaiveStreamingDetokenizer,
+            SPMStreamingDetokenizer,
+            TokenizerWrapper,
+        )
+    except ImportError:
+        return False
+
+    if type(tokenizer) is not TokenizerWrapper:
+        return False
+    if getattr(tokenizer, "_moespresso_detokenizer_clone_factory", False):
+        return True
+    original_factory = tokenizer._detokenizer_class
+    factory_type = (
+        original_factory.func
+        if isinstance(original_factory, partial)
+        else original_factory
+    )
+    cloneable_types = (
+        BPEStreamingDetokenizer,
+        SPMStreamingDetokenizer,
+        NaiveStreamingDetokenizer,
+    )
+    if factory_type not in cloneable_types:
+        return False
+    prototype = original_factory(tokenizer)
+    if type(prototype) not in cloneable_types:
+        return False
+
+    def clone_factory(active_tokenizer):
+        if active_tokenizer is not tokenizer:
+            return original_factory(active_tokenizer)
+        try:
+            detokenizer = copy.copy(prototype)
+            detokenizer.reset()
+            return detokenizer
+        except Exception:  # noqa: BLE001 - retain the dependency's fresh path
+            return original_factory(active_tokenizer)
+
+    tokenizer._detokenizer_class = clone_factory
+    tokenizer._moespresso_detokenizer_clone_factory = True
+    return True
+
 
 class PackageNotFoundError(FileNotFoundError):
     """The given path is not a MoEspresso package (no manifest there)."""
@@ -158,10 +216,38 @@ def _installed_mlx_version() -> str | None:
         return None
 
 
-_ORNITH_Q4KM_COMMAND_BUFFER_MANIFEST_ID = (
-    "pkg:aff416b9eeecfe9d18dd31798bb3e3ee91a0ff634297a5236f74e17a6c9c0ce0"
-)
-_ORNITH_Q4KM_COMMAND_BUFFER_MLX_VERSION = "0.31.2"
+_ORNITH_COMMAND_BUFFER_MLX_VERSION = "0.31.2"
+# Ornith routed-MoE runtimes the limit is measured on. The TQ streaming route
+# is unmeasured here and stays on the MLX default.
+_ORNITH_COMMAND_BUFFER_ADAPTERS = frozenset({"qwen_kquant_moe"})
+
+
+def _ornith_command_buffer_package(manifest: dict) -> bool:
+    """Whether the manifest serves an Ornith runtime the limit was measured on.
+
+    The predicate is the served shape, not a package identity: the Qwen MoE
+    family, a non-smoke expert count, and a routed adapter from the measured
+    set. Rebuilds of the public package therefore keep the tuning, and
+    unmeasured runtimes never acquire it.
+    """
+    architecture = manifest.get("architecture", {})
+    if architecture.get("family") != "qwen3_5_moe":
+        return False
+    if architecture.get("smoke_max_experts") is not None:
+        return False
+
+    # Imported lazily: runtime.build pulls no MLX at module import, so the
+    # adapter question can be answered before MLX exists in the process.
+    from moespresso.runtime.build import (
+        UnsupportedRuntimeAdapter,
+        _runtime_adapter_kind,
+    )
+
+    try:
+        adapter = _runtime_adapter_kind(manifest)
+    except UnsupportedRuntimeAdapter:
+        return False
+    return adapter in _ORNITH_COMMAND_BUFFER_ADAPTERS
 
 
 def default_ornith_mlx_command_buffer_limit(
@@ -175,20 +261,18 @@ def default_ornith_mlx_command_buffer_limit(
     MLX 0.31.2 counts array elements for ``MLX_MAX_MB_PER_BUFFER`` even though
     the variable name refers to bytes. The measured Ornith Q4_K_M routed
     gate/up pool is exactly 288 Mi-elements. That limit keeps gate/up and down
-    in one command buffer while retaining a bounded commit after the pair. The
-    setting adds roughly 5 GiB to the 37K decode peak, so hosts below 64 GiB
-    keep MLX's smaller default. An explicit MLX setting always wins. Other
-    package manifests and MLX versions remain unchanged until measured.
+    in one command buffer while retaining a bounded commit after the pair.
+
+    The public Ornith package takes it. On the K-quant package it adds roughly
+    5 GiB to the 37K decode peak.
+    Hosts below 64 GiB keep MLX's smaller default. An explicit MLX setting
+    always wins. Other families and MLX versions remain unchanged until
+    measured.
     """
     if "MLX_MAX_MB_PER_BUFFER" in os.environ:
         return None
 
-    architecture = manifest.get("architecture", {})
-    if (
-        manifest.get("artifact_id") != _ORNITH_Q4KM_COMMAND_BUFFER_MANIFEST_ID
-        or architecture.get("family") != "qwen3_5_moe"
-        or architecture.get("smoke_max_experts") is not None
-    ):
+    if not _ornith_command_buffer_package(manifest):
         return None
 
     if generation is None:
@@ -204,12 +288,12 @@ def default_ornith_mlx_command_buffer_limit(
         return None
 
     mlx_version = _installed_mlx_version()
-    if mlx_version != _ORNITH_Q4KM_COMMAND_BUFFER_MLX_VERSION:
+    if mlx_version != _ORNITH_COMMAND_BUFFER_MLX_VERSION:
         detected_version = mlx_version or "unavailable"
         print(
             f"[serve] Ornith decode: command-buffer tuning was not applied "
             f"because the installed MLX version ({detected_version}) is not the measured "
-            f"version {_ORNITH_Q4KM_COMMAND_BUFFER_MLX_VERSION}. Set "
+            f"version {_ORNITH_COMMAND_BUFFER_MLX_VERSION}. Set "
             "MLX_MAX_MB_PER_BUFFER=288 at process launch to opt in.",
             flush=True,
         )
@@ -268,17 +352,30 @@ def load_served_model(
     default_ornith_mlx_command_buffer_limit(manifest)
     default_kq_seg_tile_for_hardware()
     model, tokenizer = build_fn(manifest, package_dir)
-    print(_runtime_truth_line(model, manifest), flush=True)
+    _install_detokenizer_clone_factory(tokenizer)
+    # Speculative-drafter resolution (DeepSeek-V4 packages only; other
+    # families resolve to no drafter). An absent or empty
+    # MOESPRESSO_DS4_DRAFTER selects automatically: the MTP drafter engages
+    # only at full expert residency with a package-tied sidecar that loads,
+    # and any miss logs one line and serves plain. An explicit selection
+    # that cannot load raises DrafterConfigError so startup refuses loudly.
+    from moespresso.runtime.deepseek_v4.spec_serve import resolve_env_drafter
+
+    _, spec_state = resolve_env_drafter(model, manifest, package_dir=package_dir)
+    print(_runtime_truth_line(model, manifest, spec_state=spec_state), flush=True)
     return model, tokenizer, manifest
 
 
-def _runtime_truth_line(model, manifest: dict) -> str:
+def _runtime_truth_line(
+    model, manifest: dict, *, spec_state: str | None = None,
+) -> str:
     """One honest line stating which runtime the user actually got:
-    the user must never guess whether gate/hotlist/capacity are live."""
+    the user must never guess whether gate/hotlist/capacity/drafter are live."""
+    spec = f" spec={spec_state}" if spec_state else ""
     capacity = getattr(model, "_moespresso_ssd_streaming_capacity", None)
     if capacity is None:
         return (f"[serve] runtime=resident package="
-                f"{manifest.get('artifact_id', '?')[:16]}")
+                f"{manifest.get('artifact_id', '?')[:16]}{spec}")
     hot = getattr(model, "_moespresso_ssd_hotlist", None) or {}
     try:
         from moespresso.runtime.pooled_switchglu import (
@@ -303,7 +400,7 @@ def _runtime_truth_line(model, manifest: dict) -> str:
             f"{cap_note}"
             f" hotlist={hot.get('source')} seeded={hot.get('seeded', 0)}"
             f" decode={decode_path}"
-            f" lookahead={'off' if not lookahead else lookahead}")
+            f" lookahead={'off' if not lookahead else lookahead}{spec}")
 
 
 _HOTLIST_SAVE_WARNED = [False]
@@ -496,6 +593,12 @@ def generate_with_metadata(
     prefill_plan: list[int] | None = None,
     prompt_progress_callback: Callable[[int, int], None] | None = None,
     response_callback: Callable[[int, object], None] | None = None,
+    first_token_callback: Callable[[], None] | None = None,
+    spec_continuation_ready_callback: Callable[[], None] | None = None,
+    spec_continuation=None,
+    spec_prefill_plan: list[int] | None = None,
+    spec_prefill_progress_callback: Callable[[object], None] | None = None,
+    spec_prefill_progress_frontiers: list[int] | None = None,
     persist_expert_demand: bool = True,
     stream_generate_fn: Callable | None = None,
     raw_greedy_stream_fn: Callable | None = None,
@@ -510,6 +613,15 @@ def generate_with_metadata(
     under the full token sequence. Deterministic Ornith requests use the MoEspresso-owned
     raw-greedy stream. Other request shapes use the corresponding MLX LM generation features.
     Tests inject stream functions so the contract stays testable without a GPU/model.
+
+    ``spec_continuation`` is an internal, provenance-checked target-cache and
+    drafter-state pair. It is consumed only by an eligible DeepSeek-V4
+    speculative request and must never fall through to plain generation.
+
+    The ``spec_prefill_*`` arguments are the internal paired-state equivalent
+    of the plain disk writer's plan and callback. They are accepted only by an
+    eligible speculative request and cannot silently fall through to the plain
+    stream.
 
     ``prefill_plan`` gives the leading prompt tokens variable-size prefill
     chunks (the disk-KV frontier writer sizes them so a chunk end lands on
@@ -544,6 +656,28 @@ def generate_with_metadata(
                 f"pre-consumed")
     else:
         plan = None
+
+    spec_prefill_requested = any(
+        value is not None
+        for value in (
+            spec_prefill_plan,
+            spec_prefill_progress_callback,
+            spec_prefill_progress_frontiers,
+        )
+    )
+    if spec_prefill_requested:
+        if isinstance(prompt, str):
+            raise ValueError(
+                "paired speculative prefill requires a token-id prompt"
+            )
+        if prompt_cache is not None:
+            raise ValueError(
+                "paired speculative prefill owns its target cache"
+            )
+        if spec_prefill_progress_callback is None:
+            raise ValueError(
+                "paired speculative prefill requires a progress callback"
+            )
 
     if prompt_progress_callback is not None and plan is None:
         kv_kwargs["prompt_progress_callback"] = prompt_progress_callback
@@ -580,6 +714,68 @@ def generate_with_metadata(
             top_logprobs=top_logprobs,
         )
     )
+
+    # A DeepSeek-V4 drafter installed at load time serves the request only
+    # when the acceptance rules reproduce the effective sampler exactly
+    # (greedy or pure temperature) and nothing the spec loop cannot produce
+    # is requested: per-token logprobs, logits processors, injected stream
+    # or sampler functions, live KV quantization, a caller-provided prompt
+    # cache, or a disk-KV prefill plan. Every other shape falls through to
+    # the plain path unchanged.
+    spec_drafter = getattr(model, "_moespresso_ds4_drafter", None)
+    if (
+        spec_drafter is not None
+        and uses_default_stream_generate
+        and uses_default_sampler_factory
+        and not logits_processors
+        and plan is None
+        and prompt_cache is None
+        and kv_kwargs.get("kv_bits") is None
+        and int(max_tokens) >= 1
+    ):
+        from moespresso.runtime.deepseek_v4.spec_serve import (
+            spec_generation_result,
+            spec_sampler_eligible,
+        )
+
+        if spec_sampler_eligible(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            top_logprobs=top_logprobs,
+            greedy_only=getattr(
+                getattr(spec_drafter, "drafter", None), "greedy_only", False
+            ),
+        ):
+            result = spec_generation_result(
+                model,
+                tokenizer,
+                spec_drafter,
+                prompt,
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                cached_tokens=cached_tokens,
+                prefill_step_size=kv_kwargs.get("prefill_step_size"),
+                prefill_plan=spec_prefill_plan,
+                prefill_progress_callback=spec_prefill_progress_callback,
+                prefill_progress_frontiers=spec_prefill_progress_frontiers,
+                response_callback=response_callback,
+                first_token_callback=first_token_callback,
+                continuation_ready_callback=spec_continuation_ready_callback,
+                continuation=spec_continuation,
+            )
+            if persist_expert_demand:
+                _persist_expert_demand(model)
+            return result
+
+    if spec_continuation is not None or spec_prefill_requested:
+        from moespresso.runtime.deepseek_v4.spec_serve import SpecContinuationError
+
+        raise SpecContinuationError(
+            "speculative cache state requires an eligible speculative request"
+        )
 
     if uses_default_stream_generate:
         if owned_raw_greedy:
@@ -653,6 +849,8 @@ def generate_with_metadata(
     ):
         if first_token_seconds is None:
             first_token_seconds = time.perf_counter() - t_start
+            if first_token_callback is not None:
+                first_token_callback()
         last = response
         text_parts.append(response.text)
         token_id = _token_int(response.token)
@@ -766,6 +964,7 @@ def _generation_json_payload(
         "cache_bytes": result.cache_bytes,
         "first_token_seconds": result.first_token_seconds,
         "generation_seconds": result.generation_seconds,
+        "speculative": result.speculative,
     }
 
 
@@ -864,6 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     print(f"Loading package from its manifest: {pkg}")
+    from moespresso.runtime.deepseek_v4.spec_serve import DrafterConfigError
     from moespresso.runtime.streaming_capacity import (
         StreamingCapacityError,
         validate_min_resident_experts,
@@ -881,7 +1081,11 @@ def main(argv: list[str] | None = None) -> int:
             model,
             requested=args.min_resident_experts,
         )
-    except (PackageNotFoundError, StreamingCapacityError) as e:
+    except (
+        PackageNotFoundError,
+        StreamingCapacityError,
+        DrafterConfigError,
+    ) as e:
         print(f"FAILED: {e}")
         return 2
     from moespresso.runtime.prefix_cache import (

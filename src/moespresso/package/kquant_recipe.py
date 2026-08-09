@@ -23,7 +23,7 @@ class KQuantRecipeError(ValueError):
     pass
 
 
-PRODUCER = {"tool": "moespresso.package.kquant_recipe", "version": "1.1.0"}
+PRODUCER = {"tool": "moespresso.package.kquant_recipe", "version": "2.0.0"}
 
 
 GGUF_TO_KQUANT_CODEC = {

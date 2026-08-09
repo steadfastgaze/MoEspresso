@@ -635,6 +635,26 @@ def test_generate_once_remains_string_compatibility_wrapper():
     assert text == "ok"
 
 
+def test_first_token_callback_fires_once_for_single_token_generation():
+    callbacks = []
+
+    def fake_stream(**_kwargs):
+        yield _resp("x", 5, finish_reason="length", generation_tokens=1)
+
+    result = generate_with_metadata(
+        "MODEL",
+        "TOK",
+        [1, 2, 3],
+        max_tokens=1,
+        stream_generate_fn=fake_stream,
+        sampler_factory=lambda **_kwargs: None,
+        first_token_callback=lambda: callbacks.append("first"),
+    )
+
+    assert result.generated_token_ids == (5,)
+    assert callbacks == ["first"]
+
+
 def test_as_generation_result_preserves_legacy_string_generators():
     result = as_generation_result("plain text")
     assert isinstance(result, GenerationResult)

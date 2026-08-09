@@ -1,19 +1,46 @@
 [project]
 name = "moespresso"
-version = "1.1.0"
+version = "2.0.0"
 description = "Run large Mixture-of-Experts language models well on the memory you have."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE-2.0", "THIRD-PARTY-NOTICES"]
 requires-python = ">=3.11"
+authors = [{ name = "Riccardo Chiumiento" }]
+keywords = [
+    "apple-silicon",
+    "inference",
+    "llm",
+    "mixture-of-experts",
+    "mlx",
+    "quantization",
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "jang>=2.5.29",
     "mlx>=0.31.2",
-    "mlx-kquant @ git+https://github.com/steadfastgaze/mlx-kquant.git@e165cafafa149493d298871c610e29e95ffa8f10",
+    "mlx-iqk==0.1.2",
+    "mlx-kquant @ git+https://github.com/steadfastgaze/mlx-kquant.git@6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089",
     "mlx-lm==0.31.3",
     "numpy>=1.26",
     "psutil>=7.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/steadfastgaze/MoEspresso"
+Repository = "https://github.com/steadfastgaze/MoEspresso"
+Documentation = "https://github.com/steadfastgaze/MoEspresso#readme"
+Issues = "https://github.com/steadfastgaze/MoEspresso/issues"
 
 [project.optional-dependencies]
 # Optional build/conversion helper dependency. This is intentionally not part of
@@ -27,7 +54,8 @@ build = [
 [project.scripts]
 # Streamed end-to-end conversion: inventory->probe->optimize->package -> SSD.
 moespresso-convert = "moespresso.package.convert:main"
-# Verify a package against its manifest, then one-shot generate (prompt in, text out).
+# One-shot generate from a package (prompt in, text out); no integrity
+# verification, see moespresso-verify.
 moespresso-generate = "moespresso.runtime.serve:main"
 # Same seam, exposed as a long-running OpenAI-compatible HTTP server.
 moespresso-serve = "moespresso.runtime.http:main"
@@ -41,8 +69,34 @@ hf-model-inspect = "moespresso.inventory.hf_inspect:main"
 moespresso-ds4-q1-validate = "moespresso.correctness.deepseek_v4.parity:main"
 # Manual-only DeepSeek-V4 quality gates. Never called by make test or CI.
 moespresso-ds4-quality = "moespresso.correctness.deepseek_v4.quality:main"
+# Manual-only DeepSeek-V4 teacher-forced WikiText perplexity gate: the
+# natural-text arm of the acceptance bar, with a configured corpus and a
+# declared limit.
+moespresso-ds4-wikitext-ppl = "moespresso.correctness.deepseek_v4.wikitext_ppl:main"
+# Manual-only DeepSeek-V4 Q4 KL panel over teacher and candidate logit dumps.
+moespresso-ds4-q4 = "moespresso.correctness.deepseek_v4.q4:main"
 # Manual DeepSeek-V4 package builder from a GGUF K-quant recipe.
 moespresso-ds4-kquant-package = "moespresso.package.deepseek_v4.kquant_package:main"
+# Manual DeepSeek-V4 package builder from converted IQ_K routed-expert artifacts.
+moespresso-ds4-iqk-package = "moespresso.package.deepseek_v4.iqk_package:main"
+# Manual relayout of a built IQ_K package's routed bundles onto the decode
+# kernels' wire, without re-encoding a byte.
+moespresso-ds4-iqk-relayout = "moespresso.package.deepseek_v4.iqk_relayout:main"
+# Manual DSpark draft-model sidecar builder from the DSpark HF snapshot.
+moespresso-ds4-dspark-sidecar = "moespresso.package.deepseek_v4.dspark_sidecar:main"
+# Bundle a built DSpark sidecar into a DeepSeek-V4 package as the declared
+# optional drafter component (hard links; no bytes re-encoded).
+moespresso-ds4-dspark-bundle = "moespresso.package.deepseek_v4.dspark_bundle:main"
+# Manual MTP draft-model sidecar builder from the DeepSeek-V4-Flash base snapshot.
+moespresso-ds4-mtp-sidecar = "moespresso.package.deepseek_v4.mtp_sidecar:main"
+# Manual DFlash draft-model sidecar builder from the speculator HF snapshot.
+moespresso-ds4-dflash-sidecar = "moespresso.package.deepseek_v4.dflash_sidecar:main"
+# A/B replay of speculative decoding against plain greedy decoding. The
+# CLI name predates the drafter-generic loop; `--drafter` selects the family.
+moespresso-ds4-dspark-replay = "moespresso.correctness.deepseek_v4.spec_replay:main"
+# Manual multi-prompt speculative-decoding measurement battery: one target
+# load, every available drafter sidecar, per-arm and per-repeat statistics.
+moespresso-ds4-spec-battery = "moespresso.correctness.deepseek_v4.spec_battery:main"
 # Manual Qwen package builder from a GGUF K-quant recipe.
 moespresso-qwen-kquant-package = "moespresso.package.qwen.kquant_package:main"
 # Manual Qwen 35B exact-answer package comparison harness.
@@ -68,6 +122,7 @@ moespresso-ds4-moe-graph-replay = "moespresso.correctness.deepseek_v4.moe_graph_
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
+    "vulture>=2.11",
 ]
 native = [
     # Must match MLX's nanobind pin for shared mlx.core mx.array casters.

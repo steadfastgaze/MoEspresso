@@ -175,6 +175,40 @@ def test_duplicate_parameter_raises():
         parse_qwenxml_tool_calls(content, SCHEMAS)
 
 
+def test_parameter_opened_before_the_previous_closes_raises():
+    # Without the check the non-greedy value grammar would close the first
+    # parameter on the second one's closer, merging both parameters into one
+    # argument and shipping a call that lost an argument silently.
+    content = (
+        "<tool_call>\n<function=edit>\n"
+        "<parameter=path>\nsrc/metrics.py\n"
+        "<parameter=new_string>\nreturn 1\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ToolCallParseError, match="before its own closer"):
+        parse_qwenxml_tool_calls(content, SCHEMAS)
+
+
+def test_parameter_open_marker_quoted_mid_line_stays_value_text():
+    # The discriminator is the line-start rule: a marker that does not begin
+    # a line is text a value may quote, so a value documenting the dialect
+    # survives unchanged.
+    quoted = "Open a value with <parameter=k>, then close it."
+    content = _call("bash", _param("command", quoted))
+    assert parse_qwenxml_tool_calls(content, SCHEMAS)[0].arguments == {
+        "command": quoted}
+
+
+def test_parameter_open_marker_at_column_zero_in_a_value_is_rejected():
+    # The stated ambiguity: a value whose own content documents the dialect
+    # at column zero is indistinguishable from a real nested open, and the
+    # chosen resolution is rejection rather than a merged argument.
+    documented = "The parameter element looks like this:\n<parameter=k>value"
+    content = _call("bash", _param("command", documented))
+    with pytest.raises(ToolCallParseError, match="before its own closer"):
+        parse_qwenxml_tool_calls(content, SCHEMAS)
+
+
 def test_stray_text_inside_function_raises():
     content = _call("grep", _param("pattern", "x") + "stray words\n")
     with pytest.raises(ToolCallParseError, match="unparsed text"):

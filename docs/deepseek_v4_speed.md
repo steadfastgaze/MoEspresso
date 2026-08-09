@@ -10,14 +10,14 @@ record. Numeric anchors belong here rather than in subsystem reference docs.
 
 ## Package and prompt anchor
 
-The full-resident record uses the byte-faithful package:
+The record anchor is one prompt at one generation shape:
 
-- 47 shards, about 80.0 GiB;
-- routed expert bytes copied from the matching GGUF;
-- optimized DeepSeek kernels expected by the manifest;
 - the committed `long_code_audit.txt` prompt;
 - 3,844 tokens after one render;
 - greedy decode, temperature 0, 64 generated tokens.
+
+The shipping-package record below uses that anchor. Sections that measure
+something else state their own prompt and generation shape.
 
 Prompt path:
 
@@ -31,13 +31,20 @@ hashes for every run.
 ## Quality anchors
 
 Before retaining a speed change that affects model math or execution order, run
-the relevant gates in [`deepseek_v4_quality.md`](deepseek_v4_quality.md).
+the relevant gates in [`deepseek_v4_quality.md`](deepseek_v4_quality.md). That
+document also carries the shipping package's readings across the full ladder in
+its release package scorecard.
 
-The current record is associated with:
+The gates that qualify a speed change are:
 
-- Q1 at 17/17 on its certified MLX wheel lattice;
+- Q1 greedy selected-token identity, quoted with the MLX wheel lattice the run
+  records. The count is wheel-keyed: one package scored against one reference
+  can land a step apart on two lattices, separated by a single deterministic
+  casing knife edge and reproducible on each. A Q1 count quoted without its
+  lattice is not a comparable number. The step total comes from the reference
+  fixture, not from a constant.
 - Q2 NLL anchored per exact MLX wheel;
-- Q3 at 16/16;
+- Q3 long-context fact recall;
 - token or logit identity checks for route-specific changes.
 
 An isolated free-generation token difference is not enough to diagnose a
@@ -60,42 +67,65 @@ For comparisons:
 - compare matched pairs rather than numbers from different sessions;
 - separate first-token latency, prefill compute, and steady-state decode.
 
-## Full-resident headline
+## Shipping package record
 
-On the 3,844-token anchor, the certified matched pairs were:
+The release publishes one DeepSeek package,
+`DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2`. It stores every routed expert
+in the IQ_K formats and decodes them through `mlx-iqk`; the dense side is
+`q6_K` and decodes through `mlx-kquant`. Model shards total 84.35 GB
+(78.56 GiB), or 90.74 GB (84.51 GiB) with the bundled DSpark drafter. The
+whole-model rate is 2.37 bits per weight over the served model's 284.335e9
+parameters, with the drafter excluded from both sides; routed experts average
+2.2491 bpw as a water-filled mix of IQ2_KS on 89 cells and IQ2_K on 40.
 
-| Metric | MoEspresso | DwarfStar reference | Interpretation |
-|---|---:|---:|---|
-| Decode pair 1 | 26.06 tok/s | 24.77 tok/s | Same host and prompt, one process per arm. |
-| Decode pair 2 | 26.24 tok/s | 24.83 tok/s | Repeated certified arm. |
-| End-to-end prefill | 14.667 s median | about 13.5 s | MoEspresso within 1.09x. |
-| Pure chunk compute | 14.32-14.38 s | reference implied by the same run | MoEspresso within 1.065x. |
+Protocol: ten alternating fresh-process arms on the 3,844-token
+`long_code_audit.txt` anchor, greedy decode, the disk KV tier off, a thermal
+gate before and after each arm, and an 8-token warmup request ahead of each
+measured request. The target used the pooled runtime at capacity 256. All 43
+routed layers and all 129 projection pools were fully resident and
+identity-mapped, with no request-time expert I/O. Every arm emitted the same
+38-token reference rail.
 
-At about 8.4 GB of routed weight traffic per generated token, the certified
-decode pairs imply about 217 GB/s effective weight bandwidth for MoEspresso and
-about 208 GB/s for the reference.
+| Arm | Decode | Median | Request peak | Load |
+|---|---:|---:|---:|---:|
+| Drafter off | 26.473-27.562 tok/s | 26.591 tok/s | 86.75 GiB (93.15 GB) | 23.0-23.2 s |
+| Drafter on | 32.479-32.724 tok/s | 32.627 tok/s | 92.63 GiB (99.46 GB) | 29.6-30.2 s |
 
-Later standalone sessions measured 25.378-25.452 tok/s, with median 25.436.
-That band records environment drift; the matched pairs above remain the public
-comparison.
+The arms separate without overlap: every drafter-on arm read above every
+drafter-off arm, the smallest gap between them was 4.92 tok/s, and the median
+gain was 22.70 percent. Every drafter-on arm ran 13 fixed-three rounds,
+proposed 39 tokens, accepted 25, used no plain fallback, and prepared reusable
+cache state successfully. The drafter is the bundled DSpark sidecar, which the
+runtime engages automatically when the wired budget allows.
+`MOESPRESSO_DS4_DRAFTER=off` produces the drafter-off arm;
+[`speculative_decoding.md`](speculative_decoding.md) covers the selection
+rule.
 
-## Prefill and memory
+### Full-resident pooled cross-check
 
-The anchor first-token wall decomposed into about 0.06 s setup, 14.32-14.38 s
-chunk compute, and 0.24 s final-token work. The recorded anchor chunk wall was
-14.538 s.
+A separate five-pair A/B compared the capacity-256 pooled target with the
+dedicated resident IQ_K reference on the same artifact and 38-token rail.
+The two arms reported different graph contracts: 43 pooled routed layers with
+129 identity pools versus 43 dedicated resident routed layers with no pools.
 
-Longer prefill points on the banded-offset default were:
+| Target graph | Decode range | Median decode | Median first token | Median load | Request peak |
+|---|---:|---:|---:|---:|---:|
+| Dedicated resident reference | 26.529-26.804 tok/s | 26.749 tok/s | 15.417 s | 37.569 s | 86.7497 GiB |
+| Pooled, capacity 256 | 26.231-26.481 tok/s | 26.431 tok/s | 15.408 s | 24.454 s | 86.7498 GiB |
 
-| Context depth | First-token wall | Transient MLX peak | Comparison |
-|---:|---:|---:|---|
-| 7,698 | 34.67 s | 10.74 GiB | 1.10x faster than the composed chunked lattice. |
-| 15,406 | 72.22 s | 11.08 GiB | 1.13x faster than the composed chunked lattice. |
+All ten arms were token-exact. On this anchor, the pooled median decode rate
+was 1.19 percent lower, the first-token medians differed by 0.009 seconds, the
+request peaks differed by 0.0001 GiB, and median load time was 34.91 percent
+lower. Full residency remains the zero-I/O capacity point of the shared pooled
+graph with the measured decode delta stated above.
 
-Full-resident model state measured 72.56 GiB at load and 84.94 GiB MLX peak
-over the anchor request. Model load measured 18.8-20.3 s. Wired-limit prewarm
-moved work to load: anchor TTFT was 14.667 s with it and 17.482 s with its kill
-switch.
+## Effective weight bandwidth
+
+Decode on a fully resident package is bound by routed weight traffic. Multiply
+the routed bytes a generated token reads by the decode rate to get the effective
+weight bandwidth the run sustained. The routed byte figure comes from the
+package census rather than from the file size, because a token reads only the
+experts its router selects.
 
 ## Certified context envelope
 
@@ -106,41 +136,62 @@ Context grew in place; the only process restarts were scripted restore checks.
 | Metric | Record |
 |---|---|
 | In-place envelope | 113,855 tokens grown from zero, no aborts and no mitigation restart cadence. |
-| Run shape | 61 requests, 1,062.5 s wall, three server segments. |
+| Run shape | 61 requests across three server segments. |
 | Cache accounting | 57/57 in-memory hits at the exact previous full-plus-completion length, two misses, two disk hits, zero ledger mismatches. |
 | Frontier storage | 31 checkpoints from 4,096 through 110,592 tokens, 40.0 GB total, zero evictions or quarantines. |
-| Deep-turn cost | An 8K suffix with two checkpoint writes took 58-64 s at 81K-106K restored context; first-token latency was 57.9-61.2 s. |
+| Deep-turn shape | A deep turn at 81K-106K restored context spends nearly all of its wall in first-token latency: an 8K suffix and the two checkpoint writes it triggered, not the generated tokens. |
 | Live cache | 4.47 GB for the single chain entry at 113,855 tokens. |
 | Restart identity | Both scripted restores landed on the predicted 12,288-token frontier; the identical-geometry replay pair was byte-identical. |
 
-The 19-21 tok/s readings inside the agent loop are informational. They did not
-use the thermal gate required for a deep-context decode record.
+The table is a cache and context result. Cache accounting, frontier storage, and
+restart identity are properties of the disk KV tier; how far context grows in
+place also depends on the resident footprint of the package serving it. Readings
+taken inside an agent loop are not a decode record, because the loop does not
+apply the thermal gate a decode record requires.
 
 ## Bounded expert residency
 
-The 64 GB-class measurements imposed an expert-pool capacity on the 128 GB
-host. The package could remain in page cache, so SSD stall seconds are lower
-bounds. The table establishes runtime behavior and memory fit. Real 64 GB
-storage latency still needs physical-hardware validation.
+A bounded run serves a package under a memory budget smaller than its resident
+footprint: the runtime derives an expert-pool capacity from that budget, keeps
+the non-routed core resident, and streams the routed experts a request misses.
+[`ssd_streaming.md`](ssd_streaming.md) covers the capacity math and the
+residency policy; `--max-memory-gb` on the snapshot command below selects a
+budget.
 
-Medians of three, anchor depth 3,844 and second point at 7,698:
+Two rules hold for any bounded measurement:
 
-| Expert cap | Anchor TTFT | Anchor decode | Depth TTFT | Depth decode | Anchor MLX peak |
-|---:|---:|---:|---:|---:|---:|
-| 512, full resident | 14.752 s | 25.42 tok/s | 38.266 s | 24.484 tok/s | 84.94 GiB |
-| 56 | 21.726 s | 7.894 tok/s | 60.391 s | 8.665 tok/s | 57.82 GiB |
-| 48 | 23.038 s | 6.764 tok/s | 66.117 s | 7.345 tok/s | 49.89 GiB |
-| 40 | 24.820 s | 5.687 tok/s | 73.387 s | 6.411 tok/s | 41.95 GiB |
+- A bounded arm is valid only if it reproduces the full-resident token rail and
+  the quality anchors on the same package. Residency policy decides which expert
+  bytes sit in memory, not what the model computes, so a diverging rail is a
+  defect rather than a residency effect.
+- Capping the pool on a larger-memory host emulates the memory fit, not the
+  storage. The package can stay in page cache there, so the stall seconds such a
+  run reports are lower bounds and the decode rates that follow from them are
+  optimistic. A storage-latency claim needs a host whose memory cannot hold the
+  package.
 
-The closing cap-48 state measured 22.832 s anchor TTFT at 7.139 tok/s and
-50.17 GiB peak; at depth it measured 63.974 s and 7.999 tok/s. Caps 40, 48,
-and 56 reproduced the certified token rails, and cap 48 reproduced the full
-quality anchors. A package-vendored hotlist reduced cold first-request expert
-misses from 16,588 to 14,044 and raised the request hit rate from 0.540 to
-0.595.
+Cold-start seeding belongs in the record. A package-vendored expert hotlist
+lowers first-request misses and raises the request hit rate, so a bounded arm
+has to say which hotlist tier seeded the pools.
 
-Real 64 GB hardware remains the required next validation for stall and latency
-claims.
+The shipping package was also served with every routed layer capped at 64
+experts and seeded from its package hotlist. A capacity-256 pooled arm and the
+capacity-64 arm emitted the same 38 token ids and decoded-text digest.
+Both were fresh processes with the disk KV tier, drafting, lookahead, and
+adaptive growth off, an 8-token warmup, and nominal thermal readings before and
+after the measured request.
+
+| Pool capacity | Decode | First token | Load | Request peak | Request-time expert I/O |
+|---:|---:|---:|---:|---:|---|
+| 256 | 26.341 tok/s | 15.436 s | 24.181 s | 86.7498 GiB | none |
+| 64 | 4.784 tok/s | 31.628 s | 7.569 s | 29.3751 GiB | 32,616 loads and evictions; 10,872 bundle-row reads |
+
+The measured capacity-64 request used 21,744 sibling projection cache takes,
+matching one bundle-row read for each three-projection expert load. This record
+proves the bounded graph, exact token rail, and reduced memory footprint on the
+public artifact. It ran on a host that could retain the package in page cache,
+so its miss latency and decode rate are not a physical-storage performance
+claim.
 
 ## Run the served snapshot
 
@@ -178,7 +229,10 @@ If the route did not engage, the result is invalid regardless of speed.
 ## Known gaps
 
 - There is no thermal-gated decode record at the 113,855-token envelope.
-- The 64 GB-class stall record is emulated on a larger-memory host.
+- The shipping package record covers one prompt at one context depth. Deeper
+  context points on that package are pending.
+- No storage-latency measurement exists on a host whose memory cannot hold the
+  shipping package.
 - The t/s value obtained by dividing 3,844 tokens by the anchor TTFT is derived;
   the measured quantity of record is seconds.
 - Different prefill chunk geometries can choose different deterministic

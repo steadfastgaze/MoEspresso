@@ -136,6 +136,14 @@ def test_runtime_adapter_keeps_jangtq_for_tq_packages():
     assert _runtime_adapter_kind(man) == "jangtq_moe"
 
 
+def test_runtime_adapter_keeps_jangtq_for_tq_kquant_hybrid_packages():
+    man = _manifest(
+        "qwen3_5_moe",
+        ["tq_dequant", "kquant_dequant", "f32_passthrough"],
+    )
+    assert _runtime_adapter_kind(man) == "jangtq_moe"
+
+
 def test_runtime_adapter_selects_qwen_kquant_for_gguf_recipe_packages():
     man = _manifest("qwen3_5_moe", ["kquant_dequant", "f32_passthrough"])
     assert _runtime_adapter_kind(man) == "qwen_kquant_moe"
@@ -223,6 +231,15 @@ def test_runtime_adapter_fails_closed_for_unknown_dense_ops():
 
 def test_runtime_adapter_fails_closed_for_unknown_family_affine_only():
     man = _manifest("some_future_dense", ["affine_dequant", "fp16_passthrough"])
+    with pytest.raises(UnsupportedRuntimeAdapter, match="unsupported runtime adapter"):
+        _runtime_adapter_kind(man)
+
+
+def test_runtime_adapter_fails_closed_for_unknown_tq_companion_op():
+    man = _manifest(
+        "qwen3_5_moe",
+        ["affine_dequant", "tq_dequant", "future_dequant"],
+    )
     with pytest.raises(UnsupportedRuntimeAdapter, match="unsupported runtime adapter"):
         _runtime_adapter_kind(man)
 

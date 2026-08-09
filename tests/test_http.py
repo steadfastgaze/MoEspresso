@@ -255,6 +255,7 @@ def test_disk_checkpoints_written_surfaces_in_prompt_cache_usage():
             cache_entries=1,
             cache_bytes=512,
             disk_checkpoints_written=2,
+            disk_checkpoint_write_seconds=(0.01234567, 0.07654321),
         )
 
     resp = chat_completion({"messages": [{"role": "user", "content": "x"}]},
@@ -264,7 +265,103 @@ def test_disk_checkpoints_written_surfaces_in_prompt_cache_usage():
         "entries": 1,
         "bytes": 512,
         "disk_checkpoints_written": 2,
+        "disk_checkpoint_write_seconds": [0.012346, 0.076543],
     }
+
+
+def test_disk_drafter_state_status_is_orthogonal_to_target_cache_event():
+    def fake_generate(prompt, **opts):
+        return GenerationResult(
+            text="done",
+            prompt_tokens=10,
+            completion_tokens=1,
+            cached_tokens=8,
+            cache_event="disk_hit",
+            cache_entries=1,
+            cache_bytes=512,
+            disk_attachment_event="missing",
+            disk_attachments_written=1,
+            disk_attachment_write_seconds=(0.00123456,),
+        )
+
+    resp = chat_completion(
+        {"messages": [{"role": "user", "content": "x"}]},
+        fake_generate,
+    )
+
+    assert resp["usage"]["prompt_cache"] == {
+        "event": "disk_hit",
+        "entries": 1,
+        "bytes": 512,
+        "disk_drafter_states_written": 1,
+        "disk_drafter_state_write_seconds": [0.001235],
+        "drafter_state": {"event": "missing"},
+    }
+
+
+def test_disk_restore_and_ready_to_first_token_timings_are_surfaced():
+    def fake_generate(prompt, **opts):
+        return GenerationResult(
+            text="done",
+            prompt_tokens=10,
+            completion_tokens=1,
+            cached_tokens=8,
+            cache_event="disk_hit",
+            cache_entries=1,
+            cache_bytes=512,
+            first_token_seconds=0.012345,
+            ready_to_first_token_seconds=0.067891,
+            generation_seconds=0.2,
+            disk_restore_seconds=0.00456789,
+            disk_attachment_event="hit",
+            disk_attachment_restore_seconds=0.00098765,
+        )
+
+    resp = chat_completion(
+        {"messages": [{"role": "user", "content": "x"}]},
+        fake_generate,
+    )
+
+    assert resp["usage"]["prompt_cache"] == {
+        "event": "disk_hit",
+        "entries": 1,
+        "bytes": 512,
+        "disk_restore_seconds": 0.004568,
+        "drafter_state": {
+            "event": "hit",
+            "restore_seconds": 0.000988,
+        },
+    }
+    assert resp["usage"]["moespresso"] == {
+        "first_token_seconds": 0.0123,
+        "ready_to_first_token_seconds": 0.0679,
+        "generation_seconds": 0.2,
+        "generation_tps": 5.0,
+    }
+
+
+def test_empty_disk_write_timings_are_omitted_from_prompt_cache_usage():
+    def fake_generate(prompt, **opts):
+        return GenerationResult(
+            text="done",
+            prompt_tokens=10,
+            completion_tokens=1,
+            cached_tokens=0,
+            cache_event="miss",
+            cache_entries=1,
+            cache_bytes=512,
+            disk_checkpoints_written=1,
+            disk_attachments_written=1,
+        )
+
+    resp = chat_completion(
+        {"messages": [{"role": "user", "content": "x"}]},
+        fake_generate,
+    )
+
+    prompt_cache = resp["usage"]["prompt_cache"]
+    assert "disk_checkpoint_write_seconds" not in prompt_cache
+    assert "disk_drafter_state_write_seconds" not in prompt_cache
 
 
 def test_serialized_generator_holds_lock_while_generating():
@@ -277,7 +374,7 @@ def test_serialized_generator_holds_lock_while_generating():
             self.held = True
             self.events.append("enter")
 
-        def __exit__(self, exc_type, exc, tb):
+        def __exit__(self, _exc_type, _exc, _tb):
             self.events.append("exit")
             self.held = False
 
@@ -305,7 +402,7 @@ def test_serialized_stats_holds_lock_while_reading_cache_state():
             self.held = True
             self.events.append("enter")
 
-        def __exit__(self, exc_type, exc, tb):
+        def __exit__(self, _exc_type, _exc, _tb):
             self.events.append("exit")
             self.held = False
 
@@ -975,7 +1072,7 @@ def test_serve_accepts_deepseek_v4_prompt_cache_bounds(monkeypatch):
     class _Stop(Exception):
         pass
 
-    def fake_build_cache_generator(model, tokenizer, mani, **kwargs):
+    def fake_build_cache_generator(model, tokenizer, _mani, **kwargs):
         seen.update(kwargs)
         raise _Stop
 
@@ -1026,7 +1123,7 @@ def test_serve_uses_default_context_limit(monkeypatch):
     class _Stop(Exception):
         pass
 
-    def fake_build_cache_generator(model, tokenizer, mani, **kwargs):
+    def fake_build_cache_generator(model, tokenizer, _mani, **kwargs):
         seen.update(kwargs)
         raise _Stop
 

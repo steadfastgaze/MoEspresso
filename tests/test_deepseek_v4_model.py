@@ -14,6 +14,7 @@ import jang_tools.dsv4.mlx_model as jang_dsv4  # noqa: E402
 
 from moespresso.runtime.deepseek_v4.model import (  # noqa: E402
     DeepseekV4GraphError,
+    _architecture_config,
     _AttentionCompressorFp8KV,
     _BandedPrefillAttention,
     _patch_deepseek_v4_attention_compressor_fp8_kv,
@@ -95,6 +96,73 @@ def test_deepseek_v4_graph_rejects_ratio_length_mismatch():
 
     with pytest.raises(DeepseekV4GraphError, match="compress_ratios length"):
         build_deepseek_v4_graph_from_manifest(manifest)
+
+
+def _flash_0731_manifest(ratios):
+    """The 0731 checkpoint's own compress_ratios shape: 43 trunk entries plus
+    one entry per MTP block, with `num_nextn_predict_layers` vestigially 1."""
+    return {
+        "architecture": {
+            "family": "deepseek_v4_flash",
+            "config": {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 43,
+                "num_nextn_predict_layers": 1,
+                "n_mtp_layers": 3,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "compress_ratios": list(ratios),
+            },
+        }
+    }
+
+
+_FLASH_0731_TRUNK_RATIOS = [0, 0] + [v for _ in range(20) for v in (4, 128)] + [4]
+
+
+def test_deepseek_v4_config_accepts_the_checkpoint_mtp_tail():
+    config = _architecture_config(
+        _flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS + [0, 0, 0]))
+
+    assert config["compress_ratios"] == _FLASH_0731_TRUNK_RATIOS
+    assert len(config["compress_ratios"]) == 43
+    assert config["mtp_compress_ratios"] == [0, 0, 0]
+
+
+def test_deepseek_v4_config_accepts_trunk_only_and_single_entry_tails():
+    for tail in ([], [0], [0, 0]):
+        config = _architecture_config(
+            _flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS + tail))
+        assert config["compress_ratios"] == _FLASH_0731_TRUNK_RATIOS
+        assert config["mtp_compress_ratios"] == tail
+
+
+def test_deepseek_v4_config_rejects_tails_past_the_declared_block_count():
+    with pytest.raises(DeepseekV4GraphError, match="compress_ratios length"):
+        _architecture_config(
+            _flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS + [0, 0, 0, 0]))
+
+
+def test_deepseek_v4_config_rejects_a_short_ratio_list():
+    with pytest.raises(DeepseekV4GraphError, match="compress_ratios length"):
+        _architecture_config(_flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS[:-1]))
+
+
+def test_deepseek_v4_config_rejects_a_non_zero_mtp_tail():
+    with pytest.raises(DeepseekV4GraphError, match="tail must be all zero"):
+        _architecture_config(
+            _flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS + [0, 4, 0]))
+
+
+def test_deepseek_v4_config_tail_allowance_follows_the_declared_blocks():
+    manifest = _flash_0731_manifest(_FLASH_0731_TRUNK_RATIOS + [0, 0, 0])
+    config = manifest["architecture"]["config"]
+    config.pop("n_mtp_layers")
+    config.pop("dspark_target_layer_ids")
+
+    # Only the vestigial single-block field is left, so the three-entry tail
+    # is no longer a declared shape.
+    with pytest.raises(DeepseekV4GraphError, match="compress_ratios length"):
+        _architecture_config(manifest)
 
 
 def test_deepseek_v4_graph_pins_attention_scale_without_mscale():
@@ -469,7 +537,7 @@ def test_deepseek_v4_banded_prefill_mma_dispatch_and_kill_switch(monkeypatch):
 
     calls = []
 
-    def fake_engine(mx_mod, **kwargs):
+    def fake_engine(_mx_mod, **kwargs):
         calls.append(kwargs)
         q = kwargs["q"]
         return mx.zeros(
@@ -582,7 +650,7 @@ def test_deepseek_v4_banded_prefill_offset_engages_mma_with_counters(
 
     engine_calls = []
 
-    def fake_engine(mx_mod, **kwargs):
+    def fake_engine(_mx_mod, **kwargs):
         engine_calls.append(kwargs)
         q = kwargs["q"]
         return mx.zeros(
@@ -768,7 +836,7 @@ def test_deepseek_v4_banded_prefill_offset_skips_band_economics_gate(
     assert _patch_deepseek_v4_banded_prefill_attention(model) == 1
     wrapped = model.layers[0].self_attn
 
-    def fake_engine(mx_mod, **kwargs):
+    def fake_engine(_mx_mod, **kwargs):
         q = kwargs["q"]
         return mx.zeros(
             (1, int(q.shape[1]), int(q.shape[2]), int(q.shape[3])),
@@ -829,7 +897,7 @@ def test_deepseek_v4_banded_prefill_offset_plumbing_matches_composed(
     # isolates the wrapper plumbing: if the forward rope, the cache read,
     # or the inverse rope used a wrong position, the outputs would differ
     # from the composed original.
-    def exact_engine(mx_mod, *, q, kv, pooled, sinks, window, ratio, scale,
+    def exact_engine(_mx_mod, *, q, kv, pooled, sinks, window, ratio, scale,
                      pos0=0):
         del pooled, ratio
         tokens_in = int(q.shape[2])

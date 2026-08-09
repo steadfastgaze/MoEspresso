@@ -982,13 +982,45 @@ def chat_completion(
             # Surface the disk event on the request when one occurred: a disk
             # restore already shows as the ``disk_hit`` event, and a request that
             # wrote frontier checkpoints reports how many.
+            if generated.disk_restore_seconds is not None:
+                prompt_cache_block["disk_restore_seconds"] = round(
+                    generated.disk_restore_seconds, 6
+                )
             if generated.disk_checkpoints_written:
                 prompt_cache_block["disk_checkpoints_written"] = (
                     generated.disk_checkpoints_written
                 )
+            if generated.disk_checkpoint_write_seconds:
+                prompt_cache_block["disk_checkpoint_write_seconds"] = [
+                    round(seconds, 6)
+                    for seconds in generated.disk_checkpoint_write_seconds
+                ]
+            if generated.disk_attachments_written:
+                prompt_cache_block["disk_drafter_states_written"] = (
+                    generated.disk_attachments_written
+                )
+            if generated.disk_attachment_write_seconds:
+                prompt_cache_block["disk_drafter_state_write_seconds"] = [
+                    round(seconds, 6)
+                    for seconds in generated.disk_attachment_write_seconds
+                ]
+            if (
+                generated.disk_attachment_event is not None
+                or generated.disk_attachment_restore_seconds is not None
+            ):
+                drafter_state_block = {}
+                if generated.disk_attachment_event is not None:
+                    drafter_state_block["event"] = (
+                        generated.disk_attachment_event
+                    )
+                if generated.disk_attachment_restore_seconds is not None:
+                    drafter_state_block["restore_seconds"] = round(
+                        generated.disk_attachment_restore_seconds, 6
+                    )
+                prompt_cache_block["drafter_state"] = drafter_state_block
             response["usage"]["prompt_cache"] = prompt_cache_block
-        # first-token latency is the headline serve metric:
-        # surface it on every response instead of making users probe for it.
+        # Keep the generation-local first-token metric on every response for
+        # compatibility; the ready-origin metric covers the request lane.
         if generated.first_token_seconds is not None:
             tps = None
             if generated.completion_tokens and generated.generation_seconds:
@@ -1000,6 +1032,16 @@ def chat_completion(
                     generated.generation_seconds or 0.0, 4),
                 "generation_tps": tps,
             }
+        if generated.ready_to_first_token_seconds is not None:
+            response["usage"].setdefault("moespresso", {})[
+                "ready_to_first_token_seconds"
+            ] = round(generated.ready_to_first_token_seconds, 4)
+        # Speculative-decoding evidence rides next to the timing it explains:
+        # drafter family, rounds, acceptance, fallbacks, submit-length
+        # histogram, reported only when a drafter served the request.
+        if generated.speculative:
+            response["usage"].setdefault("moespresso", {})["speculative"] = (
+                generated.speculative)
     # Repair activity is the adoption evidence for a repair-dependent
     # dialect, so a request that fired the repair layer reports its counters,
     # and argument values that stayed schema-mismatched after coercion are
@@ -1385,6 +1427,7 @@ def serve(
     # the kill switch. A default-enabled store that cannot open (locked root,
     # unwritable cache directory) degrades to memory-only serving; an
     # explicitly requested one still refuses startup.
+    from moespresso.runtime.deepseek_v4.spec_serve import DrafterConfigError
     from moespresso.runtime.disk_kv import (
         DiskKVError,
         open_disk_store,
@@ -1427,7 +1470,7 @@ def serve(
                 model,
                 requested=min_resident_experts,
             )
-        except (FileNotFoundError, StreamingCapacityError) as e:
+        except (FileNotFoundError, StreamingCapacityError, DrafterConfigError) as e:
             # PackageNotFoundError and friends: one clear line, no traceback
             print(f"FAILED: {e}")
             return 2

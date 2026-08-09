@@ -25,8 +25,20 @@ Q2_FIXTURE_ROOT = (
     / "q2_official_continuations"
 )
 Q2_PROMPTS_PATH = Q2_FIXTURE_ROOT / "prompts.jsonl"
-Q2_PRIVATE_FIXTURE_ROOT = Q2_FIXTURE_ROOT.parent / "private" / "q2_official_continuations"
-Q2_REFERENCE_PATH = Q2_PRIVATE_FIXTURE_ROOT / "official_continuations.json"
+_PRIVATE_ROOT = Q2_FIXTURE_ROOT.parent / "private"
+# The reference of record. Two independent passes over the same prompts were
+# captured from the same provider state; pass 1 is the reference and pass 2 is
+# the self-noise witness that says how much of any difference is the provider.
+Q2_PRIVATE_FIXTURE_ROOT = _PRIVATE_ROOT / "q2_official_continuations_0731"
+Q2_REFERENCE_PATH = Q2_PRIVATE_FIXTURE_ROOT / "pass1.json"
+Q2_NOISE_FLOOR_REFERENCE_PATH = Q2_PRIVATE_FIXTURE_ROOT / "pass2.json"
+# The earlier reference, kept readable so historical scores stay reproducible.
+# It holds a different checkpoint's continuations, so a score against it and a
+# score against the reference of record are not comparable numbers.
+Q2_FROZEN_PREVIEW_FIXTURE_ROOT = _PRIVATE_ROOT / "q2_official_continuations"
+Q2_FROZEN_PREVIEW_REFERENCE_PATH = (
+    Q2_FROZEN_PREVIEW_FIXTURE_ROOT / "official_continuations.json"
+)
 Q2_REFERENCE_SCHEMA = "ds4-q2-official-continuations-v1"
 Q2_EVIDENCE_SCHEMA = "ds4-q2-target-token-nll-v1"
 Q2_PROMPT_COUNT = 100
@@ -35,7 +47,11 @@ Q2_DEFAULT_TOP_LOGPROBS = 20
 Q2_SENTINEL_LOGPROB = -9999.0
 Q2_SENTINEL_CUTOFF = -9990.0
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_DS4_FLASH_MODEL = "deepseek/deepseek-v4-flash"
+# The dated slug, always. The undated `deepseek/deepseek-v4-flash` entry is a
+# distinct model whose published canonical id names the earlier preview build,
+# so a capture sent on it cannot be attributed to a checkpoint from the response
+# alone. Send the dated slug and the identity is checkable.
+OPENROUTER_DS4_FLASH_MODEL = "deepseek/deepseek-v4-flash-0731"
 OPENROUTER_PROVIDER = {
     "only": ["deepseek"],
     "order": ["deepseek"],
@@ -739,6 +755,33 @@ def request_openrouter_q2_case_with_retry(**kwargs) -> dict:
     raise AssertionError("unreachable")
 
 
+def default_q2_capture_path(now: datetime | None = None) -> Path:
+    """Return a new timestamped capture path inside the private capture root.
+
+    A bare capture invocation must not be able to land on a reference that
+    already exists. Naming the default after the capture instant means the
+    default is always a new file, and promoting a capture to the reference of
+    record stays a deliberate, separate act.
+    """
+    stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    return Q2_PRIVATE_FIXTURE_ROOT / f"capture_{stamp}.json"
+
+
+def check_q2_capture_output_path(out_path: Path, *, force: bool = False) -> Path:
+    """Fail closed on a capture that would overwrite an existing reference.
+
+    Checked before the first request, so a refusal costs nothing.
+    """
+    out_path = Path(out_path)
+    if out_path.exists() and not force:
+        raise FileExistsError(
+            f"refusing to overwrite an existing Q2 reference: {out_path}. "
+            "Pass a new --out, or --force to replace it deliberately. A "
+            "reference is the only copy of the oracle it holds."
+        )
+    return out_path
+
+
 def capture_q2_official_reference(
     *,
     prompts_path: Path,
@@ -750,7 +793,9 @@ def capture_q2_official_reference(
     max_tokens: int = Q2_DEFAULT_MAX_TOKENS,
     top_logprobs: int = Q2_DEFAULT_TOP_LOGPROBS,
     provider: dict | None = None,
+    force: bool = False,
 ) -> dict:
+    out_path = check_q2_capture_output_path(out_path, force=force)
     prompts = load_q2_prompts(prompts_path)
     provider = dict(provider or OPENROUTER_PROVIDER)
     total = min(int(count), len(prompts))

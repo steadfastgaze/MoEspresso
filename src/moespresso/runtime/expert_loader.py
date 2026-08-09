@@ -1,13 +1,14 @@
 """Direct expert byte-range loader for SSD-streamed MoE.
 
-Loads one expert's packed/norms bytes from a package shard via `pread` (using the
-expert byte-offset index, expert_index.py) directly into an `mx.array` buffer,
-without faulting the whole stacked tensor and without materializing a Python
-`bytes` payload.
+Loads one indexed expert component from a package shard directly into an
+`mx.array` buffer, without faulting the whole bundle tensor or materializing a
+Python `bytes` payload.
 
-No TQ dequant: the bytes stay packed uint32 and jang's kernel runs them. This
-module returns a fresh per-expert array for proof/tests; the product miss path
-will use the same `pread_into` primitive to fill persistent pool slots.
+The indexed dtype and shape are preserved; this helper does not dequantize or
+relayout a component. It returns a fresh per-expert array for proof and tests.
+The serving miss path normally reads a whole bundle row through
+`BundleRowCache` and fills persistent projection slots, including IQ_K's
+kernel-native streams.
 """
 
 from __future__ import annotations

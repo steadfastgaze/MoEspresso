@@ -5,6 +5,44 @@ from __future__ import annotations
 import pytest
 
 from moespresso.runtime.chat_stream import ReasoningSplitter, split_complete_text
+from moespresso.runtime.tool_stream import DSML_DIALECT, ToolCallStreamer
+from moespresso.toolcalls.dsml import DSML_TOKEN
+
+T = DSML_TOKEN
+
+_TOOL_SCHEMAS = {
+    "bash": {"type": "object", "properties": {"command": {"type": "string"}}},
+}
+
+DSML_BASH_BLOCK = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="bash">\n'
+    f'<{T}parameter name="command" string="true">ls</{T}parameter>\n'
+    f"</{T}invoke>\n"
+    f"</{T}tool_calls>"
+)
+
+
+def _route(pieces):
+    """Drive text through the reasoning splitter into a tool streamer.
+
+    Mirrors the serve path: only ``content`` deltas are pushed into the
+    tool streamer, so anything the splitter classifies as reasoning never
+    reaches tool extraction. Returns ``(splitter, streamer)``.
+    """
+    streamer = ToolCallStreamer(
+        (DSML_DIALECT,), parameter_schemas=_TOOL_SCHEMAS)
+
+    def route_delta(kind: str, text: str) -> None:
+        if kind == "content":
+            streamer.push(text)
+
+    splitter = ReasoningSplitter(thinking_enabled=True, emit=route_delta)
+    for piece in pieces:
+        splitter.push(piece)
+    splitter.finish()
+    streamer.finish()
+    return splitter, streamer
 
 
 @pytest.mark.parametrize(
@@ -80,3 +118,37 @@ def test_unterminated_reasoning_stays_in_reasoning_channel():
     splitter.finish()
     assert splitter.reasoning == "still considering"
     assert splitter.content == ""
+
+
+# --- tool blocks emitted without closing the reasoning region ----------------
+#
+# A served turn that slides from reasoning straight into a tool-call block
+# without emitting the close marker loses the call: the splitter stays in
+# reasoning mode, and only content deltas reach tool extraction. These tests
+# pin that channel routing, which is what decides whether a well-formed block
+# is ever seen by the tool streamer at all.
+
+def test_dsml_unclosed_think_region_routes_zero_calls():
+    # Two arms differing only by the close marker, so a null result cannot
+    # come from both arms running the same path.
+    without_close, streamer = _route(["Planning.\n" + DSML_BASH_BLOCK])
+    assert streamer.calls == []
+    assert streamer.content == ""
+    assert DSML_BASH_BLOCK in without_close.reasoning
+
+    with_close, closed_streamer = _route(
+        ["Planning.</think>\n" + DSML_BASH_BLOCK])
+    assert [entry["function"]["name"] for entry in closed_streamer.calls] == [
+        "bash"]
+    assert closed_streamer.content == ""
+    assert with_close.reasoning == "Planning."
+
+
+def test_dsml_unclosed_think_close_marker_after_the_block_routes_zero_calls():
+    # The close marker arriving after the block is no better than none: the
+    # block itself was already classified as reasoning.
+    splitter, streamer = _route(
+        ["Planning.\n" + DSML_BASH_BLOCK + "\n</think>Done."])
+    assert streamer.calls == []
+    assert streamer.content == "Done."
+    assert DSML_BASH_BLOCK in splitter.reasoning

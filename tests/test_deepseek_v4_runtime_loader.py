@@ -19,6 +19,8 @@ from moespresso.runtime.deepseek_v4.model import (
     _patch_deepseek_v4_hc_post_float32,
     _patch_deepseek_v4_kquant_grouped_output_projection,
     _patch_deepseek_v4_kquant_lm_head,
+    _patch_deepseek_v4_q8_ffn_hc_post,
+    _patch_deepseek_v4_q8_hc_post,
     _patch_deepseek_v4_required_attention_cache,
     _validate_deepseek_v4_router_gate_dtypes,
     load_deepseek_v4_package_model,
@@ -91,6 +93,68 @@ class _KQuantAttention:
         self.o_lora_rank = 1
         self.wo_a = wo_a
         self.wo_b = wo_b
+
+
+class _Identity:
+    def __call__(self, x):
+        return x
+
+
+class _IdentityMlp:
+    def __call__(self, x, *, input_ids=None):
+        del input_ids
+        return x
+
+
+class _Q8HcAttention(_KQuantAttention):
+    def __init__(self, wo_a, wo_b, projection):
+        super().__init__(wo_a, wo_b)
+        self.projection = projection
+        self.raise_on_call = False
+
+    def __call__(self, x, *, mask=None, cache=None):
+        del x, mask, cache
+        if self.raise_on_call:
+            raise RuntimeError("attention failed")
+        return self.wo_b(self.projection)
+
+
+class _Q8HcDecoderLayer:
+    def __init__(self, attn, mx):
+        self.layer_id = 0
+        self.self_attn = attn
+        self.input_layernorm = _Identity()
+        self.post_attention_layernorm = _Identity()
+        self.mlp = _IdentityMlp()
+        self.hc_attn_fn = None
+        self.hc_attn_scale = None
+        self.hc_attn_base = None
+        self.hc_ffn_fn = None
+        self.hc_ffn_scale = None
+        self.hc_ffn_base = None
+        self._mx = mx
+        self.hc_post_calls = 0
+        self.original_calls = 0
+
+    def _hc_pre(self, x, fn, scale, base):
+        del fn, scale, base
+        batch, length, hc, _hidden = (int(dim) for dim in x.shape)
+        post = self._mx.ones((batch, length, hc), dtype=self._mx.float32)
+        comb = self._mx.broadcast_to(
+            self._mx.eye(hc, dtype=self._mx.float32),
+            (batch, length, hc, hc),
+        )
+        return x[..., 0, :], post, comb
+
+    def _hc_post(self, x, residual, post, comb):
+        del post, comb
+        self.hc_post_calls += 1
+        return residual + x[..., None, :]
+
+    def __call__(self, x, mask=None, cache=None, input_ids=None):
+        del mask, cache, input_ids
+        self.original_calls += 1
+        return x
 
 
 class _AttentionLayer:
@@ -199,6 +263,24 @@ def _kquant_manifest():
     return man
 
 
+def _iqk_expert_manifest():
+    man = _manifest()
+    man["required_ops"] = ["affine_dequant", "iqk_dequant"]
+    man["tensors"] = [
+        {"format": "affine"},
+        {
+            "source_name": "layers.0.ffn.experts",
+            "kind": "expert",
+            "format": "iqk",
+            "format_params": {
+                "iqk_codec": "iq2_ks",
+                "layout": "iqk_relayout",
+            },
+        },
+    ]
+    return man
+
+
 def _dense_kquant_manifest():
     man = _manifest()
     man["required_ops"] = ["affine_dequant", "kquant_dequant"]
@@ -249,6 +331,30 @@ def test_deepseek_v4_regular_loader_skips_only_expert_bundles(tmp_path):
     assert loaded == 1
     assert skipped == 1
     assert model.loaded == [({"sanitized.embed.weight": "E"}, False)]
+
+
+def test_deepseek_v4_regular_loader_reads_only_declared_shards(tmp_path):
+    """A bundled drafter's model-dspark-* shards sit beside the model
+    shards; the trunk load must consume only the manifest-declared set."""
+    _touch_shard(tmp_path)
+    (tmp_path / "model-dspark-00001-of-00001.safetensors").write_bytes(b"")
+    model = _Model()
+    read: list[str] = []
+
+    def record_load(path: Path) -> dict:
+        read.append(path.name)
+        return {"embed.weight": "E"}
+
+    loaded, skipped = _load_deepseek_v4_regular_weights(
+        model,
+        tmp_path,
+        load_shard_fn=record_load,
+        shard_names=["model-00001-of-00001.safetensors"],
+    )
+
+    assert loaded == 1
+    assert skipped == 0
+    assert read == ["model-00001-of-00001.safetensors"]
 
 
 def test_deepseek_v4_hc_post_patch_returns_float32_before_fp16_overflow():
@@ -377,6 +483,948 @@ def _real_q8_module(kq, mx, out_dims=8, in_dims=64, seed=3):
     return _KQuantModule(wire, scales)
 
 
+def _q8_hc_model_fixture(
+    mx, *, hidden=16, input_size=256, layer_cls=_Q8HcDecoderLayer
+):
+    wire_bytes = input_size // 32 * 34
+    wo_a = _KQuantModule(
+        mx.zeros((1, 34), dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.uint8),
+    )
+    wo_b = _KQuantModule(
+        mx.zeros((hidden, wire_bytes), dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.uint8),
+    )
+    projection = mx.ones((1, 1, input_size), dtype=mx.float32)
+    attn = _Q8HcAttention(wo_a, wo_b, projection)
+    layer = layer_cls(attn, mx)
+    return _WrappedModel([layer]), layer, attn
+
+
+class _Q8FfnDown(_KQuantModule):
+    def __init__(self, mx, *, hidden, input_size, events):
+        super().__init__(
+            mx.zeros((hidden, input_size // 32 * 34), dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.uint8),
+        )
+        self.mx = mx
+        self.hidden = hidden
+        self.events = events
+        self.calls = 0
+
+    def __call__(self, x):
+        self.calls += 1
+        self.events.append("down_fallback")
+        return self.mx.full(
+            (*x.shape[:-1], self.hidden), 0.25, dtype=self.mx.bfloat16)
+
+
+class _Q8FfnGate:
+    def __init__(self, mx, events):
+        self.mx = mx
+        self.events = events
+        self.calls = 0
+
+    def __call__(self, x, *, input_ids=None):
+        del input_ids
+        self.calls += 1
+        self.events.append("gate")
+        rows = tuple(int(dim) for dim in x.shape[:-1])
+        return (
+            self.mx.zeros((*rows, 1), dtype=self.mx.uint32),
+            self.mx.ones((*rows, 1), dtype=self.mx.float32),
+        )
+
+
+class _Q8FfnShared:
+    def __init__(self, down_proj, down_input, events):
+        self.down_proj = down_proj
+        self.down_input = down_input
+        self.events = events
+        self.calls = 0
+        self.raise_on_call = False
+
+    def __call__(self, x):
+        del x
+        self.calls += 1
+        self.events.append("shared")
+        if self.raise_on_call:
+            raise RuntimeError("shared expert failed")
+        return self.down_proj(self.down_input)
+
+
+def _configure_q8_ffn_hc_post(
+    monkeypatch,
+    mx,
+    kq,
+    *,
+    hidden=16,
+    attn_input=256,
+    ffn_input=32,
+):
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", True)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", attn_input)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_FFN_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_FFN_HC_POST_INPUT", ffn_input)
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_DSV4_Q8_FFN_HC_POST_WIRE_BYTES",
+        ffn_input // 32 * 34,
+    )
+    calls = {"attention": 0, "ffn": 0}
+
+    def attention_native(
+        x, weight, scales, residual, post, comb, kquant_type
+    ):
+        del scales, post, comb
+        calls["attention"] += 1
+        assert x.dtype == mx.float32
+        assert x.shape == (1, 1, attn_input)
+        assert weight.shape == (hidden, attn_input // 32 * 34)
+        assert residual.shape == (4, hidden)
+        assert kquant_type == "q8_0"
+        return residual
+
+    def ffn_native(
+        x,
+        weight,
+        scales,
+        routed,
+        residual,
+        post,
+        comb,
+        kquant_type,
+    ):
+        del scales
+        calls["ffn"] += 1
+        assert x.dtype == mx.bfloat16
+        assert x.shape == (1, 1, ffn_input)
+        assert weight.shape == (hidden, ffn_input // 32 * 34)
+        assert routed.dtype == mx.float16
+        assert routed.shape == (hidden,)
+        assert residual.dtype == mx.float32
+        assert residual.shape == (4, hidden)
+        assert post.dtype == mx.float32
+        assert post.shape == (4,)
+        assert comb.dtype == mx.float32
+        assert comb.shape == (4, 4)
+        assert kquant_type == "q8_0"
+        return residual + routed.astype(mx.float32)[None, :]
+
+    monkeypatch.setattr(
+        kq,
+        "quantized_matmul_qmv_hc_post",
+        attention_native,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kq,
+        "quantized_matmul_qmv_add_hc_post",
+        ffn_native,
+        raising=False,
+    )
+    return calls
+
+
+def test_deepseek_v4_q8_hc_post_requires_explicit_native_api(monkeypatch):
+    pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    model = _WrappedModel([])
+    monkeypatch.delattr(
+        kq, "quantized_matmul_qmv_hc_post", raising=False)
+
+    with pytest.raises(
+        DeepseekV4RuntimeLoadError,
+        match="mlx_kquant.quantized_matmul_qmv_hc_post",
+    ):
+        _patch_deepseek_v4_q8_hc_post(model)
+    assert model._moespresso_dsv4_q8_hc_post_enabled is False
+    assert model._moespresso_dsv4_q8_hc_post_native_api is False
+
+    monkeypatch.setattr(
+        kq,
+        "quantized_matmul_qmv_hc_post",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    assert _patch_deepseek_v4_q8_hc_post(model) == 0
+    assert model._moespresso_dsv4_q8_hc_post_enabled is False
+    assert model._moespresso_dsv4_q8_hc_post_native_api is True
+    assert model._moespresso_dsv4_q8_hc_post_layers == 0
+
+
+def test_deepseek_v4_q8_hc_post_engages_and_skips_only_attention_post(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    hidden = 16
+    input_size = 256
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", input_size)
+    calls = {"native": 0}
+
+    def fake_native(x, weight, scales, residual, post, comb, kquant_type):
+        del scales
+        calls["native"] += 1
+        assert x.dtype == mx.float32
+        assert x.shape == (1, 1, input_size)
+        assert weight.shape == (hidden, input_size // 32 * 34)
+        assert residual.shape == (4, hidden)
+        assert post.shape == (4,)
+        assert comb.shape == (4, 4)
+        assert kquant_type == "q8_0"
+        return residual + post[:, None]
+
+    monkeypatch.setattr(
+        kq, "quantized_matmul_qmv_hc_post", fake_native, raising=False)
+    model, layer, attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    before = dsv4_runtime.q8_hc_post_call_counts()
+    q8_before = dsv4_runtime.q8_dense_matmul_call_counts()
+
+    x = mx.ones((1, 1, 4, hidden), dtype=mx.float32)
+    out = layer(x)
+    mx.eval(out)
+    after = dsv4_runtime.q8_hc_post_call_counts()
+    q8_after = dsv4_runtime.q8_dense_matmul_call_counts()
+
+    assert out.shape == (1, 1, 4, hidden)
+    assert calls["native"] == 1
+    assert layer.hc_post_calls == 1
+    assert layer.original_calls == 0
+    assert layer._moespresso_dsv4_q8_hc_post_engaged_calls == 1
+    assert layer._moespresso_dsv4_q8_hc_post_fallback_calls == 0
+    assert after["engaged"] == before["engaged"] + 1
+    assert after["fallback"] == before["fallback"]
+    assert q8_after["decode_wire_qmv_wo_b"] == (
+        q8_before["decode_wire_qmv_wo_b"] + 1)
+    assert model._moespresso_dsv4_q8_hc_post_enabled is True
+    assert model._moespresso_dsv4_q8_hc_post_native_api is True
+    assert model._moespresso_dsv4_q8_hc_post_layers == 1
+    assert getattr(attn.wo_b, "_moespresso_dsv4_q8_hc_post_eligible")
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+
+
+def test_a_drafter_stage_loaded_after_the_patch_stays_on_the_stock_route(
+        monkeypatch):
+    """The hC-post patch replaces `__call__` on the layer *class*.
+
+    DSpark draft stages subclass the trunk decoder layer, so a drafter loaded
+    after the patch inherits the fused call. Only the per-instance eligibility
+    flag keeps it off the fused route, and nothing pinned that: a refactor
+    that hoisted eligibility to the class would send draft stages through a
+    fusion sized for the trunk. Commissioned by errata E4.
+    """
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    hidden = 16
+    input_size = 256
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", input_size)
+    calls = {"native": 0}
+
+    def fake_native(x, weight, scales, residual, post, comb, kquant_type):
+        del x, weight, scales, post, comb, kquant_type
+        calls["native"] += 1
+        return residual
+
+    monkeypatch.setattr(
+        kq, "quantized_matmul_qmv_hc_post", fake_native, raising=False)
+
+    model, layer, _attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    x = mx.ones((1, 1, 4, hidden), dtype=mx.float32)
+    mx.eval(layer(x))
+    assert calls["native"] == 1
+
+    # The drafter's stage class subclasses the trunk layer, and it is
+    # constructed after the class patch is already installed.
+    class _DraftStage(type(layer)):
+        pass
+
+    _stage_model, stage, _stage_attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size, layer_cls=_DraftStage)
+    assert type(stage).__call__ is type(layer).__call__
+
+    before = dsv4_runtime.q8_hc_post_call_counts()
+    native_before = calls["native"]
+    out = stage(x)
+    mx.eval(out)
+    after = dsv4_runtime.q8_hc_post_call_counts()
+
+    # The stage runs the stock body: no fused kernel, no engagement.
+    assert calls["native"] == native_before
+    assert stage.original_calls == 1
+    assert stage.hc_post_calls == 0
+    assert after["engaged"] == before["engaged"]
+    assert after["fallback"] == before["fallback"]
+    assert not getattr(
+        stage, "_moespresso_dsv4_q8_hc_post_eligible", False)
+
+
+def test_deepseek_v4_q8_hc_post_falls_back_delegates_and_resets(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    hidden = 16
+    input_size = 256
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", input_size)
+    native_calls = {"count": 0}
+
+    def fake_native(*args, **kwargs):
+        del args, kwargs
+        native_calls["count"] += 1
+        return mx.zeros((4, hidden), dtype=mx.float32)
+
+    monkeypatch.setattr(
+        kq, "quantized_matmul_qmv_hc_post", fake_native, raising=False)
+    model, layer, attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_deepseek_v4_q8_hc_post_eligible",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_kquant_matmul_ds4_fp32",
+        lambda *args, **kwargs: mx.zeros(
+            (1, 1, hidden), dtype=mx.float32),
+    )
+    before = dsv4_runtime.q8_hc_post_call_counts()
+    x = mx.ones((1, 1, 4, hidden), dtype=mx.float32)
+    out = layer(x)
+    mx.eval(out)
+    after = dsv4_runtime.q8_hc_post_call_counts()
+    assert native_calls["count"] == 0
+    assert layer.hc_post_calls == 2
+    assert after["fallback"] == before["fallback"] + 1
+
+    delegated = layer(x.astype(mx.bfloat16))
+    mx.eval(delegated)
+    final = dsv4_runtime.q8_hc_post_call_counts()
+    assert layer.original_calls == 1
+    assert final["delegated"] == after["delegated"] + 1
+
+    attn.raise_on_call = True
+    with pytest.raises(RuntimeError, match="attention failed"):
+        layer(x)
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+
+
+def test_deepseek_v4_q8_hc_post_leaves_ineligible_instances_on_stock_route(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    hidden = 16
+    input_size = 256
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", input_size)
+    calls = {"native": 0}
+
+    def fake_native(x, weight, scales, residual, post, comb, kquant_type):
+        del x, weight, scales, post, comb, kquant_type
+        calls["native"] += 1
+        return residual
+
+    monkeypatch.setattr(
+        kq, "quantized_matmul_qmv_hc_post", fake_native, raising=False)
+    model, layer, _attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    x = mx.ones((1, 1, 4, hidden), dtype=mx.float32)
+    mx.eval(layer(x))
+    assert calls["native"] == 1
+
+    # The layer class now carries the fusion wrapper. A second model whose
+    # wo_b never received the fp32 linear seam contract is not eligible, so
+    # it keeps the stock layer body even though the wrapper is installed.
+    fresh, fresh_layer, fresh_attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size)
+    assert _patch_deepseek_v4_q8_hc_post(fresh) == 0
+    assert fresh._moespresso_dsv4_q8_hc_post_enabled is False
+    assert fresh._moespresso_dsv4_q8_hc_post_layers == 0
+    assert not getattr(
+        fresh_layer, "_moespresso_dsv4_q8_hc_post_eligible", False)
+    assert not getattr(
+        fresh_attn.wo_b, "_moespresso_dsv4_q8_hc_post_eligible", False)
+    mx.eval(fresh_layer(x))
+    assert fresh_layer.original_calls == 1
+    assert calls["native"] == 1
+
+
+def test_deepseek_v4_q8_hc_post_composes_with_hidden_tap_orders(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    from moespresso.runtime.deepseek_v4.spec_decode import install_hidden_tap
+
+    hidden = 16
+    input_size = 256
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", input_size)
+    native_calls = {"count": 0}
+
+    def fake_native(x, weight, scales, residual, post, comb, kquant_type):
+        del x, weight, scales, post, comb, kquant_type
+        native_calls["count"] += 1
+        return residual
+
+    monkeypatch.setattr(
+        kq, "quantized_matmul_qmv_hc_post", fake_native, raising=False)
+    x = mx.ones((1, 1, 4, hidden), dtype=mx.float32)
+
+    class InnerTapLayer(_Q8HcDecoderLayer):
+        pass
+
+    # The tap wraps the layer class first, so the fusion wrapper installed
+    # by the next model finds the tap already inside the layer body. The
+    # first model is ineligible (no fp32 linear seam contract on wo_b), so
+    # its class stays unwrapped until the eligible model arrives.
+    unfused_model, unfused_layer, _unfused_attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size, layer_cls=InnerTapLayer)
+    assert _patch_deepseek_v4_q8_hc_post(unfused_model) == 0
+    inner_transform_calls = {"count": 0}
+
+    def inner_transform(layer_id, out):
+        assert layer_id == 0
+        inner_transform_calls["count"] += 1
+        return out
+
+    old_tap = install_hidden_tap(unfused_model, [0], inner_transform)
+    old_tap.active = True
+    mx.eval(unfused_layer(x))
+    assert inner_transform_calls["count"] == 1
+    old_tap.rows.clear()
+
+    inner_model, inner_layer, _inner_attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size, layer_cls=InnerTapLayer)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(inner_model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(inner_model) == 1
+    inner_tap = install_hidden_tap(inner_model, [0], inner_transform)
+    inner_tap.active = True
+    inner_out = inner_layer(x)
+    mx.eval(inner_out)
+    assert inner_transform_calls["count"] == 2
+    assert 0 in inner_tap.rows
+    assert old_tap.rows == {}
+
+    class OuterTapLayer(_Q8HcDecoderLayer):
+        pass
+
+    outer_model, outer_layer, _outer_attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=input_size, layer_cls=OuterTapLayer)
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(outer_model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(outer_model) == 1
+    outer_transform_calls = {"count": 0}
+
+    def outer_transform(layer_id, out):
+        assert layer_id == 0
+        outer_transform_calls["count"] += 1
+        return out
+
+    outer_tap = install_hidden_tap(outer_model, [0], outer_transform)
+    outer_tap.active = True
+    outer_out = outer_layer(x)
+    mx.eval(outer_out)
+    assert outer_transform_calls["count"] == 1
+    assert 0 in outer_tap.rows
+    assert native_calls["count"] == 2
+
+
+def test_deepseek_v4_q8_ffn_hc_post_requires_explicit_contract(monkeypatch):
+    pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    monkeypatch.delattr(
+        kq, "quantized_matmul_qmv_add_hc_post", raising=False)
+
+    # The FFN fusion rides inside the attention fusion, so a graph the
+    # attention fusion never claimed stays on the stock route without
+    # consulting the native API at all.
+    model = _WrappedModel([])
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 0
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is False
+    assert model._moespresso_dsv4_q8_ffn_hc_post_native_api is False
+
+    claimed = _WrappedModel(
+        [SimpleNamespace(_moespresso_dsv4_q8_hc_post_eligible=True, mlp=None)]
+    )
+    with pytest.raises(
+        DeepseekV4RuntimeLoadError,
+        match="mlx_kquant.quantized_matmul_qmv_add_hc_post",
+    ):
+        _patch_deepseek_v4_q8_ffn_hc_post(claimed)
+    assert claimed._moespresso_dsv4_q8_ffn_hc_post_native_api is False
+
+    monkeypatch.setattr(
+        kq,
+        "quantized_matmul_qmv_add_hc_post",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    assert _patch_deepseek_v4_q8_ffn_hc_post(claimed) == 0
+    assert claimed._moespresso_dsv4_q8_ffn_hc_post_enabled is False
+    assert claimed._moespresso_dsv4_q8_ffn_hc_post_native_api is True
+    assert claimed._moespresso_dsv4_q8_ffn_hc_post_layers == 0
+
+
+def test_deepseek_v4_q8_ffn_hc_post_composes_attention_and_c6(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, attn, block, shared, down, switch, events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+    attention_before = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_before = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    dense_before = dsv4_runtime.q8_dense_matmul_call_counts()
+
+    out = layer(mx.ones((1, 1, 4, 16), dtype=mx.float32))
+    mx.eval(out)
+
+    attention_after = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_after = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    dense_after = dsv4_runtime.q8_dense_matmul_call_counts()
+    assert out.dtype == mx.float32
+    assert out.shape == (1, 1, 4, 16)
+    assert calls == {"attention": 1, "ffn": 1}
+    assert events == ["gate", "switch", "shared"]
+    assert switch.calls == 1
+    assert shared.calls == 1
+    assert down.calls == 0
+    assert layer.hc_post_calls == 0
+    assert layer.original_calls == 0
+    assert attention_after["engaged"] == attention_before["engaged"] + 1
+    assert attention_after["fallback"] == attention_before["fallback"]
+    assert ffn_after["engaged"] == ffn_before["engaged"] + 1
+    assert ffn_after["fallback"] == ffn_before["fallback"]
+    assert ffn_after["delegated"] == ffn_before["delegated"]
+    assert dense_after["decode_wire_qmv_wo_b"] == (
+        dense_before["decode_wire_qmv_wo_b"] + 1)
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is True
+    assert model._moespresso_dsv4_q8_ffn_hc_post_native_api is True
+    assert model._moespresso_dsv4_q8_ffn_hc_post_layers == 1
+    assert block._moespresso_dsv4_q8_ffn_hc_post_eligible
+    assert shared.down_proj._moespresso_dsv4_q8_ffn_hc_post_eligible
+    assert attn.wo_b._moespresso_dsv4_q8_hc_post_eligible
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
+@pytest.mark.parametrize("entry_dtype_name", ["float16", "bfloat16"])
+def test_deepseek_v4_q8_ffn_hc_post_layer0_delegates_only_attention(
+    monkeypatch,
+    entry_dtype_name,
+):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, _block, shared, down, switch, _events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_kquant_matmul_ds4_fp32",
+        lambda *args, **kwargs: mx.zeros(
+            (1, 1, 16), dtype=mx.float32),
+    )
+    attention_before = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_before = dsv4_runtime.q8_ffn_hc_post_call_counts()
+
+    out = layer(
+        mx.ones((1, 1, 4, 16), dtype=getattr(mx, entry_dtype_name))
+    )
+    mx.eval(out)
+
+    attention_after = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_after = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert out.dtype == mx.float32
+    assert out.shape == (1, 1, 4, 16)
+    assert calls == {"attention": 0, "ffn": 1}
+    assert switch.calls == 1
+    assert shared.calls == 1
+    assert down.calls == 0
+    assert layer.hc_post_calls == 1
+    assert layer.original_calls == 0
+    assert attention_after["engaged"] == attention_before["engaged"]
+    assert attention_after["fallback"] == attention_before["fallback"]
+    assert attention_after["delegated"] == (
+        attention_before["delegated"] + 1)
+    assert ffn_after["engaged"] == ffn_before["engaged"] + 1
+    assert ffn_after["fallback"] == ffn_before["fallback"]
+    assert ffn_after["delegated"] == ffn_before["delegated"]
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
+def test_deepseek_v4_q8_ffn_hc_post_falls_back_delegates_and_resets(
+    monkeypatch,
+):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, _block, shared, down, switch, events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_deepseek_v4_q8_ffn_hc_post_eligible",
+        lambda *args, **kwargs: False,
+    )
+    attention_before = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_before = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    decode = mx.ones((1, 1, 4, 16), dtype=mx.float32)
+
+    out = layer(decode)
+    mx.eval(out)
+
+    attention_after = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_after = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert out.dtype == mx.float32
+    assert calls == {"attention": 1, "ffn": 0}
+    assert events == ["gate", "switch", "shared", "down_fallback"]
+    assert switch.calls == 1
+    assert shared.calls == 1
+    assert down.calls == 1
+    assert layer.hc_post_calls == 1
+    assert attention_after["engaged"] == attention_before["engaged"] + 1
+    assert ffn_after["fallback"] == ffn_before["fallback"] + 1
+    assert ffn_after["engaged"] == ffn_before["engaged"]
+
+    delegated = layer(mx.ones((1, 2, 4, 16), dtype=mx.float32))
+    mx.eval(delegated)
+    attention_delegated = dsv4_runtime.q8_hc_post_call_counts()
+    ffn_delegated = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert layer.original_calls == 1
+    assert attention_delegated["delegated"] == (
+        attention_after["delegated"] + 1)
+    assert ffn_delegated["delegated"] == ffn_after["delegated"] + 1
+
+    shared.raise_on_call = True
+    with pytest.raises(RuntimeError, match="shared expert failed"):
+        layer(decode)
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
+def test_deepseek_v4_q8_ffn_hc_post_ineligible_block_keeps_stock_route(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    installed, _layer, _attn, _block, _shared, _down, _switch, _events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(installed) == 1
+    assert _patch_deepseek_v4_q8_hc_post(installed) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(installed) == 1
+
+    # The IQ_K block class now carries the fusion wrapper. A block whose
+    # shared-expert down projection is off the declared wire shape is
+    # not a candidate, so its layer keeps the stock routed-plus-shared sum
+    # and the stock FFN hC post.
+    model, layer, _attn, block, shared, down, switch, events = (
+        _q8_iqk_ffn_hc_model_fixture(mx, ffn_input=64)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 0
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is False
+    assert model._moespresso_dsv4_q8_ffn_hc_post_native_api is True
+    assert not getattr(
+        layer, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+    assert not getattr(
+        block, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+    assert shared.down_proj is down
+
+    out = layer(mx.ones((1, 1, 4, 16), dtype=mx.float32))
+    mx.eval(out)
+    assert calls == {"attention": 1, "ffn": 0}
+    assert events == ["gate", "switch", "shared", "down_fallback"]
+    assert switch.calls == 1
+    assert down.calls == 1
+    assert layer.hc_post_calls == 1
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
+def _q8_iqk_ffn_hc_model_fixture(
+    mx, *, hidden=16, attn_input=256, ffn_input=32
+):
+    """The FFN fixture over an IQ_K-form MoE block.
+
+    The block classes are created per call so one test's class-level
+    fusion wrap can never leak into another test.
+    """
+    model, layer, attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=attn_input)
+    events = []
+    down = _Q8FfnDown(
+        mx, hidden=hidden, input_size=ffn_input, events=events)
+    shared = _Q8FfnShared(
+        down,
+        mx.ones((1, 1, ffn_input), dtype=mx.bfloat16),
+        events,
+    )
+
+    class IqkDeepseekV4SwitchGLU:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, x, indices):
+            del indices
+            self.calls += 1
+            events.append("switch")
+            rows = tuple(int(dim) for dim in x.shape[:-1])
+            return mx.full((*rows, 1, hidden), 0.5, dtype=mx.float16)
+
+    class _IqkMoEBlock:
+        def __init__(self):
+            self.gate = _Q8FfnGate(mx, events)
+            self.switch_mlp = IqkDeepseekV4SwitchGLU()
+            self.shared_experts = shared
+            self.stock_calls = 0
+
+        def __call__(self, x, input_ids=None):
+            self.stock_calls += 1
+            inds, scores = self.gate(x, input_ids=input_ids)
+            inds = inds.astype(mx.uint32)
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(
+                y.dtype).reshape(x.shape)
+            return y + self.shared_experts(x)
+
+    block = _IqkMoEBlock()
+    layer.mlp = block
+    return model, layer, attn, block, shared, down, block.switch_mlp, events
+
+
+def _q8_pooled_iqk_ffn_hc_model_fixture(
+    mx, *, full_residency=True, hidden=16, attn_input=256, ffn_input=32
+):
+    model, layer, attn = _q8_hc_model_fixture(
+        mx, hidden=hidden, input_size=attn_input)
+    events = []
+    down = _Q8FfnDown(
+        mx, hidden=hidden, input_size=ffn_input, events=events)
+    shared = _Q8FfnShared(
+        down,
+        mx.ones((1, 1, ffn_input), dtype=mx.bfloat16),
+        events,
+    )
+
+    class PooledSwitchGLU:
+        _all_iqk = True
+
+        def __init__(self):
+            self.calls = 0
+            self.commits = []
+
+        def _barrier_free_decode_ready(self):
+            return full_residency
+
+        def __call__(self, x, indices):
+            del indices
+            self.calls += 1
+            events.append("switch")
+            rows = tuple(int(dim) for dim in x.shape[:-1])
+            return mx.full((*rows, 1, hidden), 0.5, dtype=mx.float16)
+
+        def commit_iqk_output(self, output, *, rows):
+            del output
+            self.commits.append(rows)
+
+    class _PooledIqkMoEBlock:
+        def __init__(self):
+            self.gate = _Q8FfnGate(mx, events)
+            self.switch_mlp = PooledSwitchGLU()
+            self.shared_experts = shared
+            self.stock_calls = 0
+
+        def __call__(self, x, input_ids=None):
+            self.stock_calls += 1
+            inds, scores = self.gate(x, input_ids=input_ids)
+            inds = inds.astype(mx.uint32)
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(
+                y.dtype).reshape(x.shape)
+            return y + self.shared_experts(x)
+
+    block = _PooledIqkMoEBlock()
+    layer.mlp = block
+    return model, layer, attn, block, shared, down, block.switch_mlp, events
+
+
+def test_deepseek_v4_q8_ffn_hc_post_iqk_block_off_contract_keeps_stock(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    # A shared-expert down projection off the declared wire shape keeps
+    # the IQ_K block on its stock route; the fusion installs nowhere.
+    model, layer, _attn, block, shared, down, _switch, _events = (
+        _q8_iqk_ffn_hc_model_fixture(mx, ffn_input=64)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 0
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is False
+    assert model._moespresso_dsv4_q8_ffn_hc_post_layers == 0
+    assert shared.down_proj is down
+    assert not getattr(
+        layer, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+    assert not type(block).__dict__.get(
+        "_moespresso_dsv4_q8_ffn_hc_post_wrapped", False)
+
+
+def test_deepseek_v4_q8_ffn_hc_post_pooled_iqk_requires_full_residency(
+    monkeypatch,
+):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, block, shared, down, _switch, _events = (
+        _q8_pooled_iqk_ffn_hc_model_fixture(mx, full_residency=False)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 0
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is False
+    assert shared.down_proj is down
+    assert not getattr(
+        layer, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+    assert not getattr(
+        block, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+
+
+def test_deepseek_v4_q8_ffn_hc_post_pooled_iqk_engages_and_commits(
+    monkeypatch,
+):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, block, _shared, down, switch, events = (
+        _q8_pooled_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+
+    out = layer(mx.ones((1, 1, 4, 16), dtype=mx.float32))
+    mx.eval(out)
+
+    assert calls == {"attention": 1, "ffn": 1}
+    assert events == ["gate", "switch", "shared"]
+    assert switch.calls == 1
+    assert switch.commits == [1]
+    assert down.calls == 0
+    assert block.stock_calls == 0
+
+
+def test_deepseek_v4_q8_ffn_hc_post_iqk_block_engages_structurally(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, block, shared, down, switch, events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+    ffn_before = dsv4_runtime.q8_ffn_hc_post_call_counts()
+
+    out = layer(mx.ones((1, 1, 4, 16), dtype=mx.float32))
+    mx.eval(out)
+
+    ffn_after = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert out.dtype == mx.float32
+    assert out.shape == (1, 1, 4, 16)
+    assert calls == {"attention": 1, "ffn": 1}
+    assert events == ["gate", "switch", "shared"]
+    assert switch.calls == 1
+    assert shared.calls == 1
+    assert down.calls == 0
+    assert block.stock_calls == 0
+    assert layer.hc_post_calls == 0
+    assert layer.original_calls == 0
+    assert ffn_after["engaged"] == ffn_before["engaged"] + 1
+    assert ffn_after["fallback"] == ffn_before["fallback"]
+    assert ffn_after["delegated"] == ffn_before["delegated"]
+    assert model._moespresso_dsv4_q8_ffn_hc_post_enabled is True
+    assert model._moespresso_dsv4_q8_ffn_hc_post_layers == 1
+    assert block._moespresso_dsv4_q8_ffn_hc_post_eligible
+    assert shared.down_proj._moespresso_dsv4_q8_ffn_hc_post_eligible
+    assert type(block).__dict__.get(
+        "_moespresso_dsv4_q8_ffn_hc_post_wrapped", False)
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
+def test_deepseek_v4_q8_ffn_hc_post_iqk_block_falls_back_and_delegates(
+        monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    calls = _configure_q8_ffn_hc_post(monkeypatch, mx, kq)
+    model, layer, _attn, _block, shared, down, switch, events = (
+        _q8_iqk_ffn_hc_model_fixture(mx)
+    )
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    assert _patch_deepseek_v4_q8_hc_post(model) == 1
+    assert _patch_deepseek_v4_q8_ffn_hc_post(model) == 1
+    monkeypatch.setattr(
+        dsv4_runtime,
+        "_deepseek_v4_q8_ffn_hc_post_eligible",
+        lambda *args, **kwargs: False,
+    )
+    ffn_before = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    decode = mx.ones((1, 1, 4, 16), dtype=mx.float32)
+
+    out = layer(decode)
+    mx.eval(out)
+
+    ffn_after = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert out.dtype == mx.float32
+    assert calls == {"attention": 1, "ffn": 0}
+    assert events == ["gate", "switch", "shared", "down_fallback"]
+    assert switch.calls == 1
+    assert shared.calls == 1
+    assert down.calls == 1
+    assert layer.hc_post_calls == 1
+    assert ffn_after["fallback"] == ffn_before["fallback"] + 1
+    assert ffn_after["engaged"] == ffn_before["engaged"]
+
+    delegated = layer(mx.ones((1, 2, 4, 16), dtype=mx.float32))
+    mx.eval(delegated)
+    ffn_delegated = dsv4_runtime.q8_ffn_hc_post_call_counts()
+    assert layer.original_calls == 1
+    assert ffn_delegated["delegated"] == ffn_after["delegated"] + 1
+
+    shared.raise_on_call = True
+    with pytest.raises(RuntimeError, match="shared expert failed"):
+        layer(decode)
+    assert dsv4_runtime._DSV4_Q8_HC_POST_CONTEXT.get() is None
+    assert dsv4_runtime._DSV4_Q8_FFN_HC_POST_CONTEXT.get() is None
+
+
 def test_deepseek_v4_q8_affine_views_match_wire_lattice():
     mx = pytest.importorskip("mlx.core")
     kq = pytest.importorskip("mlx_kquant")
@@ -494,6 +1542,341 @@ def test_deepseek_v4_q8_multi_row_and_kill_switch_stay_on_dequant(monkeypatch):
     mx.eval(out)
     assert out.dtype == mx.float32
     assert calls["dequantize"] == 2
+
+
+def test_deepseek_v4_non_q8_multi_row_takes_the_dequant_bridge(monkeypatch):
+    # The defective kq.quantized_matmul returned wrong values when an
+    # unevaluated row-strided activation view met any multi-row shape in
+    # one call, which is exactly the shape the grouped output projection
+    # produces at prefill and scorer widths on a non-q8_0 dense package
+    # (measured rel error ~1.4 against the dequantized reference). On an
+    # unverified kernel build (the strided-bulk probe reads False) bulk
+    # multi-row calls take the dequant bridge, mirroring the q8_0 split;
+    # single-row decode calls stay on the kernel.
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+    from moespresso.runtime.deepseek_v4.model import _kquant_matmul_ds4_fp32
+
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", False)
+    bridge_before = ds4_model.kquant_bulk_route_call_counts()["bridge"]
+
+    rng = np.random.default_rng(11)
+    dense = mx.array(rng.standard_normal((16, 256), dtype=np.float32))
+    wire, scales = kq.quantize(dense, "q6_k")
+    mx.eval(wire, scales)
+    calls = {"dequantize": 0, "quantized_matmul": 0}
+    real_dequantize = kq.dequantize
+    real_qmm = kq.quantized_matmul
+
+    def spy_dequantize(*args, **kwargs):
+        calls["dequantize"] += 1
+        return real_dequantize(*args, **kwargs)
+
+    def spy_qmm(*args, **kwargs):
+        calls["quantized_matmul"] += 1
+        return real_qmm(*args, **kwargs)
+
+    spy_kq = SimpleNamespace(dequantize=spy_dequantize, quantized_matmul=spy_qmm)
+
+    # The defect shape: a row-slice of the wire and a row-strided slice of
+    # a grouped activation, multi-row.
+    weight_view = wire[8:, :]
+    grouped = mx.array(
+        rng.standard_normal((1, 3, 2, 256), dtype=np.float32)
+    ).astype(mx.bfloat16)
+    x = grouped[:, :, 1, :]
+    out = _kquant_matmul_ds4_fp32(
+        x, weight_view, scales, "q6_k", mx=mx, kq=spy_kq)
+    reference = mx.matmul(
+        mx.contiguous(x).astype(mx.float32).reshape(-1, 256),
+        real_dequantize(
+            mx.contiguous(weight_view), scales, "q6_k", dtype=mx.float32).T,
+    )
+    mx.eval(out, reference)
+    assert calls["dequantize"] == 1
+    assert calls["quantized_matmul"] == 0
+    assert (
+        ds4_model.kquant_bulk_route_call_counts()["bridge"]
+        == bridge_before + 1
+    )
+    np.testing.assert_allclose(
+        np.asarray(out.reshape(-1, 8)), np.asarray(reference),
+        rtol=2.0e-2, atol=2.0e-2)
+
+    # Single-row decode calls keep the kernel.
+    single = mx.array(
+        rng.standard_normal((1, 1, 256), dtype=np.float32))
+    out = _kquant_matmul_ds4_fp32(
+        single, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    mx.eval(out)
+    assert calls["quantized_matmul"] == 1
+    assert calls["dequantize"] == 1
+
+
+def test_deepseek_v4_non_q8_multi_row_kernel_route_when_probe_verified(
+    monkeypatch,
+):
+    # On a verified kernel build (the strided-bulk probe reads True) bulk
+    # verify-shaped tiny multi-row calls go straight to kq.quantized_matmul
+    # with no dequant bridge, while wider (prefill/scorer) calls keep the
+    # bridge: the kernel emits on the bfloat16 lattice and routing every
+    # width through it measured Q2 avg NLL 0.40094 against 0.39634 through
+    # the bridge on the ship artifact. The operands here are dense (correct
+    # on every build), so the value check holds regardless of which
+    # mlx-kquant is installed; the bit-level strided pins live in the
+    # mlx-kquant suite beside the fix.
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+    from moespresso.runtime.deepseek_v4.model import _kquant_matmul_ds4_fp32
+
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
+    counts_before = ds4_model.kquant_bulk_route_call_counts()
+
+    rng = np.random.default_rng(11)
+    dense = mx.array(rng.standard_normal((16, 256), dtype=np.float32))
+    wire, scales = kq.quantize(dense, "q6_k")
+    mx.eval(wire, scales)
+    calls = {"dequantize": 0, "quantized_matmul": 0}
+    real_dequantize = kq.dequantize
+    real_qmm = kq.quantized_matmul
+
+    def spy_dequantize(*args, **kwargs):
+        calls["dequantize"] += 1
+        return real_dequantize(*args, **kwargs)
+
+    def spy_qmm(*args, **kwargs):
+        calls["quantized_matmul"] += 1
+        return real_qmm(*args, **kwargs)
+
+    spy_kq = SimpleNamespace(dequantize=spy_dequantize, quantized_matmul=spy_qmm)
+
+    x = mx.array(rng.standard_normal((1, 3, 256), dtype=np.float32)).astype(
+        mx.bfloat16)
+    mx.eval(x)
+    out = _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    reference = mx.matmul(
+        x.astype(mx.float32).reshape(-1, 256),
+        real_dequantize(wire, scales, "q6_k", dtype=mx.float32).T,
+    )
+    mx.eval(out, reference)
+    assert calls["quantized_matmul"] == 1
+    assert calls["dequantize"] == 0
+    np.testing.assert_allclose(
+        np.asarray(out.astype(mx.float32).reshape(-1, 16)),
+        np.asarray(reference),
+        rtol=2.0e-2, atol=2.0e-2)
+
+    # Wider than the tiny-M cap: the bridge stays engaged under auto.
+    wide = mx.array(rng.standard_normal((1, 16, 256), dtype=np.float32)).astype(
+        mx.bfloat16)
+    mx.eval(wide)
+    out = _kquant_matmul_ds4_fp32(wide, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    mx.eval(out)
+    assert calls["quantized_matmul"] == 1
+    assert calls["dequantize"] == 1
+    counts_after = ds4_model.kquant_bulk_route_call_counts()
+    assert counts_after["kernel"] == counts_before["kernel"] + 1
+    assert counts_after["bridge"] == counts_before["bridge"] + 1
+
+
+def test_deepseek_v4_kquant_bulk_route_env_overrides(monkeypatch):
+    # `bridge` forces the dequant bridge even on a verified build; unknown
+    # values refuse rather than guess.
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+    from moespresso.runtime.deepseek_v4.model import (
+        DeepseekV4RuntimeLoadError,
+        _kquant_matmul_ds4_fp32,
+    )
+
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
+
+    rng = np.random.default_rng(11)
+    dense = mx.array(rng.standard_normal((16, 256), dtype=np.float32))
+    wire, scales = kq.quantize(dense, "q6_k")
+    mx.eval(wire, scales)
+    calls = {"dequantize": 0, "quantized_matmul": 0}
+
+    def spy_dequantize(*args, **kwargs):
+        calls["dequantize"] += 1
+        return kq.dequantize(*args, **kwargs)
+
+    def spy_qmm(*args, **kwargs):
+        calls["quantized_matmul"] += 1
+        return kq.quantized_matmul(*args, **kwargs)
+
+    spy_kq = SimpleNamespace(dequantize=spy_dequantize, quantized_matmul=spy_qmm)
+    x = mx.array(rng.standard_normal((1, 3, 256), dtype=np.float32)).astype(
+        mx.bfloat16)
+    mx.eval(x)
+
+    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "bridge")
+    out = _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    mx.eval(out)
+    assert calls["dequantize"] == 1
+    assert calls["quantized_matmul"] == 0
+
+    # `kernel` forces the kernel route at any bulk width on a verified
+    # build (the instrument arm behind the bounding Q2 reading).
+    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "kernel")
+    wide = mx.array(rng.standard_normal((1, 16, 256), dtype=np.float32)).astype(
+        mx.bfloat16)
+    mx.eval(wide)
+    out = _kquant_matmul_ds4_fp32(wide, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    mx.eval(out)
+    assert calls["quantized_matmul"] == 1
+    assert calls["dequantize"] == 1
+
+    # A forced kernel route on an unverified build refuses.
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", False)
+    with pytest.raises(DeepseekV4RuntimeLoadError):
+        _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
+
+    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "kernel-please")
+    with pytest.raises(DeepseekV4RuntimeLoadError):
+        _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
+
+
+def test_kquant_bulk_route_counters_reach_all_three_census_surfaces(monkeypatch):
+    """A counter on one surface defeats a census-gated instrument.
+
+    The bulk-route arms read `kquant_bulk_route_call_counts`,
+    `ssd_streaming_stats`, and the speed-stats count keys interchangeably,
+    so a route counter that exists on only one of them reports no arm
+    difference on the other two.
+    """
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+    from moespresso.runtime.deepseek_v4.model import _kquant_matmul_ds4_fp32
+    from moespresso.runtime.deepseek_v4.speed_stats import _COUNT_KEYS
+    from moespresso.runtime.ssd_streaming_build import ssd_streaming_stats
+
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
+    before = ssd_streaming_stats(_WrappedModel([]))
+
+    rng = np.random.default_rng(17)
+    dense = mx.array(rng.standard_normal((16, 256), dtype=np.float32))
+    wire, scales = kq.quantize(dense, "q6_k")
+    # A verify-shaped tiny multi-row call takes the kernel route under auto;
+    # a prefill-width call takes the dequant bridge. One of each moves both
+    # counters, so neither pin below can pass on an untouched zero.
+    tiny = mx.array(
+        rng.standard_normal((1, 3, 256), dtype=np.float32)).astype(mx.bfloat16)
+    wide = mx.array(
+        rng.standard_normal((1, 16, 256), dtype=np.float32)).astype(mx.bfloat16)
+    mx.eval(wire, scales, tiny, wide)
+    mx.eval(_kquant_matmul_ds4_fp32(tiny, wire, scales, "q6_k", mx=mx, kq=kq))
+    mx.eval(_kquant_matmul_ds4_fp32(wide, wire, scales, "q6_k", mx=mx, kq=kq))
+
+    counts = ds4_model.kquant_bulk_route_call_counts()
+    census = ssd_streaming_stats(_WrappedModel([]))
+    for route, census_key in (
+        ("kernel", "kquant_bulk_kernel_calls"),
+        ("bridge", "kquant_bulk_bridge_calls"),
+    ):
+        assert census[census_key] == counts[route], census_key
+        assert census_key in _COUNT_KEYS, census_key
+        assert census[census_key] == before[census_key] + 1, census_key
+
+
+def test_deepseek_v4_kquant_strided_bulk_probe_caches(monkeypatch):
+    # The probe runs the recorded defect pair once against the installed
+    # kernel, returns a bool, and caches the verdict for the process; a
+    # second call must not touch the kernel again.
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+
+    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", None)
+    verdict = ds4_model._dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq)
+    assert isinstance(verdict, bool)
+
+    def explode(*args, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("probe re-ran after caching")
+
+    poisoned_kq = SimpleNamespace(quantize=explode, quantized_matmul=explode)
+    assert (
+        ds4_model._dsv4_kquant_strided_bulk_fixed(mx=mx, kq=poisoned_kq)
+        is verdict
+    )
+
+
+def test_deepseek_v4_q8_tiny_m_qmm_engages_at_declared_site(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    from moespresso.runtime.deepseek_v4.model import (
+        _deepseek_v4_q8_affine_views,
+        _kquant_matmul_ds4_fp32,
+        q8_dense_matmul_call_counts,
+    )
+
+    module = _real_q8_module(kq, mx, out_dims=32, in_dims=128, seed=51)
+    affine = _deepseek_v4_q8_affine_views(module, mx=mx)
+    x = mx.array(np.random.default_rng(52).standard_normal(
+        (1, 6, 128), dtype=np.float32))
+
+    # Tiny multi-row calls at the declared site take the affine QMM.
+    before = q8_dense_matmul_call_counts()
+    tiny_out = _kquant_matmul_ds4_fp32(
+        x, module["weight"], module["scales"], "q8_0",
+        mx=mx, kq=kq, affine=affine, wire_decode_site="wo_b",
+        tiny_m_site="wo_b",
+    )
+    reference = mx.matmul(
+        x.astype(mx.float32),
+        kq.dequantize(
+            module["weight"], module["scales"], "q8_0", dtype=mx.float32).T,
+    )
+    mx.eval(tiny_out, reference)
+    after = q8_dense_matmul_call_counts()
+    assert after["tiny_m_qmm_wo_b"] == before["tiny_m_qmm_wo_b"] + 1
+    assert after["prefill_dequant"] == before["prefill_dequant"]
+    assert tiny_out.dtype == mx.float32
+    # The affine repack reproduces the q8_0 lattice exactly, so the route
+    # differs from the dequant bridge only in float32 accumulation order.
+    np.testing.assert_allclose(
+        np.asarray(tiny_out), np.asarray(reference), rtol=1.0e-5, atol=1.0e-5)
+
+    # Undeclared sites, rows past the cap, the cap kill switch, and the
+    # family switch all keep the dequant bridge.
+    for kwargs, env_max, family in (
+        (dict(), None, True),
+        (dict(tiny_m_site="wq_b"), None, True),
+        (dict(tiny_m_site="wo_b"), "0", True),
+        (dict(tiny_m_site="wo_b"), None, False),
+    ):
+        if env_max is not None:
+            monkeypatch.setenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", env_max)
+        else:
+            monkeypatch.delenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", raising=False)
+        monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", family)
+        before = q8_dense_matmul_call_counts()
+        out = _kquant_matmul_ds4_fp32(
+            x, module["weight"], module["scales"], "q8_0",
+            mx=mx, kq=kq, affine=affine, **kwargs,
+        )
+        mx.eval(out)
+        after = q8_dense_matmul_call_counts()
+        assert after["prefill_dequant"] == before["prefill_dequant"] + 1
+        assert after["tiny_m_qmm_wo_b"] == before["tiny_m_qmm_wo_b"]
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", True)
+
+    wide = mx.array(np.random.default_rng(53).standard_normal(
+        (1, 9, 128), dtype=np.float32))
+    before = q8_dense_matmul_call_counts()
+    out = _kquant_matmul_ds4_fp32(
+        wide, module["weight"], module["scales"], "q8_0",
+        mx=mx, kq=kq, affine=affine, tiny_m_site="wo_b",
+    )
+    mx.eval(out)
+    after = q8_dense_matmul_call_counts()
+    assert after["prefill_dequant"] == before["prefill_dequant"] + 1
+    assert after["tiny_m_qmm_wo_b"] == before["tiny_m_qmm_wo_b"]
 
 
 @pytest.mark.parametrize(
@@ -723,7 +2106,7 @@ def _real_wo_a_attention_fixture(kq, mx, *, groups=2, rank=4, group_feat=64,
     return attn
 
 
-def test_deepseek_v4_wo_a_multi_row_takes_group_loop():
+def test_deepseek_v4_wo_a_multi_row_routes_by_tiny_m_cap(monkeypatch):
     mx = pytest.importorskip("mlx.core")
     kq = pytest.importorskip("mlx_kquant")
     from moespresso.runtime.deepseek_v4.model import (
@@ -734,16 +2117,83 @@ def test_deepseek_v4_wo_a_multi_row_takes_group_loop():
     model = _WrappedModel([_AttentionLayer(attn)])
     assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
 
-    # Multi-row (prefill-shaped) calls take the per-group loop; the
-    # single-dispatch forms are decode-only.
+    # Tiny multi-row (verify-shaped) calls take the batched tiny-M form;
+    # the decode single-dispatch forms stay row-one only.
     before = wo_a_projection_call_counts()
     out = attn._grouped_output_projection(
         mx.zeros((1, 3, 128), dtype=mx.bfloat16))
     mx.eval(out)
     after = wo_a_projection_call_counts()
-    assert after["loop"] == before["loop"] + 1
+    assert after["batched_tiny_m"] == before["batched_tiny_m"] + 1
+    assert after["loop"] == before["loop"]
     assert after["batched_decode"] == before["batched_decode"]
     assert after["gather_decode"] == before["gather_decode"]
+
+    # Rows past the cap take the per-group loop (bulk prefill contract).
+    before = after
+    out = attn._grouped_output_projection(
+        mx.zeros((1, 9, 128), dtype=mx.bfloat16))
+    mx.eval(out)
+    after = wo_a_projection_call_counts()
+    assert after["loop"] == before["loop"] + 1
+    assert after["batched_tiny_m"] == before["batched_tiny_m"]
+
+    # The tiny-M cap env is a live kill switch.
+    monkeypatch.setenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", "0")
+    before = after
+    out = attn._grouped_output_projection(
+        mx.zeros((1, 3, 128), dtype=mx.bfloat16))
+    mx.eval(out)
+    after = wo_a_projection_call_counts()
+    assert after["loop"] == before["loop"] + 1
+    assert after["batched_tiny_m"] == before["batched_tiny_m"]
+
+    # The family switch closes the tiny-M form with the QMV family.
+    monkeypatch.delenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", raising=False)
+    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
+    before = after
+    out = attn._grouped_output_projection(
+        mx.zeros((1, 3, 128), dtype=mx.bfloat16))
+    mx.eval(out)
+    after = wo_a_projection_call_counts()
+    assert after["loop"] == before["loop"] + 1
+    assert after["batched_tiny_m"] == before["batched_tiny_m"]
+
+
+def test_deepseek_v4_wo_a_tiny_m_matches_loop_bridge(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    kq = pytest.importorskip("mlx_kquant")
+    from moespresso.runtime.deepseek_v4.model import (
+        wo_a_projection_call_counts,
+    )
+
+    attn = _real_wo_a_attention_fixture(kq, mx, seed=61)
+    model = _WrappedModel([_AttentionLayer(attn)])
+    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
+    rng = np.random.default_rng(62)
+    hidden = mx.array(rng.standard_normal((1, 6, 128), dtype=np.float32))
+
+    # Reference arm: the per-group loop on the float32 dequant bridge.
+    before = wo_a_projection_call_counts()
+    monkeypatch.setenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", "0")
+    reference = attn._grouped_output_projection(hidden)
+    mx.eval(reference)
+    monkeypatch.delenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", raising=False)
+    after_loop = wo_a_projection_call_counts()
+    assert after_loop["loop"] == before["loop"] + 1
+
+    tiny_out = attn._grouped_output_projection(hidden)
+    mx.eval(tiny_out)
+    after_tiny = wo_a_projection_call_counts()
+    assert after_tiny["batched_tiny_m"] == after_loop["batched_tiny_m"] + 1
+
+    assert tiny_out.dtype == mx.float32
+    assert tiny_out.shape == reference.shape
+    # The affine repack reproduces the q8_0 lattice exactly, so the tiny
+    # form differs from the loop's dequant bridge only in float32
+    # accumulation order.
+    np.testing.assert_allclose(
+        np.asarray(tiny_out), np.asarray(reference), rtol=1.0e-5, atol=1.0e-5)
 
 
 def test_deepseek_v4_wo_a_gather_decode_engages_and_bounds_drift(monkeypatch):
@@ -1255,6 +2705,8 @@ def test_deepseek_v4_prefill_candidate_counters_export_via_streaming_stats():
         affine_wo_fp32_call_counts,
         banded_prefill_call_counts,
         q8_dense_matmul_call_counts,
+        q8_ffn_hc_post_call_counts,
+        q8_hc_post_call_counts,
         wo_a_projection_call_counts,
     )
 
@@ -1264,6 +2716,8 @@ def test_deepseek_v4_prefill_candidate_counters_export_via_streaming_stats():
     wo_a_counts = wo_a_projection_call_counts()
     banded_counts = banded_prefill_call_counts()
     q8_dense_counts = q8_dense_matmul_call_counts()
+    q8_hc_post_counts = q8_hc_post_call_counts()
+    q8_ffn_hc_post_counts = q8_ffn_hc_post_call_counts()
     affine_wo_counts = affine_wo_fp32_call_counts()
     assert stats["r4_prefill_scores_f16_calls"] == scores_counts["f16"]
     assert stats["r4_prefill_scores_f32_calls"] == scores_counts["f32"]
@@ -1282,6 +2736,16 @@ def test_deepseek_v4_prefill_candidate_counters_export_via_streaming_stats():
         q8_dense_counts["decode_wire_qmv_lm_head"])
     assert stats["q8_dense_prefill_dequant_calls"] == (
         q8_dense_counts["prefill_dequant"])
+    assert stats["q8_hc_post_engaged_calls"] == q8_hc_post_counts["engaged"]
+    assert stats["q8_hc_post_fallback_calls"] == q8_hc_post_counts["fallback"]
+    assert stats["q8_hc_post_delegated_calls"] == (
+        q8_hc_post_counts["delegated"])
+    assert stats["q8_ffn_hc_post_engaged_calls"] == (
+        q8_ffn_hc_post_counts["engaged"])
+    assert stats["q8_ffn_hc_post_fallback_calls"] == (
+        q8_ffn_hc_post_counts["fallback"])
+    assert stats["q8_ffn_hc_post_delegated_calls"] == (
+        q8_ffn_hc_post_counts["delegated"])
     assert stats["affine_wo_fp32_wo_a_calls"] == affine_wo_counts["wo_a"]
     assert stats["affine_wo_fp32_wo_b_calls"] == affine_wo_counts["wo_b"]
     assert stats["affine_wo_fp32_delegated_calls"] == (
@@ -1829,6 +3293,56 @@ def test_deepseek_v4_default_pooled_loader_seeds_residency(
     }
     assert calls[1][0] == "install_pooled"
     assert calls[2] == ("seed", model, tmp_path)
+
+
+def test_deepseek_v4_iqk_manifest_uses_default_pool_and_seeds_residency(
+    tmp_path,
+    monkeypatch,
+):
+    _touch_shard(tmp_path)
+    import moespresso.runtime.deepseek_v4.iqk_experts as iqk
+    import moespresso.runtime.ssd_streaming_build as streaming
+
+    model = _Model()
+    calls = []
+
+    def install_pooled_switchglus(*args, **kwargs):
+        calls.append(("install_pooled", args, kwargs))
+        return 1
+
+    def seed_expert_residency(model_arg, package_dir):
+        calls.append(("seed", model_arg, package_dir))
+        return {"source": "all-default", "path": None, "seeded": 256}
+
+    def resident_iqk_installer(*_args, **_kwargs):
+        raise AssertionError("the resident-only IQ_K installer must not run")
+
+    monkeypatch.setattr(streaming, "install_pooled_switchglus",
+                        install_pooled_switchglus)
+    monkeypatch.setattr(streaming, "seed_expert_residency",
+                        seed_expert_residency)
+    monkeypatch.setattr(iqk, "install_deepseek_v4_iqk_experts",
+                        resident_iqk_installer)
+
+    result = load_deepseek_v4_package_model(
+        _iqk_expert_manifest(),
+        tmp_path,
+        load_config_fn=lambda _path: {"model_type": "deepseek_v4"},
+        load_skeleton_fn=lambda _path, **kwargs: (
+            model, kwargs["model_config"]),
+        load_tokenizer_fn=lambda _path: "TOK",
+        load_shard_fn=lambda _path: {
+            "embed.weight": "E",
+            "layers.0.ffn.experts.tq_bundle": "BUNDLE",
+        },
+        expert_index_fn=lambda _path: _ExpertIndex(),
+        read_jang_config_fn=lambda _path: {"mxtq_seed": 123},
+        capacity_per_layer=256,
+    )
+
+    assert result == (model, "TOK")
+    assert calls[0][0] == "install_pooled"
+    assert calls[1] == ("seed", model, tmp_path)
 
 
 def test_deepseek_v4_pooled_bundle_installer_wraps_moe_by_default(

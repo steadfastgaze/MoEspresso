@@ -115,6 +115,40 @@ def test_duplicate_parameter_raises():
         parse_dsml_tool_calls(_block(_invoke("grep", params)))
 
 
+def test_parameter_opened_before_the_previous_closes_raises():
+    # Without the check the non-greedy value grammar would close the first
+    # parameter on the second one's closer, merging both parameters into one
+    # argument and shipping a call that lost an argument silently.
+    params = (
+        f'<{T}parameter name="path" string="true">page.html\n'
+        f'<{T}parameter name="content" string="true">hello</{T}parameter>'
+    )
+    with pytest.raises(ToolCallParseError, match="before its own closer"):
+        parse_dsml_tool_calls(_block(_invoke("write", params)))
+
+
+def test_parameter_open_marker_quoted_mid_line_stays_value_text():
+    # The discriminator is the line-start rule: a marker that does not begin
+    # a line is text a value may quote, so a value documenting the dialect
+    # survives unchanged.
+    quoted = f'Open a value with <{T}parameter name="k" string="true">, then close it.'
+    calls = parse_dsml_tool_calls(_block(_invoke("write", _param("content", quoted))))
+    assert calls[0].arguments == {"content": quoted}
+
+
+def test_parameter_open_marker_at_column_zero_in_a_value_is_rejected():
+    # The stated ambiguity: a value whose own content documents the dialect
+    # at column zero is indistinguishable from a real nested open, and the
+    # chosen resolution is rejection rather than a merged argument.
+    documented = (
+        "The parameter element looks like this:\n"
+        f'<{T}parameter name="k" string="true">value</{T}parameter>'
+    )
+    with pytest.raises(ToolCallParseError, match="before its own closer"):
+        parse_dsml_tool_calls(
+            _block(_invoke("write", _param("content", documented))))
+
+
 def test_stray_text_between_invokes_raises():
     content = _block(_invoke("grep", _param("pattern", "a")) + "\nleftover junk")
     with pytest.raises(ToolCallParseError, match="unparsed text"):

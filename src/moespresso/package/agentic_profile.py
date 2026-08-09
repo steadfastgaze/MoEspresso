@@ -52,14 +52,23 @@ SCHEMA_VERSION = 1
 # Profiles of record, keyed by architecture family. Values come from the
 # named evidence records and change only with a new recorded study.
 _FAMILY_PROFILES: dict[str, dict] = {
-    # Ornith: the dialect study's golden form, validated end to end at this
-    # sampling shape (15 of 15 with repair; the quoting malformation class
-    # is fully salvaged and a nonzero failed count is the alarm).
+    # Ornith: the native dialect is the XML the vendored template teaches.
+    # A structural emission battery over write-shaped calls with 4-45 KB
+    # parameter values measures it clean on every artifact scored, with no
+    # structural defect and no strict-parse rejection. Teaching DSML
+    # in-context instead drops the closing quote of the parameter open tag
+    # on most parameter opens, at the open tag rather than deep in a long
+    # value, and yields no usable call through parse plus repair. An
+    # unquantized reference of the same model fails the same way, so the
+    # dialect is the cause and the quantization level is not. Repair is
+    # precautionary rather than load-bearing: it has nothing to fix in the
+    # native emissions and cannot rescue the DSML ones. The sampling and
+    # re-prompt values carry over from the loop study that recorded them.
     "qwen3_5_moe": {
         "schema_version": SCHEMA_VERSION,
         "family": "qwen3_5_moe",
-        "dialect": "dsml",
-        "repair": {"required": True},
+        "dialect": "native",
+        "repair": {"required": False},
         "thinking_for_tools": False,
         "reprompt": {"enabled": True, "limit": 1},
         "sampling": {

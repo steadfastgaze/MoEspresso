@@ -79,8 +79,8 @@ def is_routed_expert_payload_key(key: str) -> bool:
 def non_routed_payload_bytes(package_dir: str | Path) -> int:
     """Payload bytes that the SSD runtime keeps resident at startup.
 
-    This is header-only and deliberately excludes routed expert TQ stacks, which
-    are represented by the slot pools instead of resident model parameters.
+    This is header-only and deliberately excludes routed expert bundle tensors,
+    which are represented by slot pools instead of resident model parameters.
     """
     total = 0
     for shard in sorted(Path(package_dir).glob("model-*.safetensors")):

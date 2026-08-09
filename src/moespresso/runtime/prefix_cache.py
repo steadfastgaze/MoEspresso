@@ -1,15 +1,17 @@
-"""Raw in-memory prefix reuse.
+"""Memory and disk prefix reuse with producer-specific cache state.
 
-This module owns MoEspresso's cache policy glue. It stays import-light: MLX cache classes
-are only imported by the factory helpers used from the serve edge.
+This module owns MoEspresso's cache policy glue, memory producer rails, durable
+target restores, and optional DSpark companions. It stays import-light: MLX
+cache classes are imported only by factory helpers used from the serve edge.
 """
 
 from __future__ import annotations
 
 import copy
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from moespresso.runtime.generation import ContextLimitError, GenerationResult
 from moespresso.runtime.kv_policy import (
@@ -24,6 +26,11 @@ from moespresso.runtime.serve import generate_with_metadata
 
 
 DEFAULT_CONTEXT_LIMIT = 128 * 1024
+
+# The existing prompt-cache API always reads and writes this producer rail.
+# Math-affecting generation paths use another hashable identity and therefore
+# cannot reuse a cache produced on the plain path.
+PLAIN_CACHE_RAIL = ("plain",)
 
 
 def encode_rendered_prompt(tokenizer, rendered_prompt: str) -> list[int]:
@@ -159,7 +166,47 @@ def _common_prefix_len(a: tuple, b: tuple) -> int:
 @dataclass
 class _StoreEntry:
     prompt_cache: Any
+    companion: Any
     nbytes: int
+
+
+@dataclass(frozen=True)
+class CacheProbe:
+    """Read-only result of selecting one producer rail's reusable depth."""
+
+    kind: Literal["miss", "exact", "shorter", "trim"]
+    cached_tokens: int
+    has_companion: bool
+
+
+@dataclass(frozen=True)
+class _CacheSelection:
+    probe: CacheProbe
+    store_key: tuple | None = None
+    trim_tokens: int = 0
+
+
+def _companion_nbytes(companion: Any, declared_nbytes: int | None) -> int:
+    """Resolve the resident bytes of an opaque cache companion."""
+    if companion is None:
+        if declared_nbytes not in (None, 0):
+            raise ValueError("companion_nbytes requires a companion payload")
+        return 0
+
+    value = declared_nbytes
+    if value is None:
+        value = getattr(companion, "nbytes", None)
+        if value is None:
+            raise TypeError(
+                "cache companion must expose nbytes or declare companion_nbytes"
+            )
+        if callable(value):
+            value = value()
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("companion_nbytes must be an integer")
+    if value < 0:
+        raise ValueError("companion_nbytes must be non-negative")
+    return value
 
 
 class PromptCacheStore:
@@ -190,10 +237,20 @@ class PromptCacheStore:
     - ``max_bytes`` evicts least-recently-inserted entries, so resident
       cache memory is boundable for any family.
 
-    A stored key that extends the request still serves a trimmed deep copy
+    Entries also carry a producer rail. The legacy API uses the plain rail;
+    generation paths with different numerical histories use distinct hashable
+    identities. Lookup, move, strict-prefix supersession, and trim candidate
+    selection never cross rails. The entry and byte limits remain global hard
+    bounds across all rails.
+
+    An enhanced API can move an opaque companion together with its target
+    cache. Companion tensor bytes count toward ``max_bytes`` through either a
+    payload ``nbytes`` attribute or an explicit declaration. A stored key that
+    extends the request still serves a trimmed deep copy
     when every cache in the entry is trimmable (the stock mlx-lm branch
-    behavior); untrimmable caches fall through to the shorter entry or a
-    miss.
+    behavior). Its companion stays with the untrimmed stored entry because the
+    generic store cannot trim opaque state. Untrimmable caches fall through to
+    the shorter entry or a miss.
     """
 
     def __init__(
@@ -251,12 +308,30 @@ class PromptCacheStore:
         returned as-is; the caller mutates it in place and reinserts it
         under the extended key after generation.
         """
-        tokens = list(tokens)
+        prompt_cache, suffix_tokens, _ = self.fetch_nearest_cache_with_companion(
+            model,
+            tokens,
+        )
+        return prompt_cache, suffix_tokens
+
+    def _select_nearest_cache(
+        self,
+        model: Any,
+        tokens: list,
+        *,
+        producer_rail: Any,
+    ) -> _CacheSelection:
+        """Select one rail's fetch result without moving or copying it."""
+        try:
+            hash(producer_rail)
+        except TypeError as e:
+            raise TypeError("cache producer rail must be hashable") from e
+
         target = tuple(tokens)
         exact = None
         shorter = None
-        for entry_model, key in self._entries:
-            if entry_model != model:
+        for entry_rail, entry_model, key in self._entries:
+            if entry_rail != producer_rail or entry_model != model:
                 continue
             if key == target:
                 exact = key
@@ -264,28 +339,92 @@ class PromptCacheStore:
                 if shorter is None or len(key) > len(shorter):
                     shorter = key
         if exact is not None:
-            return self._pop_entry((model, exact)).prompt_cache, []
+            store_key = (producer_rail, model, exact)
+            entry = self._entries[store_key]
+            return _CacheSelection(
+                CacheProbe("exact", len(target), entry.companion is not None),
+                store_key,
+            )
 
         short_len = len(shorter) if shorter is not None else 0
         best_longer = None
         best_common = short_len
-        for entry_model, key in self._entries:
-            if entry_model != model or len(key) <= len(target):
+        for entry_rail, entry_model, key in self._entries:
+            if (
+                entry_rail != producer_rail
+                or entry_model != model
+                or len(key) <= len(target)
+            ):
                 continue
             common = _common_prefix_len(key, target)
             if common > best_common:
                 best_longer, best_common = key, common
         if best_longer is not None:
-            entry = self._entries[(model, best_longer)]
+            store_key = (producer_rail, model, best_longer)
+            entry = self._entries[store_key]
             if self._can_trim(entry.prompt_cache):
-                cache = copy.deepcopy(entry.prompt_cache)
                 prefix = min(len(target) - 1, best_common)
-                self._trim(cache, len(best_longer) - prefix)
-                return cache, tokens[prefix:]
+                return _CacheSelection(
+                    CacheProbe("trim", prefix, False),
+                    store_key,
+                    len(best_longer) - prefix,
+                )
 
         if shorter is not None:
-            return self._pop_entry((model, shorter)).prompt_cache, tokens[short_len:]
-        return None, tokens
+            store_key = (producer_rail, model, shorter)
+            entry = self._entries[store_key]
+            return _CacheSelection(
+                CacheProbe("shorter", short_len, entry.companion is not None),
+                store_key,
+            )
+        return _CacheSelection(CacheProbe("miss", 0, False))
+
+    def probe_nearest_cache(
+        self,
+        model: Any,
+        tokens: list,
+        *,
+        producer_rail: Any = PLAIN_CACHE_RAIL,
+    ) -> CacheProbe:
+        """Report one rail's reusable depth without changing store residency."""
+        return self._select_nearest_cache(
+            model,
+            list(tokens),
+            producer_rail=producer_rail,
+        ).probe
+
+    def fetch_nearest_cache_with_companion(
+        self,
+        model: Any,
+        tokens: list,
+        *,
+        producer_rail: Any = PLAIN_CACHE_RAIL,
+    ) -> tuple[Any, list, Any]:
+        """Move the nearest target cache and its companion from one rail.
+
+        Exact and shorter-prefix hits move the stored pair. A longer-prefix
+        trim hit returns a target-cache copy and no companion, leaving the
+        original pair in the store at its unchanged frontier.
+        """
+        tokens = list(tokens)
+        selection = self._select_nearest_cache(
+            model,
+            tokens,
+            producer_rail=producer_rail,
+        )
+        if selection.probe.kind == "miss":
+            return None, tokens, None
+        if selection.probe.kind == "trim":
+            entry = self._entries[selection.store_key]
+            cache = copy.deepcopy(entry.prompt_cache)
+            self._trim(cache, selection.trim_tokens)
+            return cache, tokens[selection.probe.cached_tokens:], None
+        entry = self._pop_entry(selection.store_key)
+        return (
+            entry.prompt_cache,
+            tokens[selection.probe.cached_tokens:],
+            entry.companion,
+        )
 
     def insert_cache(self, model: Any, tokens: list, prompt_cache: Any) -> None:
         """Publish a generated-through cache under its full token key.
@@ -294,24 +433,55 @@ class PromptCacheStore:
         trimmability: the longer chain supersedes them, and a later branch
         from one of those prefixes is served by the disk frontier path.
         """
+        self.insert_cache_with_companion(model, tokens, prompt_cache)
+
+    def insert_cache_with_companion(
+        self,
+        model: Any,
+        tokens: list,
+        prompt_cache: Any,
+        *,
+        producer_rail: Any = PLAIN_CACHE_RAIL,
+        companion: Any = None,
+        companion_nbytes: int | None = None,
+    ) -> bool:
+        """Publish a pair and report whether it survives global eviction."""
+        try:
+            hash(producer_rail)
+        except TypeError as e:
+            raise TypeError("cache producer rail must be hashable") from e
+        if producer_rail == PLAIN_CACHE_RAIL and companion is not None:
+            raise ValueError("the plain cache rail cannot carry a companion")
+
         key = tuple(tokens)
+        cache_nbytes = sum(int(c.nbytes) for c in prompt_cache)
+        payload_nbytes = _companion_nbytes(companion, companion_nbytes)
         entry = _StoreEntry(
-            prompt_cache, sum(int(c.nbytes) for c in prompt_cache))
-        previous = self._entries.pop((model, key), None)
+            prompt_cache=prompt_cache,
+            companion=companion,
+            nbytes=cache_nbytes + payload_nbytes,
+        )
+        store_key = (producer_rail, model, key)
+        previous = self._entries.pop(store_key, None)
         if previous is not None:
             self._n_bytes -= previous.nbytes
-        self._entries[(model, key)] = entry
+        self._entries[store_key] = entry
         self._n_bytes += entry.nbytes
-        for entry_model, existing in list(self._entries):
-            if entry_model != model or len(existing) >= len(key):
+        for entry_rail, entry_model, existing in list(self._entries):
+            if (
+                entry_rail != producer_rail
+                or entry_model != model
+                or len(existing) >= len(key)
+            ):
                 continue
             if key[:len(existing)] == existing:
-                self._pop_entry((model, existing))
+                self._pop_entry((producer_rail, model, existing))
         while len(self._entries) > self.max_size:
             self._evict_oldest()
         if self.max_bytes is not None:
             while self._n_bytes > self.max_bytes and self._entries:
                 self._evict_oldest()
+        return store_key in self._entries
 
 
 def make_prompt_cache_store(max_size: int = 10, max_bytes: int | None = None):
@@ -339,9 +509,51 @@ def _store_nbytes(cache_store) -> int | None:
     return int(value) if value is not None else None
 
 
+@dataclass(frozen=True)
+class _MemoryRoute:
+    """One claimed producer rail chosen without sacrificing cache depth."""
+
+    kind: Literal["plain", "spec", "spec_target"]
+    rail: Any
+    probe: CacheProbe
+
+
+def _choose_memory_route(
+    plain: CacheProbe,
+    speculative: CacheProbe,
+    *,
+    speculative_rail: Any,
+) -> _MemoryRoute | None:
+    """Choose the deepest usable target, using drafting only as a tie-break."""
+    candidates: list[tuple[int, int, _MemoryRoute]] = []
+    if plain.kind in {"shorter", "trim"} and plain.cached_tokens > 0:
+        candidates.append(
+            (
+                plain.cached_tokens,
+                1,
+                _MemoryRoute("plain", PLAIN_CACHE_RAIL, plain),
+            )
+        )
+    # A generic store cannot trim opaque drafter state. Exact entries also
+    # lack the continuation logits needed to generate from an empty suffix.
+    if speculative.kind == "shorter" and speculative.cached_tokens > 0:
+        kind = "spec" if speculative.has_companion else "spec_target"
+        priority = 2 if speculative.has_companion else 0
+        candidates.append(
+            (
+                speculative.cached_tokens,
+                priority,
+                _MemoryRoute(kind, speculative_rail, speculative),
+            )
+        )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
 @dataclass
 class PrefixCacheGenerator:
-    """Generate through an MLX prompt cache when a token prefix is reusable."""
+    """Generate from the deepest safe memory or disk prefix state."""
 
     model: Any
     tokenizer: Any
@@ -354,8 +566,11 @@ class PrefixCacheGenerator:
     disk_registry: Any = None
     # Effective served sequence limit in tokens.
     context_limit: int | None = None
+    clock: Callable[[], float] = time.perf_counter
     _cache_class_names: tuple[str, ...] | None = None
     _closed: bool = False
+    _cold_spec_bypass_logged: bool = False
+    _spec_resume_fallback_logged: bool = False
 
     def _cache_classes(self) -> tuple[str, ...]:
         """The live cache-class layout, built once and reused.
@@ -465,6 +680,203 @@ class PrefixCacheGenerator:
             generate_kwargs["prefill_plan"] = plan
         return writer, generate_kwargs
 
+    def _spec_frontier_writer(
+        self,
+        model_key,
+        full_tokens,
+        cached_tokens,
+        *,
+        served,
+        producer_rail,
+        session_cache_key=None,
+    ):
+        """Build the paired target-plus-DSpark prefill writer, or none."""
+        store = self.disk_store
+        stride = getattr(store, "stride", None) if store is not None else None
+        if store is None or stride is None:
+            return None, {}
+
+        from moespresso.runtime.deepseek_v4.spec_disk_kv import (
+            make_spec_disk_kv_writer,
+        )
+        from moespresso.runtime.disk_kv import build_cache_scope
+        from moespresso.runtime.serve import _model_prefill_step_size
+
+        scope = build_cache_scope(model_key, self._cache_classes())
+        default_step = _model_prefill_step_size(
+            self.model, self.tokenizer, full_tokens
+        )
+        if default_step is None:
+            default_step = 2048
+        try:
+            writer = make_spec_disk_kv_writer(
+                store,
+                scope=scope,
+                full_tokens=list(full_tokens),
+                restored_prefix=cached_tokens,
+                served=served,
+                producer_rail=producer_rail,
+                default_step=default_step,
+                session_cache_key=session_cache_key,
+            )
+        except Exception as e:  # noqa: BLE001 - disk capture is opportunistic
+            log = getattr(store, "_log", None)
+            if log is not None:
+                log(
+                    "[disk_kv] paired checkpoint planning failed; "
+                    f"continuing without writes: {e!r}"
+                )
+            return None, {}
+        if not writer.capture_frontiers:
+            return None, {}
+        generate_kwargs = {
+            "prefill_step_size": default_step,
+            "spec_prefill_progress_callback": writer.on_prefill_progress,
+            "spec_prefill_progress_frontiers": list(writer.capture_frontiers),
+        }
+        if writer.prefill_plan:
+            generate_kwargs["spec_prefill_plan"] = list(writer.prefill_plan)
+        return writer, generate_kwargs
+
+    def _spec_request_engages(
+        self,
+        *,
+        kv_policy: KVPolicy,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        presence_penalty: float | None,
+    ) -> bool:
+        """True when an installed drafter will serve this request.
+
+        Mirrors the generation seam's sampler rule so cache routing can choose
+        a resumable speculative rail, a deeper plain target, or a cold path
+        before the generation function makes the same engagement decision.
+        """
+        served = getattr(self.model, "_moespresso_ds4_drafter", None)
+        if served is None:
+            return False
+        # The generation seam does not admit live KV quantization or an empty
+        # completion budget into the speculative loop. Cache routing must make
+        # the same decision before it selects a producer rail or installs a
+        # speculative-only prefill callback.
+        if kv_policy.live_kv_format != LIVE_KV_RAW or int(max_tokens) < 1:
+            return False
+        from moespresso.runtime.deepseek_v4.spec_serve import spec_sampler_eligible
+
+        return spec_sampler_eligible(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            greedy_only=getattr(
+                getattr(served, "drafter", None), "greedy_only", False
+            ),
+        )
+
+    def _spec_producer_rail(self):
+        """The current request's resumable DSpark rail, or ``None``."""
+        served = getattr(self.model, "_moespresso_ds4_drafter", None)
+        if served is None:
+            return None
+        from moespresso.runtime.deepseek_v4.spec_serve import (
+            spec_cache_producer_rail,
+        )
+
+        return spec_cache_producer_rail(served)
+
+    @staticmethod
+    def _set_spec_publication_status(
+        result: GenerationResult,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if result.speculative is None:
+            return
+        payload = {"status": status}
+        if reason is not None:
+            payload["reason"] = reason
+        result.speculative["cache_publication"] = payload
+
+    def _publish_spec_target(
+        self,
+        *,
+        model_key: tuple,
+        full_tokens: list[int],
+        result: GenerationResult,
+        target_cache,
+        producer_rail,
+        companion=None,
+        declared_frontier: int | None = None,
+    ) -> bool:
+        """Publish one validated speculative-origin target on its own rail."""
+        from moespresso.runtime.disk_kv import caches_shared_offset
+
+        if target_cache is None:
+            self._set_spec_publication_status(
+                result, "skipped", reason="target_cache_missing"
+            )
+            return False
+        frontier = caches_shared_offset(target_cache)
+        if frontier is None:
+            self._set_spec_publication_status(
+                result, "skipped", reason="target_frontier_mismatch"
+            )
+            return False
+        if declared_frontier is not None and frontier != declared_frontier:
+            self._set_spec_publication_status(
+                result, "skipped", reason="declared_frontier_mismatch"
+            )
+            return False
+        timeline = list(full_tokens) + list(result.generated_token_ids)
+        if frontier < len(full_tokens) or frontier > len(timeline):
+            self._set_spec_publication_status(
+                result, "skipped", reason="frontier_outside_public_tokens"
+            )
+            return False
+        companion_drop_reason = None
+        if companion is None and result.speculative is not None:
+            previous = result.speculative.get("cache_publication") or {}
+            companion_drop_reason = previous.get("reason")
+        if companion is not None:
+            if (
+                getattr(companion, "producer_rail", None) != producer_rail
+                or getattr(companion, "frontier", None) != frontier
+            ):
+                companion = None
+                companion_drop_reason = "companion_identity_mismatch"
+        try:
+            retained = self.cache_store.insert_cache_with_companion(
+                model_key,
+                timeline[:frontier],
+                target_cache,
+                producer_rail=producer_rail,
+                companion=companion,
+            )
+        except Exception:  # noqa: BLE001 - cache publication is opportunistic
+            self._set_spec_publication_status(
+                result, "skipped", reason="memory_store_failed"
+            )
+            return False
+        if not retained:
+            self._set_spec_publication_status(
+                result, "skipped", reason="memory_budget"
+            )
+            return False
+        if companion is None:
+            self._set_spec_publication_status(
+                result,
+                "published_target_only",
+                reason=companion_drop_reason,
+            )
+        else:
+            self._set_spec_publication_status(result, "published")
+        return True
+
     def cache_stats(self) -> dict:
         """Small HTTP-facing snapshot of the resident prompt cache.
 
@@ -533,49 +945,298 @@ class PrefixCacheGenerator:
             max_tokens=max_tokens,
         )
 
-        # A streaming transport may commit its response only after all request
-        # and context validation has passed.  This hook intentionally runs
-        # before fetch_nearest_cache because the store hands entries out by
-        # move; a failed socket write must not cost the session its chain.
+        model_key = cache_model_key(self.manifest, effective_rendering_id, kv_policy)
+        spec_engaged = self._spec_request_engages(
+            kv_policy=kv_policy,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+        )
+        spec_rail = self._spec_producer_rail() if spec_engaged else None
+        enhanced_spec = (
+            spec_rail is not None
+            and callable(getattr(self.cache_store, "probe_nearest_cache", None))
+            and callable(
+                getattr(self.cache_store, "fetch_nearest_cache_with_companion", None)
+            )
+            and callable(
+                getattr(self.cache_store, "insert_cache_with_companion", None)
+            )
+        )
+        plain_probe = CacheProbe("miss", 0, False)
+        spec_probe = CacheProbe("miss", 0, False)
+        memory_route = None
+        exact_seen = False
+        if enhanced_spec:
+            plain_probe = self.cache_store.probe_nearest_cache(
+                model_key,
+                full_tokens,
+                producer_rail=PLAIN_CACHE_RAIL,
+            )
+            spec_probe = self.cache_store.probe_nearest_cache(
+                model_key,
+                full_tokens,
+                producer_rail=spec_rail,
+            )
+            memory_route = _choose_memory_route(
+                plain_probe,
+                spec_probe,
+                speculative_rail=spec_rail,
+            )
+            exact_seen = plain_probe.kind == "exact" or spec_probe.kind == "exact"
+
+        # Probe is read-only. Commit a streaming response only after request,
+        # context, and route validation, but before claiming the selected entry
+        # by move. A failed socket write therefore leaves every rail resident.
         if ready_callback is not None:
             ready_callback()
+        ready_at = self.clock()
 
-        model_key = cache_model_key(self.manifest, effective_rendering_id, kv_policy)
-        prompt_cache, suffix_tokens = self.cache_store.fetch_nearest_cache(
-            model_key, full_tokens)
-        suffix_tokens = list(suffix_tokens)
-        cached_tokens = len(full_tokens) - len(suffix_tokens)
-        cache_event = "hit" if cached_tokens > 0 else "miss"
+        first_token_at = None
 
-        # On an in-memory miss (and only then), consult the disk store for the
-        # longest exact valid checkpoint. A valid disk hit yields a live cache and
-        # a suffix that generation consumes exactly like a memory hit. Any disk
-        # problem returns the engine to cold serving without touching the request.
-        if self.disk_store is not None and cache_event == "miss":
-            disk_hit = self._consult_disk(model_key, full_tokens)
-            if disk_hit is not None:
-                prompt_cache = disk_hit.prompt_cache
-                suffix_tokens = list(disk_hit.suffix_tokens)
-                cached_tokens = disk_hit.cached_tokens
-                cache_event = "disk_hit"
+        def first_token_callback() -> None:
+            nonlocal first_token_at
+            if first_token_at is None:
+                first_token_at = self.clock()
 
-        # MLX generation needs at least one prompt token to compute the next token. If the
-        # trie returns an exact whole-prompt cache (empty suffix), build a fresh cache so
-        # there is a token to feed. Follow-up chat turns still hit normally because they
-        # add user suffix tokens.
-        if prompt_cache is None or not suffix_tokens:
-            cache_event = "exact_fallback" if prompt_cache is not None else "miss"
-            prompt_cache = self.make_prompt_cache_fn(self.model)
-            suffix_tokens = list(full_tokens)
-            cached_tokens = 0
+        prompt_cache = None
+        suffix_tokens = list(full_tokens)
+        cached_tokens = 0
+        cache_event = "miss"
+        writer = None
+        spec_writer = None
+        generate_kwargs = {}
+        spec_continuation = None
+        source_spec_rail = None
+        source_spec_from_disk = False
+        disk_attachment_restore = None
+        disk_attachment_event = None
+        disk_restore_seconds = None
+        disk_attachment_restore_seconds = None
+        disk_attachment_live_started = None
+        disk_attachment_live_finished = False
+        cache_claimed = False
 
-        # Build the frontier writer only when the disk store is enabled, a stride is
-        # configured, and this request actually crosses an unwritten frontier during
-        # prefill. When any of those is false no tracker is constructed and no
-        # callback is intercepted, so an off store or a short prompt adds nothing.
-        writer, generate_kwargs = self._frontier_writer(
-            model_key, full_tokens, cached_tokens, prompt_cache,
-            session_cache_key=session_cache_key)
+        def spec_continuation_ready_callback() -> None:
+            nonlocal disk_attachment_restore_seconds
+            nonlocal disk_attachment_live_finished
+            if (
+                disk_attachment_live_started is None
+                or disk_attachment_restore_seconds is None
+                or disk_attachment_live_finished
+            ):
+                return
+            disk_attachment_restore_seconds += (
+                self.clock() - disk_attachment_live_started
+            )
+            disk_attachment_live_finished = True
+
+        if spec_engaged and not enhanced_spec:
+            # Drafters without a portable state contract retain the old cold
+            # path. The cache event reports the actual outcome rather than a
+            # separate speculative-only event value.
+            if not self._cold_spec_bypass_logged:
+                self._cold_spec_bypass_logged = True
+                print(
+                    "[spec] non-resumable speculative request: prompt-cache "
+                    "store and disk KV are bypassed (fresh cache per request)",
+                    flush=True,
+                )
+        elif enhanced_spec:
+            if memory_route is not None:
+                fetched, fetched_suffix, companion = (
+                    self.cache_store.fetch_nearest_cache_with_companion(
+                        model_key,
+                        full_tokens,
+                        producer_rail=memory_route.rail,
+                    )
+                )
+                fetched_suffix = list(fetched_suffix)
+                fetched_tokens = len(full_tokens) - len(fetched_suffix)
+                route_matches = (
+                    fetched is not None
+                    and bool(fetched_suffix)
+                    and fetched_tokens == memory_route.probe.cached_tokens
+                )
+                if route_matches and memory_route.kind == "plain":
+                    prompt_cache = fetched
+                    suffix_tokens = fetched_suffix
+                    cached_tokens = fetched_tokens
+                    cache_event = "hit"
+                    cache_claimed = True
+                elif route_matches:
+                    from moespresso.runtime.disk_kv import caches_all_at_offset
+
+                    if caches_all_at_offset(fetched, fetched_tokens):
+                        suffix_tokens = fetched_suffix
+                        cached_tokens = fetched_tokens
+                        cache_event = "hit"
+                        cache_claimed = True
+                        source_spec_rail = memory_route.rail
+                        if memory_route.kind == "spec" and companion is not None:
+                            from moespresso.runtime.deepseek_v4.spec_serve import (
+                                SpecContinuation,
+                            )
+
+                            spec_continuation = SpecContinuation(
+                                target_cache=fetched,
+                                companion=companion,
+                                prefix_offset=fetched_tokens,
+                            )
+                        else:
+                            prompt_cache = fetched
+
+            # A corrupt speculative target must not hide a still-resident
+            # plain candidate selected by the read-only probe.
+            if (
+                not cache_claimed
+                and plain_probe.kind in {"shorter", "trim"}
+                and plain_probe.cached_tokens > 0
+            ):
+                fetched, fetched_suffix, _ = (
+                    self.cache_store.fetch_nearest_cache_with_companion(
+                        model_key,
+                        full_tokens,
+                        producer_rail=PLAIN_CACHE_RAIL,
+                    )
+                )
+                fetched_suffix = list(fetched_suffix)
+                fetched_tokens = len(full_tokens) - len(fetched_suffix)
+                if (
+                    fetched is not None
+                    and fetched_suffix
+                    and fetched_tokens == plain_probe.cached_tokens
+                ):
+                    prompt_cache = fetched
+                    suffix_tokens = fetched_suffix
+                    cached_tokens = fetched_tokens
+                    cache_event = "hit"
+                    cache_claimed = True
+
+            # With no usable in-memory target, consult disk even when an exact
+            # speculative entry remains resident and cannot supply logits.
+            if not cache_claimed and self.disk_store is not None:
+                disk_restore_started = self.clock()
+                disk_hit = self._consult_disk(model_key, full_tokens)
+                disk_restore_finished = self.clock()
+                if disk_hit is not None:
+                    disk_restore_seconds = (
+                        disk_restore_finished - disk_restore_started
+                    )
+                if disk_hit is not None and disk_hit.suffix_tokens:
+                    suffix_tokens = list(disk_hit.suffix_tokens)
+                    cached_tokens = disk_hit.cached_tokens
+                    cache_event = "disk_hit"
+                    cache_claimed = True
+                    served = getattr(
+                        self.model, "_moespresso_ds4_drafter", None
+                    )
+                    disk_attachment_started = self.clock()
+                    try:
+                        from moespresso.runtime.deepseek_v4.spec_disk_kv import (
+                            restore_spec_attachment,
+                        )
+
+                        disk_attachment_restore = restore_spec_attachment(
+                            self.disk_store,
+                            disk_hit,
+                            served,
+                            spec_rail,
+                        )
+                        disk_attachment_event = disk_attachment_restore.status
+                    except Exception as e:  # noqa: BLE001 - target hit stays valid
+                        log = getattr(self.disk_store, "_log", None)
+                        if log is not None:
+                            log(
+                                "[disk_kv] DSpark attachment restore failed; "
+                                f"keeping target cache: {e!r}"
+                            )
+                        disk_attachment_restore = None
+                        disk_attachment_event = "unavailable"
+                    finally:
+                        disk_attachment_elapsed = (
+                            self.clock() - disk_attachment_started
+                        )
+                    if disk_attachment_event == "hit":
+                        disk_attachment_restore_seconds = (
+                            disk_attachment_elapsed
+                        )
+                    if (
+                        disk_attachment_restore is not None
+                        and disk_attachment_restore.continuation is not None
+                    ):
+                        spec_continuation = (
+                            disk_attachment_restore.continuation
+                        )
+                        source_spec_rail = spec_rail
+                        source_spec_from_disk = True
+                        prompt_cache = None
+                    else:
+                        prompt_cache = disk_hit.prompt_cache
+                elif disk_hit is not None:
+                    exact_seen = True
+
+            if not cache_claimed:
+                # A cold eligible DSpark request creates its target cache inside
+                # the speculative loop. Exact entries stay untouched.
+                prompt_cache = None
+                suffix_tokens = list(full_tokens)
+                cached_tokens = 0
+                cache_event = "exact_fallback" if exact_seen else "miss"
+        else:
+            prompt_cache, suffix_tokens = self.cache_store.fetch_nearest_cache(
+                model_key, full_tokens)
+            suffix_tokens = list(suffix_tokens)
+            cached_tokens = len(full_tokens) - len(suffix_tokens)
+            cache_event = "hit" if cached_tokens > 0 else "miss"
+
+            # On an in-memory miss (and only then), consult the disk store for the
+            # longest exact valid checkpoint. A valid disk hit yields a live cache and
+            # a suffix that generation consumes exactly like a memory hit. Any disk
+            # problem returns the engine to cold serving without touching the request.
+            if self.disk_store is not None and cache_event == "miss":
+                disk_restore_started = self.clock()
+                disk_hit = self._consult_disk(model_key, full_tokens)
+                disk_restore_finished = self.clock()
+                if disk_hit is not None:
+                    disk_restore_seconds = (
+                        disk_restore_finished - disk_restore_started
+                    )
+                    prompt_cache = disk_hit.prompt_cache
+                    suffix_tokens = list(disk_hit.suffix_tokens)
+                    cached_tokens = disk_hit.cached_tokens
+                    cache_event = "disk_hit"
+
+            # MLX generation needs at least one prompt token to compute the next token.
+            # If the trie returns an exact whole-prompt cache (empty suffix), build a
+            # fresh cache so there is a token to feed. Follow-up chat turns still hit
+            # normally because they add user suffix tokens.
+            if prompt_cache is None or not suffix_tokens:
+                cache_event = "exact_fallback" if prompt_cache is not None else "miss"
+                prompt_cache = self.make_prompt_cache_fn(self.model)
+                suffix_tokens = list(full_tokens)
+                cached_tokens = 0
+
+        # Plain generation writes the independently valid target checkpoint.
+        # A live DSpark request instead uses the paired post-ingest callback so
+        # target and drafter state are captured at the same proven frontier.
+        if prompt_cache is not None:
+            writer, generate_kwargs = self._frontier_writer(
+                model_key, full_tokens, cached_tokens, prompt_cache,
+                session_cache_key=session_cache_key)
+        elif enhanced_spec:
+            served = getattr(self.model, "_moespresso_ds4_drafter", None)
+            spec_writer, generate_kwargs = self._spec_frontier_writer(
+                model_key,
+                full_tokens,
+                cached_tokens,
+                served=served,
+                producer_rail=spec_rail,
+                session_cache_key=session_cache_key,
+            )
 
         # The disk writer remains first at every prompt-progress position.  A
         # passive transport observer sees the same values only after the writer
@@ -590,13 +1251,23 @@ class PrefixCacheGenerator:
             generate_kwargs["prompt_progress_callback"] = frontier_progress
         elif progress_callback is not None:
             generate_kwargs["prompt_progress_callback"] = progress_callback
+
+        spec_frontier_progress = generate_kwargs.get(
+            "spec_prefill_progress_callback"
+        )
+        if spec_frontier_progress is not None and progress_callback is not None:
+            def combined_spec_progress(event) -> None:
+                spec_frontier_progress(event)
+                progress_callback(event.processed, event.total)
+
+            generate_kwargs["spec_prefill_progress_callback"] = (
+                combined_spec_progress
+            )
         if response_callback is not None:
             generate_kwargs["response_callback"] = response_callback
+        generate_kwargs["first_token_callback"] = first_token_callback
 
-        result = self.generate_fn(
-            self.model,
-            self.tokenizer,
-            suffix_tokens,
+        call_kwargs = dict(
             prompt_cache=prompt_cache,
             cached_tokens=cached_tokens,
             kv_policy=kv_policy,
@@ -606,14 +1277,142 @@ class PrefixCacheGenerator:
             **sampling_kwargs,
             **generate_kwargs,
         )
+        if spec_continuation is not None:
+            call_kwargs["spec_continuation"] = spec_continuation
+        if source_spec_from_disk:
+            disk_attachment_live_started = self.clock()
+            call_kwargs["spec_continuation_ready_callback"] = (
+                spec_continuation_ready_callback
+            )
+        try:
+            result = self.generate_fn(
+                self.model,
+                self.tokenizer,
+                suffix_tokens,
+                **call_kwargs,
+            )
+        except Exception as exc:
+            from moespresso.runtime.deepseek_v4.spec_serve import (
+                SpecContinuationError,
+            )
+
+            if spec_continuation is None or not isinstance(
+                exc, SpecContinuationError
+            ):
+                raise
+            # Preflight and capsule import happen before emitter/run. Reuse a
+            # still-valid target with plain generation; if its frontier changed,
+            # cold-serve instead. No second generation follows streamed output.
+            from moespresso.runtime.disk_kv import caches_all_at_offset
+
+            fallback_generate_kwargs = {
+                key: value
+                for key, value in generate_kwargs.items()
+                if not key.startswith("spec_prefill_")
+            }
+            if source_spec_from_disk:
+                # A disk target is a generic target checkpoint. If the paired
+                # continuation is rejected after restore validation, plain
+                # fallback publishes it on the plain memory rail.
+                source_spec_rail = None
+                disk_attachment_event = "invalid"
+            if caches_all_at_offset(
+                spec_continuation.target_cache,
+                spec_continuation.prefix_offset,
+            ):
+                fallback_cache = spec_continuation.target_cache
+                result = self.generate_fn(
+                    self.model,
+                    self.tokenizer,
+                    suffix_tokens,
+                    prompt_cache=fallback_cache,
+                    cached_tokens=cached_tokens,
+                    kv_policy=kv_policy,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **sampling_kwargs,
+                    **fallback_generate_kwargs,
+                )
+            else:
+                source_spec_rail = None
+                cache_event = "exact_fallback" if exact_seen else "miss"
+                result = self.generate_fn(
+                    self.model,
+                    self.tokenizer,
+                    list(full_tokens),
+                    prompt_cache=None,
+                    cached_tokens=0,
+                    kv_policy=kv_policy,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **sampling_kwargs,
+                    **fallback_generate_kwargs,
+                )
+            if not self._spec_resume_fallback_logged:
+                self._spec_resume_fallback_logged = True
+                print(
+                    "[spec] cached DSpark state was rejected; retained target "
+                    "cache reuse where its frontier remained valid",
+                    flush=True,
+                )
+        else:
+            if spec_continuation is not None and result.speculative is not None:
+                result.speculative["cache_resume"] = {
+                    "status": "hit",
+                    "frontier": cached_tokens,
+                }
         if writer is not None and writer.written:
             result.disk_checkpoints_written = len(writer.written)
             result.disk_checkpoint_write_seconds = tuple(writer.write_seconds)
+        if spec_writer is not None:
+            if spec_writer.target_writes:
+                result.disk_checkpoints_written = len(spec_writer.target_writes)
+                result.disk_checkpoint_write_seconds = tuple(
+                    spec_writer.target_blocking_seconds
+                )
+            if spec_writer.attachment_writes:
+                result.disk_attachments_written = len(
+                    spec_writer.attachment_writes
+                )
+                result.disk_attachment_write_seconds = tuple(
+                    spec_writer.attachment_blocking_seconds
+                )
+        result.disk_attachment_event = disk_attachment_event
+        result.disk_restore_seconds = disk_restore_seconds
+        result.disk_attachment_restore_seconds = (
+            disk_attachment_restore_seconds
+            if disk_attachment_event == "hit"
+            else None
+        )
+        if first_token_at is not None:
+            result.ready_to_first_token_seconds = first_token_at - ready_at
 
-        if result.prompt_cache is not None:
+        if source_spec_rail is not None and result.prompt_cache is not None:
+            target_cache = result.prompt_cache
+            result.prompt_cache = None
+            self._publish_spec_target(
+                model_key=model_key,
+                full_tokens=full_tokens,
+                result=result,
+                target_cache=target_cache,
+                producer_rail=source_spec_rail,
+            )
+        elif result.prompt_cache is not None:
             cache_key = list(full_tokens) + list(result.generated_token_ids)
             if cache_key:
                 self.cache_store.insert_cache(model_key, cache_key, result.prompt_cache)
+        if enhanced_spec and result.speculative_prompt_cache is not None:
+            self._publish_spec_target(
+                model_key=model_key,
+                full_tokens=full_tokens,
+                result=result,
+                target_cache=result.speculative_prompt_cache,
+                producer_rail=spec_rail,
+                companion=result.cache_companion,
+                declared_frontier=result.cache_frontier,
+            )
         if self.after_generate_fn is not None:
             self.after_generate_fn(self.model)
         result.cache_event = cache_event

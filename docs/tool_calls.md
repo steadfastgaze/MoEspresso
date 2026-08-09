@@ -59,6 +59,15 @@ Failure handling is strict-parse-first:
   candidate the strict parser accepts wins. Because attempts buffer
   through their own markers, a repaired call never leaks raw markup into
   streamed content.
+- A parameter opened before the previous one closed is rejected by both
+  strict parsers rather than parsed. A parameter value ends at the first
+  closer, so the second open would otherwise land inside the first value and
+  the call would ship one merged argument in place of two with nothing
+  reporting the loss. The discriminator is the same line-start rule the
+  streamer applies to markers: a parameter open marker that begins a line,
+  or that begins the value, is structure; the same text elsewhere on a line
+  is value text. A value that documents its own dialect at column zero is
+  therefore rejected rather than merged.
 - Text that still fails flushes back into `content`, so bytes are never
   silently dropped.
 - A block left open when generation hit the token limit is never repaired:
@@ -116,16 +125,21 @@ Per server process, resolved at startup and printed as a `[serve]` line:
    `MOESPRESSO_TOOL_REPAIR=0` keeps parsing strict-only. Both default on.
 2. `--tool-dialect native|dsml` selects explicitly.
 3. Otherwise the package's `agentic_profile.json` dialect of record
-   applies (`dsml` for the Ornith family, from the recorded dialect
-   study). A missing or unreadable profile, or a schema version above the
-   supported one, falls back to native.
+   applies (`native` for the Ornith family, from the recorded emission
+   study in `docs/package_format.md#agentic-profile-records`). A missing
+   or unreadable profile, or a schema version above the supported one,
+   falls back to native.
 
 The `dsml` selection for a template family renders the DSML instruction
 block into the system region instead of passing `tools` to the template,
 serializes past assistant `tool_calls` into DSML text, and parses DSML
 from the emission. The native XML parser stays active second: the family's
 trained format can bleed through, and catching it costs nothing. Tool
-results still travel as `role: "tool"` messages either way.
+results still travel as `role: "tool"` messages either way. The swap
+remains a supported selection for measurement and for a model whose
+recorded evidence favors it; it is no longer any template family's
+default, because the Ornith emission study measures the taught DSML form
+malformed at the parameter open tag on every artifact tested.
 
 `tool_choice` accepts `auto` (default behavior) and `none` (tools are
 withheld from the render; note that flipping between `none` and `auto`

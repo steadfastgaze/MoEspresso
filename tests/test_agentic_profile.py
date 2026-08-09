@@ -19,12 +19,14 @@ from moespresso.package.agentic_profile import (
 
 
 def test_ornith_profile_matches_the_study_record():
+    # The emission study's record: the template's native XML, with repair
+    # optional because it had nothing to fix on any native arm.
     profile = profile_for_family("qwen3_5_moe")
     assert profile == {
         "schema_version": SCHEMA_VERSION,
         "family": "qwen3_5_moe",
-        "dialect": "dsml",
-        "repair": {"required": True},
+        "dialect": "native",
+        "repair": {"required": False},
         "thinking_for_tools": False,
         "reprompt": {"enabled": True, "limit": 1},
         "sampling": {

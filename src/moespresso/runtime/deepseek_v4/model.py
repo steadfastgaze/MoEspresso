@@ -10,7 +10,7 @@ import tempfile
 from contextvars import ContextVar
 from pathlib import Path
 from types import MethodType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from moespresso.runtime.deepseek_v4 import fixed_decode_state as _fixed_decode_state
 
@@ -29,6 +29,65 @@ _DSV4_ATTENTION_STATS_CONTEXT: ContextVar[Any] = ContextVar(
 )
 
 
+class _Dsv4Q8HcPostCall:
+    """Request-local inputs consumed by the attention output projection."""
+
+    __slots__ = ("residual", "post", "comb", "used")
+
+    def __init__(self, residual, post, comb):
+        self.residual = residual
+        self.post = post
+        self.comb = comb
+        self.used = False
+
+
+_DSV4_Q8_HC_POST_CONTEXT: ContextVar[Any] = ContextVar(
+    "moespresso_dsv4_q8_hc_post_context",
+    default=None,
+)
+
+
+class _Dsv4Q8FfnHcPostCall:
+    """Request-local inputs consumed by the shared-expert down projection."""
+
+    __slots__ = ("residual", "post", "comb", "routed", "used")
+
+    def __init__(self, residual, post, comb):
+        self.residual = residual
+        self.post = post
+        self.comb = comb
+        self.routed = None
+        self.used = False
+
+
+_DSV4_Q8_FFN_HC_POST_CONTEXT: ContextVar[Any] = ContextVar(
+    "moespresso_dsv4_q8_ffn_hc_post_context",
+    default=None,
+)
+
+
+def declared_mtp_block_count(config: Mapping[str, Any]) -> int:
+    """How many next-token-prediction blocks the config declares.
+
+    `num_nextn_predict_layers` is a vestigial schema field on this
+    architecture: a checkpoint can set it to 1 while its own inference config
+    (`n_mtp_layers`) and its DSpark target list both describe a three-block
+    chain. The tail of `compress_ratios` is written by whichever component
+    owns the blocks, so the count is the widest declaration the config
+    carries, floored at one so a config that declares nothing keeps the
+    single-entry MTP tail earlier packages record.
+    """
+    counts = [1]
+    for key in ("n_mtp_layers", "num_nextn_predict_layers"):
+        value = config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            counts.append(value)
+    targets = config.get("dspark_target_layer_ids")
+    if isinstance(targets, (list, tuple)) and targets:
+        counts.append(len(targets))
+    return max(counts)
+
+
 def _architecture_config(manifest: dict) -> dict:
     architecture = manifest.get("architecture") or {}
     if architecture.get("family") != "deepseek_v4_flash":
@@ -42,11 +101,25 @@ def _architecture_config(manifest: dict) -> dict:
     n_layers = int(config.get("num_hidden_layers", 0))
     if n_layers <= 0:
         raise DeepseekV4GraphError("DeepSeek V4 config must carry num_hidden_layers")
-    if len(ratios) not in {n_layers, n_layers + 1}:
+    # A checkpoint records one entry per trunk layer and then one per MTP
+    # block. The trunk graph indexes the first `num_hidden_layers` entries and
+    # never reads the tail, so any tail up to the declared block count loads;
+    # a shorter list, a longer one, or a non-zero tail entry fails closed.
+    mtp_blocks = declared_mtp_block_count(config)
+    if not n_layers <= len(ratios) <= n_layers + mtp_blocks:
         raise DeepseekV4GraphError(
-            "DeepSeek V4 compress_ratios length must match hidden layers or include MTP"
+            "DeepSeek V4 compress_ratios length must match hidden layers or "
+            f"include up to {mtp_blocks} MTP entries; got {len(ratios)} for "
+            f"{n_layers} hidden layers"
         )
-    config["compress_ratios"] = list(ratios)
+    trunk = [int(v) for v in ratios[:n_layers]]
+    tail = [int(v) for v in ratios[n_layers:]]
+    if any(value != 0 for value in tail):
+        raise DeepseekV4GraphError(
+            f"DeepSeek V4 MTP compress_ratios tail must be all zero, got {tail}"
+        )
+    config["compress_ratios"] = trunk
+    config["mtp_compress_ratios"] = tail
     return config
 
 
@@ -85,7 +158,8 @@ def _is_deepseek_v4_bundle_key(key: str) -> bool:
 
 def _manifest_requires_routed_bundles(manifest: dict) -> bool:
     return any(
-        t.get("format") in {"tq", "mxfp4", "kquant"} and t.get("kind") == "expert"
+        t.get("format") in {"tq", "mxfp4", "kquant", "iqk"}
+        and t.get("kind") == "expert"
         for t in manifest.get("tensors", [])
     )
 
@@ -102,10 +176,10 @@ def _install_deepseek_v4_pooled_bundles(
 ) -> int:
     """Install DS4 routed experts as SSD-backed pooled SwitchGLUs.
 
-    This is the default DS4 routed-expert path. The older resident installer
-    materializes TurboQuant modules and is TQ-only; pooled installation keeps the
-    bundle contract codec-aware and routes source-mxfp4 experts to the fused
-    decode kernel.
+    This is the default DS4 target routed-expert path. Supported bundle codecs,
+    including IQ_K, use persistent projection pools. Capacity equal to the
+    declared expert count is the optimized full-resident subcase; smaller
+    capacities load experts on demand without changing the graph seam.
     """
     from moespresso.runtime.ssd_streaming_build import (
         _budget_payload,
@@ -176,6 +250,46 @@ def _install_deepseek_v4_pooled_bundles(
         spare_slots=spare_slots,
         wrap_deepseek_v4_moe=True,
     )
+    from moespresso.runtime.deepseek_v4.iqk_experts import iqk_switch_modules
+
+    iqk_switches = [
+        switch for switch in iqk_switch_modules(model)
+        if bool(getattr(switch, "_all_iqk", False))
+    ]
+    iqk_layers = [int(switch.layer) for switch in iqk_switches]
+    iqk_members: dict[str, int] = {}
+    for switch in iqk_switches:
+        for member_value in switch.members.values():
+            member = str(member_value)
+            iqk_members[member] = iqk_members.get(member, 0) + 1
+    if iqk_layers:
+        from moespresso.package.iqk_format import IQK_LAYOUT_IQK_RELAYOUT
+        from moespresso.runtime.deepseek_v4.iqk_experts import (
+            iqk_decode_flush_layers,
+            sorted_prefill_min_pairs,
+            sorted_prefill_nsplit,
+        )
+
+        cadence = iqk_decode_flush_layers()
+        object.__setattr__(model, "_moespresso_dsv4_iqk_install", {
+            "layers": iqk_layers,
+            "layers_installed": len(iqk_layers),
+            "num_experts": iqk_switches[0].gate_proj.pool.num_experts,
+            "layout": IQK_LAYOUT_IQK_RELAYOUT,
+            "member_counts": dict(sorted(iqk_members.items())),
+            "sorted_prefill_min_pairs": sorted_prefill_min_pairs(),
+            "sorted_prefill_nsplit": sorted_prefill_nsplit(),
+            "pooled": True,
+            "capacity_per_layer": int(capacity_per_layer),
+        })
+        object.__setattr__(model, "_moespresso_dsv4_iqk_decode_flush", {
+            "cadence": cadence,
+            "wrapped_blocks": (
+                sum(1 for ordinal in range(len(iqk_layers))
+                    if cadence > 0 and (ordinal + 1) % cadence == 0)
+            ),
+            "pooled": True,
+        })
     if lookahead_env > 0:
         from moespresso.runtime.ssd_streaming_build import install_lookahead
 
@@ -2719,6 +2833,7 @@ _DEEPSEEK_V4_Q8_GROUP = 32
 # can prove which composition ran.
 _WO_A_PROJECTION_CALL_COUNTS = {
     "batched_decode": 0,
+    "batched_tiny_m": 0,
     "gather_decode": 0,
     "loop": 0,
 }
@@ -2751,6 +2866,8 @@ _Q8_DENSE_MATMUL_CALL_COUNTS = {
     "decode_qmv": 0,
     "decode_wire_qmv_wo_b": 0,
     "decode_wire_qmv_lm_head": 0,
+    "tiny_m_qmm_wo_b": 0,
+    "tiny_m_qmm_lm_head": 0,
     "prefill_dequant": 0,
 }
 
@@ -2758,6 +2875,117 @@ _Q8_DENSE_MATMUL_CALL_COUNTS = {
 def q8_dense_matmul_call_counts() -> dict[str, int]:
     """Return dense q8_0 matmul engagement counts by form."""
     return dict(_Q8_DENSE_MATMUL_CALL_COUNTS)
+
+
+# Non-q8_0 dense bulk (multi-row) matmul engagement counts by route,
+# exported through `ssd_streaming_stats` so served A/B arms can prove which
+# composition ran. "kernel" counts direct kq.quantized_matmul dispatches on
+# the resident wire bytes; "bridge" counts float32 dequant-bridge calls.
+_KQUANT_BULK_ROUTE_CALL_COUNTS = {"kernel": 0, "bridge": 0}
+
+
+def kquant_bulk_route_call_counts() -> dict[str, int]:
+    """Return non-q8_0 dense bulk matmul engagement counts by route."""
+    return dict(_KQUANT_BULK_ROUTE_CALL_COUNTS)
+
+
+_DSV4_KQUANT_BULK_ROUTE_ENV = "MOESPRESSO_DSV4_KQUANT_BULK_ROUTE"
+
+# Cached verdict of the strided-bulk kernel probe below. None until the
+# first bulk call asks; then True (kernel verified on the defect pair) or
+# False (bridge stays engaged).
+_DSV4_KQUANT_STRIDED_BULK_FIXED = None
+
+
+def _dsv4_kquant_bulk_route() -> str:
+    """Route selector for non-q8_0 dense bulk multi-row matmul calls.
+
+    ``auto`` (default) serves the direct kernel route only for
+    verify-shaped tiny multi-row calls (rows within the declared tiny-M
+    width, the speculative verify class) and only when the strided-bulk
+    probe verifies the installed mlx-kquant on the recorded defect pair;
+    prefill- and scorer-width calls keep the dequant bridge. The kernel
+    op emits on the bfloat16 lattice where the bridge computes in
+    float32, and routing every bulk width through the kernel measured
+    Q2 avg NLL 0.40094 on the ship artifact against 0.39634 through the
+    bridge (above the 0.3990 dense-gate band bar), so the width gate
+    confines the math change to the verify forwards that own the round
+    wall. ``kernel`` forces the kernel route at every bulk width (the
+    instrument arm behind the bounding Q2 reading; still probe-gated,
+    refusing on an unverified build). ``bridge`` forces the dequant
+    bridge regardless of the probe (the A/B and kill lever). Unknown
+    values refuse rather than guess.
+    """
+    value = os.environ.get(_DSV4_KQUANT_BULK_ROUTE_ENV, "auto")
+    if value not in ("auto", "kernel", "bridge"):
+        raise DeepseekV4RuntimeLoadError(
+            f"{_DSV4_KQUANT_BULK_ROUTE_ENV} must be 'auto', 'kernel', or "
+            f"'bridge', got {value!r}")
+    return value
+
+
+def _dsv4_kquant_strided_bulk_fixed(*, mx, kq) -> bool:
+    """Probe the installed mlx-kquant for the strided-bulk matmul defect.
+
+    The defective kernel returns wrong values when an unevaluated
+    row-strided activation view meets any multi-row shape in one
+    ``kq.quantized_matmul`` call (the DS4 grouped output projection
+    produces exactly that shape on every multi-row forward; measured rel
+    error ~1.4 against the contiguized reference). The probe runs the
+    recorded defect pair on a tiny q6_k wire and demands bit-exact
+    agreement with the same call on contiguized operands, so the direct
+    kernel route engages only on a build whose behavior is verified, not
+    on a version string. Any probe failure reads as not-fixed and the
+    bridge stays engaged. The verdict is cached for the process.
+    """
+    global _DSV4_KQUANT_STRIDED_BULK_FIXED
+    if _DSV4_KQUANT_STRIDED_BULK_FIXED is not None:
+        return _DSV4_KQUANT_STRIDED_BULK_FIXED
+    try:
+        dense = mx.sin(mx.arange(16 * 256, dtype=mx.float32)).reshape(16, 256)
+        wire, scales = kq.quantize(dense, "q6_k")
+        base = mx.sin(
+            mx.arange(3 * 2 * 256, dtype=mx.float32) * 0.5
+        ).reshape(1, 3, 2, 256).astype(mx.bfloat16)
+        mx.eval(wire, scales, base)
+        out = kq.quantized_matmul(
+            base[:, :, 1, :], wire[8:, :], scales, "q6_k", transpose=True)
+        x_ref = mx.contiguous(base[:, :, 1, :])
+        w_ref = mx.contiguous(wire[8:, :])
+        mx.eval(x_ref, w_ref)
+        ref = kq.quantized_matmul(
+            x_ref, w_ref, scales, "q6_k", transpose=True)
+        verdict = bool(
+            mx.array_equal(
+                out.astype(mx.float32), ref.astype(mx.float32)).item())
+    except Exception:
+        verdict = False
+    _DSV4_KQUANT_STRIDED_BULK_FIXED = verdict
+    return verdict
+
+
+_Q8_HC_POST_CALL_COUNTS = {
+    "engaged": 0,
+    "fallback": 0,
+    "delegated": 0,
+}
+
+
+def q8_hc_post_call_counts() -> dict[str, int]:
+    """Return attention Q8 QMV plus hC-post calls by outcome."""
+    return dict(_Q8_HC_POST_CALL_COUNTS)
+
+
+_Q8_FFN_HC_POST_CALL_COUNTS = {
+    "engaged": 0,
+    "fallback": 0,
+    "delegated": 0,
+}
+
+
+def q8_ffn_hc_post_call_counts() -> dict[str, int]:
+    """Return shared-FFN Q8 QMV plus hC-post calls by outcome."""
+    return dict(_Q8_FFN_HC_POST_CALL_COUNTS)
 
 
 # Kill switch for the fp32 seam contract on affine dense wo modules below.
@@ -2801,6 +3029,33 @@ def _dsv4_wo_a_batched_decode_enabled() -> bool:
     always fall back to the loop.
     """
     return os.environ.get("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", "1") != "0"
+
+
+def _dsv4_q8_tiny_m_rows_max() -> int:
+    """Token-row cap for the tiny multi-row q8_0 fp32-seam route
+    (``MOESPRESSO_DSV4_Q8_TINY_M_MAX``).
+
+    Speculative-decoding verification issues 2..8-row forwards on every
+    round. At those shapes the dequant bridge materializes the full
+    float32 weight per call (about 290 MB of traffic at the served wo_b
+    shape), while one affine QMM over the cached q8_0 repack reads the
+    weight bytes once; the standalone A/B at the served shapes reads
+    wo_b 1.08 versus 0.38 ms and the grouped wo_a loop 3.33 versus 0.38
+    ms per layer at six rows. Rows within the cap route wo_b and the
+    grouped wo_a projection through the affine QMM with float32
+    activations. The affine repack dequantizes to exactly the q8_0
+    lattice, so the route differs from the bridge only in float32
+    accumulation order (max-abs 7e-6 at the served shapes on unit-scale
+    activations). Bulk prefill rows keep the dequant bridge, which
+    amortizes the dequant across the chunk. The route materializes the
+    affine repack for wo_a and wo_b (about 72 MB per layer) on first use.
+
+    Default 8 covers a draft block of five plus the bonus row; 0 disables
+    the route. Read per call, so the env is a live switch.
+    ``MOESPRESSO_DSV4_Q8_DECODE_QMV=0`` also closes the route with the
+    rest of the q8_0 QMV/QMM family.
+    """
+    return int(os.environ.get("MOESPRESSO_DSV4_Q8_TINY_M_MAX", "8"))
 
 
 def _deepseek_v4_q8_affine_views(module, *, mx):
@@ -2935,8 +3190,111 @@ def _deepseek_v4_q8_wire_decode_eligible(x, weight, site, *, mx) -> bool:
     )
 
 
+_DSV4_Q8_HC_POST_HC = 4
+_DSV4_Q8_HC_POST_HIDDEN = 4096
+_DSV4_Q8_HC_POST_INPUT = 8192
+_DSV4_Q8_FFN_HC_POST_HIDDEN = 4096
+_DSV4_Q8_FFN_HC_POST_INPUT = 2048
+_DSV4_Q8_FFN_HC_POST_WIRE_BYTES = 2176
+
+
+def _deepseek_v4_q8_hc_post_eligible(module, x, call, *, mx) -> bool:
+    """Check the exact DS4 attention Q8 QMV plus hC-post contract."""
+    if (
+        call is None
+        or call.used
+        or not getattr(module, "_moespresso_dsv4_q8_hc_post_eligible", False)
+        or not _DSV4_Q8_DECODE_QMV
+    ):
+        return False
+    original = module.original
+    if (
+        getattr(original, "mode", None) != "kquant"
+        or getattr(original, "kquant_type", None) != "q8_0"
+        or "weight" not in original
+        or "scales" not in original
+        or "bias" in original
+    ):
+        return False
+    weight = original["weight"]
+    expected_wire_bytes = (
+        _DSV4_Q8_HC_POST_INPUT
+        // _DEEPSEEK_V4_Q8_GROUP
+        * _DEEPSEEK_V4_Q8_BLOCK_BYTES
+    )
+    return (
+        x.dtype == mx.float32
+        and tuple(int(dim) for dim in x.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_INPUT)
+        and weight.dtype == mx.uint8
+        and weight.ndim == 2
+        and tuple(int(dim) for dim in weight.shape)
+        == (_DSV4_Q8_HC_POST_HIDDEN, expected_wire_bytes)
+        and call.residual.dtype == mx.float32
+        and tuple(int(dim) for dim in call.residual.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HIDDEN)
+        and call.post.dtype == mx.float32
+        and tuple(int(dim) for dim in call.post.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_HC)
+        and call.comb.dtype == mx.float32
+        and tuple(int(dim) for dim in call.comb.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HC)
+    )
+
+
+def _deepseek_v4_q8_ffn_hc_post_eligible(module, x, call, *, mx) -> bool:
+    """Check the exact DS4 shared-FFN Q8 QMV plus hC-post contract."""
+    if (
+        call is None
+        or call.used
+        or call.routed is None
+        or not getattr(
+            module, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+        or not _DSV4_Q8_DECODE_QMV
+    ):
+        return False
+    original = module.original
+    if (
+        getattr(original, "mode", None) != "kquant"
+        or getattr(original, "kquant_type", None) != "q8_0"
+        or "bias" in original
+    ):
+        return False
+    weight = original["weight"]
+    return (
+        x.dtype == mx.bfloat16
+        and tuple(int(dim) for dim in x.shape)
+        == (1, 1, _DSV4_Q8_FFN_HC_POST_INPUT)
+        and weight.dtype == mx.uint8
+        and weight.ndim == 2
+        and tuple(int(dim) for dim in weight.shape)
+        == (
+            _DSV4_Q8_FFN_HC_POST_HIDDEN,
+            _DSV4_Q8_FFN_HC_POST_WIRE_BYTES,
+        )
+        and call.routed.dtype == mx.float16
+        and tuple(int(dim) for dim in call.routed.shape)
+        == (1, 1, _DSV4_Q8_FFN_HC_POST_HIDDEN)
+        and call.residual.dtype == mx.float32
+        and tuple(int(dim) for dim in call.residual.shape)
+        == (
+            1,
+            1,
+            _DSV4_Q8_HC_POST_HC,
+            _DSV4_Q8_FFN_HC_POST_HIDDEN,
+        )
+        and call.post.dtype == mx.float32
+        and tuple(int(dim) for dim in call.post.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_HC)
+        and call.comb.dtype == mx.float32
+        and tuple(int(dim) for dim in call.comb.shape)
+        == (1, 1, _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HC)
+    )
+
+
 def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
-                            mx, kq, affine=None, wire_decode_site=None):
+                            mx, kq, affine=None, wire_decode_site=None,
+                            tiny_m_site=None):
     if kquant_type == "q8_0":
         rows = 1
         for dim in x.shape[:-1]:
@@ -2977,10 +3335,40 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
             # the dequantize + float32 matmul below is accumulation order
             # (measured 4e-7 rel on the served wo shapes), without
             # materializing hundreds of MB of float32 weights per token.
-            # Multi-row calls stay on the dequant path: the affine QMM
-            # tile path has a different (float16 staging) contract at
-            # bulk shapes and prefill amortizes the dequant.
+            # Bulk multi-row calls stay on the dequant path: the affine
+            # QMM tile path has a different (float16 staging) contract at
+            # bulk shapes and prefill amortizes the dequant. Tiny
+            # multi-row calls at declared sites take the branch below.
             _Q8_DENSE_MATMUL_CALL_COUNTS["decode_qmv"] += 1
+            w_q, affine_scales, affine_biases = affine
+            y = mx.quantized_matmul(
+                x.astype(mx.float32),
+                w_q,
+                scales=affine_scales,
+                biases=affine_biases,
+                transpose=True,
+                group_size=_DEEPSEEK_V4_Q8_GROUP,
+                bits=8,
+            )
+        elif (
+            1 < rows <= _dsv4_q8_tiny_m_rows_max()
+            and _DSV4_Q8_DECODE_QMV
+            and ("tiny_m_qmm_" + str(tiny_m_site))
+            in _Q8_DENSE_MATMUL_CALL_COUNTS
+            and x.dtype in (mx.float32, mx.bfloat16, mx.float16)
+            and (affine := (affine() if callable(affine) else affine))
+            is not None
+        ):
+            # Verify-shaped tiny multi-row route: the speculative-decoding
+            # verify forward issues 2..8-row calls per round, where the
+            # dequant bridge below materializes the full float32 weight
+            # per call. One float32 affine QMM over the cached q8_0
+            # repack reads the weight bytes once and accumulates in
+            # float32, so the route differs from the bridge only in
+            # accumulation order (see ``_dsv4_q8_tiny_m_rows_max``).
+            # Only declared sites engage (fail closed on unknown labels);
+            # ``MOESPRESSO_DSV4_Q8_TINY_M_MAX=0`` restores the bridge.
+            _Q8_DENSE_MATMUL_CALL_COUNTS["tiny_m_qmm_" + tiny_m_site] += 1
             w_q, affine_scales, affine_biases = affine
             y = mx.quantized_matmul(
                 x.astype(mx.float32),
@@ -3002,13 +3390,66 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
             )
             y = mx.matmul(x.astype(mx.float32), weight.T)
     else:
-        y = kq.quantized_matmul(
-            x,
-            weight,
-            scales,
-            kquant_type,
-            transpose=True,
-        )
+        rows = 1
+        for dim in x.shape[:-1]:
+            rows *= int(dim)
+        if rows > 1:
+            # Bulk multi-row route. The defective kernel returned wrong
+            # values when an unevaluated row-strided activation view met
+            # any multi-row shape in one call (the DS4 grouped output
+            # projection produces exactly that shape at prefill and scorer
+            # widths; measured rel error ~1.4 against the dequantized
+            # reference, dependent on evaluation batching), so bulk calls
+            # took the float32 dequant bridge. The direct kernel route
+            # re-engages only for verify-shaped tiny multi-row calls and
+            # only when the strided-bulk probe verifies the installed
+            # mlx-kquant bit-exact on the recorded defect pair; wider
+            # calls and unverified builds keep the bridge, and the route
+            # selector documents the Q2 reading behind the width gate.
+            # A forced `kernel` route on an unverified build refuses
+            # rather than serve the defect. Single-row decode calls never
+            # carried a multi-row strided activation and measure clean
+            # in-situ, so they stay on the kernel unconditionally.
+            route = _dsv4_kquant_bulk_route()
+            use_kernel = False
+            if route == "kernel":
+                if not _dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq):
+                    raise DeepseekV4RuntimeLoadError(
+                        f"{_DSV4_KQUANT_BULK_ROUTE_ENV}=kernel requires an "
+                        "mlx-kquant build that passes the strided-bulk "
+                        "probe; the installed build does not")
+                use_kernel = True
+            elif route == "auto":
+                use_kernel = (
+                    rows <= _dsv4_q8_tiny_m_rows_max()
+                    and _dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq)
+                )
+            if use_kernel:
+                _KQUANT_BULK_ROUTE_CALL_COUNTS["kernel"] += 1
+                y = kq.quantized_matmul(
+                    x,
+                    weight,
+                    scales,
+                    kquant_type,
+                    transpose=True,
+                )
+            else:
+                _KQUANT_BULK_ROUTE_CALL_COUNTS["bridge"] += 1
+                weight = kq.dequantize(
+                    weight,
+                    scales,
+                    kquant_type,
+                    dtype=mx.float32,
+                )
+                y = mx.matmul(x.astype(mx.float32), weight.T)
+        else:
+            y = kq.quantized_matmul(
+                x,
+                weight,
+                scales,
+                kquant_type,
+                transpose=True,
+            )
     if bias is not None:
         y = y + bias
     return y
@@ -3035,11 +3476,35 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
             self.freeze()
 
         def __call__(self, x):
+            call = _DSV4_Q8_HC_POST_CONTEXT.get()
+            if _deepseek_v4_q8_hc_post_eligible(self, x, call, mx=mx):
+                original = self.original
+                out = kq.quantized_matmul_qmv_hc_post(
+                    x,
+                    original["weight"],
+                    original["scales"],
+                    call.residual.reshape(
+                        _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HIDDEN),
+                    call.post.reshape(_DSV4_Q8_HC_POST_HC),
+                    call.comb.reshape(
+                        _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HC),
+                    "q8_0",
+                )
+                _Q8_DENSE_MATMUL_CALL_COUNTS[
+                    "decode_wire_qmv_wo_b"] += 1
+                call.used = True
+                return out.reshape(
+                    1,
+                    1,
+                    _DSV4_Q8_HC_POST_HC,
+                    _DSV4_Q8_HC_POST_HIDDEN,
+                )
             affine = None
             if self.original.kquant_type == "q8_0":
-                # A thunk defers the affine views. The wire route serves decode rows
-                # and prefill takes the dequant bridge, so the affine
-                # repack only materializes if a fallback branch asks.
+                # A thunk defers the affine views. The wire route serves
+                # decode rows and bulk prefill takes the dequant bridge,
+                # so the affine repack only materializes when the tiny
+                # multi-row route or a fallback branch asks.
                 original = self.original
                 affine = lambda: _deepseek_v4_q8_affine_views(  # noqa: E731
                     original, mx=mx)
@@ -3053,6 +3518,7 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
                 kq=kq,
                 affine=affine,
                 wire_decode_site="wo_b",
+                tiny_m_site="wo_b",
             )
 
     def _kquant_grouped_output_projection(self, out):
@@ -3134,6 +3600,40 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
                 if "bias" in wo_a:
                     y = y + wo_a["bias"].reshape(groups, 1, rank)
                 return y.reshape(bsz, length, groups * rank)
+        if (
+            1 < rows <= _dsv4_q8_tiny_m_rows_max()
+            and wo_a.kquant_type == "q8_0"
+            and _DSV4_Q8_DECODE_QMV
+            and grouped.dtype in (mx.float32, mx.bfloat16, mx.float16)
+        ):
+            group_views = _deepseek_v4_q8_affine_group_views(
+                wo_a, groups=groups, rank=rank, group_feat=group_feat, mx=mx)
+            if group_views is not None:
+                # Verify-shaped tiny multi-row form: one batched float32
+                # QMM over the stacked affine group views instead of the
+                # per-group loop below, whose dequant bridge materializes
+                # each group's float32 weight per call. The affine repack
+                # dequantizes to exactly the q8_0 lattice, so the form
+                # differs from the loop only in float32 accumulation
+                # order (see ``_dsv4_q8_tiny_m_rows_max``). The swapaxes
+                # pair keeps the loop's row order and last-axis group
+                # concatenation. Missing views or the kill switches fall
+                # through to the loop.
+                _WO_A_PROJECTION_CALL_COUNTS["batched_tiny_m"] += 1
+                w_qg, group_scales, group_biases = group_views
+                y = mx.quantized_matmul(
+                    grouped.astype(mx.float32).reshape(
+                        rows, groups, group_feat).swapaxes(0, 1),
+                    w_qg,
+                    scales=group_scales,
+                    biases=group_biases,
+                    transpose=True,
+                    group_size=_DEEPSEEK_V4_Q8_GROUP,
+                    bits=8,
+                )
+                if "bias" in wo_a:
+                    y = y + wo_a["bias"].reshape(groups, 1, rank)
+                return y.swapaxes(0, 1).reshape(bsz, length, groups * rank)
         _WO_A_PROJECTION_CALL_COUNTS["loop"] += 1
 
         def _group_affine_thunk(row_start, row_end):
@@ -3194,6 +3694,421 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
         patched += 1
     object.__setattr__(
         model, "_moespresso_dsv4_kquant_grouped_output_projection_layers", patched)
+    return patched
+
+
+def _record_dsv4_q8_hc_post_call(layer, outcome: str) -> None:
+    _Q8_HC_POST_CALL_COUNTS[outcome] += 1
+    attr = f"_moespresso_dsv4_q8_hc_post_{outcome}_calls"
+    object.__setattr__(layer, attr, int(getattr(layer, attr, 0)) + 1)
+
+
+def _record_dsv4_q8_ffn_hc_post_call(layer, outcome: str) -> None:
+    _Q8_FFN_HC_POST_CALL_COUNTS[outcome] += 1
+    attr = f"_moespresso_dsv4_q8_ffn_hc_post_{outcome}_calls"
+    object.__setattr__(layer, attr, int(getattr(layer, attr, 0)) + 1)
+
+
+def _patch_deepseek_v4_q8_hc_post(model) -> int:
+    """Fuse attention wo_b Q8 QMV with the following hC-post operation.
+
+    The fusion computes the same reduction the stock pair computes, so it
+    installs on every eligible layer with no switch. Kernel and chain
+    comparisons on real q8_0 wire read zero differing float32 words, and
+    served 64-token greedy generations over the long-code-audit fixture
+    reproduce the same token ids and the same completion digest on the
+    streamed k-quant package while decode rises 1.12 percent.
+
+    Eligibility is structural: a layer joins only when its attention wo_b is
+    a bias-free q8_0 kquant module already carrying the fp32 linear seam
+    contract. Layers, models, and shapes outside that contract keep the
+    stock path, and a call whose activation, residual, or control shapes
+    miss the contract delegates to the unfused layer body. A missing
+    ``mlx_kquant.quantized_matmul_qmv_hc_post`` is a broken environment
+    rather than a supported configuration, so it fails closed.
+    """
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    object.__setattr__(model, "_moespresso_dsv4_q8_hc_post_enabled", False)
+    object.__setattr__(model, "_moespresso_dsv4_q8_hc_post_native_api", False)
+    object.__setattr__(model, "_moespresso_dsv4_q8_hc_post_layers", 0)
+
+    try:
+        import mlx.core as mx
+        import mlx_kquant as kq
+    except ImportError as exc:  # pragma: no cover - runtime dependency guard
+        raise DeepseekV4RuntimeLoadError(
+            "the DeepSeek-V4 Q8 attention hC-post fusion requires mlx_kquant"
+        ) from exc
+
+    native = getattr(kq, "quantized_matmul_qmv_hc_post", None)
+    if not callable(native):
+        raise DeepseekV4RuntimeLoadError(
+            "the DeepSeek-V4 Q8 attention hC-post fusion requires "
+            "mlx_kquant.quantized_matmul_qmv_hc_post"
+        )
+    object.__setattr__(
+        model, "_moespresso_dsv4_q8_hc_post_native_api", True)
+
+    patched = 0
+    eligible = 0
+    classes = set()
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        wo_b = getattr(attn, "wo_b", None)
+        original = getattr(wo_b, "original", None)
+        if (
+            not getattr(wo_b, "_moespresso_dsv4_q8_fp32_linear", False)
+            or getattr(original, "mode", None) != "kquant"
+            or getattr(original, "kquant_type", None) != "q8_0"
+            or "bias" in original
+        ):
+            continue
+        eligible += 1
+        classes.add(type(layer))
+        if getattr(layer, "_moespresso_dsv4_q8_hc_post_eligible", False):
+            continue
+        object.__setattr__(
+            wo_b, "_moespresso_dsv4_q8_hc_post_eligible", True)
+        object.__setattr__(
+            layer, "_moespresso_dsv4_q8_hc_post_eligible", True)
+        object.__setattr__(
+            layer, "_moespresso_dsv4_q8_hc_post_engaged_calls", 0)
+        object.__setattr__(
+            layer, "_moespresso_dsv4_q8_hc_post_fallback_calls", 0)
+        object.__setattr__(
+            layer, "_moespresso_dsv4_q8_hc_post_delegated_calls", 0)
+        patched += 1
+
+    if eligible == 0:
+        return 0
+    object.__setattr__(model, "_moespresso_dsv4_q8_hc_post_enabled", True)
+
+    for cls in classes:
+        if cls.__dict__.get("_moespresso_dsv4_q8_hc_post_wrapped", False):
+            continue
+        original_call = cls.__call__
+        hidden_tap_inside = bool(
+            cls.__dict__.get("_moespresso_hidden_tap_wrapped", False))
+
+        def _q8_hc_post_layer_call(
+            self,
+            x,
+            mask=None,
+            cache=None,
+            input_ids=None,
+            _original=original_call,
+            _hidden_tap_inside=hidden_tap_inside,
+        ):
+            if not getattr(
+                self, "_moespresso_dsv4_q8_hc_post_eligible", False
+            ):
+                return _original(
+                    self, x, mask=mask, cache=cache, input_ids=input_ids)
+            ffn_eligible = getattr(
+                self, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+            fuse_attention = x.dtype == mx.float32
+            if (
+                tuple(int(dim) for dim in x.shape)
+                != (
+                    1,
+                    1,
+                    _DSV4_Q8_HC_POST_HC,
+                    _DSV4_Q8_HC_POST_HIDDEN,
+                )
+                or (
+                    not fuse_attention
+                    and not (
+                        ffn_eligible
+                        and x.dtype in (mx.bfloat16, mx.float16)
+                    )
+                )
+            ):
+                _record_dsv4_q8_hc_post_call(self, "delegated")
+                if ffn_eligible:
+                    _record_dsv4_q8_ffn_hc_post_call(self, "delegated")
+                return _original(
+                    self, x, mask=mask, cache=cache, input_ids=input_ids)
+
+            residual = x
+            x, post, comb = self._hc_pre(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+            x = self.input_layernorm(x)
+            if fuse_attention:
+                call = _Dsv4Q8HcPostCall(residual, post, comb)
+                token = _DSV4_Q8_HC_POST_CONTEXT.set(call)
+                try:
+                    x = self.self_attn(x, mask=mask, cache=cache)
+                finally:
+                    _DSV4_Q8_HC_POST_CONTEXT.reset(token)
+                if call.used:
+                    _record_dsv4_q8_hc_post_call(self, "engaged")
+                else:
+                    _record_dsv4_q8_hc_post_call(self, "fallback")
+                    x = self._hc_post(x, residual, post, comb)
+            else:
+                _record_dsv4_q8_hc_post_call(self, "delegated")
+                x = self.self_attn(x, mask=mask, cache=cache)
+                x = self._hc_post(x, residual, post, comb)
+
+            residual = x
+            x, post, comb = self._hc_pre(
+                x,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+            )
+            x = self.post_attention_layernorm(x)
+            if ffn_eligible:
+                call = _Dsv4Q8FfnHcPostCall(residual, post, comb)
+                token = _DSV4_Q8_FFN_HC_POST_CONTEXT.set(call)
+                try:
+                    x = self.mlp(x, input_ids=input_ids)
+                finally:
+                    _DSV4_Q8_FFN_HC_POST_CONTEXT.reset(token)
+                if call.used:
+                    _record_dsv4_q8_ffn_hc_post_call(self, "engaged")
+                else:
+                    _record_dsv4_q8_ffn_hc_post_call(self, "fallback")
+                    x = self._hc_post(x, residual, post, comb)
+            else:
+                x = self.mlp(x, input_ids=input_ids)
+                x = self._hc_post(x, residual, post, comb)
+            if _hidden_tap_inside:
+                tap = getattr(self, "_moespresso_hidden_tap", None)
+                if tap is not None and tap.active:
+                    tap.rows[self.layer_id] = tap.transform(self.layer_id, x)
+            return x
+
+        setattr(cls, "__call__", _q8_hc_post_layer_call)
+        setattr(cls, "_moespresso_dsv4_q8_hc_post_wrapped", True)
+
+    object.__setattr__(model, "_moespresso_dsv4_q8_hc_post_layers", eligible)
+    return patched
+
+
+def _patch_deepseek_v4_q8_ffn_hc_post(model) -> int:
+    """Fuse the shared-expert down QMV, routed add, and FFN hC-post.
+
+    The fusion reproduces the stock expression word for word on real q8_0
+    wire and installs with no switch. It is driven from inside the attention
+    hC-post layer body, so it installs only on layers that fusion already
+    claimed, and only on an IQ_K block whose decode seam exposes the routed
+    result the epilogue adds, where the routed row is the stock score-weighted
+    sum of the switch output. A fully resident pooled IQ_K
+    block exposes the same switch result without loading or exporting routes,
+    so it keeps the fusion. Bounded-residency pools keep the stock block path.
+    A missing ``mlx_kquant.quantized_matmul_qmv_add_hc_post`` on a graph
+    that is otherwise eligible is a broken environment and fails closed.
+    """
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    object.__setattr__(model, "_moespresso_dsv4_q8_ffn_hc_post_enabled", False)
+    object.__setattr__(
+        model, "_moespresso_dsv4_q8_ffn_hc_post_native_api", False)
+    object.__setattr__(model, "_moespresso_dsv4_q8_ffn_hc_post_layers", 0)
+
+    if not any(
+        getattr(layer, "_moespresso_dsv4_q8_hc_post_eligible", False)
+        for layer in layers
+    ):
+        return 0
+
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        import mlx_kquant as kq
+    except ImportError as exc:  # pragma: no cover - runtime dependency guard
+        raise DeepseekV4RuntimeLoadError(
+            "the DeepSeek-V4 Q8 shared-FFN hC-post fusion requires mlx_kquant"
+        ) from exc
+
+    native = getattr(kq, "quantized_matmul_qmv_add_hc_post", None)
+    if not callable(native):
+        raise DeepseekV4RuntimeLoadError(
+            "the DeepSeek-V4 Q8 shared-FFN hC-post fusion requires "
+            "mlx_kquant.quantized_matmul_qmv_add_hc_post"
+        )
+    object.__setattr__(
+        model, "_moespresso_dsv4_q8_ffn_hc_post_native_api", True)
+
+    candidates = []
+    iqk_block_classes = []
+    for layer in layers:
+        block = getattr(layer, "mlp", None)
+        shared = getattr(block, "shared_experts", None)
+        down = getattr(shared, "down_proj", None)
+        original = getattr(down, "original", down)
+        weight = None
+        has_scales = False
+        if original is not None and hasattr(original, "__contains__"):
+            if "weight" in original:
+                weight = original["weight"]
+            has_scales = "scales" in original
+        switch = getattr(block, "switch_mlp", None)
+        if not (
+            hasattr(block, "gate")
+            and (
+                type(switch).__name__ == "IqkDeepseekV4SwitchGLU"
+                or (
+                    bool(getattr(switch, "_all_iqk", False))
+                    and callable(getattr(
+                        switch, "_barrier_free_decode_ready", None))
+                    and switch._barrier_free_decode_ready()
+                )
+            )
+        ):
+            continue
+        if (
+            getattr(
+                layer, "_moespresso_dsv4_q8_hc_post_eligible", False)
+            and getattr(original, "mode", None) == "kquant"
+            and getattr(original, "kquant_type", None) == "q8_0"
+            and has_scales
+            and "bias" not in original
+            and weight is not None
+            and weight.dtype == mx.uint8
+            and weight.ndim == 2
+            and tuple(int(dim) for dim in weight.shape)
+            == (
+                _DSV4_Q8_FFN_HC_POST_HIDDEN,
+                _DSV4_Q8_FFN_HC_POST_WIRE_BYTES,
+            )
+        ):
+            candidates.append((layer, block, shared, down, original))
+            if type(block) not in iqk_block_classes:
+                iqk_block_classes.append(type(block))
+
+    if not candidates:
+        return 0
+
+    class _DS4Q8FfnHcPostDown(nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            self.original = original
+            self.mode = getattr(original, "mode", None)
+            self.kquant_type = getattr(original, "kquant_type", None)
+            self.group_size = getattr(original, "group_size", None)
+            self.bits = getattr(original, "bits", None)
+            self.biases = getattr(original, "biases", None)
+            self.freeze()
+
+        def __call__(self, x):
+            call = _DSV4_Q8_FFN_HC_POST_CONTEXT.get()
+            if _deepseek_v4_q8_ffn_hc_post_eligible(
+                self, x, call, mx=mx
+            ):
+                original = self.original
+                out = kq.quantized_matmul_qmv_add_hc_post(
+                    x,
+                    original["weight"],
+                    original["scales"],
+                    call.routed.reshape(_DSV4_Q8_FFN_HC_POST_HIDDEN),
+                    call.residual.reshape(
+                        _DSV4_Q8_HC_POST_HC,
+                        _DSV4_Q8_FFN_HC_POST_HIDDEN,
+                    ),
+                    call.post.reshape(_DSV4_Q8_HC_POST_HC),
+                    call.comb.reshape(
+                        _DSV4_Q8_HC_POST_HC, _DSV4_Q8_HC_POST_HC),
+                    "q8_0",
+                )
+                call.used = True
+                return out.reshape(
+                    1,
+                    1,
+                    _DSV4_Q8_HC_POST_HC,
+                    _DSV4_Q8_FFN_HC_POST_HIDDEN,
+                )
+            return self.original(x)
+
+    patched = 0
+    for layer, block, shared, down, original in candidates:
+        if not getattr(
+            down, "_moespresso_dsv4_q8_ffn_hc_post_down", False
+        ):
+            down = _DS4Q8FfnHcPostDown(original)
+            object.__setattr__(
+                down, "_moespresso_dsv4_q8_ffn_hc_post_down", True)
+            object.__setattr__(shared, "down_proj", down)
+        object.__setattr__(
+            down, "_moespresso_dsv4_q8_ffn_hc_post_eligible", True)
+        object.__setattr__(
+            block, "_moespresso_dsv4_q8_ffn_hc_post_eligible", True)
+        if not getattr(
+            layer, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False
+        ):
+            object.__setattr__(
+                layer, "_moespresso_dsv4_q8_ffn_hc_post_engaged_calls", 0)
+            object.__setattr__(
+                layer, "_moespresso_dsv4_q8_ffn_hc_post_fallback_calls", 0)
+            object.__setattr__(
+                layer, "_moespresso_dsv4_q8_ffn_hc_post_delegated_calls", 0)
+            patched += 1
+        object.__setattr__(
+            layer, "_moespresso_dsv4_q8_ffn_hc_post_eligible", True)
+
+    for iqk_cls in iqk_block_classes:
+        if iqk_cls.__dict__.get(
+            "_moespresso_dsv4_q8_ffn_hc_post_wrapped", False
+        ):
+            continue
+        iqk_original_call = iqk_cls.__call__
+
+        def _q8_ffn_hc_post_iqk_block_call(
+            self,
+            x,
+            input_ids=None,
+            _original=iqk_original_call,
+        ):
+            call = _DSV4_Q8_FFN_HC_POST_CONTEXT.get()
+            if (
+                call is None
+                or not getattr(
+                    self, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
+            ):
+                return _original(self, x, input_ids=input_ids)
+            # The stock routed expression, reproduced word for word so the
+            # ineligible and fallback paths stay bit-identical to the
+            # unwrapped block: gate, switch, score-weighted sum, cast back
+            # to the switch dtype, reshape to the carrier.
+            inds, scores = self.gate(x, input_ids=input_ids)
+            inds = inds.astype(mx.uint32)
+            y = self.switch_mlp(x, inds)
+            y = (
+                (y * scores[..., None])
+                .sum(axis=-2)
+                .astype(y.dtype)
+                .reshape(x.shape)
+            )
+            if (
+                y.dtype == mx.float16
+                and tuple(int(dim) for dim in y.shape)
+                == (1, 1, _DSV4_Q8_FFN_HC_POST_HIDDEN)
+            ):
+                call.routed = y
+            shared_out = self.shared_experts(x)
+            result = shared_out if call.used else y + shared_out
+            commit = getattr(self.switch_mlp, "commit_iqk_output", None)
+            if callable(commit):
+                rows = 1
+                for dim in x.shape[:-1]:
+                    rows *= int(dim)
+                commit(result, rows=rows)
+            return result
+
+        setattr(iqk_cls, "__call__", _q8_ffn_hc_post_iqk_block_call)
+        setattr(
+            iqk_cls,
+            "_moespresso_dsv4_q8_ffn_hc_post_wrapped",
+            True,
+        )
+
+    object.__setattr__(model, "_moespresso_dsv4_q8_ffn_hc_post_enabled", True)
+    object.__setattr__(
+        model, "_moespresso_dsv4_q8_ffn_hc_post_layers", len(candidates))
     return patched
 
 
@@ -3394,10 +4309,21 @@ def _load_deepseek_v4_regular_weights(
     package_dir: Path,
     *,
     load_shard_fn: Callable[[Path], dict] | None = None,
+    shard_names: Sequence[str] | None = None,
 ) -> tuple[int, int]:
-    """Load every non-bundle DS4 package tensor through the graph sanitizer."""
+    """Load every non-bundle DS4 package tensor through the graph sanitizer.
+
+    ``shard_names`` restricts the load to the manifest's declared model
+    shards; a package that bundles a drafter component carries the drafter's
+    own ``model-dspark-*`` shard files beside the model shards, and those
+    belong to the drafter loader, never the trunk graph. Without the
+    restriction (direct callers, tests) every shard in the directory loads.
+    """
     package_dir = Path(package_dir)
-    shards = sorted(package_dir.glob("model-*.safetensors"))
+    if shard_names is not None:
+        shards = sorted(package_dir / name for name in shard_names)
+    else:
+        shards = sorted(package_dir.glob("model-*.safetensors"))
     if not shards:
         raise DeepseekV4RuntimeLoadError(
             f"DeepSeek V4 package has no safetensors shards: {package_dir}")
@@ -3671,15 +4597,39 @@ def load_deepseek_v4_package_model(
         )
         _patch_deepseek_v4_kquant_grouped_output_projection(model)
         _patch_deepseek_v4_kquant_lm_head(model)
+    from moespresso.runtime.deepseek_v4.iqk_dense import (
+        manifest_requires_iqk_dense as _manifest_requires_iqk_dense,
+    )
+
+    if _manifest_requires_iqk_dense(manifest):
+        # Dense IQ_K modules swap before the regular-weight load so their
+        # packed wire binds by module weight key; the DS4 seam routes and
+        # the lm_head patch key on the installed modules' mode and leave
+        # every non-IQ_K module on its stock route.
+        from moespresso.runtime.deepseek_v4.iqk_dense import (
+            install_deepseek_v4_iqk_dense_modules,
+            install_deepseek_v4_iqk_dense_seams,
+            patch_deepseek_v4_iqk_dense_lm_head,
+        )
+
+        install_deepseek_v4_iqk_dense_modules(model, manifest)
+        install_deepseek_v4_iqk_dense_seams(model)
+        patch_deepseek_v4_iqk_dense_lm_head(model)
     _patch_deepseek_v4_affine_wo_fp32(model)
     _patch_deepseek_v4_hc_post_float32(model)
     _patch_deepseek_v4_hc_fused(model)
+    _patch_deepseek_v4_q8_hc_post(model)
     _patch_deepseek_v4_required_attention_cache(model)
     _patch_deepseek_v4_attention_fp16_qkv(model)
     _patch_deepseek_v4_attention_seam_rope(model)
 
+    declared_shards = [
+        str(entry["path"]) for entry in manifest.get("files", [])
+        if isinstance(entry, dict) and entry.get("path")
+    ]
     loaded_regular, skipped_bundles = _load_deepseek_v4_regular_weights(
-        model, package_dir, load_shard_fn=load_shard_fn)
+        model, package_dir, load_shard_fn=load_shard_fn,
+        shard_names=declared_shards or None)
     if loaded_regular == 0:
         raise DeepseekV4RuntimeLoadError("DeepSeek V4 package loaded no regular tensors")
     _validate_deepseek_v4_router_gate_dtypes(model)
@@ -3716,6 +4666,8 @@ def load_deepseek_v4_package_model(
                 seed_expert_residency(model, package_dir),
             )
         wrap_switchglus_fn(model, required_mixed_layers=_mixed_gate_up_layers(index))
+
+    _patch_deepseek_v4_q8_ffn_hc_post(model)
 
     tokenizer = load_tokenizer_fn(package_dir)
     model._moespresso_dsv4_regular_tensors_loaded = loaded_regular

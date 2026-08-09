@@ -72,18 +72,20 @@ def _kquant_passthrough_tensors(inventory: dict) -> list[dict]:
     for entry in inventory.get("tensors", []):
         if entry.get("kind") != "affine" or not _is_ds4_router_gate(entry):
             continue
-        out.append({
-            "source_name": entry["source_name"],
-            "role": entry["role"],
-            "kind": "passthrough",
-            "layer_index": entry.get("layer_index"),
-            "shape": entry.get("shape", []),
-            "dtype": entry.get("dtype"),
-            "shard": entry.get("shard"),
-            "gguf_keys": [],
-            "status": entry.get("status", "required"),
-            "format": "fp16",
-        })
+        out.append(
+            {
+                "source_name": entry["source_name"],
+                "role": entry["role"],
+                "kind": "passthrough",
+                "layer_index": entry.get("layer_index"),
+                "shape": entry.get("shape", []),
+                "dtype": entry.get("dtype"),
+                "shard": entry.get("shard"),
+                "gguf_keys": [],
+                "status": entry.get("status", "required"),
+                "format": "fp16",
+            }
+        )
     return out
 
 
@@ -150,7 +152,7 @@ def _conservative_dense_allocation(entry: dict, scale_names: set[str]) -> dict:
         "bits": 8,
         "group_size": 32,
     }
-    scale_name = f"{name[:-len('.weight')]}.scale" if name.endswith(".weight") else None
+    scale_name = f"{name[: -len('.weight')]}.scale" if name.endswith(".weight") else None
     if entry.get("dtype") == "F8_E4M3" and scale_name in scale_names:
         # Not lossless through the current writer: `mx.quantize(mode="mxfp8")`
         # re-derives each group's e8m0 scale from the group amax, which rounds
@@ -158,11 +160,13 @@ def _conservative_dense_allocation(entry: dict, scale_names: set[str]) -> dict:
         # (measured 3955/524288 mismatched elements, rel RMS 0.035, on
         # e4m3-times-2^k lattice data). A true byte repack would need the
         # writer to carry the source e8m0 block scale per group.
-        alloc.update({
-            "format": "mxfp8",
-            "source_codec": "fp8_e4m3_ue8m0",
-            "lossless": False,
-        })
+        alloc.update(
+            {
+                "format": "mxfp8",
+                "source_codec": "fp8_e4m3_ue8m0",
+                "lossless": False,
+            }
+        )
     else:
         alloc["format"] = "affine"
     return alloc
@@ -173,7 +177,8 @@ def _dense_recipe_match(entry: dict, recipe: dict[str, str]) -> tuple[str, str] 
     if len(matched) > 1:
         keys = ", ".join(key for key, _codec in matched)
         raise KQuantRecipeError(
-            f"{entry['source_name']}: multiple dense GGUF recipe keys matched: {keys}")
+            f"{entry['source_name']}: multiple dense GGUF recipe keys matched: {keys}"
+        )
     return matched[0] if matched else None
 
 
@@ -194,8 +199,7 @@ def _dense_kquant_target(entry: dict, gguf_name: str, codec: str) -> DS4KQuantDe
 def _dense_kquant_allocation(target: DS4KQuantDenseTarget) -> dict:
     geometry = KQUANT_GEOMETRY.get(target.codec)
     if geometry is None:
-        raise KQuantRecipeError(
-            f"{target.gguf_tensor}: unknown kquant codec {target.codec!r}")
+        raise KQuantRecipeError(f"{target.gguf_tensor}: unknown kquant codec {target.codec!r}")
     return {
         "source_name": target.source_name,
         "kind": "affine",
@@ -252,8 +256,8 @@ def _validate_targets_against_source(targets, expert_group, imatrix_vectors) -> 
         experts = expert_group.experts(target.layer_index)
         if not experts:
             raise KQuantRecipeError(
-                f"{target.gguf_tensor}: source has no experts for layer "
-                f"{target.layer_index}")
+                f"{target.gguf_tensor}: source has no experts for layer {target.layer_index}"
+            )
         shape = expert_group.logical_shape(
             layer=target.layer_index,
             expert_index=experts[0],
@@ -311,7 +315,8 @@ def _dense_recipe_report(recipe: dict[str, str], inventory: dict) -> dict:
             preview += f", ... ({len(unmatched)} total)"
         raise KQuantRecipeError(
             "GGUF recipe contains DS4 non-expert tensor(s) not present in "
-            f"source inventory: {preview}")
+            f"source inventory: {preview}"
+        )
 
     return {
         "targets": matched,
@@ -327,13 +332,16 @@ def _fit_report(targets, expert_group, imatrix_vectors) -> dict:
         experts = expert_group.experts(target.layer_index)
         if not experts:
             raise KQuantRecipeError(
-                f"{target.gguf_tensor}: source has no experts for layer "
-                f"{target.layer_index}")
-        shape = tuple(int(v) for v in expert_group.logical_shape(
-            layer=target.layer_index,
-            expert_index=experts[0],
-            projection=target.projection,
-        ))
+                f"{target.gguf_tensor}: source has no experts for layer {target.layer_index}"
+            )
+        shape = tuple(
+            int(v)
+            for v in expert_group.logical_shape(
+                layer=target.layer_index,
+                expert_index=experts[0],
+                projection=target.projection,
+            )
+        )
         validate_kquant_target_fit(target, shape, imatrix_vectors)
         shape_key = (target.projection, target.codec, shape)
         shape_counts[shape_key] = shape_counts.get(shape_key, 0) + 1
@@ -382,7 +390,8 @@ def _dense_fit_report(
         entry = by_source.get(alloc["source_name"])
         if entry is None:
             raise KQuantRecipeError(
-                f"{alloc['source_name']}: dense allocation has no inventory entry")
+                f"{alloc['source_name']}: dense allocation has no inventory entry"
+            )
         target = _dense_kquant_target(
             entry,
             str(alloc["gguf_tensor"]),
@@ -538,9 +547,7 @@ def build_ds4_kquant_package(
     imatrix_path = Path(imatrix_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     if copy_gguf_expert_bytes and _is_remote_ref(gguf_recipe_path):
-        raise KQuantRecipeError(
-            "copying GGUF expert bytes requires a local GGUF file")
-
+        raise KQuantRecipeError("copying GGUF expert bytes requires a local GGUF file")
     config = _read_config(model_dir)
     family = family_of(config)
     if family != "deepseek_v4_flash":
@@ -574,13 +581,9 @@ def build_ds4_kquant_package(
     if copy_gguf_expert_bytes:
         recipe_targets = build_ds4_expert_kquant_targets(recipe, required_layers=layers)
         expected = {
-            (int(target.layer_index), target.projection): target.codec
-            for target in recipe_targets
+            (int(target.layer_index), target.projection): target.codec for target in recipe_targets
         }
-        got = {
-            (int(target.layer_index), target.projection): target.codec
-            for target in targets
-        }
+        got = {(int(target.layer_index), target.projection): target.codec for target in targets}
         if got != expected:
             raise KQuantRecipeError(
                 "copying GGUF expert bytes requires the routed expert codecs to "
@@ -597,7 +600,7 @@ def build_ds4_kquant_package(
         recipe_source=Path(gguf_recipe_path).name,
         imatrix_identity=imatrix_identity,
         extra_allocation=extra_allocation,
-        diagnostic=_recipe_mode(fast_diagnostic, keep_iquants) if fast_diagnostic else None,
+        diagnostic=(_recipe_mode(fast_diagnostic, keep_iquants) if fast_diagnostic else None),
         optimized_kernels_expected=optimized_kernels_expected,
         force_overrides=parse_force_overrides(force_format),
         allow_unmatched_force=allow_unmatched_force,
@@ -605,18 +608,21 @@ def build_ds4_kquant_package(
     )
     if package_plan["status"] == "invalid":
         raise RuntimeError(
-            f"K-quant recipe package plan failed: {_blocking_messages(package_plan)}")
+            f"K-quant recipe package plan failed: {_blocking_messages(package_plan)}"
+        )
     if force_format_dry_run:
         write_artifact(out_dir / INVENTORY_NAME, inventory)
         write_artifact(out_dir / PACKAGE_PLAN_NAME, package_plan)
-        _write_report(out_dir, {
-            "status": "valid",
-            "package_plan_id": package_plan["artifact_id"],
-            "force_overrides": package_plan["force_overrides"],
-            "matched": (
-                package_plan.get("force_override_preview") or {}).get("matched", []),
-            "manual_q1": {"status": "not_run"},
-        })
+        _write_report(
+            out_dir,
+            {
+                "status": "valid",
+                "package_plan_id": package_plan["artifact_id"],
+                "force_overrides": package_plan["force_overrides"],
+                "matched": (package_plan.get("force_override_preview") or {}).get("matched", []),
+                "manual_q1": {"status": "not_run"},
+            },
+        )
         return package_plan
     if kquant_encoder is None and _requires_kquant_backend(package_plan["allocation"]):
         check_kquant_backend_available()
@@ -684,31 +690,34 @@ def build_ds4_kquant_package(
     hotlist_layers = 0
     try:
         hotlist_layers = write_package_expert_hotlist(
-            out_dir, imatrix_path, imatrix_identity=imatrix_identity)
+            out_dir, imatrix_path, imatrix_identity=imatrix_identity
+        )
         if hotlist_layers:
-            log(f"  expert hotlist: {hotlist_layers} layer(s) from imatrix "
-                f"routing counts")
+            log(f"  expert hotlist: {hotlist_layers} layer(s) from imatrix routing counts")
         else:
             hotlist_layers = write_package_expert_hotlist_from_payload(
-                out_dir, load_vendored_expert_hotlist())
+                out_dir, load_vendored_expert_hotlist()
+            )
             if hotlist_layers:
-                log(f"  expert hotlist: {hotlist_layers} layer(s) from the "
-                    f"vendored ranking")
+                log(f"  expert hotlist: {hotlist_layers} layer(s) from the vendored ranking")
     except HotlistAlignmentError as e:
-        print(f"  [hotlist] SKIPPED (misaligned expert counts): {e}",
-              flush=True)
+        print(f"  [hotlist] SKIPPED (misaligned expert counts): {e}", flush=True)
 
+    expert_report = {
+        "mode": "gguf_bytes" if copy_gguf_expert_bytes else "source_reencode",
+        "name": Path(gguf_recipe_path).name if copy_gguf_expert_bytes else None,
+        "expert_targets": len(targets),
+        "expert_codec_counts": _codec_counts(targets),
+    }
+    recipe_mode = _recipe_mode(fast_diagnostic, keep_iquants)
     report = {
         "recipe": {
             "source": Path(gguf_recipe_path).name,
-            "mode": _recipe_mode(fast_diagnostic, keep_iquants),
-            "expert_byte_source": {
-                "mode": "gguf_bytes" if copy_gguf_expert_bytes else "source_reencode",
-                "name": Path(gguf_recipe_path).name if copy_gguf_expert_bytes else None,
-            },
+            "mode": recipe_mode,
+            "expert_byte_source": expert_report,
             "tensor_count": len(recipe),
-            "expert_targets": len(targets),
-            "expert_codec_counts": _codec_counts(targets),
+            "expert_targets": expert_report["expert_targets"],
+            "expert_codec_counts": expert_report["expert_codec_counts"],
             "dense": dense_recipe,
         },
         "fit": {"dense": dense_fit},
@@ -740,40 +749,70 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shard-size-gb", type=float, default=4.0)
     parser.add_argument("--chunk-bytes", type=int, default=None)
     parser.add_argument("--max-experts-per-layer", type=int, default=None)
-    parser.add_argument("--smoke", action="store_true",
-                        help="Shorthand for --max-experts-per-layer 1")
-    parser.add_argument("--preflight-only", action="store_true",
-                        help="Validate source, recipe, and imatrix fit without encoding")
-    parser.add_argument("--fast-diagnostic", action="store_true",
-                        help=("Fast diagnostic recipe: swap every routed iq* expert "
-                              "codec (gate, up, AND down) to q2_k, which encodes on "
-                              "the GPU bit-identically to its CPU encode. Builds in "
-                              "~10 min instead of the faithful recipe's many hours. "
-                              "Not the faithful DS4-c artifact."))
     parser.add_argument(
-        "--force-very-slow-cpu-iquant-encode", action="store_true",
-        help=("DANGER / VERY SLOW: keep iq* codecs (e.g. iq2_xxs) inside a "
-              "--fast-diagnostic build instead of swapping them to q2_k. iq* has "
-              "NO GPU encoder and is force-pinned to a single-threaded CPU encode, "
-              "making the full build MANY HOURS (measured ~8h). Only for a faithful "
-              "artifact; never for iteration. No effect without --fast-diagnostic."))
-    parser.add_argument("--kquant-cache-dir", default=None,
-                        help="Cache encoded K-quant wire tensors by source+codec+imatrix")
+        "--smoke", action="store_true", help="Shorthand for --max-experts-per-layer 1"
+    )
     parser.add_argument(
-        "--copy-gguf-expert-bytes", action="store_true",
-        help=("Copy routed expert K-quant wire bytes directly from --gguf-recipe "
-              "instead of re-encoding source FP4 experts. This is byte-faithful "
-              "to DS4-c for routed experts; dense tensors still follow the normal "
-              "package recipe path."))
-    parser.add_argument("--optimized-kernels-expected", action="store_true",
-                        help="Stamp the package as intended for optimized kernels.")
-    parser.add_argument("--force-format", action="append", default=[],
-                        metavar="PATTERN=FORMAT",
-                        help="Force matched package-plan rows to a format such as "
-                             "tq2, tq4, mxfp4, mxfp8, affine4, or kquant:q2_k.")
+        "--preflight-only",
+        action="store_true",
+        help="Validate source, recipe, and imatrix fit without encoding",
+    )
+    parser.add_argument(
+        "--fast-diagnostic",
+        action="store_true",
+        help=(
+            "Fast diagnostic recipe: swap every routed iq* expert "
+            "codec (gate, up, AND down) to q2_k, which encodes on "
+            "the GPU bit-identically to its CPU encode. Builds in "
+            "~10 min instead of the faithful recipe's many hours. "
+            "Not the faithful DS4-c artifact."
+        ),
+    )
+    parser.add_argument(
+        "--force-very-slow-cpu-iquant-encode",
+        action="store_true",
+        help=(
+            "DANGER / VERY SLOW: keep iq* codecs (e.g. iq2_xxs) inside a "
+            "--fast-diagnostic build instead of swapping them to q2_k. iq* has "
+            "NO GPU encoder and is force-pinned to a single-threaded CPU encode, "
+            "making the full build MANY HOURS (measured ~8h). Only for a faithful "
+            "artifact; never for iteration. No effect without --fast-diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--kquant-cache-dir",
+        default=None,
+        help="Cache encoded K-quant wire tensors by source+codec+imatrix",
+    )
+    parser.add_argument(
+        "--copy-gguf-expert-bytes",
+        action="store_true",
+        help=(
+            "Copy routed expert K-quant wire bytes directly from --gguf-recipe "
+            "instead of re-encoding source FP4 experts. This is byte-faithful "
+            "to DS4-c for routed experts; dense tensors still follow the normal "
+            "package recipe path."
+        ),
+    )
+    parser.add_argument(
+        "--optimized-kernels-expected",
+        action="store_true",
+        help="Stamp the package as intended for optimized kernels.",
+    )
+    parser.add_argument(
+        "--force-format",
+        action="append",
+        default=[],
+        metavar="PATTERN=FORMAT",
+        help="Force matched package-plan rows to a format such as "
+        "tq2, tq4, mxfp4, mxfp8, affine4, or kquant:q2_k.",
+    )
     parser.add_argument("--allow-unmatched-force", action="store_true")
-    parser.add_argument("--force-format-dry-run", action="store_true",
-                        help="Write package_plan/report and exit before encoding.")
+    parser.add_argument(
+        "--force-format-dry-run",
+        action="store_true",
+        help="Write package_plan/report and exit before encoding.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     max_experts = 1 if args.smoke else args.max_experts_per_layer
@@ -782,12 +821,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.force_very_slow_cpu_iquant_encode and not args.fast_diagnostic:
         parser.error(
             "--force-very-slow-cpu-iquant-encode only applies inside a "
-            "--fast-diagnostic build (the faithful default already uses iq* codecs)")
-    if args.copy_gguf_expert_bytes and args.fast_diagnostic and not args.force_very_slow_cpu_iquant_encode:
+            "--fast-diagnostic build (the faithful default already uses iq* codecs)"
+        )
+    if (
+        args.copy_gguf_expert_bytes
+        and args.fast_diagnostic
+        and not args.force_very_slow_cpu_iquant_encode
+    ):
         parser.error(
             "--copy-gguf-expert-bytes requires routed codecs to match the GGUF "
             "recipe; use the faithful default or combine --fast-diagnostic with "
-            "--force-very-slow-cpu-iquant-encode")
+            "--force-very-slow-cpu-iquant-encode"
+        )
     fast_diagnostic = args.fast_diagnostic
 
     try:
@@ -844,8 +889,10 @@ def main(argv: list[str] | None = None) -> int:
 
     package_bytes = _package_size_bytes(manifest)
     print(f"Done: {args.out_dir}")
-    print(f"  shards={len(manifest['files'])} tensors={len(manifest['tensors'])} "
-          f"size={package_bytes / 2**30:.2f} GiB")
+    print(
+        f"  shards={len(manifest['files'])} tensors={len(manifest['tensors'])} "
+        f"size={package_bytes / 2**30:.2f} GiB"
+    )
     print(f"  manifest={manifest['artifact_id'][:24]}")
     return 0
 

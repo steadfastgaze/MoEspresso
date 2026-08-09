@@ -1,17 +1,21 @@
-# SSD-streaming MoE runtime
+# Pooled routed-expert runtime
 
-The SSD-streaming runtime serves a routed Mixture-of-Experts model whose routed
-expert weights do not fit in memory. Only the non-routed core (attention, norms,
-router gates, shared experts) stays resident; the routed experts live on disk and
-are streamed in on demand, into a fixed per-layer pool of MLX buffers, so a large
-MoE serves within a bounded memory budget.
+The pooled runtime serves routed Mixture-of-Experts weights from persistent
+per-layer MLX buffers. Their capacity is stable during each request. The
+non-routed core stays resident. When every expert fits, all rows are loaded
+before serving and inference performs no demand I/O. At smaller capacities,
+missing routed rows stream from the package into the same buffers as routing
+selects them. Full residency and bounded SSD streaming are two capacity points
+of one graph. After a request, selected layers can replace their buffers with
+larger ones through the adaptive transaction described below.
 
-The design follows a hard rule: there is no Python/numpy expert *tensor* compute
-on the per-token path. The host is allowed only small integer bookkeeping (read
-the router's selected expert ids, look up which slots they occupy, decide which
-to load) plus the byte-range `pread` of a missing expert. All expert math runs in
-MLX/Metal kernels, and the routed MLP is dispatched as one fused operation per
-layer.
+The design follows a hard rule: there is no Python or NumPy expert tensor
+compute on the per-token path. The host performs routing bookkeeping and moves
+encoded bundle bytes into persistent slots. Some codecs copy stored components
+directly; IQ_K deinterleaves a stored `blocks` row into kernel-native streams.
+The host does not dequantize weights or compute expert activations. All expert
+math runs in MLX and Metal kernels, and one pooled SwitchGLU operation owns each
+routed layer.
 
 Source: `src/moespresso/runtime/`.
 
@@ -25,13 +29,13 @@ Source: `src/moespresso/runtime/`.
 | `expert_index.py` | Per-layer bundle byte-offset index; maps `(layer, expert[, projection, component])` to an exact byte range in a shard. |
 | `expert_loader.py` | Single-expert byte-range loader (`pread` one expert into a fresh `mx.array`); proof/test helper that uses the same primitive the pools use. |
 | `pread_into.py` | The direct-IO primitive: `os.preadv` a file byte range straight into a writable MLX buffer (no Python `bytes`), with a bounded fd cache. |
-| `expert_slot_pool.py` | The persistent fixed-capacity slot pool per (layer, projection); LFU residency, miss loads, hotness decay, page-cache hygiene, on-device slot table. |
+| `expert_slot_pool.py` | The persistent slot pool per (layer, projection); LFU residency, miss loads, hotness decay, transactional growth, page-cache hygiene, on-device slot table. |
 | `expert_pool.py` | Compact-pool proof primitive that validates bit identity between a remapped compact `packed` tensor and the full stack. The product hot path uses the persistent slot pools. |
 | `expert_locality.py` | Pure router-locality analysis: activation histogram, per-layer hotlist, simulated LRU hit-rate curve. |
 | `streaming_capacity.py` | Capacity math: byte cost per capacity unit from the index, memory budget, `choose_capacity`. |
-| `pooled_switchglu.py` | The SwitchGLU forward over pooled experts and the single-dispatch routed decode driver (ring export + worker + compiled island). |
+| `pooled_switchglu.py` | The SwitchGLU forward over pooled experts, including codec-specific full-resident and bounded-residency scheduling. |
 | `gather_tq_split_norms.py` | MoEspresso-owned fork of jang's gather-TQ kernel that decouples `norms` (full-resident) from `packed` (streamed pool). |
-| `routed_decode_kernel.py` | MoEspresso-owned single-dispatch Metal kernel that fuses the whole routed MLP for one decode token. |
+| `routed_decode_kernel.py` | MoEspresso-owned single-dispatch Metal kernel for the TQ routed MLP on one decode token. |
 | `native_gate.py` | Loader for the optional native MTLSharedEvent gate extension; falls back transparently if absent. |
 | `streaming_run_lock.py` | Single-owner process lock so only one real-model streaming run executes at a time. |
 
@@ -41,10 +45,12 @@ Source: `src/moespresso/runtime/`.
 
 A package stores one routed layer's experts as a single **bundle** tensor
 `...switch_mlp.experts.tq_bundle`, a `uint8 [n_experts, row_bytes]` array whose
-row `e` concatenates expert `e`'s full payload (gate/up/down `packed` + `norms`)
-in a fixed `ROW_ORDER`. The within-row geometry (each component's offset, byte
-count, shape, dtype, and the projection bit-width) travels in the shard's
-safetensors `__metadata__`.
+row `e` concatenates expert `e`'s declared projection components in a fixed
+`ROW_ORDER`. TQ rows contain `packed` and `norms`, MXFP4 rows contain `packed`
+and `scales`, K-quant rows contain their wire components, and IQ_K projections
+contain one `blocks` component. The within-row geometry carries each
+component's offset, byte count, shape, dtype, codec, and codec parameters in the
+shard's safetensors metadata.
 
 `build_expert_index(package_dir)` scans every shard's headers for bundle tensors,
 pairs each with its layer's metadata geometry, and records absolute byte offsets.
@@ -88,12 +94,11 @@ high-frequency misses do not re-`open`/`close` the shard each time. It supports
 refcounted `acquire_fd` (so an fd in use is never evicted) and is thread-safe.
 `pread_into_cached` / `pread_view_cached` read through the shared default cache.
 
-`expert_loader.load_expert(...)` is the single-expert form: allocate a fresh
-`mx.array` of the right shape/dtype from the index and `pread` the bytes in. The
-bytes stay packed (`uint32`); no TQ dequant happens at load time. Jang's kernel
-runs the packed weights. This module is a proof/test helper; the product miss
-path uses the same `pread_view_cached` primitive to fill persistent pool slots in
-place.
+`expert_loader.load_expert(...)` is the single-component form: allocate a fresh
+`mx.array` of the declared shape and dtype from the index and `pread` the bytes
+in. The payload stays in its encoded format; no expert dequantization happens at
+load time. This module is a proof/test helper. The product miss path uses the
+same `pread_view_cached` primitive to fill persistent pool slots in place.
 
 ---
 
@@ -103,7 +108,7 @@ Capacity is derived from the memory contract. One **capacity unit** means
 "one resident expert slot in every routed (layer, projection) pool", so its byte
 cost is summed across the whole model.
 
-- `bytes_per_layer_slot(index)`: for each routed layer, the `packed`+`norms`
+- `bytes_per_layer_slot(index)`: for each routed layer, the declared component
   bytes of one expert summed over its projections, read from the index geometry.
 - `bytes_per_capacity_unit(index)` = the sum of those over all layers: the
   marginal RAM cost of raising capacity by one slot everywhere.
@@ -162,10 +167,12 @@ yields the all-resident case of the same code path.
 
 ## 5. Persistent slot pools (`expert_slot_pool.py`)
 
-`ExpertSlotPool` is a fixed-capacity, persistent set of MLX buffers for one
-(layer, projection). The pool arrays (`packed (capacity, out_features,
-packed_cols) uint32` and `norms (capacity, out_features) float16`) are allocated
-once and reused; a miss overwrites a slot **in place** via `pread`.
+`ExpertSlotPool` is a persistent set of codec-native MLX buffers for one
+(layer, projection). Its capacity is fixed between adaptive-growth
+transactions. TQ uses packed and norms arrays, MXFP4 uses packed and scales,
+K-quant uses wire arrays, and IQ_K allocates the streams exposed by
+`IqkSwitchLinear`. A miss overwrites one slot and publishes residency only
+after every declared component or stream has landed.
 
 Bookkeeping is host-side integer state:
 
@@ -198,20 +205,49 @@ loads). The caller guarantees `|active ∪ protect| <= capacity`. If the active 
 cannot fit, `ExpertCapacityExceeded` is raised; the SwitchGLU layer falls back to
 chunking.
 
-`grow(capacity)` enlarges a pool in place (copying live and spare rows into new,
-larger buffers) without shrinking.
+### Transactional adaptive growth
+
+The post-generation hook can grow hot routed layers after a completed request
+provides demand evidence. Growth never shrinks a pool. One routed layer is one
+transaction across all distinct gate, up, and down projection pools:
+
+1. Mark growth pending for the projection set. Demand loads, pool prefetch, and
+   spare placement register as storage writers, so the transaction can stop new
+   writers and drain existing ones without holding sibling locks.
+2. Allocate and evaluate complete replacement buffers without changing the
+   live pools. The old and replacement allocations coexist during this step.
+3. Fence prior readers, copy live rows and slot ledgers under the projection
+   locks, then publish every replacement and reset the route certificates
+   together. Allocation or copy failure before publication leaves that layer's
+   live storage, mappings, and capacity unchanged.
+4. Record the committed layer capacity, then seed newly available slots from
+   observed hotness. Gate, up, and down rows land before any projection map is
+   published. A seed failure restores the exact post-growth maps and
+   reservations. A later layer or seed failure does not erase an earlier
+   committed growth transaction.
+
+Adaptive growth runs after generated cache state has been published. A hard
+growth or seed failure is recorded in runtime statistics, logged once, and
+latched off for later requests. Serving continues at the capacities that were
+successfully committed.
+
+The planner keeps two memory limits separate. The extra-capacity budget charges
+only the long-lived slot delta beyond startup capacity. Replacement headroom
+must also hold the complete target allocation, including spare slots, beside
+the old layer while its transaction runs. The default live-memory floor leaves
+4 GiB available. After a commit releases the old storage, only the net delta is
+charged before the next layer is considered.
 
 ### One-pread misses via the shared row cache
 
-Since the package stores one contiguous bundle row per (layer, expert), a layer's
-three projection pools share a `BundleRowCache`. On a miss the first pool to ask
-`pread`s the whole row once into a staging buffer; the other two consume it from
-the cache and `memcpy` their `packed`/`norms` slices out of it. The cache is
-thread-safe (the three pools may load in parallel on the projection executor; an
-in-flight marker dedups concurrent loads of the same row) and drops a row after
-`consumers` takes, so the steady state is an empty cache. A pool built standalone
-(no cache, as in tests) falls back to exact per-component `pread`s through the
-same index.
+Since the package stores one contiguous bundle row per (layer, expert), a
+layer's three projection pools share a `BundleRowCache`. On a miss the first
+pool to ask reads the whole row once into a staging buffer; the other two
+consume it from the cache. Direct-copy codecs take their declared component
+slices. IQ_K splits its `blocks` slice into the kernel-native streams for that
+member. The cache is thread-safe, deduplicates concurrent row loads, and drops a
+row after every projection consumer has taken it. A standalone pool falls back
+to exact per-component reads through the same index.
 
 ### Cold-start hotlist seeding
 
@@ -257,24 +293,32 @@ all active experts first so no sentinel reaches the kernel.
 
 ## 6. SwitchGLU forward over pooled experts (`pooled_switchglu.py`)
 
-`PooledTurboQuantSwitchLinear` is one routed TQ projection backed by an
-`ExpertSlotPool`. `matmul_slots(x, remapped_indices)` calls jang's
-`gather_tq_matmul` over `pool.packed`/`pool.norms` with indices already remapped
-to pool slots. The kernel reads `n_experts` from `packed.shape`, so a compact pool
-of `capacity` slots is bit-identical to a full stack. That equivalence is what
-`expert_pool.py` validates as the foundational primitive.
+Each pooled projection is backed by an `ExpertSlotPool` and presents the
+codec's native matmul contract over slot ids. `PooledTurboQuantSwitchLinear`
+calls jang over packed and norms storage. The K-quant and MXFP4 projections use
+their own wire layouts. `PooledIqkSwitchLinear` calls the `mlx_iqk` module whose
+streams the pool owns. Replacing original expert ids with slots changes only
+weight placement; the codec kernel sees the same encoded expert bytes.
 
-`PooledSwitchGLU` owns the whole SwitchGLU seam (sort/gather, gate/up activation,
-down, scatter) so jang's class-level `SwitchGLU` monkeypatch cannot bypass it, and
-so a mixed-bit gate/up package is handled correctly. Its `__call__`:
+`PooledSwitchGLU` owns the whole SwitchGLU seam (sort/gather, gate/up
+activation, down, scatter) so a class-level `SwitchGLU` monkeypatch cannot
+bypass it and a mixed-codec package keeps its declared behavior. Its bounded
+path:
 
-- Reads the router indices to the host once (small integer array), counts unique
-  active experts, classifies the call as decode (one token-layer) or prefill.
-- If the active set exceeds capacity, falls back to chunking: sorted chunks
-  (`_call_sorted_chunked`) when `indices.size >= 64` (prefill), else row chunks
-  (`_call_chunked`). Otherwise it goes through the direct path.
+- Reads the router indices to the host once, counts active experts, and
+  classifies the call as decode or prefill. Full-resident K-quant and IQ_K
+  routes consume router ids on device and skip this synchronization.
+- If the active set exceeds capacity, chunks the operation. The exact sorted
+  crossover and projection kernel are codec-specific.
 - The direct path ensures all three projection pools (in parallel on a 3-worker
   executor when two or more pools have misses), then runs the projections.
+
+IQ_K retains the `mlx_iqk` execution policy inside this seam. Below 4,096 routed
+pairs it uses the gate, up, and down GEMV modules. At or above that crossover it
+sorts once and runs range-dequantized projections with a default split count of
+16. Capacity 256 selects a host-sync-free identity-slot route. Smaller
+capacities use the same math after demand loading, eviction, slot remapping, and
+chunking.
 
 **Fused gate+up.** When gate and up share codebook, signs, and bits (true for real
 packages), `MOESPRESSO_SSD_FUSED_GATE_UP` (default on) computes `SiLU(gate)*up` in
@@ -283,7 +327,7 @@ gather path. The precondition is checked at construction; anything else falls ba
 to the exact separate path (two gather kernels plus a Python activation),
 preferring correctness over speed.
 
-### Norms decoupled from slots (`gather_tq_split_norms.py`)
+### TQ norms decoupled from slots (`gather_tq_split_norms.py`)
 
 This is a MoEspresso-owned fork of jang's gather-TQ kernel. jang indexes both
 `packed` and `norms` by the same remapped slot, which would force `norms` to be
@@ -296,39 +340,32 @@ upstream kernel (pinned by test).
 
 ---
 
-## 7. Single-dispatch routed decode
+## 7. Routed decode scheduling
 
-For decode (one token per layer) the routed island's cost is dependent-chain
-*latency*: rotate -> fused gate/up -> rotate -> down would be four serial Metal
-dispatches per layer, each paying launch + drain. The fix is to fuse the whole
-routed MLP into **one dispatch per layer**, with one dispatch boundary, and never
-to split a layer into resident-plus-missing partial matmuls. Misses are resolved
-into the pool *before* the single fused operation runs, so the matmul always sees
-one residency state.
+The pool never splits one routed layer into resident and missing partial
+matmuls. Misses land before compute, then one `PooledSwitchGLU` operation runs
+the routed layer. Metal dispatch geometry is codec-specific. TQ has a
+single-dispatch routed kernel, K-quant uses its fused routed kernels, and IQ_K
+retains the `mlx_iqk` gate, up, and down kernel family. Python sees one routed
+operation in every case.
 
 ### Barrier-free full-resident decode
 
-The pipeline above overlaps expert-miss service with compute; when there are no
-misses to hide it pays its machinery cost for nothing. At full residency (every
-projection pool holds the whole expert set, so the residency certificate holds),
-the decode blocks skip the ring export, the event gate, the worker submit, and the
-per-layer block-exit kick, and queue the whole token graph lazily, committing every
-`MOESPRESSO_DSV4_DECODE_FLUSH_LAYERS` layers. The routed math is the same combined
-gate/up gather, activation, and down gather the pipelined builder emits, so the
-route is bit-identical to the ring path; only the index source (router ids consumed
-on device rather than worker-published slot buffers) and the scheduling change.
-Without this route the streamed forward builds one lazy MLX graph per routed layer
-and flushes forty times per decode token, where the resident runtime builds one
-graph and flushes once; the barrier-free route matches the resident shape and
-recovers the full-capacity streamed decode rate. Each block gates the route on
-the shared residency certificate plus its own kill switch: the DS4 block on
-`MOESPRESSO_SSD_BARRIER_FREE_DECODE` (default on; `0` restores the pipelined
-path), the Qwen block on `MOESPRESSO_SSD_DECODE_SCHED` (default on; `0`
-restores the pipelined path). Any partial-residency session fails the
-certificate closed and keeps the pipeline, which is the correct path when
-there are misses to overlap.
+The bounded pipeline overlaps expert-miss service with compute. When every
+projection pool holds the whole expert set, the residency certificate selects a
+lighter route: blocks skip ring export, the event gate, worker submission, and
+per-layer demand kicks. Router ids stay on device. K-quant keeps its combined
+gate/up and down route; IQ_K calls the stream modules owned by each pool directly
+and uses its measured decode/verify commit cadence. Both are bit-identical to
+their bounded counterparts because the slot table contains the same encoded
+rows.
 
-Two mechanisms implement the single fused operation:
+The DS4 block gates this route on `MOESPRESSO_SSD_BARRIER_FREE_DECODE` and the
+Qwen block on `MOESPRESSO_SSD_DECODE_SCHED`; `0` restores their pipelined paths.
+Any partial-residency session fails the certificate closed and keeps the
+pipeline, where there are misses to overlap.
+
+The TQ single-dispatch route uses two mechanisms:
 
 - **Compiled island.** `_get_compiled_island(K)` builds, once per `K`, an
   `mx.compile`d closure: on-device slot-table gather (x2) -> rotate -> fused
@@ -394,9 +431,12 @@ difference, so the prediction only moves bytes, never routing. Measured at
 cap-192: 37K prefill 516.7 to 560.8 t/s and 4K prefill 620.2 to 677.4 t/s, with
 the miss volume down about 30 percent, token-identical across capacities. The
 full-capacity build never dispatches over capacity, so the certificate path never
-submits or consumes a ticket. Default ON; `MOESPRESSO_SSD_PREFETCH=0` is the kill
-switch. Engagement counters (`prefetch_ticket_submitted/consumed/mismatched/
-stale/experts/loaded`) are exported in the streaming stats.
+submits or consumes a ticket. This evidence covers K-quant. IQ_K disables the
+cross-call prediction because its one-chunk DS4 prefill has no later prefill
+consumer and each speculative landing also performs row-to-stream relayout.
+`MOESPRESSO_SSD_PREFETCH=0` disables the feature globally. Engagement counters
+(`prefetch_ticket_submitted/consumed/mismatched/stale/experts/loaded`) are
+exported in the streaming stats.
 
 ### Opt-in decode lookahead (`MOESPRESSO_SSD_LOOKAHEAD`)
 
@@ -452,8 +492,8 @@ miss. Sources, in precedence order:
    serve the segmented numerics until the pools fill, diverging from the
    gate-certified barrier-free path at knife-edge tokens on long prompts.
    Prewarming at load pins serving to the gate-certified numerics and moves
-   the cold first-request SSD reads into load time (~14 s on the byte-faithful
-   DS4 package, and faster than saved-hotlist seeding of the same expert set).
+   the cold first-request SSD reads into load time, which measured faster than
+   saved-hotlist seeding of the same expert set.
    `MOESPRESSO_SSD_PREWARM_DEFAULT=0` restores lazy hotlist seeding.
    Partial-capacity configurations are unaffected.
 3. **Saved demand** from a prior session (`save_expert_hotlist` persists each
@@ -469,6 +509,11 @@ would make seeded experts un-evictable. Seeding only fills *free* slots, so it c
 never evict live demand. `MOESPRESSO_SSD_HOTLIST=0` disables the hotlist tiers;
 combined with `MOESPRESSO_SSD_PREWARM_DEFAULT=0` it yields a fully cold pool
 state (the diagnostic configuration).
+
+The three projection consumers are seeded in shared row-cache windows. Gate,
+up, and down therefore consume one bundle row while it is live instead of
+reading the row once per projection when the seed capacity exceeds the cache
+window.
 
 `expert_locality.py` is the offline analysis that justifies this: given a trace of
 per-layer selected experts, it computes the activation histogram
@@ -502,18 +547,18 @@ message. `MOESPRESSO_ALLOW_PARALLEL_SSD_STREAMING=1` overrides the guard;
 | `MOESPRESSO_SSD_KV_ALLOWANCE_GB` | 1 | KV-cache / activation allowance in the capacity budget. |
 | `MOESPRESSO_SSD_SAFETY_MARGIN_GB` | 2 | Safety headroom in the capacity budget. |
 | `MOESPRESSO_SSD_HOTLIST` | 1 | Cold-start residency seeding (`0` disables). |
-| `MOESPRESSO_SSD_PREWARM_EXPERTS` | unset | `all` forces a full expert prewarm at load (fails closed below full capacity); `none` skips both the prewarm and hotlist seeding. |
+| `MOESPRESSO_SSD_PREWARM_EXPERTS` | unset | `all` forces a full expert prewarm at load (fails closed below full capacity); `none` skips explicit and default full prewarm, then uses the hotlist tiers unless `MOESPRESSO_SSD_HOTLIST=0`. |
 | `MOESPRESSO_SSD_PREWARM_DEFAULT` | 1 | Default full prewarm when every pool covers the full expert set (`0` restores lazy hotlist seeding). |
 | `MOESPRESSO_HOTLIST_DIR` | user cache | Directory for saved-demand hotlists (tests, multi-user). |
 | `MOESPRESSO_SSD_HOTNESS_DECAY_TOUCHES` | 128 | Halve LFU counters every N touches (`0` disables). |
 | `MOESPRESSO_SSD_EVICT_DONTNEED` | 1 | Advisory page-cache drop on demand eviction. |
-| `MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB` | 2 | Cap on adaptive pool growth beyond build-time capacity (`0` disables growth). |
+| `MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB` | 2 | Cap on committed adaptive slot bytes beyond startup capacity (`0` disables growth). Detached replacement storage must separately fit above the live-memory floor. |
 | `MOESPRESSO_SSD_ONDEVICE_REMAP` | on | On-device slot-table gather vs host remap. |
 | `MOESPRESSO_SSD_FUSED_GATE_UP` | on | One-dispatch fused gate/up vs separate kernels. |
 | `MOESPRESSO_SSD_FUSED_SORTED_SWIGLU` | on | Fused sorted K-quant gate/up + SwiGLU kernel on the sorted routes (`0` restores the unfused pair). |
 | `MOESPRESSO_SSD_UNIFIED_PREFILL` | on | Partial-residency sorted-chunked prefill through the same fused sorted kernels as the full-resident route (`0` restores the segmented chunked compute). |
 | `MOESPRESSO_SSD_COMPILED_ISLAND` | on | `mx.compile`d single-dispatch routed island. |
-| `MOESPRESSO_SSD_PREFETCH` | on | Cross-chunk predictive expert prefetch on the over-capacity streamed prefill path (`0` disables). |
+| `MOESPRESSO_SSD_PREFETCH` | on for supported non-IQ_K pools | Cross-chunk predictive expert prefetch on the over-capacity streamed prefill path (`0` disables globally). IQ_K remains demand-driven. |
 | `MOESPRESSO_SSD_LOOKAHEAD` | 0 | Decode lookahead depth in layers; a positive value loads predicted experts into spare slots on the native-gate decode path (parked off; see the lookahead subsection). |
 | `MOESPRESSO_SSD_BARRIER_FREE_DECODE` | on | Barrier-free full-resident decode for the DS4 block (`0` restores the pipelined ring/gate decode). |
 | `MOESPRESSO_SSD_DECODE_SCHED` | on | Barrier-free full-resident decode scheduling for the Qwen block (`0` restores the pipelined ring/gate decode). |

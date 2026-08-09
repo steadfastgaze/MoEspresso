@@ -21,6 +21,7 @@ test:
 
 lint:
 	uv run --locked ruff check src tests
+	uv run --locked vulture src tests vulture_whitelist.py --min-confidence 100
 
 fmt:
 	uv run ruff format src tests

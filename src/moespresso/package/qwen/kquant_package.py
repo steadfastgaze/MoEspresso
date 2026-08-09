@@ -192,7 +192,7 @@ def preflight_qwen_kquant_package(
 ) -> dict:
     """Validate Qwen source, GGUF recipe, and imatrix fit without encoding."""
     parts = _recipe_parts(model_dir, gguf_recipe_path, imatrix_path)
-    return {
+    report = {
         "status": "valid",
         "recipe": {
             "dense_targets": len(parts["dense_targets"]),
@@ -204,6 +204,7 @@ def preflight_qwen_kquant_package(
         "fit": parts["fit"],
         "imatrix": parts["imatrix_identity"],
     }
+    return report
 
 
 def build_qwen_kquant_package(
@@ -235,6 +236,7 @@ def build_qwen_kquant_package(
     imatrix-calibrated K-quant encode. This is the hybrid arm: K-quant-calibrated
     dense plus TQ experts. Copying GGUF expert bytes cannot be combined with it
     (K-quant wire bytes are not a TQ allocation).
+
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
@@ -247,7 +249,6 @@ def build_qwen_kquant_package(
             "--copy-gguf-expert-bytes cannot be combined with "
             "--expert-allocation-from: GGUF K-quant wire bytes are not a "
             "TurboQuant expert allocation")
-
     def log(message: str) -> None:
         if verbose:
             print(message, flush=True)
@@ -382,19 +383,21 @@ def build_qwen_kquant_package(
             log(f"  expert hotlist: {hotlist_layers} layer(s) from imatrix "
                 f"routing counts")
 
+    achieved = package_plan.get("achieved", {})
+    if expert_allocations is not None:
+        expert_target_count = len(expert_allocations)
+        expert_codec_counts = achieved.get("expert_tq_bit_counts")
+    else:
+        expert_target_count = len(parts["expert_targets"])
+        expert_codec_counts = _codec_counts(parts["expert_targets"])
     report = {
         "status": "valid",
         "manifest_id": manifest["artifact_id"],
         "recipe": {
             "dense_targets": len(parts["dense_targets"]),
-            "expert_targets": (
-                len(expert_allocations) if expert_allocations is not None
-                else len(parts["expert_targets"])),
+            "expert_targets": expert_target_count,
             "dense_codec_counts": _codec_counts(parts["dense_targets"]),
-            "expert_codec_counts": (
-                package_plan.get("achieved", {}).get("expert_tq_bit_counts")
-                if expert_allocations is not None
-                else _codec_counts(parts["expert_targets"])),
+            "expert_codec_counts": expert_codec_counts,
             "expert_byte_source": _expert_byte_source(
                 copy_gguf_expert_bytes=copy_gguf_expert_bytes,
                 expert_decision_id=expert_decision_id,
@@ -468,7 +471,6 @@ def main(argv: list[str] | None = None) -> int:
     max_experts = 1 if args.smoke else args.max_experts_per_layer
     if max_experts is not None and max_experts <= 0:
         parser.error("--max-experts-per-layer must be a positive integer")
-
     try:
         if args.preflight_only:
             report = preflight_qwen_kquant_package(

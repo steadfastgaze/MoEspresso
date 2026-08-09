@@ -77,8 +77,11 @@ def test_no_profile_falls_through_to_builtins(tmp_path):
 def test_ornith_profile_configures_the_loop(tmp_path):
     write_agentic_profile(tmp_path, family="qwen3_5_moe")
     settings = _resolve(package_dir=tmp_path)
-    assert settings.dialect == "dsml"
-    assert settings.repair is True
+    # The recorded dialect agrees with the built-in fallback, so the fields
+    # that show the profile layer was applied are the thinking flag, the
+    # nudge policy, and the sampling table.
+    assert settings.dialect == "native"
+    assert settings.repair is False
     assert settings.thinking_for_tools is False
     assert settings.reprompt_enabled is True
     assert settings.sampling == {
@@ -88,7 +91,7 @@ def test_ornith_profile_configures_the_loop(tmp_path):
     policy = settings.nudge_policy()
     assert isinstance(policy, ToolNudgePolicy) and policy.limit == 1
     assert settings.chat_template_kwargs() == {"enable_thinking": False}
-    assert settings.dialect_adapter().name == "dsml"
+    assert settings.dialect_adapter().name == "native"
 
 
 def test_ds4_profile_leaves_unproven_settings_to_builtins(tmp_path):
@@ -114,14 +117,15 @@ def test_user_config_overrides_package_profile(tmp_path):
     config = _write_config(tmp_path, (
         "[agent]\n"
         'dialect = "envelope"\n'
-        "repair = false\n"
+        "repair = true\n"
         "[agent.sampling]\n"
         "temperature = 0.9\n"
     ))
     settings = resolve_loop_settings(
         package_dir=tmp_path, config_path=config)
     assert settings.dialect == "envelope"
-    assert settings.repair is False
+    # the profile records repair as optional; the config turns it on
+    assert settings.repair is True
     # per-key sampling merge: config pins temperature, profile keeps the rest
     assert settings.sampling["temperature"] == 0.9
     assert settings.sampling["top_p"] == 0.95
@@ -136,11 +140,12 @@ def test_explicit_arguments_override_everything(tmp_path):
         "[agent.sampling]\n"
         "temperature = 0.9\n"
     ))
+    # the explicit dialect differs from both the config layer and the profile
     settings = resolve_loop_settings(
         package_dir=tmp_path, config_path=config,
-        dialect="native", thinking_for_tools=None,
+        dialect="dsml", thinking_for_tools=None,
         sampling={"top_k": 5})
-    assert settings.dialect == "native"
+    assert settings.dialect == "dsml"
     assert settings.thinking_for_tools is None
     assert settings.sampling["top_k"] == 5          # explicit wins
     assert settings.sampling["temperature"] == 0.9  # config layer survives
@@ -151,7 +156,10 @@ def test_missing_config_file_contributes_nothing(tmp_path):
     write_agentic_profile(tmp_path, family="qwen3_5_moe")
     settings = resolve_loop_settings(
         package_dir=tmp_path, config_path=tmp_path / "absent.toml")
-    assert settings.dialect == "dsml"
+    # the package layer survives untouched: an absent config adds nothing
+    assert settings.dialect == "native"
+    assert settings.reprompt_enabled is True
+    assert settings.sampling["temperature"] == 0.6
 
 
 def test_package_profile_argument_wins_over_package_dir(tmp_path):
@@ -159,7 +167,10 @@ def test_package_profile_argument_wins_over_package_dir(tmp_path):
     settings = _resolve(
         package_dir=tmp_path,
         package_profile=profile_for_family("deepseek_v4_flash"))
-    assert settings.repair is False
+    # the passed profile decides: its dialect, and none of the sidecar's
+    # sampling defaults
+    assert settings.dialect == "dsml"
+    assert settings.sampling == {}
 
 
 # --- fail-closed config and profile fields ---------------------------------------

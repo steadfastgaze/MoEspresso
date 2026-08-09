@@ -1,15 +1,16 @@
 """Persistent routed-expert slots for the SSD-streaming runtime.
 
-This is the bridge-B shape: a fixed MLX pool per routed projection, host-side
-integer slot bookkeeping, and direct `pread_into` on misses. The pool arrays are
-created once and reused; misses overwrite slots in place after an explicit MLX
-synchronization fence.
+Each routed projection owns fixed kernel-native storage, host-side integer slot
+bookkeeping, and direct range reads on misses. Storage remains fixed between
+coherent adaptive-capacity replacements; misses overwrite slots in place after
+an explicit MLX synchronization fence.
 
-The package stores one bundle row per (layer, expert): the expert's
-full gate/up/down payload, contiguous. A per-layer `BundleRowCache` shared by
-the layer's three projection pools turns a miss into one pread + six host
-memcpys (was six scattered preads); pools built standalone (no cache) fall back
-to exact per-component preads through the same index.
+The package stores one contiguous bundle row per layer and expert. A per-layer
+`BundleRowCache` shared by the three projection pools turns a coordinated miss
+into one row read. Each pool copies its indexed components into persistent
+storage; an IQ_K pool splits its blocks component into the kernel's relayout
+streams. Pools built without the cache fall back to exact component reads
+through the same index.
 """
 
 from __future__ import annotations
@@ -18,18 +19,43 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 
 from moespresso.runtime.expert_index import ExpertIndex, ProjectionGeometry
-from moespresso.package.bundle import KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.package.iqk_format import (
+    IQK_LAYOUT_IQK_RELAYOUT,
+    normalize_iqk_layout,
+)
+from moespresso.package.iqk_relayout import split_streams
 from moespresso.runtime.pread_into import pread_view_cached
 
 
 class ExpertCapacityExceeded(RuntimeError):
     pass
+
+
+@dataclass
+class _PoolGrowthCandidate:
+    """Detached storage and bookkeeping prepared for one capacity growth."""
+
+    old_capacity: int
+    capacity: int
+    iqk: object | None
+    iqk_views: dict[str, memoryview]
+    iqk_slot_nbytes: dict[str, int]
+    packed: object | None
+    norms: object | None
+    scales: object | None
+    packed_view: memoryview | None
+    norms_view: memoryview | None
+    scales_view: memoryview | None
+    expert_at: list[int | None] | None = None
+    slot_of: dict[int, int] | None = None
 
 
 # In-session hotness decay: halve LFU counters every N
@@ -122,6 +148,11 @@ class BundleRowCache:
                 self._inflight.pop(expert, None)
             event.set()
 
+    def discard(self, expert: int) -> None:
+        """Drop a partially consumed row after a coordinated-load failure."""
+        with self._lock:
+            self._rows.pop(int(expert), None)
+
 
 class ExpertSlotPool:
     """Fixed-capacity persistent MLX slots for one layer/projection."""
@@ -173,7 +204,12 @@ class ExpertSlotPool:
         self.components = index.components_for_projection(layer=layer, projection=projection)
         if self.codec == KQUANT_CODEC:
             self.components = tuple(c for c in self.components if c != "scales")
-        weight_component = "weight" if self.codec == KQUANT_CODEC else "packed"
+        if self.codec == KQUANT_CODEC:
+            weight_component = "weight"
+        elif self.codec == IQK_CODEC:
+            weight_component = "blocks"
+        else:
+            weight_component = "packed"
         self._comp_packed = comps.get((projection, weight_component))
         if self._comp_packed is None:
             raise ValueError(
@@ -189,14 +225,33 @@ class ExpertSlotPool:
         self._comp_scales = comps.get((projection, "scales"))
 
         total_slots = capacity + self.spare_slots
-        packed_dtype = mx.uint8 if self.codec == KQUANT_CODEC else mx.uint32
-        self.packed = mx.zeros(
-            (total_slots, self.geometry.out_features, self.geometry.packed_cols),
-            dtype=packed_dtype,
-        )
-        self.weight = self.packed if self.codec == KQUANT_CODEC else None
+        self.iqk = None
+        self._iqk_views: dict[str, memoryview] = {}
+        self._iqk_slot_nbytes: dict[str, int] = {}
+        self.packed = None
+        self.weight = None
         self.norms = None
         self.scales = None
+        if self.codec == IQK_CODEC:
+            if (
+                normalize_iqk_layout(self.geometry.layout)
+                != IQK_LAYOUT_IQK_RELAYOUT
+            ):
+                raise ValueError(
+                    f"{projection}: IQ_K pool requires "
+                    f"{IQK_LAYOUT_IQK_RELAYOUT!r}, got {self.geometry.layout!r}"
+                )
+            if self.geometry.iqk_codec is None or self.geometry.in_features is None:
+                raise ValueError(
+                    f"{projection}: IQ_K pool is missing member or input geometry")
+            self._allocate_iqk_storage(total_slots)
+        else:
+            packed_dtype = mx.uint8 if self.codec == KQUANT_CODEC else mx.uint32
+            self.packed = mx.zeros(
+                (total_slots, self.geometry.out_features, self.geometry.packed_cols),
+                dtype=packed_dtype,
+            )
+            self.weight = self.packed if self.codec == KQUANT_CODEC else None
         if self.codec == TQ_CODEC:
             self.norms = mx.zeros((total_slots, self.geometry.out_features),
                                   dtype=mx.float16)
@@ -210,9 +265,12 @@ class ExpertSlotPool:
         elif self.codec == KQUANT_CODEC:
             self.scales = mx.zeros((1,), dtype=mx.uint8)
             mx.eval(self.packed, self.scales)
+        elif self.codec == IQK_CODEC:
+            pass
         else:
             raise ValueError(f"{projection}: unsupported expert codec {self.codec!r}")
-        self._packed_view = memoryview(self.packed).cast("B")
+        self._packed_view = (
+            memoryview(self.packed).cast("B") if self.packed is not None else None)
         self._norms_view = memoryview(self.norms).cast("B") if self.norms is not None else None
         self._scales_view = memoryview(self.scales).cast("B") if self.scales is not None else None
 
@@ -223,6 +281,14 @@ class ExpertSlotPool:
         # dict/list bookkeeping is locked; preads happen outside the lock so
         # a slow prefetch read can never block a demand ensure's bookkeeping.
         self._bk_lock = threading.Lock()
+        self._growth_cv = threading.Condition(self._bk_lock)
+        # Every operation that writes pool storage registers before releasing
+        # the bookkeeping lock and unregisters only after publication or
+        # rollback. Growth closes the gate across a switch's projection pools,
+        # waits for this count to reach zero, and prevents new writers until
+        # all replacement storage and slot maps publish together.
+        self._loads_inflight = 0
+        self._growth_pending = False
         self._prefetch_inflight = 0
         # expert ids currently reserved by an in-flight prefetch (bytes
         # landing). A demand ensure for such an expert waits for the publish
@@ -268,6 +334,39 @@ class ExpertSlotPool:
         # Instrumentation: each rebuild is one small host->device upload on
         # the decode path. This event proxies dispatch engagement and carries no timing.
         self.slot_table_rebuilds = 0
+
+    def _new_iqk_storage(
+        self,
+        total_slots: int,
+    ) -> tuple[object, dict[str, memoryview], dict[str, int]]:
+        """Allocate detached kernel-native IQ_K streams."""
+        from mlx_iqk.nn import IqkSwitchLinear
+
+        assert self.geometry.iqk_codec is not None
+        assert self.geometry.in_features is not None
+        module = IqkSwitchLinear(
+            self.geometry.iqk_codec,
+            total_slots,
+            self.geometry.out_features,
+            self.geometry.in_features,
+        )
+        arrays = [getattr(module, name) for name in module.stream_names()]
+        mx.eval(*arrays)
+        views = {
+            name: memoryview(getattr(module, name)).cast("B")
+            for name in module.stream_names()
+        }
+        slot_nbytes = {
+            name: len(view) // total_slots
+            for name, view in views.items()
+        }
+        return module, views, slot_nbytes
+
+    def _allocate_iqk_storage(self, total_slots: int) -> None:
+        """Allocate and install the initial kernel-native IQ_K streams."""
+        self.iqk, self._iqk_views, self._iqk_slot_nbytes = (
+            self._new_iqk_storage(total_slots)
+        )
 
     def _init_combined_kquant_geometry(
         self,
@@ -339,115 +438,236 @@ class ExpertSlotPool:
         return total
 
     def resident_ids(self) -> set[int]:
-        return set(self._slot_of)
+        with self._bk_lock:
+            return set(self._slot_of)
+
+    def hotness_snapshot(self) -> dict[int, int]:
+        """Return a stable copy of the LFU counters."""
+        with self._bk_lock:
+            return dict(self._freq)
 
     def slot_of(self, expert: int) -> int:
         return self._slot_of[int(expert)]
 
+    def _free_slots_locked(self) -> int:
+        """Count empty demand slots while the bookkeeping lock is held."""
+        return sum(
+            occupant is None
+            for occupant in self._expert_at[:self.capacity]
+        )
+
     def free_slots(self) -> int:
-        return self.capacity - len(self._slot_of)
+        with self._bk_lock:
+            return self._free_slots_locked()
 
     def grow(self, capacity: int) -> None:
+        """Grow this pool through the same transaction used by a full switch."""
+        grow_expert_slot_pools((self,), capacity)
+
+    def _validate_growth_locked(self, capacity: int) -> None:
         capacity = int(capacity)
         if capacity < self.capacity:
             raise ValueError("ExpertSlotPool.grow cannot shrink capacity")
         if capacity + self.spare_slots > self.num_experts:
             raise ValueError("capacity cannot exceed num_experts")
-        if capacity == self.capacity:
-            return
 
-        with self._bk_lock:
-            delta = capacity - self.capacity
-            old_capacity = self.capacity
-            total = capacity + self.spare_slots
-            packed_dtype = mx.uint8 if self.codec == KQUANT_CODEC else mx.uint32
-            packed = mx.zeros(
-                (total, self.geometry.out_features, self.geometry.packed_cols),
-                dtype=packed_dtype,
+    def _allocate_growth_candidate(self, capacity: int) -> _PoolGrowthCandidate | None:
+        """Allocate and evaluate detached replacement storage.
+
+        The growth-pending gate keeps the live capacity stable while this runs.
+        No live pool field is changed, so allocation failure is a clean abort.
+        """
+        capacity = int(capacity)
+        old_capacity = self.capacity
+        if capacity == old_capacity:
+            return None
+        total = capacity + self.spare_slots
+        if self.codec == IQK_CODEC:
+            iqk, views, slot_nbytes = self._new_iqk_storage(total)
+            return _PoolGrowthCandidate(
+                old_capacity=old_capacity,
+                capacity=capacity,
+                iqk=iqk,
+                iqk_views=views,
+                iqk_slot_nbytes=slot_nbytes,
+                packed=None,
+                norms=None,
+                scales=None,
+                packed_view=None,
+                norms_view=None,
+                scales_view=None,
             )
-            norms = None
-            scales = None
-            if self.codec == TQ_CODEC:
-                norms = mx.zeros((total, self.geometry.out_features),
-                                 dtype=mx.float16)
-                mx.eval(packed, norms)
-            elif self.codec == MXFP4_CODEC:
-                assert self._comp_scales is not None
-                scales = mx.zeros((total, *self._comp_scales["shape"]), dtype=mx.uint8)
-                mx.eval(packed, scales)
-            elif self.codec == KQUANT_CODEC:
-                scales = self.scales
-                mx.eval(packed)
-            else:
-                raise ValueError(f"{self.projection}: unsupported expert codec {self.codec!r}")
-            packed_view = memoryview(packed).cast("B")
-            norms_view = memoryview(norms).cast("B") if norms is not None else None
-            scales_view = memoryview(scales).cast("B") if scales is not None else None
-            prow = self._packed_row_nbytes()
-            nrow = self.geometry.out_features * 2 if norms is not None else 0
-            srow = (
-                self._comp_scales["nbytes"]
-                if self.codec == MXFP4_CODEC and scales is not None
-                else 0
-            )
-            # demand region copies in place; the spare region moves up by
-            # delta rows. Growth must not drop the spare rows while _slot_of
-            # still points at them (that caused out-of-bounds writes on the next
-            # place_spare_trio when lookahead + growth both ran).
-            packed_view[:old_capacity * prow] = (
-                self._packed_view[:old_capacity * prow])
-            if norms_view is not None and self._norms_view is not None:
-                norms_view[:old_capacity * nrow] = (
-                    self._norms_view[:old_capacity * nrow])
-            if scales_view is not None and self._scales_view is not None:
-                scales_view[:old_capacity * srow] = (
-                    self._scales_view[:old_capacity * srow])
-            if self.spare_slots:
-                packed_view[capacity * prow:total * prow] = (
-                    self._packed_view[old_capacity * prow:
-                                      (old_capacity + self.spare_slots) * prow])
-                if norms_view is not None and self._norms_view is not None:
-                    norms_view[capacity * nrow:total * nrow] = (
-                        self._norms_view[old_capacity * nrow:
-                                         (old_capacity + self.spare_slots) * nrow])
-                if scales_view is not None and self._scales_view is not None:
-                    scales_view[capacity * srow:total * srow] = (
-                        self._scales_view[old_capacity * srow:
-                                          (old_capacity + self.spare_slots) * srow])
 
-            self.packed = packed
-            self.weight = packed if self.codec == KQUANT_CODEC else None
-            self.norms = norms
-            self.scales = scales
-            self._packed_view = packed_view
-            self._norms_view = norms_view
-            self._scales_view = scales_view
-            spare_tail = self._expert_at[old_capacity:]
-            self._expert_at = (self._expert_at[:old_capacity]
-                               + [None] * delta + spare_tail)
-            self._slot_of = {
-                expert: (slot + delta if slot >= old_capacity else slot)
-                for expert, slot in self._slot_of.items()
-            }
-            self._slot_table_dirty = True
-            self.capacity = capacity
-
-    def seed_hot(self, limit: int | None = None) -> list[int]:
-        free = self.free_slots()
-        if free <= 0:
-            return []
-        if limit is not None:
-            free = min(free, int(limit))
-        if free <= 0:
-            return []
-        ranked = sorted(
-            (
-                (-count, expert)
-                for expert, count in self._freq.items()
-                if expert not in self._slot_of
+        packed_dtype = mx.uint8 if self.codec == KQUANT_CODEC else mx.uint32
+        packed = mx.zeros(
+            (total, self.geometry.out_features, self.geometry.packed_cols),
+            dtype=packed_dtype,
+        )
+        norms = None
+        scales = None
+        if self.codec == TQ_CODEC:
+            norms = mx.zeros(
+                (total, self.geometry.out_features), dtype=mx.float16)
+            mx.eval(packed, norms)
+        elif self.codec == MXFP4_CODEC:
+            assert self._comp_scales is not None
+            scales = mx.zeros(
+                (total, *self._comp_scales["shape"]), dtype=mx.uint8)
+            mx.eval(packed, scales)
+        elif self.codec == KQUANT_CODEC:
+            scales = self.scales
+            mx.eval(packed)
+        else:
+            raise ValueError(
+                f"{self.projection}: unsupported expert codec {self.codec!r}")
+        return _PoolGrowthCandidate(
+            old_capacity=old_capacity,
+            capacity=capacity,
+            iqk=None,
+            iqk_views={},
+            iqk_slot_nbytes={},
+            packed=packed,
+            norms=norms,
+            scales=scales,
+            packed_view=memoryview(packed).cast("B"),
+            norms_view=(memoryview(norms).cast("B") if norms is not None else None),
+            scales_view=(
+                memoryview(scales).cast("B")
+                if scales is not None and self.codec != KQUANT_CODEC
+                else self._scales_view
             ),
         )
-        experts = [expert for _neg_count, expert in ranked[:free]]
+
+    def _prepare_growth_locked(self, candidate: _PoolGrowthCandidate | None) -> None:
+        """Copy stable live bytes and maps into a detached candidate."""
+        if candidate is None:
+            return
+        if self.capacity != candidate.old_capacity:
+            raise RuntimeError(
+                f"{self.projection}: capacity changed during pool growth")
+        old_capacity = candidate.old_capacity
+        capacity = candidate.capacity
+        total = capacity + self.spare_slots
+        delta = capacity - old_capacity
+
+        if self.codec == IQK_CODEC:
+            if set(candidate.iqk_views) != set(self._iqk_views):
+                raise ValueError(
+                    f"{self.projection}: IQ_K stream set changed during pool growth")
+            for name, new_view in candidate.iqk_views.items():
+                row = candidate.iqk_slot_nbytes[name]
+                if row != self._iqk_slot_nbytes[name]:
+                    raise ValueError(
+                        f"{self.projection}: IQ_K stream {name} row size changed "
+                        "during pool growth")
+                new_view[:old_capacity * row] = self._iqk_views[name][
+                    :old_capacity * row]
+                if self.spare_slots:
+                    new_view[capacity * row:total * row] = self._iqk_views[name][
+                        old_capacity * row:
+                        (old_capacity + self.spare_slots) * row]
+        else:
+            assert candidate.packed_view is not None
+            assert self._packed_view is not None
+            prow = self._packed_row_nbytes()
+            nrow = self.geometry.out_features * 2 if candidate.norms is not None else 0
+            srow = (
+                self._comp_scales["nbytes"]
+                if self.codec == MXFP4_CODEC and candidate.scales is not None
+                else 0
+            )
+            candidate.packed_view[:old_capacity * prow] = self._packed_view[
+                :old_capacity * prow]
+            if candidate.norms_view is not None and self._norms_view is not None:
+                candidate.norms_view[:old_capacity * nrow] = self._norms_view[
+                    :old_capacity * nrow]
+            if (
+                self.codec == MXFP4_CODEC
+                and candidate.scales_view is not None
+                and self._scales_view is not None
+            ):
+                candidate.scales_view[:old_capacity * srow] = self._scales_view[
+                    :old_capacity * srow]
+            if self.spare_slots:
+                candidate.packed_view[capacity * prow:total * prow] = self._packed_view[
+                    old_capacity * prow:(old_capacity + self.spare_slots) * prow]
+                if candidate.norms_view is not None and self._norms_view is not None:
+                    candidate.norms_view[capacity * nrow:total * nrow] = (
+                        self._norms_view[
+                            old_capacity * nrow:
+                            (old_capacity + self.spare_slots) * nrow]
+                    )
+                if (
+                    self.codec == MXFP4_CODEC
+                    and candidate.scales_view is not None
+                    and self._scales_view is not None
+                ):
+                    candidate.scales_view[capacity * srow:total * srow] = (
+                        self._scales_view[
+                            old_capacity * srow:
+                            (old_capacity + self.spare_slots) * srow]
+                    )
+
+        spare_tail = self._expert_at[old_capacity:]
+        candidate.expert_at = (
+            self._expert_at[:old_capacity] + [None] * delta + spare_tail)
+        candidate.slot_of = {
+            expert: (slot + delta if slot >= old_capacity else slot)
+            for expert, slot in self._slot_of.items()
+        }
+
+    def _publish_growth_locked(self, candidate: _PoolGrowthCandidate | None) -> None:
+        """Publish an already prepared candidate; this method cannot allocate."""
+        if candidate is None:
+            return
+        assert candidate.expert_at is not None
+        assert candidate.slot_of is not None
+        self.iqk = candidate.iqk
+        self._iqk_views = candidate.iqk_views
+        self._iqk_slot_nbytes = candidate.iqk_slot_nbytes
+        self.packed = candidate.packed
+        self.weight = candidate.packed if self.codec == KQUANT_CODEC else None
+        self.norms = candidate.norms
+        self.scales = candidate.scales
+        self._packed_view = candidate.packed_view
+        self._norms_view = candidate.norms_view
+        self._scales_view = candidate.scales_view
+        self._expert_at = candidate.expert_at
+        self._slot_of = candidate.slot_of
+        self._slot_table_dirty = True
+        self.capacity = candidate.capacity
+
+    def _wait_for_growth_locked(self) -> None:
+        while self._growth_pending:
+            self._growth_cv.wait()
+
+    def _finish_load_locked(self) -> None:
+        self._loads_inflight -= 1
+        if self._loads_inflight < 0:  # pragma: no cover - internal invariant
+            raise RuntimeError("pool in-flight load counter underflow")
+        self._growth_cv.notify_all()
+
+    def hot_seed_candidates(self, limit: int | None = None) -> list[int]:
+        """Return the hottest nonresident experts that fit free slots."""
+        with self._bk_lock:
+            free = self._free_slots_locked()
+            if free <= 0:
+                return []
+            if limit is not None:
+                free = min(free, int(limit))
+            if free <= 0:
+                return []
+            ranked = sorted(
+                (
+                    (-count, expert)
+                    for expert, count in self._freq.items()
+                    if expert not in self._slot_of
+                ),
+            )
+        return [expert for _neg_count, expert in ranked[:free]]
+
+    def seed_hot(self, limit: int | None = None) -> list[int]:
+        experts = self.hot_seed_candidates(limit)
         if experts:
             self.ensure(experts)
         return experts
@@ -546,6 +766,31 @@ class ExpertSlotPool:
             dst_offset=slot * br.nbytes,
         )
 
+    def _load_iqk_blocks(self, source: memoryview, *, slot: int) -> None:
+        """Deinterleave one on-disk IQ_K expert into its kernel streams."""
+        if self.iqk is None:
+            raise ValueError(f"{self.projection}: IQ_K storage is not allocated")
+        assert self.geometry.iqk_codec is not None
+        assert self.geometry.in_features is not None
+        blocks = np.frombuffer(source, dtype=np.uint8).reshape(
+            self.geometry.out_features,
+            self.geometry.packed_cols,
+        )
+        streams = split_streams(
+            self.geometry.iqk_codec,
+            blocks,
+            self.geometry.in_features,
+        )
+        for name, value in streams.items():
+            dst = self._iqk_views[name]
+            row = self._iqk_slot_nbytes[name]
+            src = memoryview(np.ascontiguousarray(value)).cast("B")
+            if len(src) != row:
+                raise ValueError(
+                    f"{self.projection}: IQ_K stream {name} is {len(src)} bytes, "
+                    f"expected {row}")
+            dst[slot * row:(slot + 1) * row] = src
+
     def slot_nbytes(self) -> int:
         total = self._packed_row_nbytes()
         if self._comp_norms is not None:
@@ -561,6 +806,28 @@ class ExpertSlotPool:
         layer (the cache dedups across the three pools) + two host memcpys;
         without, two exact per-component preads.
         """
+        if self.codec == IQK_CODEC:
+            if self.row_cache is None:
+                br = self.index.locate(
+                    layer=self.layer,
+                    expert=expert,
+                    projection=self.projection,
+                    component="blocks",
+                )
+                buf = bytearray(br.nbytes)
+                pread_view_cached(
+                    memoryview(buf),
+                    self.package_dir / br.shard,
+                    file_offset=br.offset,
+                    nbytes=br.nbytes,
+                )
+                source = memoryview(buf)
+            else:
+                row = self.row_cache.take(expert)
+                comp = self._comp_packed
+                source = row[comp["offset"]:comp["offset"] + comp["nbytes"]]
+            self._load_iqk_blocks(source, slot=slot)
+            return
         if self.row_cache is None:
             if self.is_combined_kquant:
                 assert self._combined_comp_packed is not None
@@ -665,6 +932,7 @@ class ExpertSlotPool:
         evicted_any = False
         while True:
             with self._bk_lock:
+                self._wait_for_growth_locked()
                 self._demand_protect = set(active)
                 # Demand outranks speculation: in-flight prefetch
                 # reservations are invisible to _choose_slot, so a big
@@ -722,6 +990,8 @@ class ExpertSlotPool:
                         for expert, slot in placements:
                             self._expert_at[slot] = None
                         raise
+                if placements:
+                    self._loads_inflight += 1
             if not retry:
                 break
             time.sleep(0.0005)
@@ -733,19 +1003,19 @@ class ExpertSlotPool:
                 self._advise_dontneed(evicted)
         if not placements:
             return
-        if evicted_any and fence:
-            # From a worker thread this does not reliably fence stream 0 (MLX
-            # streams are thread_local; synchronize(s) on a foreign stream
-            # raises, no-arg behavior is undefined for the main GPU stream).
-            # Decode paths are safe without it (per-layer pools +
-            # publish-before-commit + token-boundary evals mean no in-flight
-            # reader of a victim slot can exist). The prefill chunk-ahead path
-            # passes fence=False and performs a targeted main-thread wait
-            # (mx.eval of the chunk i-1 output) before any evicting
-            # ensure-ahead is submitted.
-            mx.synchronize()
         loaded = 0
         try:
+            if evicted_any and fence:
+                # From a worker thread this does not reliably fence stream 0 (MLX
+                # streams are thread_local; synchronize(s) on a foreign stream
+                # raises, no-arg behavior is undefined for the main GPU stream).
+                # Decode paths are safe without it (per-layer pools +
+                # publish-before-commit + token-boundary evals mean no in-flight
+                # reader of a victim slot can exist). The prefill chunk-ahead path
+                # passes fence=False and performs a targeted main-thread wait
+                # (mx.eval of the chunk i-1 output) before any evicting
+                # ensure-ahead is submitted.
+                mx.synchronize()
             for expert, slot in placements:
                 self._load_expert(expert=expert, slot=slot)
                 with self._bk_lock:
@@ -761,6 +1031,9 @@ class ExpertSlotPool:
                 for expert, slot in placements[loaded:]:
                     self._expert_at[slot] = None
             raise
+        finally:
+            with self._bk_lock:
+                self._finish_load_locked()
         self.total_load_seconds += time.perf_counter() - t0
 
     def prefetch(self, expert_ids, *, protect: set[int] | None = None,
@@ -782,6 +1055,7 @@ class ExpertSlotPool:
         protected = {int(e) for e in (protect or ())}
         placements: list[tuple[int, int]] = []
         with self._bk_lock:
+            self._wait_for_growth_locked()
             protected |= self._demand_protect
             budget = self.capacity - reserve_floor - self._prefetch_inflight
             for expert in expert_ids:
@@ -804,6 +1078,8 @@ class ExpertSlotPool:
                 placements.append((expert, slot))
                 budget -= 1
             self._prefetch_inflight += len(placements)
+            if placements:
+                self._loads_inflight += 1
         loaded = 0
         try:
             for expert, slot in placements:
@@ -826,6 +1102,8 @@ class ExpertSlotPool:
                 self._prefetch_inflight -= len(placements)
                 for expert, _slot in placements:
                     self._prefetch_reserved.discard(expert)
+                if placements:
+                    self._finish_load_locked()
         return loaded
 
     def _advise_dontneed(self, expert: int) -> None:
@@ -908,6 +1186,278 @@ class ExpertSlotPool:
         return self.remap_loaded(host, indices.shape)
 
 
+def _unique_pool_sequence(pools) -> tuple[ExpertSlotPool, ...]:
+    out = []
+    seen = set()
+    for pool in pools:
+        ident = id(pool)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(pool)
+    return tuple(out)
+
+
+def _acquire_pool_locks(pools: tuple[ExpertSlotPool, ...]) -> None:
+    for pool in pools:
+        pool._bk_lock.acquire()
+
+
+def _release_pool_locks(pools: tuple[ExpertSlotPool, ...]) -> None:
+    for pool in reversed(pools):
+        pool._bk_lock.release()
+
+
+def _acquire_growth_ready_pool_locks(
+    pools: tuple[ExpertSlotPool, ...],
+) -> None:
+    """Acquire every pool lock after any active growth transaction finishes."""
+    while True:
+        _acquire_pool_locks(pools)
+        pending = next((pool for pool in pools if pool._growth_pending), None)
+        if pending is None:
+            return
+        _release_pool_locks(pools)
+        with pending._bk_lock:
+            pending._wait_for_growth_locked()
+
+
+def grow_expert_slot_pools(pools, capacity: int, *, after_publish=None) -> None:
+    """Atomically grow one switch's physical projection pools.
+
+    Gate, up, and down first close a shared growth gate. Existing demand and
+    speculative storage writers finish; new writers wait. Replacement arrays
+    are then allocated and evaluated while detached from the live pools. A
+    main-thread device fence completes existing readers before stable live
+    bytes and maps are copied into the candidates. Only after every allocation
+    and copy succeeds are all candidates published under every bookkeeping
+    lock. Any preparation failure clears the gate and leaves every live field
+    unchanged.
+    """
+    pools = _unique_pool_sequence(pools)
+    if not pools:
+        return
+    capacity = int(capacity)
+
+    while True:
+        _acquire_pool_locks(pools)
+        pending = next((pool for pool in pools if pool._growth_pending), None)
+        if pending is None:
+            try:
+                for pool in pools:
+                    pool._validate_growth_locked(capacity)
+                if all(pool.capacity == capacity for pool in pools):
+                    if after_publish is not None:
+                        after_publish()
+                    return
+                for pool in pools:
+                    pool._growth_pending = True
+            finally:
+                _release_pool_locks(pools)
+            break
+        _release_pool_locks(pools)
+        with pending._bk_lock:
+            pending._wait_for_growth_locked()
+
+    try:
+        # Writers publish and unregister under their own pool lock. The pending
+        # gate prevents replacements from starting while these waits release it.
+        for pool in pools:
+            with pool._bk_lock:
+                while pool._loads_inflight:
+                    pool._growth_cv.wait()
+
+        # Allocation and MLX evaluation can block. They stay outside all pool
+        # locks, and every candidate remains detached until the commit below.
+        candidates = [
+            pool._allocate_growth_candidate(capacity)
+            for pool in pools
+        ]
+
+        # Growth runs on the request thread after generation. Complete any old
+        # storage readers before the live references can be replaced. Never run
+        # a device wait while holding bookkeeping locks.
+        mx.synchronize()
+
+        _acquire_pool_locks(pools)
+        try:
+            if any(pool._loads_inflight for pool in pools):
+                raise RuntimeError("pool load started while growth gate was closed")
+            for pool, candidate in zip(pools, candidates, strict=True):
+                pool._prepare_growth_locked(candidate)
+            for pool, candidate in zip(pools, candidates, strict=True):
+                pool._publish_growth_locked(candidate)
+            if after_publish is not None:
+                after_publish()
+        finally:
+            _release_pool_locks(pools)
+    finally:
+        _acquire_pool_locks(pools)
+        try:
+            for pool in pools:
+                pool._growth_pending = False
+                pool._growth_cv.notify_all()
+        finally:
+            _release_pool_locks(pools)
+
+
+def seed_hot_expert_slot_pools(pools) -> int:
+    """Fill common free demand slots as one all-projection transaction.
+
+    Bounded routed kernels reuse the gate pool's slot ids for the up projection,
+    so gate, up, and down must publish identical expert-to-slot maps. Hot seeding
+    therefore reserves common free slots while the shared mutation gate is
+    closed, lands every projection, and publishes all maps together. A failed
+    projection load restores the exact pre-seed bookkeeping state; bytes written
+    into still-free slots remain unreachable.
+    """
+    pools = _unique_pool_sequence(pools)
+    if not pools:
+        return 0
+
+    _acquire_growth_ready_pool_locks(pools)
+    try:
+        for pool in pools:
+            pool._growth_pending = True
+    finally:
+        _release_pool_locks(pools)
+
+    placements: list[tuple[int, int]] = []
+    snapshots = []
+    registered = False
+    load_seconds = [0.0] * len(pools)
+    try:
+        for pool in pools:
+            with pool._bk_lock:
+                while pool._loads_inflight:
+                    pool._growth_cv.wait()
+
+        _acquire_pool_locks(pools)
+        try:
+            capacity = pools[0].capacity
+            if any(pool.capacity != capacity for pool in pools[1:]):
+                raise RuntimeError("projection pool capacities differ before hot seed")
+            reference_map = dict(pools[0]._slot_of)
+            reference_demand = list(pools[0]._expert_at[:capacity])
+            for pool in pools[1:]:
+                if pool._slot_of != reference_map:
+                    raise RuntimeError("projection pool slot maps differ before hot seed")
+                if pool._expert_at[:capacity] != reference_demand:
+                    raise RuntimeError("projection pool occupancy differs before hot seed")
+            for slot, expert in enumerate(reference_demand):
+                if expert is not None and reference_map.get(expert) != slot:
+                    raise RuntimeError("pool has occupied unpublished demand slot")
+
+            free_slots = [
+                slot for slot, expert in enumerate(reference_demand)
+                if expert is None
+            ]
+            scores: dict[int, int] = {}
+            for pool in pools:
+                for expert, count in pool._freq.items():
+                    if 0 <= expert < pool.num_experts and expert not in reference_map:
+                        scores[expert] = scores.get(expert, 0) + int(count)
+            ranked = sorted(scores, key=lambda expert: (-scores[expert], expert))
+            selected = ranked[:len(free_slots)]
+            placements = list(
+                zip(selected, free_slots[:len(selected)], strict=True)
+            )
+
+            snapshots = [
+                {
+                    "slot_of": dict(pool._slot_of),
+                    "expert_at": list(pool._expert_at),
+                    "freq": dict(pool._freq),
+                    "recency": dict(pool._recency),
+                    "clock": pool._clock,
+                    "total_misses": pool.total_misses,
+                    "total_loads": pool.total_loads,
+                    "total_load_seconds": pool.total_load_seconds,
+                    "slot_table_dirty": pool._slot_table_dirty,
+                }
+                for pool in pools
+            ]
+            if placements:
+                for pool in pools:
+                    for expert, slot in placements:
+                        pool._expert_at[slot] = expert
+                    pool._loads_inflight += 1
+                registered = True
+        finally:
+            _release_pool_locks(pools)
+
+        if not placements:
+            return 0
+
+        for expert, slot in placements:
+            for ordinal, pool in enumerate(pools):
+                started = time.perf_counter()
+                pool._load_expert(expert=expert, slot=slot)
+                load_seconds[ordinal] += time.perf_counter() - started
+
+        _acquire_pool_locks(pools)
+        try:
+            for pool in pools:
+                for expert, slot in placements:
+                    if pool._expert_at[slot] != expert:
+                        raise RuntimeError("hot-seed reservation changed before publication")
+            for pool, elapsed in zip(pools, load_seconds, strict=True):
+                for expert, slot in placements:
+                    pool._slot_of[expert] = slot
+                    pool._touch(expert)
+                pool._slot_table_dirty = True
+                pool.total_misses += len(placements)
+                pool.total_loads += len(placements)
+                pool.total_load_seconds += elapsed
+        finally:
+            _release_pool_locks(pools)
+        return len(placements) * len(pools)
+    except BaseException:
+        row_caches = []
+        seen_caches = set()
+        for pool in pools:
+            cache = pool.row_cache
+            if cache is not None and id(cache) not in seen_caches:
+                seen_caches.add(id(cache))
+                row_caches.append(cache)
+        for cache in row_caches:
+            for expert, _slot in placements:
+                cache.discard(expert)
+        if snapshots:
+            _acquire_pool_locks(pools)
+            try:
+                for pool, snapshot in zip(pools, snapshots, strict=True):
+                    pool._slot_of = snapshot["slot_of"]
+                    pool._expert_at = snapshot["expert_at"]
+                    pool._freq = snapshot["freq"]
+                    pool._recency = snapshot["recency"]
+                    pool._clock = snapshot["clock"]
+                    pool.total_misses = snapshot["total_misses"]
+                    pool.total_loads = snapshot["total_loads"]
+                    pool.total_load_seconds = snapshot["total_load_seconds"]
+                    pool._slot_table_dirty = snapshot["slot_table_dirty"]
+            finally:
+                _release_pool_locks(pools)
+        raise
+    finally:
+        try:
+            if registered:
+                _acquire_pool_locks(pools)
+                try:
+                    for pool in pools:
+                        pool._finish_load_locked()
+                finally:
+                    _release_pool_locks(pools)
+        finally:
+            _acquire_pool_locks(pools)
+            try:
+                for pool in pools:
+                    pool._growth_pending = False
+                    pool._growth_cv.notify_all()
+            finally:
+                _release_pool_locks(pools)
+
+
 def place_spare_trio(pools, expert: int, spare_index: int) -> bool:
     """Atomically place `expert` into the same spare slot of all three
     projection pools. All-or-nothing under all three bookkeeping
@@ -918,9 +1468,10 @@ def place_spare_trio(pools, expert: int, spare_index: int) -> bool:
     all three loads landed; a demand ensure arriving mid-flight waits on the
     reservation registry. Returns True when loaded."""
     expert = int(expert)
-    locks = [pool._bk_lock for pool in pools]
-    for lock in locks:
-        lock.acquire()
+    pools = _unique_pool_sequence(pools)
+    _acquire_growth_ready_pool_locks(pools)
+    slots = []
+    registered = False
     try:
         for pool in pools:
             if not (0 <= spare_index < pool.spare_slots):
@@ -946,6 +1497,7 @@ def place_spare_trio(pools, expert: int, spare_index: int) -> bool:
                 return False
         for pool in pools:
             slot = pool.capacity + spare_index
+            slots.append(slot)
             occupant = pool._expert_at[slot]
             if occupant is not None:
                 # Sever only the spare mapping this eviction owns: if the
@@ -960,27 +1512,38 @@ def place_spare_trio(pools, expert: int, spare_index: int) -> bool:
             pool._prefetch_reserved.add(expert)
             pool._prefetch_inflight += 1
             pool._touch(expert)
+            pool._loads_inflight += 1
+        registered = True
     finally:
-        for lock in reversed(locks):
-            lock.release()
+        _release_pool_locks(pools)
     try:
-        for pool in pools:
-            pool._load_expert(expert=expert, slot=pool.capacity + spare_index)
-        for pool in pools:
-            with pool._bk_lock:
-                pool._slot_of[expert] = pool.capacity + spare_index
+        for pool, slot in zip(pools, slots, strict=True):
+            pool._load_expert(expert=expert, slot=slot)
+        _acquire_pool_locks(pools)
+        try:
+            for pool, slot in zip(pools, slots, strict=True):
+                pool._slot_of[expert] = slot
                 pool._slot_table_dirty = True
                 pool.total_prefetch_loads += 1
+        finally:
+            _release_pool_locks(pools)
         return True
     except BaseException:
-        for pool in pools:
-            with pool._bk_lock:
-                slot = pool.capacity + spare_index
+        _acquire_pool_locks(pools)
+        try:
+            for pool, slot in zip(pools, slots, strict=True):
                 if pool._expert_at[slot] == expert and expert not in pool._slot_of:
                     pool._expert_at[slot] = None
+        finally:
+            _release_pool_locks(pools)
         raise
     finally:
-        for pool in pools:
-            with pool._bk_lock:
-                pool._prefetch_reserved.discard(expert)
-                pool._prefetch_inflight -= 1
+        if registered:
+            _acquire_pool_locks(pools)
+            try:
+                for pool in pools:
+                    pool._prefetch_reserved.discard(expert)
+                    pool._prefetch_inflight -= 1
+                    pool._finish_load_locked()
+            finally:
+                _release_pool_locks(pools)

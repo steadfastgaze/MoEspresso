@@ -16,6 +16,7 @@ run record. It cannot vouch for the real engine; the GPU road-test does.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import threading
@@ -185,6 +186,7 @@ class FakeEngineState:
             "prompt_cache": {"event": event, "entries": len(self.memory),
                              "bytes": 0},
             "moespresso": {"first_token_seconds": 0.01,
+                           "ready_to_first_token_seconds": 0.015,
                            "generation_seconds": 0.02,
                            "generation_tps": 100.0},
         }
@@ -364,6 +366,7 @@ def test_full_driver_run_against_the_fake_engine(tmp_path, fake_controller):
         for line in (config.run_root / "events.jsonl").read_text().splitlines()
     ]
     requests = [e for e in events if e["kind"] == "request"]
+    assert {e["ready_to_first_token_seconds"] for e in requests} == {0.015}
     disk_hits = [(e["session"], e["where"]) for e in requests
                  if e["event"] == "disk_hit"]
     # Both restarted probe arms restore session a from disk. The interleaved
@@ -571,6 +574,10 @@ def test_align_restart_realigns_large_extensions(tmp_path, fake_controller):
 
 # --- profile mode -----------------------------------------------------------
 
+# A repair-required DSML loop. No family ships this as its dialect of record
+# any more (the Ornith profile serves the template's native XML), but the mode
+# stays supported as an explicit selection, so the driver's system-prompt
+# teaching, repair path, and telemetry alarm keep their coverage here.
 PROFILE_LOOP = LoopSettings(
     dialect="dsml",
     repair=True,
@@ -580,8 +587,9 @@ PROFILE_LOOP = LoopSettings(
     sampling={"temperature": 0.6, "top_p": 0.95},
 )
 
-# The recorded served malformation class: the closing quote of the parameter
-# name attribute is dropped and fuses into the string attribute.
+# The malformation class recorded against the taught DSML form: the closing
+# quote of the parameter name attribute is dropped and fuses into the string
+# attribute.
 _QUOTE_DAMAGE_RE = re.compile(r'(name="[^"]*)" (string=")')
 
 
@@ -609,7 +617,8 @@ def test_profile_mode_repairs_every_call_and_enforces_request_policy(
         tmp_path, fake_controller):
     # Every tool call the fake emits carries the recorded quoting damage, so
     # strict parsing fails on every attempt and the repair layer must carry
-    # the whole run, exactly the served dialect's operating point.
+    # the whole run: the operating point a repair-required dialect selection
+    # puts the driver in.
     state = fake_controller.state
     state.shape_content = _damage_dsml_quoting
 
@@ -682,6 +691,43 @@ def test_profile_mode_unrecoverable_repair_fails_the_run(
     # contract and the scenario checks that depend on executed calls.
     assert not any(code.startswith(("cache.", "disk.", "health."))
                    for code in codes)
+
+
+def test_profile_mode_without_repair_leaves_the_alarm_disarmed(
+        tmp_path, fake_controller):
+    # The served Ornith profile leaves repair optional. Damaged calls then fail
+    # strict parsing and end the turn without a repair attempt, so the repair
+    # alarm must stay disarmed: no fire is recorded and no repair finding is
+    # raised, even though a well-formed call was lost. This is the branch the
+    # served profile actually takes.
+    state = fake_controller.state
+    state.shape_content = _damage_dsml_quoting
+
+    config = _profile_config(
+        tmp_path,
+        target_tokens=0,
+        loop=dataclasses.replace(PROFILE_LOOP, repair=False),
+    )
+    run = RoadtestRun(config, fake_controller, log_fn=lambda *a, **k: None)
+    run.run()
+
+    assert run.repair_telemetry.fires == 0
+    assert run.repair_telemetry.failed == 0
+    codes = {finding.code for finding in run.findings}
+    assert not any(code.startswith("repair.") for code in codes)
+    assert not (config.run_root / "repairs.jsonl").exists()
+
+    # The fire really happened: the turn recorded an unparseable tool call.
+    events = [
+        json.loads(line)
+        for line in (config.run_root / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        e["kind"] == "note" and "tool-call parse failed" in e.get("message", "")
+        for e in events
+    )
+    summary = json.loads((config.run_root / "summary.json").read_text())
+    assert summary["loop"]["repair"] is False
 
 
 def test_profile_mode_nudges_a_prose_first_turn_once(tmp_path, fake_controller):

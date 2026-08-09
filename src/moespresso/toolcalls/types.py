@@ -26,6 +26,23 @@ class ToolCall:
     id: str | None = None
 
 
+def opens_nested_marker(raw: str, open_prefix: str) -> bool:
+    """Whether a parsed value carries a structural parameter open marker.
+
+    Shared by the marker dialects, which differ only in ``open_prefix``. The
+    marker counts as structure when it begins a line or begins the value, and
+    as value text anywhere else on a line. ``docs/tool_calls.md`` states why a
+    nested open is rejected and why the ambiguous column-zero case resolves
+    this way.
+    """
+    index = raw.find(open_prefix)
+    while index >= 0:
+        if index == 0 or raw[index - 1] == "\n":
+            return True
+        index = raw.find(open_prefix, index + 1)
+    return False
+
+
 def parse_tool_calls(message: dict) -> list[ToolCall]:
     """Parse ``message["tool_calls"]`` into ``ToolCall`` values, in order.
 
