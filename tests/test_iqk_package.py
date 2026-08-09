@@ -1,9 +1,7 @@
 """The IQ_K package builder: allocation reading, converted artifacts, dense side.
 
 Allocation reading is exercised on a synthetic candidate file so the suite runs
-from a source release. The campaign's own recorded allocations are additionally
-read when the working tree carries them, which pins the reader against the real
-file shape rather than only against the one these tests write.
+from a source release without depending on campaign artifacts.
 """
 
 from __future__ import annotations
@@ -24,27 +22,6 @@ from moespresso.package.deepseek_v4.iqk_package import (
     read_iqk_allocation,
 )
 from moespresso.package.iqk_format import iqk_geometry
-
-CANDIDATES = (
-    Path(__file__).resolve().parents[1]
-    / "specs_archive/ds4_v2/phase4/candidates_downgram.json"
-)
-
-# DeepSeek-V4-Flash routed geometry: gate/up are [2048, 4096], down is
-# [4096, 2048], 256 experts per cell.
-DS4_SHAPES = {"gate": (2048, 4096), "up": (2048, 4096), "down": (4096, 2048)}
-DS4_NUM_EXPERTS = 256
-
-
-def _routed_bytes(members: dict[int, dict[str, str]]) -> int:
-    total = 0
-    for cells in members.values():
-        for projection, codec in cells.items():
-            out_features, in_features = DS4_SHAPES[projection]
-            total += (DS4_NUM_EXPERTS * out_features
-                      * iqk_geometry(codec).bytes_per_row(in_features))
-    return total
-
 
 # --------------------------------------------------------------------------
 # Candidate allocations
@@ -105,23 +82,6 @@ def test_unknown_ambiguous_and_malformed_candidates_fail_closed(tmp_path):
     }]}))
     with pytest.raises(IQKPackageError, match="not gate/up/down"):
         read_iqk_allocation(short, "X")
-
-
-@pytest.mark.skipif(
-    not CANDIDATES.exists(),
-    reason="campaign allocation artifacts are not part of a source release")
-def test_reads_the_recorded_flagship_and_floor_allocations():
-    f1, f1_record = read_iqk_allocation(CANDIDATES, "F1")
-    a1, a1_record = read_iqk_allocation(CANDIDATES, "A1")
-
-    assert len(f1) == 43 and len(a1) == 43
-    assert allocation_member_counts(f1) == {"iq2_k": 40, "iq2_ks": 89}
-    assert allocation_member_counts(a1) == {"iq2_ks": 129}
-    # The struct arithmetic reproduces each candidate's own recorded total.
-    assert _routed_bytes(f1) == f1_record["accounting"]["routed_bytes"]
-    assert _routed_bytes(a1) == a1_record["accounting"]["routed_bytes"]
-    assert _routed_bytes(f1) == 77_882_982_400
-    assert _routed_bytes(a1) == 75_929_485_312
 
 
 # --------------------------------------------------------------------------

@@ -67,6 +67,7 @@ EXPECTED_SURFACE_SUFFIXES = (
     "moespresso/package/templates/qwen3_5_moe.chat_template.jinja",
 )
 PUBLIC_ENTRY_POINTS = tuple(sorted(PROJECT_METADATA["project"]["scripts"]))
+QUARANTINED_ENTRY_POINTS = {"moespresso-ds4-mtp-sidecar"}
 PRIVATE_TEST_CALL = "tasks.load_private_" + "questions()"
 
 
@@ -175,6 +176,9 @@ def audit_members(kind: str, members: dict[str, bytes]) -> list[str]:
         for command in PUBLIC_ENTRY_POINTS:
             if f"{command} =" not in entry_points:
                 failures.append(f"wheel: missing console entry point {command}")
+        for command in QUARANTINED_ENTRY_POINTS:
+            if f"{command} =" in entry_points:
+                failures.append(f"wheel: quarantined console entry point {command}")
 
     if kind == "sdist":
         pkg_info = members.get("PKG-INFO", b"")
@@ -195,6 +199,10 @@ def audit_members(kind: str, members: dict[str, bytes]) -> list[str]:
             failures.append("sdist: Ornith tests read ignored private fixtures")
 
     return failures
+
+
+def test_quarantined_entry_points_are_not_declared():
+    assert QUARANTINED_ENTRY_POINTS.isdisjoint(PUBLIC_ENTRY_POINTS)
 
 
 def _audit_core_metadata(kind: str, label: str, data: bytes) -> list[str]:

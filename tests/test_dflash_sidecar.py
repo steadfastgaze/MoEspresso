@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
+from moespresso.core.artifact import compute_artifact_id
 from jang_tools.dsv4.mlx_model import Model, ModelArgs
 
 from moespresso.package.deepseek_v4.dflash_sidecar import (
@@ -30,7 +31,10 @@ from moespresso.package.deepseek_v4.dflash_sidecar import (
     build_dflash_sidecar,
 )
 from moespresso.runtime.deepseek_v4 import dflash_load as dflash_load_module
-from moespresso.runtime.deepseek_v4.dflash_load import load_dflash_sidecar
+from moespresso.runtime.deepseek_v4.dflash_load import (
+    load_dflash_sidecar,
+    read_sidecar_manifest,
+)
 from moespresso.runtime.deepseek_v4.dflash_model import DFlashArgs, DFlashDraftModel
 
 VOCAB = 97
@@ -424,6 +428,27 @@ class TestFailClosed:
         target = make_target()
         with pytest.raises(DFlashSidecarError, match="hash mismatch"):
             load_dflash_sidecar(copy, target.model.embed)
+
+    def test_manifest_shard_path_cannot_escape_sidecar(self, built, tmp_path):
+        _, out, _ = built
+        copy = tmp_path / "sidecar_copy"
+        shutil.copytree(out, copy)
+        manifest_path = copy / SIDECAR_MANIFEST_NAME
+        payload = json.loads(manifest_path.read_text())
+        old = next(iter(payload["provenance"]["file_sha256"]))
+        escaped = "../outside.safetensors"
+        payload["provenance"]["file_sha256"] = {
+            escaped: payload["provenance"]["file_sha256"][old]
+        }
+        for row in payload["tensors"].values():
+            if row["file"] == old:
+                row["file"] = escaped
+        payload.pop("artifact_id")
+        payload["artifact_id"] = compute_artifact_id(payload)
+        manifest_path.write_text(json.dumps(payload))
+
+        with pytest.raises(DFlashSidecarError, match="root-relative"):
+            read_sidecar_manifest(copy, verify_files=False)
 
 
 # Dimension overrides that make the constructed float32 skeleton dwarf the

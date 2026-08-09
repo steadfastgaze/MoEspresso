@@ -54,7 +54,8 @@ identical to the sequential schedule.
 
 ## Drafter families
 
-The protocol carries three implemented families: DSpark, MTP, and DFlash.
+The release exposes two drafter families: DSpark and DFlash. The source tree
+also retains a quarantined MTP research implementation.
 
 **DSpark** (`runtime/deepseek_v4/dspark_model.py`) is the semi-autoregressive
 drafter shipped with the DeepSeek-V4-Flash-DSpark checkpoint: three MoE draft
@@ -65,9 +66,10 @@ sampled draft token, and a confidence head emits one raw logit per position;
 consumers apply the sigmoid. Block size 5. Its per-round confidence
 discrimination is its edge on open-ended content.
 
-**MTP** (`runtime/deepseek_v4/mtp_model.py`) is a retained capability for
-future checkpoints, not a supported path on the current weights, and it is
-explicit-selection only. No valid sidecar for the current weights exists: the
+**MTP** (`runtime/deepseek_v4/mtp_model.py`) is retained research code for
+future checkpoints, not a released drafter path. It has no installed builder,
+serving selector, replay selector, or battery option. No valid sidecar for the
+current weights exists: the
 implementation targets preview-era `mtp.0` semantics (an `e_proj`/`h_proj`
 head) that the 0731 checkpoint does not carry, and its own sidecar builder
 refuses that checkpoint. It also carries two known draft-tree graph defects
@@ -114,8 +116,8 @@ multi-token verify and single-token decode are different numeric
 lattices, so knife-edge argmax flips against a plain stream are possible
 and reported by the replay harness.
 
-DSpark and MTP share the target's embedding and language-model head; DFlash
-shares the embedding and carries its own pruned head. No sidecar stores an
+DSpark shares the target's embedding and language-model head. DFlash shares
+the embedding and carries its own pruned head. No released sidecar stores an
 embedding.
 
 ## Memory
@@ -123,7 +125,6 @@ embedding.
 | Component | Size |
 |---|---:|
 | DSpark sidecar, resident | 10.2 GiB |
-| MTP sidecar, resident (preview-era weights) | 3.4 GiB |
 | Lazy q8_0 affine views | ~3.1 GB |
 
 The q8_0 affine views back the batched fp32-seam route for verify-shaped
@@ -176,7 +177,6 @@ instrument. The prompt set is evaluation-only and never feeds tuning.
 uv run --locked moespresso-ds4-spec-battery \
   --package <package-dir> \
   --dspark-sidecar <sidecar-dir> \
-  --mtp-sidecar <sidecar-dir> \
   --dflash-sidecar <sidecar-dir> \
   --json-out <report.json>
 ```
@@ -192,7 +192,7 @@ uv run --locked moespresso-ds4-dspark-replay \
   --json-out <report.json>
 ```
 
-`--drafter` selects `dspark`, `mtp`, or `dflash`. The harness runs the same
+`--drafter` selects `dspark` or `dflash`. The harness runs the same
 prompt through plain greedy decoding and speculative decoding with a shared
 prefill schedule and reports token identity with the first divergence index,
 acceptance statistics, per-position and submit-length histograms, and
@@ -202,8 +202,8 @@ greedy-only DFlash drafter), and `--confidence-threshold` applies the fixed
 truncation.
 
 Serving selects a drafter with the `MOESPRESSO_DS4_DRAFTER` environment
-variable: `off`, `dspark:<sidecar-dir>`, `mtp:<sidecar-dir>`, or
-`dflash:<sidecar-dir>`. The sidecar loads once at model-load time for
+variable: `off`, `dspark:<sidecar-dir>`, or `dflash:<sidecar-dir>`. The
+sidecar loads once at model-load time for
 DeepSeek-V4 packages; other families ignore the variable with a notice, and
 an explicitly configured sidecar that fails to load refuses startup.
 `MOESPRESSO_DS4_DRAFTER=off` is the kill switch. An explicit value in
@@ -247,8 +247,8 @@ drove the comparison) attaches to the served model and exports through
 
 A package without a declared drafter component serves plain. The
 declaration is the whole of automatic selection: no directory is searched,
-so a sidecar cannot pair with a package that does not name it. MTP and
-DFlash are explicit-selection only.
+so a sidecar cannot pair with a package that does not name it. DFlash is
+explicit-selection only.
 
 Any automatic miss prints one line naming the reason (`spec: auto off
 (bounded residency)`, `spec: auto off (optional drafter component absent,
@@ -269,8 +269,8 @@ adaptive schedule. `MOESPRESSO_DS4_SPEC_SCHEDULE` (`fixed:<K>` or
 schedule is recorded in every response's `speculative` block.
 
 The runtime truth line records the resolved state as one token:
-`spec=dspark(auto)` for automatic selection, `spec=dspark`, `spec=mtp`, or
-`spec=dflash` for an explicit selection, `spec=off` for an explicit off, or
+`spec=dspark(auto)` for automatic selection, `spec=dspark`, or `spec=dflash`
+for an explicit selection, `spec=off` for an explicit off, or
 an automatic off reason (`spec=off(auto:bounded-residency)`,
 `spec=off(auto:drafter-absent)`, `spec=off(auto:budget)`,
 `spec=off(auto:no-declared-drafter)`, `spec=off(auto:sidecar-failed)`). A
@@ -292,8 +292,8 @@ submit-length histogram under `usage.moespresso.speculative`.
 ## Cache reuse
 
 The shipped DSpark runtime has a portable state capsule, so its eligible
-requests use both in-memory prefix reuse and the disk KV tier. MTP, DFlash, and
-any DSpark implementation without the complete state protocol still serve from
+requests use both in-memory prefix reuse and the disk KV tier. DFlash and any
+DSpark implementation without the complete state protocol still serve from
 a fresh per-request cache. For those non-resumable speculative paths, the
 prompt-cache store and disk KV tier are bypassed and one notice is logged.
 

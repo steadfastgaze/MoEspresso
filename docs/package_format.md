@@ -423,9 +423,11 @@ and proceeds without a hotlist rather than shipping a wrong one.
 
 ## Draft-model sidecar manifests
 
-Speculative-decoding drafters load from standalone sidecar folders (builders
-in `package/deepseek_v4/dspark_sidecar.py`, `mtp_sidecar.py`, and
-`dflash_sidecar.py`; usage in `docs/speculative_decoding.md`). A sidecar is
+Speculative-decoding drafters load from standalone sidecar folders. The
+released builders are `package/deepseek_v4/dspark_sidecar.py` and
+`dflash_sidecar.py`; usage is in `docs/speculative_decoding.md`. The source tree
+also retains `mtp_sidecar.py` as quarantined research code with no installed
+command or serving selector. A sidecar is
 not a mjtq package. It carries its own manifest (`dspark_sidecar.json` /
 `mtp_sidecar.json` / `dflash_sidecar.json`), content-hashed through the
 `core/artifact.py` helpers, with a per-tensor format table and per-file
@@ -471,13 +473,16 @@ keeps all of its routed rows resident; the target model's pooled installation
 does not wrap the sidecar. The resident switch also remains the reference
 implementation for full-capacity target-pool identity checks.
 
-Three manifest kinds exist, all at schema version 1:
+Three source-level manifest kinds exist, all at schema version 1. This release
+exposes the DSpark and DFlash kinds:
 
 - `deepseek_v4_dspark_sidecar`: the DSpark drafter (three draft blocks, the
   Markov head, and the confidence head), one shard per draft stage.
 - `deepseek_v4_mtp_sidecar`: the MTP drafter (one vendored decoder block plus
   the fusion projections and norms), one shard. The manifest records the
-  chained draft depth cap (block size 3).
+  chained draft depth cap (block size 3). This kind is quarantined because the
+  current weights cannot produce a valid sidecar for the retained
+  implementation.
 - `deepseek_v4_dflash_sidecar`: the DFlash drafter (five dense llama-type
   layers, the `fc` feature projection, the pruned 32000-entry head, and the
   raw d2t/t2d vocabulary tables), one shard. Projections and the head are
@@ -501,8 +506,9 @@ closed at load:
 | `iqk` | `iqk_codec` member, `iqk_relayout` layout, per-tensor `num_experts`/`out_features`/`in_features` | DSpark routed draft experts relaid from IQ_K conversion artifacts, served through the mlx-iqk decode kernels |
 
 No sidecar stores an embedding; the drafter shares the target package's at
-load time. DSpark and MTP also share the target language-model head, while
-DFlash carries its own pruned draft-vocabulary head.
+load time. DSpark shares the target language-model head, while DFlash carries
+its own pruned draft-vocabulary head. The quarantined MTP format also shares
+the target head.
 
 ### The bundled drafter component
 

@@ -17,9 +17,8 @@ Any acceptance or decode number measured through this drafter is invalid
 until the two are fixed. The module also targets preview-era ``mtp.0``
 semantics (an ``e_proj``/``h_proj`` head) that the 0731 checkpoint does not
 carry, and the MTP sidecar builder refuses that checkpoint, so no valid
-sidecar for the current weights exists. Selection is explicit only:
-automatic selection serves a package-declared drafter component and never
-reaches this family.
+sidecar for the current weights exists. This release does not expose MTP
+through serving, replay, or battery selectors.
 
 Implements the checkpoint's own multi-token-prediction module as a drafter
 for the speculative decoding loop. The reference implementation is the

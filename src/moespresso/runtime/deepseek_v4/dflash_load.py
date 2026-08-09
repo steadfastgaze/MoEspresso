@@ -28,6 +28,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from moespresso.core.artifact import compute_artifact_id
+from moespresso.core.paths import UnsafeArtifactPathError, resolve_artifact_file
 from moespresso.package.deepseek_v4.dflash_sidecar import (
     EMBED_SAMPLE_NAMES,
     EMBED_SAMPLE_ROWS,
@@ -83,6 +84,13 @@ def read_sidecar_manifest(sidecar_dir: Path, verify_files: bool = True) -> dict:
     file_sha256 = (payload.get("provenance") or {}).get("file_sha256")
     if not isinstance(file_sha256, dict) or not file_sha256:
         raise DFlashSidecarError("sidecar manifest has no file hashes")
+    try:
+        shard_paths = {
+            file_name: resolve_artifact_file(sidecar_dir, file_name)
+            for file_name in file_sha256
+        }
+    except UnsafeArtifactPathError as exc:
+        raise DFlashSidecarError(str(exc)) from exc
     for name, row in tensors.items():
         fmt = row.get("format")
         if fmt not in KNOWN_FORMATS:
@@ -92,7 +100,7 @@ def read_sidecar_manifest(sidecar_dir: Path, verify_files: bool = True) -> dict:
 
     if verify_files:
         for file_name, expected in sorted(file_sha256.items()):
-            shard_path = Path(sidecar_dir) / file_name
+            shard_path = shard_paths[file_name]
             if not shard_path.exists():
                 raise DFlashSidecarError(f"missing sidecar shard {shard_path}")
             actual = _sha256_file(shard_path)
@@ -193,7 +201,11 @@ def load_dflash_sidecar(sidecar_dir, embed) -> tuple[DFlashDraftModel, DFlashArg
     rows = manifest["tensors"]
     weights: dict[str, mx.array] = {}
     for file_name in sorted(manifest["provenance"]["file_sha256"]):
-        part = mx.load(str(sidecar_dir / file_name))
+        try:
+            shard_path = resolve_artifact_file(sidecar_dir, file_name)
+        except UnsafeArtifactPathError as exc:
+            raise DFlashSidecarError(str(exc)) from exc
+        part = mx.load(str(shard_path))
         overlap = set(part) & set(weights)
         if overlap:
             raise DFlashSidecarError(

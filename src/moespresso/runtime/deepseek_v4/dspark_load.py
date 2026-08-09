@@ -39,6 +39,7 @@ import numpy as np
 from jang_tools.dsv4.mlx_model import ModelArgs
 
 from moespresso.core.artifact import compute_artifact_id
+from moespresso.core.paths import UnsafeArtifactPathError, resolve_artifact_file
 from moespresso.package.deepseek_v4.dspark_sidecar import (
     KNOWN_FORMATS,
     FORMAT_AFFINE8,
@@ -102,6 +103,13 @@ def read_sidecar_manifest(sidecar_dir: Path, verify_files: bool = True) -> dict:
     file_sha256 = (payload.get("provenance") or {}).get("file_sha256")
     if not isinstance(file_sha256, dict) or not file_sha256:
         raise DSparkSidecarError("sidecar manifest has no file hashes")
+    try:
+        shard_paths = {
+            file_name: resolve_artifact_file(sidecar_dir, file_name)
+            for file_name in file_sha256
+        }
+    except UnsafeArtifactPathError as exc:
+        raise DSparkSidecarError(str(exc)) from exc
     for name, row in tensors.items():
         fmt = row.get("format")
         if fmt not in KNOWN_FORMATS:
@@ -111,7 +119,7 @@ def read_sidecar_manifest(sidecar_dir: Path, verify_files: bool = True) -> dict:
 
     if verify_files:
         for file_name, expected in sorted(file_sha256.items()):
-            shard_path = Path(sidecar_dir) / file_name
+            shard_path = shard_paths[file_name]
             if not shard_path.exists():
                 raise DSparkSidecarError(f"missing sidecar shard {shard_path}")
             actual = _sha256_file(shard_path)
@@ -338,7 +346,11 @@ def load_dspark_sidecar(
     rows = manifest["tensors"]
     weights: dict[str, mx.array] = {}
     for file_name in sorted(manifest["provenance"]["file_sha256"]):
-        part = mx.load(str(sidecar_dir / file_name))
+        try:
+            shard_path = resolve_artifact_file(sidecar_dir, file_name)
+        except UnsafeArtifactPathError as exc:
+            raise DSparkSidecarError(str(exc)) from exc
+        part = mx.load(str(shard_path))
         overlap = set(part) & set(weights)
         if overlap:
             raise DSparkSidecarError(

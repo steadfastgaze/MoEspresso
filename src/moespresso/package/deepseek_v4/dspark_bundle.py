@@ -35,6 +35,7 @@ import shutil
 from pathlib import Path
 
 from moespresso.core.artifact import compute_artifact_id, read_artifact, write_artifact
+from moespresso.core.paths import UnsafeArtifactPathError, resolve_artifact_file
 from moespresso.package.bundle import IQK_CODEC
 from moespresso.package.constants import MANIFEST_NAME
 from moespresso.package.iqk_format import (
@@ -101,7 +102,10 @@ def read_valid_sidecar_manifest(sidecar_dir: Path) -> dict:
     if not isinstance(file_sha256, dict) or not file_sha256:
         raise DSparkBundleError("sidecar manifest has no file hashes")
     for name, expected in sorted(file_sha256.items()):
-        shard = Path(sidecar_dir) / name
+        try:
+            shard = resolve_artifact_file(sidecar_dir, name)
+        except UnsafeArtifactPathError as exc:
+            raise DSparkBundleError(str(exc)) from exc
         if not shard.is_file():
             raise DSparkBundleError(f"missing sidecar shard {shard}")
         actual = _sha256_file(shard)
@@ -245,6 +249,11 @@ def bundle_dspark_drafter(
     for name in package_names:
         placements[name] = _place(package_dir / name, out_dir / name)
     for name in sidecar_names:
+        try:
+            source_path = resolve_artifact_file(sidecar_dir, name)
+            dest_path = resolve_artifact_file(out_dir, name)
+        except UnsafeArtifactPathError as exc:
+            raise DSparkBundleError(str(exc)) from exc
         if name == SIDECAR_MANIFEST_NAME and sidecar_changed:
             rewritten = dict(sidecar_manifest)
             rewritten.pop("artifact_id", None)
@@ -256,7 +265,7 @@ def bundle_dspark_drafter(
             sidecar_manifest["artifact_id"] = sidecar_id
             placements[name] = "rewrite"
         else:
-            placements[name] = _place(sidecar_dir / name, out_dir / name)
+            placements[name] = _place(source_path, dest_path)
     linked = sum(1 for how in placements.values() if how == "link")
     copied = sum(1 for how in placements.values() if how == "copy")
     rewritten = sum(1 for how in placements.values() if how == "rewrite")

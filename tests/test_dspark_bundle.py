@@ -295,6 +295,24 @@ def test_bundle_refuses_a_name_collision(tmp_path):
         bundle_dspark_drafter(package, sidecar, tmp_path / "bundled")
 
 
+def test_bundle_refuses_a_sidecar_path_escape(tmp_path):
+    package, _ = _tiny_ds4_package(tmp_path)
+    sidecar, payload = _tiny_sidecar(tmp_path)
+    escaped = "../outside.safetensors"
+    source = sidecar.parent / "outside.safetensors"
+    source.write_bytes((sidecar / DRAFT_SHARD).read_bytes())
+    payload["provenance"]["file_sha256"] = {
+        escaped: hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+    payload["tensors"]["blocks.0.x"]["file"] = escaped
+    payload.pop("artifact_id")
+    payload["artifact_id"] = compute_artifact_id(payload)
+    (sidecar / SIDECAR_MANIFEST_NAME).write_text(json.dumps(payload))
+
+    with pytest.raises(DSparkBundleError, match="root-relative"):
+        bundle_dspark_drafter(package, sidecar, tmp_path / "bundled")
+
+
 def test_read_valid_sidecar_manifest_checks_the_contract(tmp_path):
     sidecar, payload = _tiny_sidecar(tmp_path)
     assert read_valid_sidecar_manifest(sidecar)["artifact_id"] == (

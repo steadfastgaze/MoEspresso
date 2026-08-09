@@ -128,23 +128,26 @@ carry a compatible DSpark-state companion. Details:
 The DeepSeek-V4 runtime carries a drafter-based speculative decoding loop.
 `runtime/deepseek_v4/spec_decode.py` defines the drafter protocol, the
 draft/verify loop, and the adaptive verify-length scheduler;
-`dspark_model.py`, `mtp_model.py`, and `dflash_model.py` implement the
-DSpark, MTP, and DFlash drafter families; `dspark_load.py`, `mtp_load.py`,
-and `dflash_load.py` load their sidecars; and `dspark_rollback.py` restores
+`dspark_model.py` and `dflash_model.py` implement the released DSpark and
+DFlash drafter families; `dspark_load.py` and `dflash_load.py` load their
+sidecars; and `dspark_rollback.py` restores
 the target caches bit-exactly after a rejected verify. `spec_serve.py` is the
 served-path glue: it resolves the selection, loads the sidecar once at model
 load, and admits a request to the speculative path only when the effective
 sampler is one the acceptance rules reproduce exactly. `drafter_policy.py` is
 the load-time wired-budget capacity policy behind automatic selection.
 `spec_disk_kv.py` binds resumable DSpark state to aligned target checkpoints
-without making the target depend on that optional state. The sidecar builders
-are `package/deepseek_v4/dspark_sidecar.py`, `mtp_sidecar.py`, and
+without making the target depend on that optional state. The released sidecar
+builders are `package/deepseek_v4/dspark_sidecar.py` and
 `dflash_sidecar.py`; `package/deepseek_v4/dspark_bundle.py` bundles a built
 DSpark sidecar into a package as the declared optional drafter component,
 which is what lets a package select a drafter automatically.
 `correctness/deepseek_v4/spec_replay.py` is the speculative-versus-plain A/B
 harness and `spec_battery.py` is the multi-prompt measurement battery over one
-target load and every available sidecar. See `docs/speculative_decoding.md`.
+target load and every released sidecar. The source tree retains the MTP model,
+loader, and builder as quarantined research code for a future compatible
+checkpoint. They have no installed entry point or serving selector. See
+`docs/speculative_decoding.md`.
 
 ## Entry points
 
@@ -163,8 +166,8 @@ Declared in `pyproject.toml`:
   bundles onto the decode kernels' wire without re-encoding a byte.
 - `moespresso-qwen-kquant-package`: technical Qwen-architecture package builder
   used by the Ornith path.
-- `moespresso-ds4-dspark-sidecar`, `moespresso-ds4-mtp-sidecar`,
-  `moespresso-ds4-dflash-sidecar`: DeepSeek-V4 drafter sidecar builders for
+- `moespresso-ds4-dspark-sidecar`, `moespresso-ds4-dflash-sidecar`:
+  DeepSeek-V4 drafter sidecar builders for
   speculative decoding.
 - `moespresso-ds4-dspark-bundle`: bundle a built DSpark sidecar into a
   DeepSeek-V4 package as its declared optional drafter component.

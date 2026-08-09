@@ -233,18 +233,18 @@ MOESPRESSO_DS4_DRAFTER=off moespresso-serve ./models/deepseek-v4-flash  # no dra
 ```
 
 `MOESPRESSO_DS4_DRAFTER` also selects a sidecar explicitly, as
-`dspark:<sidecar-dir>`, `mtp:<sidecar-dir>`, or `dflash:<sidecar-dir>`. Three
-drafter families are implemented. DSpark is the bundled family and the only
-one automatic selection reaches. DFlash is explicit-selection only and
-greedy-only, so a request with temperature above 0 takes the plain path. MTP
-is retained for future checkpoints and is not a supported path on the current
-weights.
+`dspark:<sidecar-dir>` or `dflash:<sidecar-dir>`. DSpark is the bundled family
+and the only one automatic selection reaches. DFlash is explicit-selection
+only and greedy-only, so a request with temperature above 0 takes the plain
+path. The source tree retains an MTP research implementation for future
+checkpoints, but this release exposes no MTP builder or serving selector: the
+current weights cannot produce a valid sidecar for it.
 
 DSpark requests keep the in-memory prefix cache and the disk checkpoint tier
 described below, so a follow-up turn over a shared prefix resumes speculation
 instead of prefilling that prefix again. When the stored drafter state cannot
-be reused, the validated prompt cache still serves the request plainly. The
-other two families serve from a fresh per-request cache.
+be reused, the validated prompt cache still serves the request plainly.
+DFlash serves from a fresh per-request cache.
 
 See [speculative decoding](docs/speculative_decoding.md) for the drafter
 protocol, the families and their sidecars, the adaptive scheduler, the memory

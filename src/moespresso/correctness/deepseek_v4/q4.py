@@ -45,13 +45,20 @@ the full-vocab log-partition instead makes the top-K mass a measured quantity
 rather than an assumption, so a probe whose teacher distribution is not covered
 by K is visible in the panel. The earlier field name is still read, and evidence
 from it records `top_k_renormalized` normalization so the two are never confused.
-The candidate dump mirrors it with `top_logits` gathered at the teacher's
-`top_ids`, its own `log_partition`, and its own `argmax`.
+The candidate dump mirrors `ids` and `top_ids`, carries `top_logits` gathered
+at that exact support, and adds its own `log_partition` and `argmax`. Scoring
+requires exact equality of the token-position and ordered-support arrays.
+Shape equality alone is not evidence that two dumps describe the same panel.
+
+An unbarred or partially barred panel is emitted as `draft` measurement
+evidence. A `valid` quality result requires all three declared bars. The CLI
+requires the bars unless `--report-only` explicitly requests draft evidence.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -67,8 +74,9 @@ from moespresso.correctness.environment import mlx_wheel_tag
 from moespresso.correctness.ladder import PRODUCER
 
 Q4_TEACHER_DUMP_SCHEMA = "ds4-q4-teacher-dump-v1"
-Q4_EVIDENCE_SCHEMA = "ds4-q4-kl-panel-v1"
+Q4_EVIDENCE_SCHEMA = "ds4-q4-kl-panel-v2"
 Q4_MARKERS_ENV = "MOESPRESSO_DS4_Q4_MARKERS"
+Q4_BAR_KEYS = ("kl_mean_max", "top1_agreement_min", "marker_ratio_max")
 
 # The conditioning definition, not a bar: the top quintile of teacher entropy is
 # where quantization divergence concentrates, so the panel reports the whole
@@ -95,6 +103,19 @@ def _blocking(code: str, message: str, *, path: str, expected=None, actual=None)
     )
 
 
+def _warning(code: str, message: str, *, path: str, expected=None, actual=None) -> Validation:
+    return Validation(
+        "warning",
+        code,
+        message,
+        path=path,
+        phase="Q4",
+        blocking=False,
+        expected=_json_safe(expected),
+        actual=_json_safe(actual),
+    )
+
+
 @dataclass(frozen=True)
 class MarkerSet:
     """Overthinking marker surface forms resolved against the model tokenizer."""
@@ -113,6 +134,7 @@ class MarkerSet:
 class TeacherDump:
     """Teacher top-K support with full-vocab normalization when it is available."""
 
+    ids: np.ndarray
     top_ids: np.ndarray
     top_logprobs: np.ndarray
     argmax: np.ndarray
@@ -133,6 +155,8 @@ class TeacherDump:
 class CandidateDump:
     """Candidate log-probabilities gathered at the teacher's top-K ids."""
 
+    ids: np.ndarray
+    top_ids: np.ndarray
     top_logprobs: np.ndarray
     argmax: np.ndarray
     normalization: str
@@ -227,6 +251,9 @@ def load_teacher_dump(path: str | Path) -> TeacherDump:
         logprobs, normalization = _support_logprobs(payload, source=str(dump_path))
         if "top_ids" not in payload:
             raise SystemExit(f"{dump_path} carries no top_ids")
+        if "ids" not in payload:
+            raise SystemExit(f"{dump_path} carries no ids")
+        ids = np.asarray(payload["ids"], dtype=np.int64)
         top_ids = np.asarray(payload["top_ids"], dtype=np.int64)
         argmax = (
             np.asarray(payload["argmax"], dtype=np.int64)
@@ -236,6 +263,7 @@ def load_teacher_dump(path: str | Path) -> TeacherDump:
             else top_ids[..., 0]
         )
     return teacher_dump_from_arrays(
+        ids=ids,
         top_ids=top_ids,
         top_logprobs=logprobs,
         argmax=argmax,
@@ -246,12 +274,14 @@ def load_teacher_dump(path: str | Path) -> TeacherDump:
 
 def teacher_dump_from_arrays(
     *,
+    ids: np.ndarray,
     top_ids: np.ndarray,
     top_logprobs: np.ndarray,
     argmax: np.ndarray,
     normalization: str = "full_vocab",
     source: str = "arrays",
 ) -> TeacherDump:
+    ids = np.asarray(ids, dtype=np.int64)
     top_ids = np.asarray(top_ids, dtype=np.int64)
     top_logprobs = np.asarray(top_logprobs, dtype=np.float64)
     argmax = np.asarray(argmax, dtype=np.int64)
@@ -259,11 +289,16 @@ def teacher_dump_from_arrays(
         raise SystemExit(
             f"teacher top_ids {top_ids.shape} and support {top_logprobs.shape} disagree"
         )
+    if ids.shape != top_logprobs.shape[:-1]:
+        raise SystemExit(
+            f"teacher ids {ids.shape} do not cover {top_logprobs.shape[:-1]}"
+        )
     if argmax.shape != top_logprobs.shape[:-1]:
         raise SystemExit(
             f"teacher argmax {argmax.shape} does not cover {top_logprobs.shape[:-1]}"
         )
     return TeacherDump(
+        ids=ids,
         top_ids=top_ids,
         top_logprobs=top_logprobs,
         argmax=argmax,
@@ -281,13 +316,75 @@ def load_candidate_dump(path: str | Path) -> CandidateDump:
         logprobs, normalization = _support_logprobs(payload, source=str(dump_path))
         if "argmax" not in payload:
             raise SystemExit(f"{dump_path} carries no argmax; top-1 agreement needs it")
+        if "top_ids" not in payload:
+            raise SystemExit(
+                f"{dump_path} carries no top_ids; candidate logits cannot be bound "
+                "to the teacher support"
+            )
+        if "ids" not in payload:
+            raise SystemExit(
+                f"{dump_path} carries no ids; candidate positions cannot be bound "
+                "to the teacher input"
+            )
+        ids = np.asarray(payload["ids"], dtype=np.int64)
+        top_ids = np.asarray(payload["top_ids"], dtype=np.int64)
         argmax = np.asarray(payload["argmax"], dtype=np.int64)
-    return CandidateDump(
-        top_logprobs=np.asarray(logprobs, dtype=np.float64),
+    return candidate_dump_from_arrays(
+        ids=ids,
+        top_ids=top_ids,
+        top_logprobs=logprobs,
         argmax=argmax,
         normalization=normalization,
         source=str(dump_path),
     )
+
+
+def candidate_dump_from_arrays(
+    *,
+    ids: np.ndarray,
+    top_ids: np.ndarray,
+    top_logprobs: np.ndarray,
+    argmax: np.ndarray,
+    normalization: str = "full_vocab",
+    source: str = "arrays",
+) -> CandidateDump:
+    ids = np.asarray(ids, dtype=np.int64)
+    top_ids = np.asarray(top_ids, dtype=np.int64)
+    top_logprobs = np.asarray(top_logprobs, dtype=np.float64)
+    argmax = np.asarray(argmax, dtype=np.int64)
+    if top_ids.shape != top_logprobs.shape:
+        raise SystemExit(
+            f"candidate top_ids {top_ids.shape} and support "
+            f"{top_logprobs.shape} disagree"
+        )
+    if ids.shape != top_logprobs.shape[:-1]:
+        raise SystemExit(
+            f"candidate ids {ids.shape} do not cover {top_logprobs.shape[:-1]}"
+        )
+    if argmax.shape != top_logprobs.shape[:-1]:
+        raise SystemExit(
+            f"candidate argmax {argmax.shape} does not cover "
+            f"{top_logprobs.shape[:-1]}"
+        )
+    return CandidateDump(
+        ids=ids,
+        top_ids=top_ids,
+        top_logprobs=top_logprobs,
+        argmax=argmax,
+        normalization=normalization,
+        source=source,
+    )
+
+
+def _support_sha256(ids: np.ndarray, top_ids: np.ndarray) -> str:
+    """Identity of the scored token positions and ordered teacher support."""
+    digest = hashlib.sha256(b"moespresso-q4-support-v1\0")
+    for value in (ids, top_ids):
+        array = np.ascontiguousarray(value, dtype="<i8")
+        digest.update(json.dumps(array.shape, separators=(",", ":")).encode())
+        digest.update(b"\0")
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 def _marker_block(
@@ -360,6 +457,16 @@ def score_kl_panel(
             f"teacher dump {teacher.shape} and candidate dump {candidate.shape} "
             "do not cover the same positions"
         )
+    if not np.array_equal(teacher.ids, candidate.ids):
+        raise SystemExit(
+            "teacher and candidate dumps have different token ids at the "
+            "scored positions"
+        )
+    if not np.array_equal(teacher.top_ids, candidate.top_ids):
+        raise SystemExit(
+            "candidate logits were not gathered on the teacher's ordered "
+            "top-K support"
+        )
     if not 0.0 <= entropy_quantile < 1.0:
         raise ValueError(f"entropy_quantile must be in [0, 1), got {entropy_quantile}")
 
@@ -384,6 +491,7 @@ def score_kl_panel(
         "probe": probe,
         "positions": int(entropy.size),
         "support_width": teacher.shape[-1],
+        "support_sha256": _support_sha256(teacher.ids, teacher.top_ids),
         "normalization": {
             "teacher": teacher.normalization,
             "candidate": candidate.normalization,
@@ -550,6 +658,61 @@ def validate_deepseek_v4_q4_evidence(evidence: dict) -> list[Validation]:
         return out
 
     bars = evidence.get("bars") if isinstance(evidence.get("bars"), dict) else {}
+    unknown_bars = sorted(set(bars) - set(Q4_BAR_KEYS))
+    if unknown_bars:
+        out.append(_blocking(
+            "deepseek_v4.q4.unknown_bars",
+            "Q4 evidence carries unknown quality bars",
+            path="/bars",
+            expected=list(Q4_BAR_KEYS),
+            actual=unknown_bars,
+        ))
+    invalid_bars = sorted(key for key in Q4_BAR_KEYS if key in bars and _finite(bars[key]) is None)
+    if invalid_bars:
+        out.append(_blocking(
+            "deepseek_v4.q4.invalid_bars",
+            "declared Q4 quality bars must be finite numbers",
+            path="/bars",
+            expected="finite numbers",
+            actual={key: bars[key] for key in invalid_bars},
+        ))
+    bar_values = {key: _finite(bars.get(key)) for key in Q4_BAR_KEYS}
+    bad_bar_domains = {
+        key: value
+        for key, value in bar_values.items()
+        if value is not None
+        and (
+            (key in {"kl_mean_max", "marker_ratio_max"} and value < 0.0)
+            or (key == "top1_agreement_min" and not 0.0 <= value <= 1.0)
+        )
+    }
+    if bad_bar_domains:
+        out.append(_blocking(
+            "deepseek_v4.q4.invalid_bar_domains",
+            "declared Q4 quality bars must use the metric's valid domain",
+            path="/bars",
+            expected={
+                "kl_mean_max": ">= 0",
+                "top1_agreement_min": "number in [0, 1]",
+                "marker_ratio_max": ">= 0",
+            },
+            actual=bad_bar_domains,
+        ))
+    missing_bars = [key for key in Q4_BAR_KEYS if _finite(bars.get(key)) is None]
+    if missing_bars:
+        code = (
+            "deepseek_v4.q4.unbarred"
+            if len(missing_bars) == len(Q4_BAR_KEYS)
+            else "deepseek_v4.q4.incomplete_bars"
+        )
+        out.append(_warning(
+            code,
+            "Q4 results without all declared quality bars are measurement "
+            "evidence, not a package quality pass",
+            path="/bars",
+            expected=list(Q4_BAR_KEYS),
+            actual=sorted(bars),
+        ))
     kl_max = _finite(bars.get("kl_mean_max"))
     top1_min = _finite(bars.get("top1_agreement_min"))
     marker_ratio_max = _finite(bars.get("marker_ratio_max"))
@@ -573,6 +736,19 @@ def validate_deepseek_v4_q4_evidence(evidence: dict) -> list[Validation]:
                 path=f"{path}/positions",
                 expected="positive integer",
                 actual=positions,
+            ))
+        support_sha256 = panel.get("support_sha256")
+        if (
+            not isinstance(support_sha256, str)
+            or len(support_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in support_sha256)
+        ):
+            out.append(_blocking(
+                "deepseek_v4.q4.bad_support_identity",
+                "each Q4 panel must identify its paired token positions and support",
+                path=f"{path}/support_sha256",
+                expected="64 lowercase hexadecimal characters",
+                actual=support_sha256,
             ))
 
         kl = panel.get("kl") if isinstance(panel.get("kl"), dict) else {}
@@ -664,7 +840,8 @@ def validate_deepseek_v4_q4_evidence(evidence: dict) -> list[Validation]:
                     ))
                     continue
                 ratio = entry.get("ratio")
-                if ratio is not None and _finite(ratio) is None:
+                finite_ratio = _finite(ratio)
+                if ratio is not None and finite_ratio is None:
                     out.append(_blocking(
                         "deepseek_v4.q4.non_finite_marker_ratio",
                         "a marker inflation ratio is not finite",
@@ -672,20 +849,36 @@ def validate_deepseek_v4_q4_evidence(evidence: dict) -> list[Validation]:
                         expected="finite number or null",
                         actual=ratio,
                     ))
+                elif finite_ratio is not None and finite_ratio < 0.0:
+                    out.append(_blocking(
+                        "deepseek_v4.q4.negative_marker_ratio",
+                        "a marker inflation ratio cannot be negative",
+                        path=f"{path}/markers/{subset_name}/{column}/ratio",
+                        expected=">= 0",
+                        actual=finite_ratio,
+                    ))
                 elif (
                     subset_name == "top_entropy_positions"
                     and column == "narrow_subset"
                     and marker_ratio_max is not None
-                    and _finite(ratio) is not None
-                    and float(ratio) > marker_ratio_max
                 ):
-                    out.append(_blocking(
-                        "deepseek_v4.q4.marker_ratio_above_bar",
-                        "narrow-subset marker inflation exceeds the declared bar",
-                        path=f"{path}/markers/{subset_name}/{column}/ratio",
-                        expected=f"<= {marker_ratio_max}",
-                        actual=float(ratio),
-                    ))
+                    if finite_ratio is None:
+                        out.append(_blocking(
+                            "deepseek_v4.q4.marker_ratio_unavailable",
+                            "the declared marker bar requires an evaluated "
+                            "top-entropy narrow-subset ratio",
+                            path=f"{path}/markers/{subset_name}/{column}/ratio",
+                            expected=f"finite number <= {marker_ratio_max}",
+                            actual=ratio,
+                        ))
+                    elif finite_ratio > marker_ratio_max:
+                        out.append(_blocking(
+                            "deepseek_v4.q4.marker_ratio_above_bar",
+                            "narrow-subset marker inflation exceeds the declared bar",
+                            path=f"{path}/markers/{subset_name}/{column}/ratio",
+                            expected=f"<= {marker_ratio_max}",
+                            actual=finite_ratio,
+                        ))
     return out
 
 
@@ -694,6 +887,18 @@ def make_deepseek_v4_q4_evidence(subject: dict, external_evidence: dict) -> dict
     external_evidence = _json_safe(external_evidence)
     findings = validate_deepseek_v4_q4_evidence(external_evidence)
     blocking = any(f.blocking for f in findings)
+    bars = external_evidence.get("bars") if isinstance(
+        external_evidence.get("bars"), dict
+    ) else {}
+    bars_complete = all(_finite(bars.get(key)) is not None for key in Q4_BAR_KEYS)
+    status = "invalid" if blocking else "valid" if bars_complete else "draft"
+    judgement = (
+        "invalid"
+        if blocking
+        else "quality_bar_passed"
+        if bars_complete
+        else "instrument_valid_unbarred"
+    )
     panels = external_evidence.get("panels") if isinstance(
         external_evidence.get("panels"), list
     ) else []
@@ -701,7 +906,7 @@ def make_deepseek_v4_q4_evidence(subject: dict, external_evidence: dict) -> dict
         "correctness_evidence",
         subject,
         PRODUCER,
-        status="invalid" if blocking else "valid",
+        status=status,
         validation=findings,
         inputs=external_evidence.get("inputs", []),
         rung="Q4",
@@ -721,6 +926,7 @@ def make_deepseek_v4_q4_evidence(subject: dict, external_evidence: dict) -> dict
                 if isinstance(p, dict)
             ],
             "bars": external_evidence.get("bars", {}),
+            "judgement": judgement,
             # The wheel variant keys the numeric lattice; record it so a silent
             # reinstall flip is attributable from the artifact alone.
             "mlx_wheel": mlx_wheel_tag(),
@@ -788,6 +994,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="declared bar: top-1 agreement at or above this value")
     parser.add_argument("--marker-ratio-max", type=float, default=None,
                         help="declared bar: narrow-subset marker inflation ratio ceiling")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="emit draft measurement evidence when quality bars are incomplete",
+    )
     parser.add_argument("--json-out", type=Path, help="write full correctness_evidence JSON")
     args = parser.parse_args(argv)
 
@@ -830,6 +1041,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if value is not None
     }
+    missing_bars = [key for key in Q4_BAR_KEYS if key not in bars]
+    if missing_bars and not args.report_only:
+        parser.error(
+            "a Q4 quality pass requires all three declared bars; missing "
+            f"{', '.join(missing_bars)}. Use --report-only for unbarred "
+            "measurement evidence."
+        )
     external = build_q4_external_evidence(
         panels=panels,
         teacher_sources=[str(p) for p in args.teacher],
@@ -847,6 +1065,8 @@ def main(argv: list[str] | None = None) -> int:
         "summary": evidence.get("summary"),
         "artifact_id": evidence.get("artifact_id"),
     }, indent=2, sort_keys=True))
+    if evidence["status"] == "draft" and args.report_only:
+        return 0
     return 0 if evidence["status"] == "valid" else 1
 
 

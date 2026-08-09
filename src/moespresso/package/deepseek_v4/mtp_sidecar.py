@@ -744,15 +744,15 @@ def resolve_output_dir(value: str) -> Path:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build the MTP draft-model sidecar from the DeepSeek-V4-Flash "
-                    "base HF snapshot.")
+        description="Build a research MTP draft-model sidecar from a compatible "
+                    "DeepSeek-V4-Flash HF snapshot.")
     parser.add_argument(
         "--source", required=True,
         help="DeepSeek-V4-Flash snapshot directory (config.json + shards)")
     parser.add_argument(
         "--output", required=True,
         help="sidecar directory: a path, or a bare name placed under the HF hub "
-             "cache (moespresso-ds4-mtp-mxfp4-sidecar is the conventional name)")
+             "cache")
     args = parser.parse_args(argv)
 
     try:

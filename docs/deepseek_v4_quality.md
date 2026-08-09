@@ -38,7 +38,8 @@ uv run --locked moespresso-ds4-wikitext-ppl \
   --package <package-dir> --corpus <corpus.txt> --limit <perplexity-bar>
 
 uv run --locked moespresso-ds4-q4 \
-  --teacher <teacher.npz> --candidate <candidate.npz> --markers <markers.json>
+  --teacher <teacher.npz> --candidate <candidate.npz> --markers <markers.json> \
+  --kl-mean-max <bar> --top1-agreement-min <bar> --marker-ratio-max <bar>
 ```
 
 Every gate accepts `--json-out <path>`. Each run records the installed MLX wheel
@@ -217,16 +218,24 @@ renormalized inside the top-K support; storing raw logits with the full-vocab
 log-partition instead makes the top-K mass a measured quantity, so a probe whose
 teacher distribution is not covered by K is visible in the panel rather than
 silently assumed away. The earlier field name still reads, and the evidence
-labels which normalization produced it. The candidate dump mirrors the teacher's
-with `top_logits` gathered at the teacher's `top_ids`, its own `log_partition`,
-and its own `argmax`.
+labels which normalization produced it. The candidate dump mirrors the
+teacher's `ids` and ordered `top_ids`, with `top_logits` gathered at that exact
+support, its own `log_partition`, and its own `argmax`. The scorer requires
+exact equality of `ids` and `top_ids` before using any candidate values. It
+records a SHA-256 identity of the paired token positions and support in each
+panel.
 
 **What gates.** Only properties of the instrument: finite and non-negative KL,
 agreement inside `[0, 1]`, teacher and candidate covering the same positions, a
 top-K mass in `(0, 1]`, finite marker ratios. Every level is package dependent,
 lands in structured output for ledger comparison, and gates only against bars
 the caller declares with `--kl-mean-max`, `--top1-agreement-min`, and
-`--marker-ratio-max`.
+`--marker-ratio-max`. All three bars are required for `valid` quality evidence.
+The KL and marker ceilings must be non-negative, the agreement floor must lie
+in `[0, 1]`, and a declared marker ceiling requires an evaluated top-entropy
+narrow-subset ratio in every panel.
+An unbarred or partially barred run is `draft` measurement evidence and carries
+a structured warning. `--report-only` is the explicit CLI mode for that use.
 
 The marker set is passed with `--markers` or `MOESPRESSO_DS4_Q4_MARKERS` and has
 no default location. It is campaign material that resolves overthinking surface
@@ -302,7 +311,7 @@ from the checkpoint the package was built from:
 | Q2 step-level selected-token agreement | 87.42 percent |
 | Q2 first-token matches | 66/100 |
 | Q3 long-context fact recall | 16/16 |
-| Q4 served KL panels | valid, 0 findings |
+| Q4 served KL panels | instrument-valid, unbarred; not a quality pass |
 | WikiText test-split perplexity, 32 windows | 6.4774 |
 
 How to read them:
@@ -315,6 +324,8 @@ How to read them:
   the provider's own noise floor beside it: two capture passes over the same
   prompts agree with each other on 89.67 percent of steps, and the package
   reaches 87.42 percent on the same rail.
+- **Q4.** The recorded panels are structurally sound measurements, but their
+  evidence declares no quality bars. They do not establish a Q4 quality pass.
 - **WikiText.** The perplexity reading pairs with its teacher. A bf16
   teacher-forced pass over the same 32 windows scores 4.8886.
 
@@ -366,10 +377,11 @@ run, not what is accepted:
 
 Bitwise identity between the speculative stream and the fused single-token
 stream is not a general property without giving up the multi-token verify
-forward. The acceptance evidence for speculative serving is therefore: the
+forward. The acceptance evidence for speculative serving is therefore the
 rollback bit-exactness above, the speculative stream being an exact greedy
-decode under the verify lattice, the quality gates passing with speculation
-enabled, and the measured divergence statistics reported alongside.
+decode under the verify lattice, and the measured divergence statistics
+reported alongside. The real-package evidence is the single-prompt
+certification below; it is not a broader speculative quality-gate pass.
 
 The shipping package also has a product-loading one-prompt generation
 certification on the 3,844-token speed anchor. Five fresh-process

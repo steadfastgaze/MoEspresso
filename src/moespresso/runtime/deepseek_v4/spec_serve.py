@@ -1,8 +1,8 @@
 """Served-path glue for DeepSeek-V4 speculative decoding.
 
 Serving selects a drafter with the ``MOESPRESSO_DS4_DRAFTER`` environment
-variable: ``off``, ``dspark:<sidecar-dir>``, ``mtp:<sidecar-dir>``, or
-``dflash:<sidecar-dir>``. The sidecar loads once at model-load time for
+variable: ``off``, ``dspark:<sidecar-dir>``, or ``dflash:<sidecar-dir>``. The
+sidecar loads once at model-load time for
 DeepSeek-V4 packages; other families ignore the variable with a notice. An
 explicitly configured sidecar that fails to load refuses startup, the same
 convention the disk KV store applies to an explicitly requested root.
@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 DRAFTER_ENV = "MOESPRESSO_DS4_DRAFTER"
 SPEC_SCHEDULE_ENV = "MOESPRESSO_DS4_SPEC_SCHEDULE"
-DRAFTER_FAMILIES = ("dspark", "mtp", "dflash")
+DRAFTER_FAMILIES = ("dspark", "dflash")
 # Served submit schedule per drafter family. DSpark serves the measured
 # fixed:3 pick (schedule sweep at the long-prompt anchor: fixed:3 28.666
 # tok/s, fixed:2 28.263, adaptive 27.621, fixed:4 26.343; the drafter-on
@@ -83,7 +83,6 @@ SPEC_PRODUCER_LATTICE = "deepseek_v4_speculative"
 # serve seam stays importable without it.
 _SIDECAR_MANIFEST_NAMES = {
     "dspark": "dspark_sidecar.json",
-    "mtp": "mtp_sidecar.json",
     "dflash": "dflash_sidecar.json",
 }
 
@@ -164,7 +163,7 @@ def parse_drafter_env(value: str | None) -> DrafterConfig | None:
     """Parse the drafter selection; None means no drafter is named.
 
     Accepts ``off`` (also an absent or empty value), ``dspark:<sidecar-dir>``,
-    ``mtp:<sidecar-dir>``, or ``dflash:<sidecar-dir>``. Any other shape is a
+    or ``dflash:<sidecar-dir>``. Any other shape is a
     configuration error. The serve path distinguishes an explicit ``off``
     from an absent or empty value (automatic selection) before calling; both
     map to None here.
@@ -179,8 +178,7 @@ def parse_drafter_env(value: str | None) -> DrafterConfig | None:
     if not sep or family not in DRAFTER_FAMILIES or not sidecar:
         raise DrafterConfigError(
             f"invalid {DRAFTER_ENV} value {value!r}; expected off, "
-            f"dspark:<sidecar-dir>, mtp:<sidecar-dir>, or "
-            f"dflash:<sidecar-dir>")
+            f"dspark:<sidecar-dir>, or dflash:<sidecar-dir>")
     return DrafterConfig(family=family, sidecar_dir=Path(sidecar).expanduser())
 
 
@@ -252,12 +250,6 @@ def _load_drafter(family: str, sidecar_dir: Path, model):
         from moespresso.runtime.deepseek_v4.dspark_load import load_dspark_sidecar
 
         drafter, _ = load_dspark_sidecar(
-            sidecar_dir, embed=model.model.embed, lm_head=model.lm_head)
-        return drafter
-    if family == "mtp":
-        from moespresso.runtime.deepseek_v4.mtp_load import load_mtp_sidecar
-
-        drafter, _ = load_mtp_sidecar(
             sidecar_dir, embed=model.model.embed, lm_head=model.lm_head)
         return drafter
     if family == "dflash":
@@ -575,8 +567,8 @@ def resolve_env_drafter(
 
     Returns ``(served, state)``: the installed drafter (or None) and the
     one-token drafter state for the runtime truth line (``dspark(auto)``,
-    ``mtp(auto)``, ``mtp``, ``dspark``, ``off``, or an ``off(auto:...)``
-    reason). The state is None for non-DeepSeek-V4 packages, which have no
+    ``dspark``, ``dflash``, ``off``, or an ``off(auto:...)`` reason). The
+    state is None for non-DeepSeek-V4 packages, which have no
     drafter contract.
 
     An explicit ``MOESPRESSO_DS4_DRAFTER`` selection always wins and is

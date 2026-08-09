@@ -114,6 +114,37 @@ Mapped material:
 The two draft models are MLX implementations written against those reference
 modules, and their comments quote short reference expressions.
 
+## Speculators and the DFlash checkpoint
+
+Sources:
+
+- [vllm-project/speculators at
+  `60cd9833fdd1af767001f87423ca49cc41552931`](https://github.com/vllm-project/speculators/tree/60cd9833fdd1af767001f87423ca49cc41552931)
+- [RedHatAI/DeepSeek-V4-Flash-speculator.dflash at
+  `e44fc94ceb1e7ed45550d15e782aeadd08050483`](https://huggingface.co/RedHatAI/DeepSeek-V4-Flash-speculator.dflash/tree/e44fc94ceb1e7ed45550d15e782aeadd08050483)
+
+The pinned Speculators `pyproject.toml` declares `Apache-2.0` and identifies
+Red Hat as the author. That revision carries the Apache License 2.0 and no
+`NOTICE` file. The complete terms are in `LICENSE-APACHE-2.0`.
+
+The pinned checkpoint revision identifies a DFlash model trained with
+Speculators. It carries no license or notice file. MoEspresso does not
+redistribute the checkpoint weights.
+
+Mapped material:
+
+- `src/moespresso/runtime/deepseek_v4/dflash_model.py` is an MLX
+  reimplementation of the model, attention, and configuration contracts in
+  `src/speculators/models/dflash/`, specialized for the pinned checkpoint and
+  MoEspresso's served cache interface.
+- `src/moespresso/package/deepseek_v4/dflash_sidecar.py` and
+  `src/moespresso/runtime/deepseek_v4/dflash_load.py` implement the pinned
+  checkpoint's configuration, tensor-name, and vocabulary-table contracts.
+
+The MoEspresso implementation replaces the PyTorch training graph with an MLX
+inference graph, adds persistent windowed context caches, and packages the
+checkpoint tensors in a content-hashed sidecar.
+
 ## Apple MLX and MLX LM
 
 Sources:

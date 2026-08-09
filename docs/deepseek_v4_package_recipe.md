@@ -222,11 +222,12 @@ full package.
 
 Speculative decoding
 ([`speculative_decoding.md`](speculative_decoding.md)) loads a drafter from a
-standalone sidecar folder. Three builders exist, one per drafter family. Each
+standalone sidecar folder. The release provides DSpark and DFlash builders.
+Each
 resolves source names once at build time and writes safetensors shards plus a
 content-hashed manifest that the loader validates fail-closed. No sidecar
-stores an embedding; the drafter shares the target package's. DSpark and MTP
-also share the target language-model head, while DFlash carries its own pruned
+stores an embedding; the drafter shares the target package's. DSpark also
+shares the target language-model head, while DFlash carries its own pruned
 draft-vocabulary head. `--output` takes a path, or a bare name placed under the
 Hugging Face hub cache.
 
@@ -247,19 +248,11 @@ package route uses. The default, `mxfp4`, converts the checkpoint's own
 experts. The release package bundles a sidecar built the IQ_K way, with its
 routed draft experts at the IQ2_K member.
 
-The MTP sidecar reads the `mtp.0` draft tensors from the base
-DeepSeek-V4-Flash checkpoint (one vendored decoder block plus the fusion
-projections and norms). MTP is a retained capability for future checkpoints
-rather than a supported path on the current weights: the builder refuses the
-0731 checkpoint, which does not carry the `e_proj`/`h_proj` fusion head the
-implementation targets. The reasons and the drafter's known draft-tree defects
-are in [`speculative_decoding.md`](speculative_decoding.md).
-
-```bash
-uv run --locked moespresso-ds4-mtp-sidecar \
-  --source <ds4-snapshot-dir> \
-  --output moespresso-ds4-mtp-mxfp4-sidecar
-```
+The source tree retains an MTP builder as quarantined research code for a
+future compatible checkpoint. It has no installed command in this release.
+The current checkpoint cannot produce a valid sidecar for that implementation;
+the compatibility limits are in
+[`speculative_decoding.md`](speculative_decoding.md).
 
 The DFlash sidecar reads a different checkpoint, the
 `RedHatAI/DeepSeek-V4-Flash-speculator.dflash` snapshot, which stores five
@@ -277,16 +270,16 @@ uv run --locked moespresso-ds4-dflash-sidecar \
 instead of the 8-bit affine default; the choice is recorded per tensor and
 under the manifest's `build_options`.
 
-The DSpark and MTP builders share one format policy: routed draft experts are
-repacked byte-losslessly from source FP4 into the MLX mxfp4 layout, dense FP8
-projections are dequantized and affine-quantized at 8 bits, and the
+The DSpark builder repacks routed draft experts byte-losslessly from source FP4
+into the MLX mxfp4 layout. Dense FP8 projections are dequantized and
+affine-quantized at 8 bits, and the
 precision-sensitive glue (norms, Markov tables, router gate, hyper-connection
 parameters, attention sink, confidence projection) stays unquantized. DFlash
 has no FP4 experts to repack: its projections and head are affine 8-bit and its
 norms and vocabulary tables are passthrough. The recorded mxfp4 DSpark sidecar
-is 140 tensors in three shards at about 10 GiB; the MTP sidecar is 55 tensors
-in one shard at about 3.4 GiB. The manifest kinds and per-tensor format tables
-are documented in [`package_format.md`](package_format.md).
+is 140 tensors in three shards at about 10 GiB. The manifest kinds and
+per-tensor format tables are documented in
+[`package_format.md`](package_format.md).
 
 ### Bundling a drafter into a package
 

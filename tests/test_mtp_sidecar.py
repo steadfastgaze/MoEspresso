@@ -23,6 +23,7 @@ from mlx.utils import tree_flatten, tree_map
 from jang_tools.dsv4.mlx_model import Model, ModelArgs
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
+from moespresso.core.artifact import compute_artifact_id
 from moespresso.package.deepseek_v4.mtp_sidecar import (
     SIDECAR_KIND,
     SIDECAR_MANIFEST_NAME,
@@ -31,7 +32,10 @@ from moespresso.package.deepseek_v4.mtp_sidecar import (
 )
 from moespresso.probe.deepseek_v4.codec import dequant_fp4_e2m1_ue8m0
 from moespresso.runtime.deepseek_v4 import mtp_load as mtp_load_module
-from moespresso.runtime.deepseek_v4.mtp_load import load_mtp_sidecar
+from moespresso.runtime.deepseek_v4.mtp_load import (
+    load_mtp_sidecar,
+    read_sidecar_manifest,
+)
 from moespresso.runtime.deepseek_v4.mtp_model import MTPArgs, MTPDraftModel
 
 VOCAB = 97
@@ -416,6 +420,27 @@ class TestFailClosed:
         target = make_target()
         with pytest.raises(MTPSidecarError, match="hash mismatch"):
             load_mtp_sidecar(copy, target.model.embed, target.lm_head)
+
+    def test_manifest_shard_path_cannot_escape_sidecar(self, built, tmp_path):
+        _, out, _ = built
+        copy = tmp_path / "sidecar_copy"
+        shutil.copytree(out, copy)
+        manifest_path = copy / SIDECAR_MANIFEST_NAME
+        payload = json.loads(manifest_path.read_text())
+        old = next(iter(payload["provenance"]["file_sha256"]))
+        escaped = "../outside.safetensors"
+        payload["provenance"]["file_sha256"] = {
+            escaped: payload["provenance"]["file_sha256"][old]
+        }
+        for row in payload["tensors"].values():
+            if row["file"] == old:
+                row["file"] = escaped
+        payload.pop("artifact_id")
+        payload["artifact_id"] = compute_artifact_id(payload)
+        manifest_path.write_text(json.dumps(payload))
+
+        with pytest.raises(MTPSidecarError, match="root-relative"):
+            read_sidecar_manifest(copy, verify_files=False)
 
 
 # Dimension overrides that make the constructed float32 skeleton dwarf the

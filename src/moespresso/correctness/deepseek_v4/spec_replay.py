@@ -11,9 +11,9 @@ Both arms share the same prefill schedule (chunked over all but the final
 prompt token, then a single-token forward) so the comparison isolates the
 decode strategy.
 
-`--drafter` selects the drafter family. DSpark, MTP, and DFlash are the
-wired families; each shares the target's embedding (DSpark and MTP also
-the language-model head) and installs its own hidden tap. DFlash is
+`--drafter` selects the drafter family. DSpark and DFlash are the wired
+families; each shares the target's embedding, DSpark also shares the
+language-model head, and each installs its own hidden tap. DFlash is
 greedy-only: it proposes argmax tokens with no draft distribution over
 the target vocabulary, so `--temperature` above 0 is rejected for it.
 """
@@ -34,7 +34,7 @@ from moespresso.runtime.deepseek_v4.spec_decode import (
 )
 from moespresso.runtime.serve import load_served_model
 
-DRAFTER_FAMILIES = ("dspark", "mtp", "dflash")
+DRAFTER_FAMILIES = ("dspark", "dflash")
 
 
 def build_drafter(family: str, sidecar_dir: Path, model):
@@ -45,13 +45,6 @@ def build_drafter(family: str, sidecar_dir: Path, model):
         from moespresso.runtime.deepseek_v4.dspark_load import load_dspark_sidecar
 
         drafter, _ = load_dspark_sidecar(
-            sidecar_dir, embed=model.model.embed, lm_head=model.lm_head
-        )
-        return drafter
-    if family == "mtp":
-        from moespresso.runtime.deepseek_v4.mtp_load import load_mtp_sidecar
-
-        drafter, _ = load_mtp_sidecar(
             sidecar_dir, embed=model.model.embed, lm_head=model.lm_head
         )
         return drafter

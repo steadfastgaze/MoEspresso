@@ -87,8 +87,6 @@ moespresso-ds4-dspark-sidecar = "moespresso.package.deepseek_v4.dspark_sidecar:m
 # Bundle a built DSpark sidecar into a DeepSeek-V4 package as the declared
 # optional drafter component (hard links; no bytes re-encoded).
 moespresso-ds4-dspark-bundle = "moespresso.package.deepseek_v4.dspark_bundle:main"
-# Manual MTP draft-model sidecar builder from the DeepSeek-V4-Flash base snapshot.
-moespresso-ds4-mtp-sidecar = "moespresso.package.deepseek_v4.mtp_sidecar:main"
 # Manual DFlash draft-model sidecar builder from the speculator HF snapshot.
 moespresso-ds4-dflash-sidecar = "moespresso.package.deepseek_v4.dflash_sidecar:main"
 # A/B replay of speculative decoding against plain greedy decoding. The

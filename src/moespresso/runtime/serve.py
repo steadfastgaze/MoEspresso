@@ -355,7 +355,7 @@ def load_served_model(
     _install_detokenizer_clone_factory(tokenizer)
     # Speculative-drafter resolution (DeepSeek-V4 packages only; other
     # families resolve to no drafter). An absent or empty
-    # MOESPRESSO_DS4_DRAFTER selects automatically: the MTP drafter engages
+    # MOESPRESSO_DS4_DRAFTER selects automatically: the DSpark drafter engages
     # only at full expert residency with a package-tied sidecar that loads,
     # and any miss logs one line and serves plain. An explicit selection
     # that cannot load raises DrafterConfigError so startup refuses loudly.

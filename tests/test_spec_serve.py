@@ -53,14 +53,10 @@ def test_parse_drafter_env_off_shapes_stay_off():
     assert parse_drafter_env("  off  ") is None
 
 
-def test_parse_drafter_env_accepts_all_families():
+def test_parse_drafter_env_accepts_released_families():
     config = parse_drafter_env("dspark:/side/car")
     assert config.family == "dspark"
     assert config.sidecar_dir == Path("/side/car")
-
-    config = parse_drafter_env("mtp:~/sidecars/mtp")
-    assert config.family == "mtp"
-    assert config.sidecar_dir == Path("~/sidecars/mtp").expanduser()
 
     config = parse_drafter_env("dflash:/side/dflash")
     assert config.family == "dflash"
@@ -69,7 +65,16 @@ def test_parse_drafter_env_accepts_all_families():
 
 @pytest.mark.parametrize(
     "value",
-    ["dspark", "dspark:", "dspark:   ", "dflash:", "banana", ":path", "on"],
+    [
+        "dspark",
+        "dspark:",
+        "dspark:   ",
+        "dflash:",
+        "mtp:/sidecar",
+        "banana",
+        ":path",
+        "on",
+    ],
 )
 def test_parse_drafter_env_rejects_malformed_values(value):
     with pytest.raises(DrafterConfigError, match="MOESPRESSO_DS4_DRAFTER"):
@@ -175,14 +180,14 @@ def test_install_env_drafter_unloadable_sidecar_fails_startup():
         install_env_drafter(
             SimpleNamespace(),
             DS4_MANIFEST,
-            env_value="mtp:/side",
+            env_value="dspark:/side",
             load_drafter_fn=broken_load,
         )
 
 
 def test_install_env_drafter_reads_process_environment(monkeypatch, capsys):
     model = SimpleNamespace()
-    monkeypatch.setenv(DRAFTER_ENV, "mtp:/from-env")
+    monkeypatch.setenv(DRAFTER_ENV, "dspark:/from-env")
 
     served = install_env_drafter(
         model,
@@ -191,7 +196,7 @@ def test_install_env_drafter_reads_process_environment(monkeypatch, capsys):
         install_tap_fn=lambda m, layer_ids, transform: "TAP",
     )
 
-    assert served.family == "mtp"
+    assert served.family == "dspark"
     assert served.sidecar_dir == Path("/from-env")
     capsys.readouterr()
 
@@ -346,7 +351,7 @@ def test_explicit_selection_still_fails_loud_on_bad_sidecar():
 
     with pytest.raises(DrafterConfigError, match="failed to load"):
         resolve_env_drafter(
-            SimpleNamespace(), DS4_MANIFEST, env_value="mtp:/bad",
+            SimpleNamespace(), DS4_MANIFEST, env_value="dflash:/bad",
             residency_fn=lambda m: True,
             load_drafter_fn=broken_load)
 
@@ -714,7 +719,7 @@ def _generation(tokens, **stats):
 
 def _served():
     return ServedDrafter(
-        family="mtp", sidecar_dir=Path("/side"), drafter="DRAFT", tap="TAP")
+        family="dflash", sidecar_dir=Path("/side"), drafter="DRAFT", tap="TAP")
 
 
 def test_spec_generation_result_stop_surface_and_stats():
@@ -760,7 +765,7 @@ def test_spec_generation_result_stop_surface_and_stats():
     assert result.first_token_seconds is not None
     assert result.generation_seconds is not None
     assert result.speculative == {
-        "drafter": "mtp",
+        "drafter": "dflash",
         "schedule": "adaptive",
         "rounds": 2,
         "proposed": 3,
@@ -1289,9 +1294,9 @@ def test_package_without_component_serves_plain(tmp_path, capsys):
     pair with it.
     """
     package = tmp_path / "pkg"
-    stray = package / "mtp-sidecar"
+    stray = package / "dflash-sidecar"
     stray.mkdir(parents=True)
-    (stray / "mtp_sidecar.json").write_text(json.dumps({"artifact_id": "x"}))
+    (stray / "dflash_sidecar.json").write_text(json.dumps({"artifact_id": "x"}))
     model = SimpleNamespace()
 
     def fail_load(*_args):
@@ -1382,10 +1387,9 @@ def test_dspark_schedule_defaults_to_the_measured_fixed_three():
 
 
 def test_non_dspark_families_default_to_adaptive():
-    for family in ("mtp", "dflash"):
-        kind, submit, label = spec_serve.resolve_spec_schedule(
-            family, env_value=None)
-        assert (kind, submit, label) == ("adaptive", None, "adaptive")
+    kind, submit, label = spec_serve.resolve_spec_schedule(
+        "dflash", env_value=None)
+    assert (kind, submit, label) == ("adaptive", None, "adaptive")
 
 
 def test_schedule_env_overrides_in_both_directions():
@@ -1393,7 +1397,7 @@ def test_schedule_env_overrides_in_both_directions():
         "dspark", env_value="adaptive")
     assert (kind, submit, label) == ("adaptive", None, "adaptive")
     kind, submit, label = spec_serve.resolve_spec_schedule(
-        "mtp", env_value="fixed:5")
+        "dflash", env_value="fixed:5")
     assert (kind, submit, label) == ("fixed", 5, "fixed:5")
 
 
@@ -1494,7 +1498,7 @@ def test_spec_cache_producer_rail_matches_companion_identity(monkeypatch):
     "served",
     [
         ServedDrafter(
-            family="mtp",
+            family="dflash",
             sidecar_dir=Path("/side"),
             drafter=_ResumableFakeDrafter(),
             tap="TAP",

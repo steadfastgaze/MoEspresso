@@ -2,7 +2,7 @@
 
 Generalizes the single-prompt A/B replay (`spec_replay`) into a fixed
 battery: one process loads the target package once, loads the available
-drafter sidecars (DSpark, MTP, and DFlash), and runs every evaluation
+drafter sidecars (DSpark and DFlash), and runs every evaluation
 prompt through a plain greedy arm plus one speculative arm per drafter. The
 report is machine-readable JSON with per-prompt and per-arm throughput,
 acceptance statistics, divergence against the plain stream, per-repeat
@@ -13,10 +13,9 @@ series side by side, which is the A/B/A reading.
 Tap lifecycle. `install_hidden_tap` stores a tap in a single per-layer
 attribute, and a tap's `take_rows` requires a recorded row from every
 one of its layers. Two drafters' taps therefore do not compose: the
-DSpark tap covers three trunk layers with the hyper-connection mean
-transform while the MTP tap covers the last trunk layer with the
-identity transform, and installing the second tap replaces the first
-one's registration on the shared layer. The battery installs a fresh tap
+DSpark tap covers three trunk layers while the DFlash tap covers five;
+installing a second tap can replace the first one's registration on a
+shared layer. The battery installs a fresh tap
 immediately before each speculative arm and removes it afterwards
 (`uninstall_hidden_tap`), so exactly one tap is registered at any time
 and every recorded row uses the active drafter's transform.
@@ -532,10 +531,6 @@ def _sidecar_manifest_name(family: str) -> str:
         from moespresso.package.deepseek_v4.dspark_sidecar import SIDECAR_MANIFEST_NAME
 
         return SIDECAR_MANIFEST_NAME
-    if family == "mtp":
-        from moespresso.package.deepseek_v4.mtp_sidecar import SIDECAR_MANIFEST_NAME
-
-        return SIDECAR_MANIFEST_NAME
     if family == "dflash":
         from moespresso.package.deepseek_v4.dflash_sidecar import (
             SIDECAR_MANIFEST_NAME,
@@ -710,8 +705,6 @@ def main() -> int:
                         help="target package directory")
     parser.add_argument("--dspark-sidecar", type=Path, default=None,
                         help="DSpark drafter sidecar directory")
-    parser.add_argument("--mtp-sidecar", type=Path, default=None,
-                        help="MTP drafter sidecar directory")
     parser.add_argument("--dflash-sidecar", type=Path, default=None,
                         help="DFlash drafter sidecar directory")
     parser.add_argument("--max-new-tokens", type=int, default=300)
@@ -728,14 +721,11 @@ def main() -> int:
     sidecar_dirs: Dict[str, Path] = {}
     if args.dspark_sidecar is not None:
         sidecar_dirs["dspark"] = args.dspark_sidecar
-    if args.mtp_sidecar is not None:
-        sidecar_dirs["mtp"] = args.mtp_sidecar
     if args.dflash_sidecar is not None:
         sidecar_dirs["dflash"] = args.dflash_sidecar
     if not sidecar_dirs:
         parser.error(
-            "provide at least one of --dspark-sidecar, --mtp-sidecar, or "
-            "--dflash-sidecar")
+            "provide at least one of --dspark-sidecar or --dflash-sidecar")
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
     if args.max_new_tokens < 1:

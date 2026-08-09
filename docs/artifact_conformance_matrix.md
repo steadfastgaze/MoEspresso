@@ -5,12 +5,14 @@ Scope is the five pipeline artifacts (`source_inventory`, `probe_evidence`,
 `optimizer_decision`, `package_plan`, `package_manifest`) plus the base contract
 every artifact shares.
 
-Two shipped subsystems write durable state outside that pipeline and are not
-mapped here. Speculative decoding loads drafters from standalone sidecar
-folders whose manifests are content-hashed through `core/artifact.py` in three
-kinds (`deepseek_v4_dspark_sidecar`, `deepseek_v4_mtp_sidecar`,
-`deepseek_v4_dflash_sidecar`), and a package that bundles one declares a
-`drafter` component in its own manifest; the format is in
+Two runtime subsystems write durable state outside that pipeline and are not
+mapped here. The speculative-decoding release loads DSpark and DFlash drafters
+from standalone sidecar folders whose manifests are content-hashed through
+`core/artifact.py` as `deepseek_v4_dspark_sidecar` and
+`deepseek_v4_dflash_sidecar`. The source tree also defines the
+`deepseek_v4_mtp_sidecar` kind as quarantined research code; this release has no
+MTP builder command or serving selector. A package that bundles a released
+sidecar declares a `drafter` component in its own manifest; the format is in
 [`package_format.md`](package_format.md). The disk KV tier keeps checkpoints
 and speculative companions under its own versioned on-disk schemas
 (`moespresso-disk-kv-v1`, `moespresso-disk-kv-attachment-v1`), documented in
