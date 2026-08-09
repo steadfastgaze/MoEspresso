@@ -34,12 +34,19 @@ behavior.
 
 ## In numbers
 
-**DeepSeek-V4-Flash**, on the shipping 2.37 bpw package at a 3,844-token
-prompt: median decode 32.627 tok/s with the bundled drafter and 26.591 tok/s
-without it on the full-capacity pooled runtime. Its WikiText test-split
-perplexity is 6.4774 over 32 windows,
-against a bf16 teacher's 4.8886 on the same windows. See
-[accuracy](#accuracy-focus) and [performance](#performance-focus).
+**DeepSeek-V4-Flash**, full-resident on an M3 Max with 40 GPU cores and 128 GB
+unified memory. Lower NLL and perplexity are better; higher first-token
+agreement and decode throughput are better:
+
+| Package and runtime | Drafter-free weights | WikiText mean NLL | WikiText PPL | API-continuation mean NLL | API first-token agreement | 37K decode, drafter off |
+|---|---:|---:|---:|---:|---:|---:|
+| MoEspresso 2.37 bpw / MoEspresso | 84.35 GB | 1.71466 | 5.5548 | 0.39634 | 66/100 | 22.424 tok/s |
+| antirez IQ2_XXS / DS4 | 86.72 GB | 1.76824 | 5.8605 | 0.41517 | 54/100 | 22.806 tok/s |
+| Unsloth UD-IQ2_XXS / llama.cpp | 90.86 GB | 1.71695 | 5.5675 | 0.36224 | 62/100 | 9.113 tok/s |
+
+**MoEspresso was not calibrated on this WikiText test panel.** See
+[accuracy](#accuracy-focus), [performance](#performance-focus), and the
+[comparison protocol](docs/benchmark_reproduction.md#deepseek-v4-flash-quality-comparison).
 
 **Ornith 1.0 35B**, full-resident on an M3 Max with 40 GPU cores and 128 GB
 unified memory:
@@ -309,6 +316,8 @@ DwarfStar suite.
 Provider-derived Q2 continuations and top-logprob captures remain private by
 design.
 
+### DeepSeek-V4-Flash release gates
+
 The DeepSeek-V4-Flash results below were measured on the published artifact
 against the DeepSeek-V4-Flash 0731 release, at full residency with the drafter
 off:
@@ -322,12 +331,14 @@ off:
 | First token | the same 100 prompts | 66/100 |
 | Long-context fact recall | 16 facts in a 30,000-token-class prompt | 16/16 |
 | Served KL panels | calibration, held-out, and WikiText-test probes against the bf16 reference | valid, 0 findings |
-| WikiText test-split perplexity | 32 test windows | 6.4774 |
+| WikiText test-split perplexity, all-position release gate | 32 windows, 65,504 targets | 6.4774 |
 
 Two reference points frame those numbers. The official API's own pass-to-pass
-step-level agreement on the same 100 prompts is 89.67 percent, so the package
-sits about 2.3 points under the provider's run-to-run noise. The bf16 teacher's
+step-level agreement on the same 100 prompts is 89.67 percent, and the package
+sits about 2.3 points below that reproducibility reading. The bf16 teacher's
 perplexity on the same 32 WikiText windows is 4.8886.
+
+### Ornith
 
 Ornith has a separate nine-item served gate spanning reasoning,
 agentic coding, and long-context recall.
@@ -369,6 +380,10 @@ request-time expert I/O.
 
 Every drafter-on arm read above every drafter-off arm, and the smallest gap
 between the two sets is 4.92 tok/s. The median gain is 22.70 percent.
+
+The 37,000-token product-stack comparison is summarized [in numbers](#in-numbers).
+Exact artifacts, engine revisions, prompt hashes, cache controls, thermal
+readings, and per-run results are in [DeepSeek speed](docs/deepseek_v4_speed.md).
 
 The Ornith comparison matrix was measured on an M3 Max with 40 GPU cores and
 128 GB unified memory. Every cell is the median of three fresh-process runs

@@ -285,9 +285,27 @@ thing. Every recorded perplexity run already used the test split, so this
 changed no recorded number; the tracked default caught up with the practiced
 protocol.
 
+**This package was not calibrated on the WikiText test panel.** Its
+routed-expert importance statistics and allocation objective came from the
+separate mixed calibration spine described in the package record. The
+WikiText-2 test split was held out, verified disjoint from both calibration
+components, and emitted no moments or importance-matrix data. A full-file
+overlap check also found no substantive exact overlap between the pinned
+Bartowski v5 component and either the test split or the known historical
+train-split excerpt. This is a statement about package-specific calibration,
+not a claim that the calibration sources contain no Wikipedia-derived prose.
+
 The default window count is 32, the count every recorded package limit was
 measured at. `--window-count` still overrides; the older 8-window readings are
 comparable only against other 8-window readings.
+
+The matched cross-artifact panel in
+[`benchmark_reproduction.md`](benchmark_reproduction.md#deepseek-v4-flash-quality-comparison)
+uses the same first 32 windows but scores only the final 1,023 targets in each,
+for 32,736 target losses. It reports 5.5548 for the release package. The normal
+release gate scores all 2,047 targets in each window, for 65,504 losses, and
+reports 6.4774. The two results use different target positions and are not
+directly comparable.
 
 **The limit is declared, never assumed.** Perplexity is package-family
 dependent: two packages of the same weights read differently on the same corpus,
@@ -312,7 +330,7 @@ from the checkpoint the package was built from:
 | Q2 first-token matches | 66/100 |
 | Q3 long-context fact recall | 16/16 |
 | Q4 served KL panels | instrument-valid, unbarred; not a quality pass |
-| WikiText test-split perplexity, 32 windows | 6.4774 |
+| WikiText test-split perplexity, all-position release-gate geometry, 65,504 targets | 6.4774 |
 
 How to read them:
 
@@ -320,14 +338,14 @@ How to read them:
   steps of that trajectory, and one further step is a single-token knife edge.
   The remaining steps are exact. Q1 counts are keyed to the MLX wheel lattice
   and to the reference; a count quoted without both is not comparable.
-- **Q2.** The reference is a provider capture, so the agreement column needs
-  the provider's own noise floor beside it: two capture passes over the same
+- **Q2.** The reference is a provider capture, so the agreement column includes
+  the provider's own reproducibility reading: two capture passes over the same
   prompts agree with each other on 89.67 percent of steps, and the package
   reaches 87.42 percent on the same rail.
 - **Q4.** The recorded panels are structurally sound measurements, but their
   evidence declares no quality bars. They do not establish a Q4 quality pass.
-- **WikiText.** The perplexity reading pairs with its teacher. A bf16
-  teacher-forced pass over the same 32 windows scores 4.8886.
+- **WikiText.** The all-position release-gate reading pairs with its teacher. A
+  bf16 teacher-forced pass over the same 65,504 targets scores 4.8886.
 
 The pooled IQ_K runtime has an additional graph-regression gate on the public
 package. A fresh capacity-256 forward over one 2,048-token Q4 row matched the

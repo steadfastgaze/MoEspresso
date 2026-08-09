@@ -101,6 +101,93 @@ runtime engages automatically when the wired budget allows.
 [`speculative_decoding.md`](speculative_decoding.md) covers the selection
 rule.
 
+### 37,000-token drafter-off decode point
+
+A separate long-context record compares three independently packaged 0731
+artifacts in MoEspresso, DS4, and llama.cpp. It measures each complete artifact,
+runtime, and generation-cache stack. It does not isolate engine performance
+from quantization or cache representation.
+
+The prompt repeats the committed `long_code_audit.txt` fixture with numbered
+public-speed-fixture separators and takes the first 181,419 Unicode code
+points. The DeepSeek no-thinking renderer produces exactly 37,000 tokens. DS4
+retokenizes the rendered chat prompt and asserts the complete numeric sequence;
+llama.cpp receives that sequence directly.
+
+Prompt identity:
+
+- rendered UTF-8 SHA-256:
+  `71a5afeceba87a06d17cad997c07b4cd8b05a3d4e77e25e56cb5d92e17b4579d`;
+- compact-JSON token-id SHA-256:
+  `05efd13da6de033bfb1d1483a9cd976646b3465f68d4dc52086994c52a7f3b00`.
+
+Each cell used a fresh process, ran an unreported 8-output warmup on the full
+prompt, destroyed or erased that logical session, and measured from empty
+state. The measured request produced exactly 256 output boundaries with token
+1 excluded at the logits. Decode is `255 / (t256 - t1)`; no unused token-257
+evaluation was submitted. Drafting, MTP, speculative decoding, disk restore,
+and prompt reuse were off.
+
+MoEspresso loaded all 256 experts into its capacity-256 pooled graph and used
+the architecture-required HSA/CSA composite cache. DS4 used its ordinary
+non-MTP graph and native latent cache. llama.cpp ran one server slot with
+continuous batching, context shift, and vision disabled. It set
+`cache_prompt=false`, erased the warmed slot, proved a second erase removed zero
+tokens, and attested `q8_0` K and V from its startup log.
+
+Immediately before every fresh process, the session ran:
+
+```bash
+mactop --headless --count 1
+```
+
+Accepted starts were on AC power, with Low Power Mode off and nominal thermal
+state. Every post sample remained nominal and on AC.
+
+| Package and runtime | Run 1 | Run 2 | Run 3 | Median | Full range | Start GPU range | Post GPU range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MoEspresso 2.37 bpw / MoEspresso | 22.2432 | 22.4244 | 22.4243 | **22.4243** | 22.2432-22.4244 | 44.4-46.8 C | 60.1-60.8 C |
+| antirez IQ2_XXS / DS4 | 22.8289 | 22.8056 | 22.4846 | **22.8056** | 22.4846-22.8289 | 40.6-44.9 C | 63.4-64.2 C |
+| Unsloth UD-IQ2_XXS / llama.cpp | 9.1362 | 9.0620 | 9.1135 | **9.1135** | 9.0620-9.1362 | 46.3-50.6 C | 58.6-59.4 C |
+
+All values are tokens per second. The complete-range widths are 0.81 percent
+of the median for MoEspresso, 1.51 percent for DS4, and 0.82 percent for
+llama.cpp. The colder llama.cpp third run lies between its first two values, so
+the accepted readings do not show a temperature trend over that start band.
+
+MoEspresso and llama.cpp each emitted one repeat-identical 256-token digest.
+DS4 emitted three different greedy-rail digests. Its first 33 output tokens
+matched before the first divergence between the first two retained cells. The
+three retained DS4 speed cells still passed exact prompt, route, cache, output
+count, timing boundary, and thermal gates, so the record retains all three
+rather than selecting by output rail or speed. This speed arm makes no
+cross-artifact token agreement claim.
+
+MoEspresso's request peak was 87.0439 GiB in every cell. All 43 routed layers
+retained capacity 256 and all 129 projection pools stayed identity-mapped.
+Measured requests recorded zero expert loads, misses, evictions, bundle-row
+reads, projection waits, index synchronizations, and verify-shaped IQ_K
+commits. The active `mlx-iqk` version was 0.1.2.
+
+MoEspresso and DS4 use equivalent in-process materialized-token boundaries.
+llama.cpp uses client-side streamed token-ready timestamps; its independently
+reported server interval agreed with the client interval in every cell. The
+3,844-token table uses the package's natural 38-token stop. This record uses a
+fixed 256-output rail and should be treated as a separate generation shape.
+
+Source and artifact pins:
+
+- MoEspresso revision `b1444abeed0ae5f031a26a8ace07060d0edc7c85`,
+  artifact id
+  `pkg:d46e752414eaa44d4d5d661e7700feef69dacc9c12548206035f32128ce36bdf`;
+- DS4 revision `b0309611041655f4e45671cfd9c9886aff161406`, antirez GGUF SHA-256
+  `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`;
+- llama.cpp revision `936918514ce522b553c0fd80b169a6440e6096c6`,
+  Unsloth snapshot `fbbb5b93fb787c21338159b0af3318bb3f4d9768`.
+
+The complete artifact sizes and shard hashes are in
+[`benchmark_reproduction.md`](benchmark_reproduction.md#deepseek-v4-flash-quality-comparison).
+
 ### Full-resident pooled cross-check
 
 A separate five-pair A/B compared the capacity-256 pooled target with the

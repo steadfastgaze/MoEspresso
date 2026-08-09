@@ -3,11 +3,12 @@
 The README tables compare complete engine, artifact, and cache stacks. This
 document defines the controls and evidence required for an independent
 repetition. The cross-engine sections that follow, from artifact pinning
-through engine seams, cover Ornith. The DeepSeek-V4-Flash release package is
-served and scored by MoEspresso alone, under the separate serving protocol and
-quality protocol further down. MoEspresso does not ship a cross-project
-benchmark framework, copies of third-party runners, exact prompt-token
-fixtures, or benchmark-only measurement adapters.
+through engine seams, cover Ornith. DeepSeek-V4-Flash has a MoEspresso-only
+drafter certification at 3,844 prompt tokens and a separate 37,000-token decode
+comparison across independently packaged 0731 artifacts in MoEspresso, DS4, and
+llama.cpp. The quality protocol uses the same three product stacks. MoEspresso
+does not ship a cross-project benchmark framework, copies of third-party
+runners, exact prompt-token fixtures, or benchmark-only measurement adapters.
 
 Keep raw results and any temporary adapters in a separate work directory. Large
 downloads happen before the measurement session and run one at a time.
@@ -197,12 +198,11 @@ changes.
 
 ## Serving protocol for the DeepSeek-V4-Flash release package
 
-No cross-engine matrix has been measured on the release package
-`DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2`: no other engine loads a
-MoEspresso package, and the public third-party DeepSeek artifacts are built from
-a different checkpoint. Its published serving numbers are MoEspresso-only
-certifications, and they follow a different protocol from the cross-engine
-matrix above:
+No other engine loads the release package
+`DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2`. Its 3,844-token drafter-on/off
+numbers are therefore MoEspresso-only certifications. They follow a different
+protocol from the Ornith matrix above, the 37,000-token DeepSeek product-stack
+comparison below, and the DeepSeek quality comparison:
 
 - ten fresh-process arms at one 3,844-token prompt, five per side and
   alternating, drafter off first;
@@ -223,6 +223,50 @@ The readings are in [`deepseek_v4_speed.md`](deepseek_v4_speed.md), and the
 quality ladder for the same artifact is in
 [`deepseek_v4_quality.md`](deepseek_v4_quality.md).
 
+### DeepSeek 37,000-token decode comparison
+
+The release also carries one long-context comparison across three complete
+artifact and runtime stacks. It is separate from the ten-arm 3,844-token
+drafter comparison:
+
+- the repeated public `long_code_audit.txt` fixture renders to exactly 37,000
+  tokens; prompt text, rendered text, and numeric token IDs are hash-pinned;
+- MoEspresso sets `MOESPRESSO_DISK_KV=off` and
+  `MOESPRESSO_DS4_DRAFTER=off`; DS4 uses its ordinary non-MTP session graph;
+  llama.cpp runs with no speculative implementation;
+- every fresh process runs an unreported 8-output warmup on the same full
+  prompt shape, destroys or erases that logical session, and measures from
+  empty state;
+- EOG token 1 is excluded at the logits to retain exactly 256 output
+  boundaries and 255 after-first timing intervals;
+- MoEspresso keeps all 256 experts resident in the capacity-256 pooled graph,
+  and route counters must report no request-time expert I/O;
+- DS4 uses its native latent cache. llama.cpp uses one slot, disables
+  continuous batching and context shift, passes numeric prompt IDs directly,
+  sets `cache_prompt=false`, and attests effective `q8_0` K and V cache storage
+  from the startup log;
+- each process starts only after an exact
+  `mactop --headless --count 1` sample reports AC power, Low Power Mode off,
+  nominal thermal state, and a GPU reading no higher than 54 C;
+- all post samples must remain nominal and on AC;
+- every receipt records the 256-token output digest. MoEspresso and llama.cpp
+  require repeat-identical digests. DS4 records, but does not require, that
+  identity because its low-margin greedy rail varied across otherwise valid
+  fresh-process repeats.
+
+The timing boundary and aggregation use the 256-output formulas above. The
+published rows report three-run medians and full ranges. MoEspresso and DS4 use
+equivalent in-process materialized-token boundaries. llama.cpp uses streamed
+client token-ready timestamps; its independently reported server interval must
+agree with the client interval. The 3,844-token and 37,000-token records use
+different generation shapes, so the documents keep them in separate tables.
+
+This comparison does not isolate runtime speed from quantization or cache
+format. MoEspresso uses the 84.35 GB release target, DS4 uses the 86.72 GB
+antirez IQ2_XXS GGUF, and llama.cpp uses the 90.86 GB Unsloth UD-IQ2_XXS GGUF.
+The artifact and source pins are the same ones listed in the DeepSeek quality
+comparison below.
+
 ## Quality protocol
 
 ### DeepSeek-V4-Flash
@@ -235,9 +279,132 @@ serve as a textual oracle. No API perplexity is claimed.
 The release package is scored against a later capture of the same 100 prompts
 from the checkpoint it was built from, containing 2,313 target tokens, and
 against a second capture pass that supplies the provider's own step-level
-self-noise. Those two references hold different continuations, so their scores
+self-agreement. Those two references hold different continuations, so their scores
 are not a before and after. The release ladder and its readings are in
 [`deepseek_v4_quality.md`](deepseek_v4_quality.md).
+
+#### DeepSeek-V4-Flash quality comparison
+
+This panel compares three independently packaged DeepSeek-V4-Flash 0731
+artifacts. It measures each complete artifact and runtime stack. It does not
+isolate an engine from its quantization recipe.
+
+| Artifact and runtime | Target weight files | Target weight bytes | Decimal GB | Drafter treatment |
+|---|---:|---:|---:|---|
+| MoEspresso 2.37 bpw / MoEspresso | 47 safetensors | 84,354,585,696 | 84.3546 | 6,388,822,111-byte DSpark sidecar excluded |
+| antirez IQ2_XXS / DS4 | 1 GGUF | 86,720,111,488 | 86.7201 | no drafter payload |
+| Unsloth UD-IQ2_XXS / llama.cpp | 3 GGUF shards | 90,860,736,928 | 90.8607 | no drafter payload |
+
+The sizes are logical model-file sizes in decimal GB. They are not complete
+repository download sizes. Small package furniture is outside the MoEspresso
+weight count, while GGUF headers remain part of their files.
+
+| Package and runtime | WikiText mean NLL | WikiText PPL | API-continuation mean NLL | API selected-token agreement | API first-token agreement |
+|---|---:|---:|---:|---:|---:|
+| MoEspresso 2.37 bpw / MoEspresso | 1.714662117 | 5.554798326 | 0.396341911 | 2022/2313 (87.42%) | 66/100 |
+| antirez IQ2_XXS / DS4 | 1.768240384 | 5.860532000 | 0.415167895 | 1996/2313 (86.29%) | 54/100 |
+| Unsloth UD-IQ2_XXS / llama.cpp | 1.716948 | 5.5675 | 0.362239186 | 2052/2313 (88.72%) | 62/100 |
+
+##### WikiText controls
+
+The corpus is the held-out test split of `Salesforce/wikitext`,
+`wikitext-2-raw-v1`, distributed as `wiki.test.raw`: 1,290,590 bytes with
+SHA-256
+`173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`.
+The panel takes the first 32 complete, contiguous, non-overlapping 2,048-token
+windows. Each window starts with fresh state. Positions 0 through 1,024 provide
+context, and positions 1,025 through 2,047 are the 1,023 scored targets. The
+aggregate therefore contains 32,736 target losses.
+
+All three engines produced identical token IDs over the 65,536-token benchmark
+prefix. Its little-endian uint32 SHA-256 is
+`641ecd4ce1149af6e90cc66837daf0fd6f3a14bba1c006ba35a4cbe6b31edd2c`.
+For every target, the scorer takes the negative log probability under the full
+output distribution. Aggregate target loss is divided by 32,736 for mean NLL,
+and `exp(mean NLL)` is reported as perplexity. NLL and perplexity are the same
+measurement in different units.
+
+MoEspresso uses a direct full-model forward with the routed pool at full
+capacity. The DSpark component can be resolved during package load, but no
+speculative generation call occurs. Prefix caches and disk KV do not
+participate. DS4 uses the same prompt and target files through its quality
+scorer. llama.cpp runs with a 2,048-token context, logical batch 2,048, and
+physical microbatch 512. Changing llama.cpp's physical grouping changed the
+cumulative loss slightly, so the grouping is part of the recorded protocol.
+
+This last-half panel is not the all-position MoEspresso release gate. The gate
+scores 65,504 targets over the same number and size of windows and reports
+6.4774 for this package. The matched comparison reports 5.5548 over 32,736
+targets. Neither value supersedes the other.
+
+##### Calibration boundary
+
+MoEspresso was not calibrated on this WikiText test panel. The package's
+routed-expert importance statistics and allocation objective use a separate
+mixed training spine: the pinned Bartowski `calibration_datav5` corpus joined
+with exllamav3's `technical.utf8`. Neither the WikiText-2 test split nor the
+known historical train-split excerpt emitted importance-matrix data, moments,
+or optimizer inputs. WikiText was used later as held-out quality evidence.
+
+The disjointness audit found zero shared exact lines of 48 characters or more
+between either calibration component and the test split. A separate full-file
+comparison against Bartowski v5 found no substantive exact overlap with the
+test split or the known historical train excerpt; no normalized shared run was
+longer than eight case-folded, whitespace-normalized tokens. This supports the
+panel-specific calibration claim. It does not prove that the calibration
+corpus contains no Wikipedia-derived prose, because its complete upstream
+source genealogy is not established.
+
+##### API-continuation controls
+
+The API panel uses one pinned official-provider pass over 100 prompts, with
+thinking disabled and temperature zero. It contains 2,313 provider-selected
+continuation tokens. Each local engine receives the same rendered prefix and
+is teacher-forced under that continuation. Mean NLL is the local negative log
+probability of the provider-selected token. Selected-token agreement compares
+the local argmax with the provider-selected token at each teacher-forced step;
+first-token agreement applies the same comparison to the first step of each
+case.
+
+The provider row compares selected tokens from a second independent pass over
+the same rail. It is a run-to-run reproducibility reference, not a mathematical
+upper bound. The provider's selected-token log probabilities were unusable, so
+the provider row has no NLL. The hosted API does not expose the arbitrary-corpus
+full logits needed for a WikiText NLL or perplexity arm. These columns also do
+not measure free-running generation agreement because every local step is
+conditioned on the provider continuation.
+
+##### Artifact and implementation pins
+
+- MoEspresso revision
+  `b1444abeed0ae5f031a26a8ace07060d0edc7c85`; package artifact id
+  `pkg:d46e752414eaa44d4d5d661e7700feef69dacc9c12548206035f32128ce36bdf`;
+  package-manifest SHA-256
+  `01e1b8863aafc7476d823307e6f4f70911efcad8f76932eb098af073bedc7b01`;
+  repository `steadfastgaze/DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2`.
+- DS4 revision `b0309611041655f4e45671cfd9c9886aff161406`; artifact
+  `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`;
+  GGUF SHA-256
+  `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`.
+- llama.cpp revision `936918514ce522b553c0fd80b169a6440e6096c6`; Unsloth repository
+  `unsloth/DeepSeek-V4-Flash-0731-GGUF`, variant `UD-IQ2_XXS`, snapshot
+  `fbbb5b93fb787c21338159b0af3318bb3f4d9768`.
+- Unsloth shards
+  `DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf`,
+  `DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00002-of-00003.gguf`, and
+  `DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00003-of-00003.gguf`; SHA-256 values in
+  the same order:
+  `c58c9d62eac7b62e9578b52613f425e48313d7212ab8d1d76caed8ea8de26595`,
+  `65a113df6d4469f16db6882b6919e153c464c3c78c833f5e1b41a33803cdbd52`,
+  and `a69102ddfaf4a84426e11fdb66716654f4260dc3a1de3ade9fd50e006b8691d3`.
+
+The two GGUF payloads each declare 1,328 tensors. Their complete tensor-name
+inventories are identical: target blocks `blk.0` through `blk.42` plus six
+global target tensors. Neither contains an MTP block or drafter tensor. The
+source checkpoint contains 4,705 explicit tensors under `mtp.0`, `mtp.1`, and
+`mtp.2`, totaling 10.86 GB before conversion; none occurs in either measured
+GGUF. The DS4 GGUF retains `deepseek4.nextn_predict_layers = 1` as metadata,
+but there is no corresponding weight block.
 
 Holders of the private capture can run MoEspresso Q0, Q2, and Q3 with explicit
 paths and retain each JSON report:
@@ -254,17 +421,17 @@ uv run --locked moespresso-ds4-quality \
   q3 --package <deepseek-package> --json-out <q3.json>
 ```
 
-The scoring method, for any engine scoring these fixtures: for every target
-position, compute full-vocabulary log-softmax and retain the negative log
-probability of the reference token. Aggregate all 2,290 values with `math.fsum`,
-divide by 2,290 for mean NLL, and exponentiate that mean for perplexity. Q3 uses
-the same deterministic story, thinking-off render, greedy selection, and
-256-token cap in every engine it runs in.
+For the earlier 2,290-token capture, every engine computes full-vocabulary
+log-softmax at each target position and retains the negative log probability of
+the reference token. Aggregate all 2,290 values with `math.fsum`, divide by
+2,290 for mean NLL, and exponentiate that mean for perplexity. Q3 uses the same
+deterministic story, thinking-off render, greedy selection, and 256-token cap in
+every engine it runs in.
 
-The private capture is validated by scoring the same rendered prompts and exact
-continuation texts through independent reference implementations alongside
-MoEspresso, so a result cannot rest on one scorer. Those readings are not
-published.
+That earlier capture is validated by scoring the same rendered prompts and
+exact continuation texts through independent reference implementations
+alongside MoEspresso, so a result cannot rest on one scorer. Its per-engine
+readings are not published here.
 
 The upstream public official-vector gate is four vectors and 13 next-token
 decisions, and its suite excludes `long_memory_archive` because the captured API
