@@ -54,8 +54,10 @@ identical to the sequential schedule.
 
 ## Drafter families
 
-The release exposes two drafter families: DSpark and DFlash. The source tree
-also retains a quarantined MTP research implementation.
+The runtime contains DSpark and DFlash family implementations. The public
+external-sidecar command accepts DSpark. DFlash and the quarantined MTP
+implementation remain available to future model packages and internal
+engineering tools.
 
 **DSpark** (`runtime/deepseek_v4/dspark_model.py`) is the semi-autoregressive
 drafter shipped with the DeepSeek-V4-Flash-DSpark checkpoint: three MoE draft
@@ -201,14 +203,19 @@ size, `--temperature` selects the sampled acceptance rule (rejected for the
 greedy-only DFlash drafter), and `--confidence-threshold` applies the fixed
 truncation.
 
-Serving selects a drafter with the `MOESPRESSO_DS4_DRAFTER` environment
-variable: `off`, `dspark:<sidecar-dir>`, or `dflash:<sidecar-dir>`. The
-sidecar loads once at model-load time for
-DeepSeek-V4 packages; other families ignore the variable with a notice, and
-an explicitly configured sidecar that fails to load refuses startup.
-`MOESPRESSO_DS4_DRAFTER=off` is the kill switch. An explicit value in
-either direction is recorded as an override on the drafter policy
-attestation. DFlash engages through the explicit selection only.
+`moespresso serve <package> --drafter <sidecar-dir>` selects an external
+DSpark sidecar. `moespresso generate` accepts the same option, and
+`moespresso verify <package> --drafter <sidecar-dir>` checks the package and
+sidecar together before serving. The command detects the family from the
+manifest at the supplied root, accepts DSpark, and refuses DFlash or MTP in
+this release. The sidecar loads once at model-load time. A sidecar that fails
+to load refuses startup. The explicit command option overrides both the
+environment variable and bundled automatic selection.
+
+`MOESPRESSO_DS4_DRAFTER=off` remains the kill switch. The lower-level runtime
+selector retains the existing family-specific values for internal tooling.
+An explicit value in either direction is recorded as an override on the
+drafter policy attestation.
 
 An absent or empty variable selects automatically. A package whose
 manifest declares a bundled `drafter` component (family `dspark`) takes
@@ -245,10 +252,9 @@ drove the comparison) attaches to the served model and exports through
 (`ds4_drafter_policy_auto_on`, `ds4_drafter_policy_auto_off`,
 `ds4_drafter_policy_override`).
 
-A package without a declared drafter component serves plain. The
-declaration is the whole of automatic selection: no directory is searched,
-so a sidecar cannot pair with a package that does not name it. DFlash is
-explicit-selection only.
+A package without a declared drafter component serves plain unless the user
+passes `--drafter`. The declaration is the whole of automatic selection: no
+directory is searched.
 
 Any automatic miss prints one line naming the reason (`spec: auto off
 (bounded residency)`, `spec: auto off (optional drafter component absent,

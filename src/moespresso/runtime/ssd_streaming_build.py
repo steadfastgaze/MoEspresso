@@ -248,6 +248,7 @@ def install_pooled_switchglus(
 
     installed = 0
     last_block = None
+    resolved_capacities: dict[int, int] = {}
     for layer_idx, layer in enumerate(_layers(model)):
         mlp = getattr(layer, "mlp", None)
         sw = getattr(mlp, "switch_mlp", None)
@@ -263,6 +264,14 @@ def install_pooled_switchglus(
         if layer_capacity < 1:
             raise SSDStreamingBuildError(
                 f"layer {layer_idx} capacity must be >= 1")
+        if layer_capacity + spare_slots > index.max_num_experts:
+            raise ValueError("capacity+spare_slots cannot exceed num_experts")
+        layer_num_experts = index.num_experts_for_layer(layer_idx)
+        layer_capacity = min(layer_capacity, layer_num_experts)
+        layer_spare_slots = min(
+            spare_slots,
+            max(0, layer_num_experts - layer_capacity),
+        )
         # One bundle-row cache per layer: a missed expert is pread once (the
         # whole bundle row) and each physical pool memcpys its slices. Combined
         # K-quant gate/up has two physical consumers (combined gate/up + down);
@@ -290,7 +299,7 @@ def install_pooled_switchglus(
                 capacity=layer_capacity,
                 eviction_policy=eviction_policy,
                 row_cache=row_cache,
-                spare_slots=spare_slots,
+                spare_slots=layer_spare_slots,
             )
             projections["gate_proj"] = combined
             projections["up_proj"] = combined.up_alias
@@ -306,7 +315,7 @@ def install_pooled_switchglus(
                 seed=seed,
                 eviction_policy=eviction_policy,
                 row_cache=row_cache,
-                spare_slots=spare_slots,
+                spare_slots=layer_spare_slots,
             )
         else:
             for projection in _SWITCH_PROJECTIONS:
@@ -322,7 +331,7 @@ def install_pooled_switchglus(
                     seed=seed,
                     eviction_policy=eviction_policy,
                     row_cache=row_cache,
-                    spare_slots=spare_slots,
+                    spare_slots=layer_spare_slots,
                 )
         pooled_switch = PooledSwitchGLU(
             gate_proj=projections["gate_proj"],
@@ -348,6 +357,7 @@ def install_pooled_switchglus(
             block = PooledDeepseekV4MoEBlock(mlp)
             setattr(layer, "mlp", block)
             last_block = block
+        resolved_capacities[layer_idx] = layer_capacity
         installed += 1
 
     if last_block is not None:
@@ -359,6 +369,11 @@ def install_pooled_switchglus(
         raise SSDStreamingBuildError(
             f"installed {installed} pooled SwitchGLU layer(s), "
             f"but expert index declares {len(expected)} layer(s)")
+    object.__setattr__(
+        model,
+        "_moespresso_ssd_streaming_resolved_capacities",
+        dict(sorted(resolved_capacities.items())),
+    )
     return installed
 
 
@@ -393,9 +408,18 @@ def install_lookahead(model, delta: int) -> int:
                               group_size=g.group_size, bits=g.bits)
         else:  # fp16 passthrough (our packages)
             w = g.weight
+        compact_source_ids = getattr(
+            g,
+            "_moespresso_compact_source_ids",
+            None,
+        )
+        if compact_source_ids is not None:
+            w = mx.take(w, compact_source_ids, axis=0)
         sw.lookahead_w = w.astype(mx.float16)
         bias = getattr(g, "bias", None)
         if bias is not None:
+            if compact_source_ids is not None:
+                bias = mx.take(bias, compact_source_ids, axis=0)
             # The DS4 score gate adds a per-expert selection bias after
             # the monotone score transform; the block's prediction
             # scoring needs it to rank candidates the way the real
@@ -545,6 +569,7 @@ def _budget_payload(budget) -> dict:
         "usable_bytes": budget.usable_bytes,
         "min_capacity": budget.min_capacity,
         "max_capacity": budget.max_capacity,
+        "full_resident_expert_bytes": budget.full_resident_expert_bytes,
     }
 
 
@@ -857,6 +882,7 @@ def ssd_streaming_stats(model) -> dict:
     q6_down_qmv_calls = 0
     iqk_decode_flush_calls = 0
     iqk_verify_flush_calls = 0
+    iqk_dual_gemv_calls = iqk_dual_gemv_pairs = 0
     iqk_gemv_calls = iqk_gemv_pairs = 0
     iqk_sorted_prefill_calls = iqk_sorted_prefill_pairs = 0
     iqk_sorted_nsplit_calls = iqk_sorted_nsplit_parts = 0
@@ -906,6 +932,10 @@ def ssd_streaming_stats(model) -> dict:
                 switch, "iqk_decode_flush_calls", 0) or 0)
             iqk_verify_flush_calls += int(getattr(
                 switch, "iqk_verify_flush_calls", 0) or 0)
+            iqk_dual_gemv_calls += int(getattr(
+                switch, "iqk_dual_gemv_calls", 0) or 0)
+            iqk_dual_gemv_pairs += int(getattr(
+                switch, "iqk_dual_gemv_pairs", 0) or 0)
         if not isinstance(switch, PooledSwitchGLU):
             continue
         modules += 1
@@ -1050,6 +1080,9 @@ def ssd_streaming_stats(model) -> dict:
     # the count surfaces carry the registry size, which the phase splitter can
     # subtract, so a nonzero delta names a kernel build the phase paid for.
     from mlx_iqk.kernels import built_dequant_range_kernels
+    from moespresso.runtime.deepseek_v4.iqk_decode_kernel import (
+        built_dual_gemv_kernels,
+    )
 
     consumer_counts = prefill_consumer_call_counts()
     scores_counts = indexer_scores_call_counts()
@@ -1228,6 +1261,8 @@ def ssd_streaming_stats(model) -> dict:
         "pipelined_decode_fused_calls": pipelined_decode_fused_calls,
         "iqk_decode_flush_calls": iqk_decode_flush_calls,
         "iqk_verify_flush_calls": iqk_verify_flush_calls,
+        "iqk_dual_gemv_calls": iqk_dual_gemv_calls,
+        "iqk_dual_gemv_pairs": iqk_dual_gemv_pairs,
         "iqk_gemv_calls": iqk_gemv_calls,
         "iqk_gemv_pairs": iqk_gemv_pairs,
         "iqk_sorted_prefill_calls": iqk_sorted_prefill_calls,
@@ -1235,6 +1270,7 @@ def ssd_streaming_stats(model) -> dict:
         "iqk_sorted_nsplit_calls": iqk_sorted_nsplit_calls,
         "iqk_sorted_nsplit_parts": iqk_sorted_nsplit_parts,
         "built_dequant_range_kernel_count": len(built_dequant_range_kernels()),
+        "built_iqk_dual_gemv_kernel_count": len(built_dual_gemv_kernels()),
         "drafter_policy": drafter_policy,
         "ds4_drafter_policy_auto_on": int(
             policy_mode == "auto" and policy_decision == "on"),
@@ -1466,6 +1502,13 @@ def grow_ssd_streaming_capacity(
         "_moespresso_ssd_streaming_capacity_overrides",
         {},
     ))
+    resolved_capacities = getattr(
+        model,
+        "_moespresso_ssd_streaming_resolved_capacities",
+        None,
+    )
+    if resolved_capacities is not None:
+        resolved_capacities = dict(resolved_capacities)
     layers = _layers(model)
     # Preserve the planner's insertion order. Replacement-headroom accounting
     # is sequential because each committed layer releases its old allocation
@@ -1493,6 +1536,13 @@ def grow_ssd_streaming_capacity(
             "_moespresso_ssd_streaming_capacity_overrides",
             dict(current_overrides),
         )
+        if resolved_capacities is not None:
+            resolved_capacities[layer_idx] = capacity
+            object.__setattr__(
+                model,
+                "_moespresso_ssd_streaming_resolved_capacities",
+                dict(sorted(resolved_capacities.items())),
+            )
         if seed_hot:
             switch.seed_hot_free_slots()
     return applied
@@ -2022,6 +2072,10 @@ def ssd_streaming_layer_stats(model) -> list[dict]:
                 switch, "decode_routed_fused_calls", 0),
             "pipelined_decode_fused_calls": getattr(
                 switch, "pipelined_decode_fused_calls", 0),
+            "iqk_dual_gemv_calls": getattr(
+                switch, "iqk_dual_gemv_calls", 0),
+            "iqk_dual_gemv_pairs": getattr(
+                switch, "iqk_dual_gemv_pairs", 0),
             "over_capacity_calls": switch.over_capacity_calls,
             "projection_load_wait_calls": switch.projection_load_wait_calls,
             "projection_no_miss_calls": switch.projection_no_miss_calls,

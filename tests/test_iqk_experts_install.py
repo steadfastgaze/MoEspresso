@@ -51,6 +51,7 @@ from moespresso.runtime.pooled_switchglu import (
     PooledDeepseekV4MoEBlock,
     PooledIqkSwitchLinear,
     PooledSwitchGLU,
+    install_compact_iqk_dual_gemv,
 )
 from moespresso.runtime.ssd_streaming_build import (
     seed_expert_residency,
@@ -92,15 +93,24 @@ def _wire(codec: str, rows: int, in_features: int, seed: int) -> np.ndarray:
     return out
 
 
-def _package(tmp_path, layout=IQK_LAYOUT_IQK_RELAYOUT, layer=0):
+def _package(
+    tmp_path,
+    layout=IQK_LAYOUT_IQK_RELAYOUT,
+    layer=0,
+    *,
+    members=None,
+    model_width=D,
+    expert_width=H,
+):
     """One relayout bundle shard plus the reference weights it carries."""
+    members = dict(MEMBERS if members is None else members)
     pkg = tmp_path / "pkg"
     pkg.mkdir(exist_ok=True)
     comps, reference = {}, {}
     for i, projection in enumerate(PROJECTIONS):
-        codec = MEMBERS[projection]
-        in_features = D if projection != "down_proj" else H
-        out_features = H if projection != "down_proj" else D
+        codec = members[projection]
+        in_features = model_width if projection != "down_proj" else expert_width
+        out_features = expert_width if projection != "down_proj" else model_width
         wire = _wire(codec, E * out_features, in_features, seed=11 + 7 * i)
         rows = (rl.pack_rows(codec, wire, in_features)
                 if layout == IQK_LAYOUT_IQK_RELAYOUT else wire)
@@ -110,9 +120,9 @@ def _package(tmp_path, layout=IQK_LAYOUT_IQK_RELAYOUT, layer=0):
         ).reshape(E, out_features, in_features).astype(np.float32)
     bundle, geometry = assemble_layer_bundle(
         comps,
-        bits={p: iqk_geometry(MEMBERS[p]).bits for p in PROJECTIONS},
+        bits={p: iqk_geometry(members[p]).bits for p in PROJECTIONS},
         codecs={p: "iqk" for p in PROJECTIONS},
-        iqk_codecs=MEMBERS,
+        iqk_codecs=members,
         iqk_layout=layout,
     )
     key = f"layers.{layer}.ffn.experts.tq_bundle"
@@ -182,8 +192,21 @@ def _reference_forward(reference, x, indices):
     return out
 
 
-def _install(tmp_path, layout=IQK_LAYOUT_IQK_RELAYOUT):
-    pkg, reference = _package(tmp_path, layout=layout)
+def _install(
+    tmp_path,
+    layout=IQK_LAYOUT_IQK_RELAYOUT,
+    *,
+    members=None,
+    model_width=D,
+    expert_width=H,
+):
+    pkg, reference = _package(
+        tmp_path,
+        layout=layout,
+        members=members,
+        model_width=model_width,
+        expert_width=expert_width,
+    )
     model = _StubModel(1, _activation())
     installed = install_deepseek_v4_iqk_experts(
         model, pkg, build_expert_index(pkg))
@@ -627,6 +650,156 @@ def test_pooled_switch_full_resident_nonidentity_slots_remap_on_device(tmp_path)
     assert pooled.index_resync_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("gate_member", "up_member"),
+    [
+        ("iq1_s_r4", "iq1_s_r4"),
+        ("iq1_s_r4", "iq2_ks"),
+        ("iq2_ks", "iq2_k"),
+        ("iq2_ks", "iq2_ks"),
+    ],
+)
+def test_iqk_dual_gemv_matches_separate_projection_words(
+    tmp_path,
+    gate_member,
+    up_member,
+):
+    from moespresso.runtime.deepseek_v4.iqk_decode_kernel import dual_gemv
+
+    members = {
+        "gate_proj": gate_member,
+        "up_proj": up_member,
+        "down_proj": "iq2_k",
+    }
+    model, _reference, _ = _install(tmp_path, members=members)
+    resident = model.layers[0].mlp.switch_mlp
+    pooled = _pooled_switch(tmp_path / "pkg", resident, capacity=E)
+    for pool in pooled._projection_pools_lockstep():
+        pool.ensure(range(E))
+
+    rng = np.random.default_rng(171)
+    x = mx.array((rng.standard_normal((1, D)) * 0.5).astype(np.float16))
+    indices = mx.array([[0, 1]], dtype=mx.uint32)
+    x4 = mx.expand_dims(x, (-2, -3))
+    want_gate = pooled.gate_proj.pool.iqk.gemv(x4, indices)
+    want_up = pooled.up_proj.pool.iqk.gemv(x4, indices)
+    got_gate, got_up = dual_gemv(
+        pooled.gate_proj.pool.iqk,
+        pooled.up_proj.pool.iqk,
+        x4,
+        indices,
+    )
+    mx.eval(want_gate, want_up, got_gate, got_up)
+
+    assert np.array_equal(np.asarray(got_gate), np.asarray(want_gate))
+    assert np.array_equal(np.asarray(got_up), np.asarray(want_up))
+
+
+def test_iqk_dual_gemv_matches_words_at_ds4_gate_up_geometry(tmp_path):
+    from moespresso.runtime.deepseek_v4.iqk_decode_kernel import dual_gemv
+
+    model, _reference, _ = _install(
+        tmp_path,
+        members={
+            "gate_proj": "iq1_s_r4",
+            "up_proj": "iq2_ks",
+            "down_proj": "iq2_k",
+        },
+        model_width=4096,
+        expert_width=2048,
+    )
+    resident = model.layers[0].mlp.switch_mlp
+    pooled = _pooled_switch(tmp_path / "pkg", resident, capacity=E)
+    for pool in pooled._projection_pools_lockstep():
+        pool.ensure(range(E))
+
+    rng = np.random.default_rng(172)
+    x = mx.array((rng.standard_normal((1, 4096)) * 0.5).astype(np.float16))
+    indices = mx.array([[0, 1]], dtype=mx.uint32)
+    x4 = mx.expand_dims(x, (-2, -3))
+    want_gate = pooled.gate_proj.pool.iqk.gemv(x4, indices)
+    want_up = pooled.up_proj.pool.iqk.gemv(x4, indices)
+    got_gate, got_up = dual_gemv(
+        pooled.gate_proj.pool.iqk,
+        pooled.up_proj.pool.iqk,
+        x4,
+        indices,
+    )
+    mx.eval(want_gate, want_up, got_gate, got_up)
+
+    assert np.array_equal(np.asarray(got_gate), np.asarray(want_gate))
+    assert np.array_equal(np.asarray(got_up), np.asarray(want_up))
+
+
+def test_compact_iqk_dual_gemv_is_bit_identical_and_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    import moespresso.runtime.pooled_switchglu as psg
+    from moespresso.runtime.deepseek_v4.speed_stats import _COUNT_KEYS
+
+    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
+    model, _reference, _ = _install(tmp_path)
+    resident = model.layers[0].mlp.switch_mlp
+    pooled = _pooled_switch(tmp_path / "pkg", resident, capacity=E)
+    for pool in pooled._projection_pools_lockstep():
+        pool.ensure(range(E))
+    assert pooled._barrier_free_decode_ready()
+
+    rng = np.random.default_rng(173)
+    x = mx.array((rng.standard_normal((1, D)) * 0.5).astype(np.float16))
+    indices = mx.array([[0, 1]], dtype=mx.uint32)
+    compact_source_ids = mx.array([3, 11], dtype=mx.uint32)
+
+    incumbent = pooled.build_barrier_free_decode(x, indices)
+    assert getattr(pooled, "iqk_dual_gemv_calls", 0) == 0
+    assert not install_compact_iqk_dual_gemv(
+        pooled,
+        mx.array([3], dtype=mx.uint32),
+    )
+    mismatch = pooled.build_barrier_free_decode(x, indices)
+    assert getattr(pooled, "iqk_dual_gemv_calls", 0) == 0
+    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", False)
+    assert not install_compact_iqk_dual_gemv(pooled, compact_source_ids)
+    assert (
+        pooled.build_barrier_free_decode.__func__
+        is PooledSwitchGLU.build_barrier_free_decode
+    )
+    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
+    assert install_compact_iqk_dual_gemv(pooled, compact_source_ids)
+    assert (
+        pooled.build_barrier_free_decode.__func__
+        is PooledSwitchGLU.build_compact_barrier_free_decode
+    )
+    compact = pooled.build_barrier_free_decode(x, indices)
+    mx.eval(incumbent, mismatch, compact)
+
+    assert np.array_equal(np.asarray(mismatch), np.asarray(incumbent))
+    assert np.array_equal(np.asarray(compact), np.asarray(incumbent))
+    assert pooled.iqk_dual_gemv_calls == 1
+    assert pooled.iqk_dual_gemv_pairs == 2
+
+    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", False)
+    killed = pooled.build_barrier_free_decode(x, indices)
+    mx.eval(killed)
+    assert np.array_equal(np.asarray(killed), np.asarray(incumbent))
+    assert pooled.iqk_dual_gemv_calls == 1
+
+    model.layers[0].mlp.switch_mlp = pooled
+    engagement = iqk_engagement(model)
+    census = ssd_streaming_stats(model)
+    assert engagement["iqk_dual_gemv_calls"] == 1
+    assert engagement["iqk_dual_gemv_pairs"] == 2
+    assert census["iqk_dual_gemv_calls"] == 1
+    assert census["iqk_dual_gemv_pairs"] == 2
+    assert census["built_iqk_dual_gemv_kernel_count"] == len(
+        engagement["built_iqk_dual_gemv_kernels"]
+    )
+    assert "iqk_dual_gemv_calls" in _COUNT_KEYS
+    assert "iqk_dual_gemv_pairs" in _COUNT_KEYS
+    assert "built_iqk_dual_gemv_kernel_count" in _COUNT_KEYS
+
+
 def test_pooled_switch_partial_residency_matches_resident_across_eviction(tmp_path):
     model, _reference, _ = _install(tmp_path)
     resident = model.layers[0].mlp.switch_mlp
@@ -857,6 +1030,7 @@ def test_pooled_iqk_block_preserves_decode_and_verify_commit_cadence(
     assert switch.iqk_decode_flush_calls == 1
     assert switch.iqk_verify_flush_calls == 1
     assert switch.barrier_free_decode_flush_calls == 1
+    assert getattr(switch, "iqk_dual_gemv_calls", 0) == 0
     model.layers[0].mlp = block
     engagement = iqk_engagement(model)
     census = ssd_streaming_stats(model)
@@ -866,6 +1040,50 @@ def test_pooled_iqk_block_preserves_decode_and_verify_commit_cadence(
     assert census["iqk_decode_flush_calls"] == 1
     assert census["iqk_verify_flush_calls"] == 1
     assert census["iqk_gemv_calls"] == switch.gemv_calls
+
+
+def test_compact_install_engages_the_iqk_dual_gemv(tmp_path, monkeypatch):
+    import moespresso.runtime.pooled_switchglu as psg
+
+    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
+    model, _reference, _ = _install(tmp_path)
+    resident = model.layers[0].mlp.switch_mlp
+    switch = _pooled_switch(tmp_path / "pkg", resident, capacity=E)
+    for pool in switch._projection_pools_lockstep():
+        pool.ensure(range(E))
+
+    class _CompactGate:
+        def __call__(self, x, input_ids=None):
+            del input_ids
+            shape = (*x.shape[:-1], 1)
+            return (
+                mx.zeros(shape, dtype=mx.uint32),
+                mx.ones(shape, dtype=mx.float32),
+            )
+
+    class _Shared:
+        def __call__(self, x):
+            return mx.zeros_like(x)
+
+    class _Original:
+        gate = _CompactGate()
+        shared_experts = _Shared()
+        sharding_group = None
+
+        def __init__(self, switch_mlp):
+            self.switch_mlp = switch_mlp
+
+    block = PooledDeepseekV4MoEBlock(_Original(switch))
+    block.eval()
+    assert install_compact_iqk_dual_gemv(
+        switch,
+        mx.array([2, 9], dtype=mx.uint32),
+    )
+    output = block(mx.ones((1, D), dtype=mx.float16))
+    mx.eval(output)
+
+    assert switch.iqk_dual_gemv_calls == 1
+    assert switch.iqk_dual_gemv_pairs == 1
 
 
 def test_sorted_route_matches_the_reference_forward(tmp_path, monkeypatch):

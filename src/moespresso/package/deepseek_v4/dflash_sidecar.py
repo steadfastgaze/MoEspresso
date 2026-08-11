@@ -46,7 +46,11 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
 
-from moespresso.core.artifact import compute_artifact_id, write_artifact
+from moespresso.core.artifact import (
+    artifact_producer,
+    compute_artifact_id,
+    write_artifact,
+)
 from moespresso.inventory.safetensors_header import (
     TensorHeader,
     read_headers_with_offsets,
@@ -75,7 +79,7 @@ FC_FORMAT_DEFAULT = FC_FORMAT_AFFINE8
 
 AFFINE8_PARAMS = {"group_size": 32, "bits": 8, "mode": "affine"}
 
-PRODUCER = {"tool": "moespresso.package.deepseek_v4.dflash_sidecar", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.package.deepseek_v4.dflash_sidecar")
 SUBJECT = {"family": "deepseek_v4_flash_dflash", "role": "draft_sidecar"}
 
 HUB_CACHE = Path("~/.cache/huggingface/hub").expanduser()

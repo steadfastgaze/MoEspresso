@@ -10,7 +10,7 @@ An infeasible run produces a durable, inspectable artifact with
 
 from __future__ import annotations
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.optimize import allocate
 from moespresso.optimize.aggregate import fidelity, worst_layer_tail
 from moespresso.optimize.health import health_check
@@ -20,7 +20,7 @@ from moespresso.optimize.monotone import (
 )
 from moespresso.optimize.sizes import affine_bytes, mx_float_bytes
 
-PRODUCER = {"tool": "moespresso.optimize", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.optimize")
 
 # Roles kept fp16 (never quantized): only the router / shared-expert gates. They
 # select experts via argmax/top-k, a discrete decision a reconstruction-error proxy

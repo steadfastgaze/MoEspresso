@@ -21,10 +21,21 @@ from moespresso.core.artifact import (
     ArtifactError,
     Validation,
     compute_artifact_id,
+    read_artifact,
     validate_base,
 )
 from moespresso.inventory.safetensors_header import read_header
 from moespresso.package.manifest import PACKAGE_FORMAT, PACKAGE_FORMAT_VERSION
+from moespresso.runtime.deepseek_v4.expert_layout import (
+    EXPERT_SELECTION_FILENAME,
+    NUM_HASH_LAYERS,
+    PER_LAYER_EXPERTS_FEATURE,
+    DeepseekV4ExpertLayout,
+    DeepseekV4ExpertLayoutError,
+    parse_deepseek_v4_expert_layout,
+    validate_expert_index_counts,
+)
+from moespresso.runtime.expert_index import build_expert_index
 
 
 class PackageVerificationError(Exception):
@@ -434,6 +445,268 @@ def _verify_identity(
     return out, declared
 
 
+def _verify_deepseek_v4_expert_layout(
+    manifest: dict,
+    package_dir: Path,
+) -> list[Validation]:
+    """Authenticate the compact selection artifact and its bundle geometry."""
+    try:
+        layout = parse_deepseek_v4_expert_layout(manifest)
+    except DeepseekV4ExpertLayoutError as exc:
+        return [_validation(
+            "runtime.invalid_deepseek_v4_expert_layout",
+            f"invalid DeepSeek V4 compact expert layout: {exc}",
+            path="/expert_layout/per_layer_experts",
+        )]
+    if layout is None:
+        return []
+
+    out: list[Validation] = []
+    files = manifest.get("files")
+    declarations = [
+        entry for entry in files
+        if isinstance(entry, dict)
+        and entry.get("path") == EXPERT_SELECTION_FILENAME
+    ] if isinstance(files, list) else []
+    if len(declarations) != 1:
+        out.append(_validation(
+            "runtime.expert_selection_identity_missing",
+            f"compact packages must declare exactly one {EXPERT_SELECTION_FILENAME} "
+            "file identity",
+            path="/files",
+            expected=1,
+            actual=len(declarations),
+        ))
+
+    selection_path = _declared_path(
+        package_dir,
+        EXPERT_SELECTION_FILENAME,
+        manifest_path="/expert_layout/per_layer_experts/source_selection_artifact_id",
+        out=out,
+    )
+    selection = None
+    if selection_path is not None:
+        if not selection_path.is_file():
+            out.append(_validation(
+                "runtime.missing_expert_selection",
+                f"compact package is missing {EXPERT_SELECTION_FILENAME}",
+                path=f"/{EXPERT_SELECTION_FILENAME}",
+            ))
+        else:
+            try:
+                selection = read_artifact(selection_path)
+            except (ArtifactError, OSError, UnicodeError, ValueError, TypeError) as exc:
+                out.append(_validation(
+                    "runtime.invalid_expert_selection",
+                    f"could not authenticate {EXPERT_SELECTION_FILENAME}: {exc}",
+                    path=f"/{EXPERT_SELECTION_FILENAME}",
+                ))
+
+    if selection is not None:
+        if selection.get("artifact_kind") != "deepseek_v4_expert_selection":
+            out.append(_validation(
+                "runtime.wrong_expert_selection_kind",
+                f"{EXPERT_SELECTION_FILENAME} has the wrong artifact kind",
+                path=f"/{EXPERT_SELECTION_FILENAME}/artifact_kind",
+                expected="deepseek_v4_expert_selection",
+                actual=selection.get("artifact_kind"),
+            ))
+        if selection.get("status") != "valid":
+            out.append(_validation(
+                "runtime.expert_selection_not_valid",
+                f"{EXPERT_SELECTION_FILENAME} must have status 'valid'",
+                path=f"/{EXPERT_SELECTION_FILENAME}/status",
+                expected="valid",
+                actual=selection.get("status"),
+            ))
+        if selection.get("artifact_id") != layout.source_selection_artifact_id:
+            out.append(_validation(
+                "runtime.expert_selection_id_mismatch",
+                "embedded expert selection id does not match the shipped artifact",
+                path=(
+                    "/expert_layout/per_layer_experts/"
+                    "source_selection_artifact_id"
+                ),
+                expected=layout.source_selection_artifact_id,
+                actual=selection.get("artifact_id"),
+            ))
+        selection_features = selection.get("required_features")
+        if (
+            not isinstance(selection_features, list)
+            or PER_LAYER_EXPERTS_FEATURE not in selection_features
+        ):
+            out.append(_validation(
+                "runtime.expert_selection_feature_missing",
+                f"{EXPERT_SELECTION_FILENAME} does not require "
+                f"{PER_LAYER_EXPERTS_FEATURE!r}",
+                path=f"/{EXPERT_SELECTION_FILENAME}/required_features",
+            ))
+        expected_payload = layout.selection_payload()
+        for key, expected in expected_payload.items():
+            actual = selection.get(key)
+            if actual != expected:
+                out.append(_validation(
+                    "runtime.expert_selection_payload_mismatch",
+                    f"embedded expert layout field {key!r} does not match "
+                    f"{EXPERT_SELECTION_FILENAME}",
+                    path=f"/expert_layout/per_layer_experts/{key}",
+                    expected=expected,
+                    actual=actual,
+                ))
+
+    try:
+        index = build_expert_index(package_dir)
+        validate_expert_index_counts(layout, index)
+    except (
+        DeepseekV4ExpertLayoutError,
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        struct.error,
+    ) as exc:
+        out.append(_validation(
+            "runtime.expert_layout_bundle_mismatch",
+            f"compact expert layout does not match routed bundle headers: {exc}",
+            path="/expert_layout/per_layer_experts/layers",
+        ))
+    out.extend(_verify_deepseek_v4_router_headers(manifest, package_dir, layout))
+    return out
+
+
+def _verify_deepseek_v4_router_headers(
+    manifest: dict,
+    package_dir: Path,
+    layout: DeepseekV4ExpertLayout,
+) -> list[Validation]:
+    """Check router axis zero from manifest-declared shard and tensor keys."""
+    router_roles = {"moe.router_gate", "moe.router_bias"}
+    entries: dict[tuple[int, str], tuple[int, dict]] = {}
+    out: list[Validation] = []
+    tensors = manifest.get("tensors")
+    if not isinstance(tensors, list):
+        return [_validation(
+            "runtime.invalid_router_manifest",
+            "compact package manifest tensors must be a list",
+            path="/tensors",
+        )]
+    for tensor_index, tensor in enumerate(tensors):
+        if not isinstance(tensor, dict) or tensor.get("role") not in router_roles:
+            continue
+        role = tensor["role"]
+        layer = tensor.get("layer_index")
+        if (
+            not isinstance(layer, int)
+            or isinstance(layer, bool)
+            or layer not in layout.layers
+        ):
+            out.append(_validation(
+                "runtime.invalid_router_manifest",
+                f"router tensor {tensor_index} has an invalid compact layer",
+                path=f"/tensors/{tensor_index}/layer_index",
+                actual=layer,
+            ))
+            continue
+        entry_key = (layer, role)
+        if entry_key in entries:
+            out.append(_validation(
+                "runtime.duplicate_router_tensor",
+                f"compact layer {layer} declares duplicate {role} tensors",
+                path=f"/tensors/{tensor_index}",
+            ))
+            continue
+        entries[entry_key] = (tensor_index, tensor)
+
+    for layer in sorted(layout.layers):
+        # Score routing cannot be reconstructed without both learned tensors.
+        # Reduced manifests may omit hash-router passthrough entries; their graph
+        # state is checked post-hydration. Any declared hash gate is checked at
+        # source width below.
+        required_roles = (
+            ["moe.router_gate", "moe.router_bias"]
+            if layer >= NUM_HASH_LAYERS
+            else []
+        )
+        for role in required_roles:
+            if (layer, role) not in entries:
+                out.append(_validation(
+                    "runtime.missing_router_tensor",
+                    f"compact layer {layer} has no manifest {role} tensor",
+                    path="/tensors",
+                ))
+
+    headers: dict[str, dict | None] = {}
+    for (layer, role), (tensor_index, tensor) in sorted(entries.items()):
+        shard = tensor.get("shard")
+        key = tensor.get("key_prefix")
+        tensor_path = f"/tensors/{tensor_index}"
+        if not isinstance(shard, str) or not isinstance(key, str) or not key:
+            out.append(_validation(
+                "runtime.invalid_router_manifest",
+                f"compact layer {layer} {role} has no shard/key location",
+                path=tensor_path,
+            ))
+            continue
+        if shard not in headers:
+            shard_path = _declared_path(
+                package_dir,
+                shard,
+                manifest_path=f"{tensor_path}/shard",
+                out=out,
+            )
+            if shard_path is None or not shard_path.is_file():
+                headers[shard] = None
+            else:
+                try:
+                    headers[shard] = read_header(shard_path)
+                except (
+                    AttributeError,
+                    OSError,
+                    TypeError,
+                    UnicodeError,
+                    ValueError,
+                    struct.error,
+                ) as exc:
+                    out.append(_validation(
+                        "runtime.invalid_router_header",
+                        f"could not read router shard {shard}: {exc}",
+                        path=f"/{shard}",
+                    ))
+                    headers[shard] = None
+        header = headers[shard]
+        if header is None:
+            continue
+        meta = header.get(key)
+        if not isinstance(meta, dict):
+            out.append(_validation(
+                "runtime.missing_router_tensor_key",
+                f"compact layer {layer} {role} key {key!r} is absent from {shard}",
+                path=tensor_path,
+            ))
+            continue
+        shape = meta.get("shape")
+        expected_rank = 2 if role == "moe.router_gate" else 1
+        expected_width = layout.layers[layer].num_experts
+        if (
+            not isinstance(shape, list)
+            or len(shape) != expected_rank
+            or not isinstance(shape[0], int)
+            or isinstance(shape[0], bool)
+            or shape[0] != expected_width
+        ):
+            out.append(_validation(
+                "runtime.router_header_width_mismatch",
+                f"compact layer {layer} {role} header shape {shape!r} does not "
+                f"declare axis-0 width {expected_width}",
+                path=f"/{shard}/{key}",
+                expected=expected_width,
+                actual=shape[0] if isinstance(shape, list) and shape else None,
+            ))
+    return out
+
+
 def expected_keys(tensor: dict) -> list[str]:
     """The on-disk safetensors keys a manifest tensor entry declares."""
     prefix = tensor["key_prefix"]
@@ -462,6 +735,10 @@ def verify_package(manifest: dict, package_dir: Path) -> list[Validation]:
 
     # The bundled drafter carries its own all-or-nothing presence contract.
     out.extend(_verify_drafter_component(manifest, package_dir))
+
+    # Compact DS4 packages bind their router rows to one authenticated selection
+    # artifact and to the per-layer expert counts encoded in bundle headers.
+    out.extend(_verify_deepseek_v4_expert_layout(manifest, package_dir))
 
     # Every declared tensor key must be present in a manifest-declared shard.
     headers: dict[str, set[str] | None] = {}

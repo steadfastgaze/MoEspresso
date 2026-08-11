@@ -117,7 +117,7 @@ the canonical JSON of the payload.
    by the triple `{path (relative POSIX), size_bytes, sha256}`, never by absolute path or
    mtime. This is how `source_inventory` and `package_manifest` pin file content: the
    manifest records `{"path": ..., "size_bytes": ..., "sha256": ...}` per file, and
-   `moespresso-verify` re-checks presence + size + sha256 against it.
+   `moespresso verify` re-checks presence + size + sha256 against it.
 
 Because the hash is over the canonical (compact) form, the on-disk representation is free
 to differ for human convenience: `write_artifact` stores the file **pretty-printed**

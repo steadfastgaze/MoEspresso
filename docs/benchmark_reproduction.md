@@ -52,7 +52,7 @@ hf download steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso \
   --revision c67d34262a258f815789a2018341317c755c45a6 \
   --local-dir <ornith-package>
 
-uv run --locked moespresso-verify <ornith-package>
+uv run --locked moespresso verify <ornith-package>
 ```
 
 Before a run, record the package manifest id, manifest hash, model filename,

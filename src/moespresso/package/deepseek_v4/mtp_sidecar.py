@@ -49,7 +49,11 @@ from mlx.utils import tree_flatten
 
 from jang_tools.dsv4.mlx_model import ModelArgs
 
-from moespresso.core.artifact import compute_artifact_id, write_artifact
+from moespresso.core.artifact import (
+    artifact_producer,
+    compute_artifact_id,
+    write_artifact,
+)
 from moespresso.inventory.safetensors_header import TensorHeader, read_headers_with_offsets
 from moespresso.package.bundle import ds4_source_to_mxfp4_components
 from moespresso.runtime.deepseek_v4.mtp_model import (
@@ -71,7 +75,7 @@ KNOWN_FORMATS = frozenset({FORMAT_MXFP4, FORMAT_AFFINE8, FORMAT_PASSTHROUGH})
 MXFP4_PARAMS = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
 AFFINE8_PARAMS = {"group_size": 32, "bits": 8, "mode": "affine"}
 
-PRODUCER = {"tool": "moespresso.package.deepseek_v4.mtp_sidecar", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.package.deepseek_v4.mtp_sidecar")
 SUBJECT = {"family": "deepseek_v4_flash_mtp", "role": "draft_sidecar"}
 
 # Chained draft depth cap recorded in the manifest. Chaining the single

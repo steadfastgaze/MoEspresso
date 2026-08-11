@@ -7,6 +7,7 @@ index supplies its exact byte cost.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,7 @@ class CapacityBudget:
     min_capacity: int
     max_capacity: int
     runtime_resident_bytes: int = 0
+    full_resident_expert_bytes: int | None = None
 
     @property
     def usable_bytes(self) -> int:
@@ -65,6 +67,15 @@ def bytes_per_layer_slot(index: ExpertIndex) -> dict[int, int]:
                 ).nbytes
         result[layer] = total
     return result
+
+
+def full_resident_expert_bytes(index: ExpertIndex) -> int:
+    """Exact bytes for every compact expert slot in every routed layer."""
+    layer_bytes = bytes_per_layer_slot(index)
+    return sum(
+        index.num_experts_for_layer(layer) * layer_bytes[layer]
+        for layer in index.layers_indexed()
+    )
 
 
 def is_routed_expert_payload_key(key: str) -> bool:
@@ -117,13 +128,25 @@ def validate_min_resident_experts(
             "--min-resident-experts requires a routed runtime that reports "
             "resident expert capacity"
         )
-    capacities = [int(base_capacity)]
-    overrides = getattr(
+    resolved = getattr(
         model,
-        "_moespresso_ssd_streaming_capacity_overrides",
+        "_moespresso_ssd_streaming_resolved_capacities",
         None,
-    ) or {}
-    capacities.extend(int(capacity) for capacity in overrides.values())
+    )
+    if resolved is not None:
+        if not isinstance(resolved, Mapping) or not resolved:
+            raise StreamingCapacityError(
+                "pooled routed runtime reports no resolved per-layer capacity"
+            )
+        capacities = [int(capacity) for capacity in resolved.values()]
+    else:
+        capacities = [int(base_capacity)]
+        overrides = getattr(
+            model,
+            "_moespresso_ssd_streaming_capacity_overrides",
+            None,
+        ) or {}
+        capacities.extend(int(capacity) for capacity in overrides.values())
     actual = min(capacities)
     if actual < requested:
         raise StreamingCapacityError(
@@ -142,11 +165,26 @@ def choose_capacity(budget: CapacityBudget) -> int:
         raise ValueError("min_capacity must be >= 1")
     if budget.runtime_resident_bytes < 0:
         raise ValueError("runtime_resident_bytes must be >= 0")
+    if (
+        budget.full_resident_expert_bytes is not None
+        and budget.full_resident_expert_bytes <= 0
+    ):
+        raise ValueError("full_resident_expert_bytes must be > 0 when provided")
     if budget.min_capacity > budget.max_capacity:
         raise StreamingCapacityError(
             f"min_capacity {budget.min_capacity} exceeds max_capacity "
             f"{budget.max_capacity}")
 
+    if (
+        budget.full_resident_expert_bytes is not None
+        and budget.usable_bytes >= budget.full_resident_expert_bytes
+    ):
+        return int(budget.max_capacity)
+
+    # Below an exact full-resident fit, retain the established conservative
+    # planner. With mixed layer counts this may leave some memory unused once
+    # shorter layers saturate, but it never overcommits and preserves the
+    # measured bounded-residency policy.
     capacity = budget.usable_bytes // budget.bytes_per_capacity_unit
     if capacity < budget.min_capacity:
         need = budget.min_capacity * budget.bytes_per_capacity_unit
@@ -201,8 +239,9 @@ def package_capacity_budget(
             max_router_fanout=max_router_fanout,
             staging_slots=staging_slots,
         ),
-        max_capacity=index.num_experts,
+        max_capacity=index.max_num_experts,
         runtime_resident_bytes=int(runtime_resident_bytes),
+        full_resident_expert_bytes=full_resident_expert_bytes(index),
     )
 
 

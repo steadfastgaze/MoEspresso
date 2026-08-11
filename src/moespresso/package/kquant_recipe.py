@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
+from moespresso.core.artifact import artifact_producer
 from moespresso.package.kquant_format import (
     IMATRIX_REQUIRED_CODECS,
     KQUANT_GEOMETRY,
@@ -23,7 +24,7 @@ class KQuantRecipeError(ValueError):
     pass
 
 
-PRODUCER = {"tool": "moespresso.package.kquant_recipe", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.package.kquant_recipe")
 
 
 GGUF_TO_KQUANT_CODEC = {

@@ -19,9 +19,9 @@ artifact (not wired into convert/serve/verify yet; the gate comes later).
 
 from __future__ import annotations
 
-from moespresso.core.artifact import make_artifact
+from moespresso.core.artifact import artifact_producer, make_artifact
 
-PRODUCER = {"tool": "moespresso.architecture_profile", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.architecture_profile")
 
 
 def _profile(subject: dict, **fields) -> dict:

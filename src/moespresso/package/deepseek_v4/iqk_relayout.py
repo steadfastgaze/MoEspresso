@@ -334,7 +334,7 @@ def _relayout_manifest(manifest: dict, plan_id: str, files: list[dict]) -> tuple
 def _rewrite_sidecars(package_dir: Path, manifest: dict, seed: int) -> bool:
     """Regenerate the jang-compatible sidecars from the rewritten manifest.
 
-    `moespresso-verify` re-derives them and compares, so they are written
+    `moespresso verify` re-derives them and compares, so they are written
     again from the manifest that now ships rather than left as the ones the
     previous manifest produced. A package that carries no sidecars keeps
     none.

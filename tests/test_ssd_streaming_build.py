@@ -56,6 +56,37 @@ def _package(tmp_path, *, n_experts=8, hidden=64, intermediate=32, layers=(0,)):
     return pkg
 
 
+def _mixed_package(tmp_path, *, hidden=64, intermediate=32):
+    from conftest import write_bundle_package
+
+    pkg = tmp_path / "mixed-pkg"
+    pkg.mkdir()
+
+    def packed_cols(in_features, bits):
+        return (in_features + (32 // bits) - 1) // (32 // bits)
+
+    specs = {
+        "gate_proj": (intermediate, packed_cols(hidden, 2), 2),
+        "up_proj": (intermediate, packed_cols(hidden, 4), 4),
+        "down_proj": (hidden, packed_cols(intermediate, 2), 2),
+    }
+    write_bundle_package(
+        pkg,
+        layers=(0,),
+        n_exp=4,
+        specs=specs,
+        shard_name="model-00001-of-00002.safetensors",
+    )
+    write_bundle_package(
+        pkg,
+        layers=(1,),
+        n_exp=3,
+        specs=specs,
+        shard_name="model-00002-of-00002.safetensors",
+    )
+    return pkg
+
+
 def _kquant_package(tmp_path, *, n_experts=4, hidden=256, intermediate=256):
     from conftest import write_safetensors_raw
 
@@ -305,6 +336,43 @@ def test_install_pooled_switchglus_replaces_indexed_layers(tmp_path):
     assert layer0.mlp.switch_mlp.gate_proj.bits == 2
     assert layer0.mlp.switch_mlp.up_proj.bits == 4
     assert layer0.mlp.switch_mlp.gate_proj.pool.capacity == 4
+
+
+def test_install_pooled_switchglus_caps_mixed_layers_locally(tmp_path):
+    pkg = _mixed_package(tmp_path)
+    index = build_expert_index(pkg)
+
+    full = _Model(n_experts=4, n_layers=2)
+    assert install_pooled_switchglus(
+        full,
+        package_dir=pkg,
+        index=index,
+        capacity_per_layer=4,
+        spare_slots=0,
+    ) == 2
+    full_layer0 = full.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool
+    full_layer1 = full.language_model.model.layers[1].mlp.switch_mlp.gate_proj.pool
+    assert (full_layer0.capacity, full_layer0.num_experts) == (4, 4)
+    assert (full_layer1.capacity, full_layer1.num_experts) == (3, 3)
+    assert full._moespresso_ssd_streaming_resolved_capacities == {0: 4, 1: 3}
+
+    bounded = _Model(n_experts=4, n_layers=2)
+    assert install_pooled_switchglus(
+        bounded,
+        package_dir=pkg,
+        index=index,
+        capacity_per_layer=2,
+        spare_slots=2,
+    ) == 2
+    bounded_layer0 = (
+        bounded.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool
+    )
+    bounded_layer1 = (
+        bounded.language_model.model.layers[1].mlp.switch_mlp.gate_proj.pool
+    )
+    assert (bounded_layer0.capacity, bounded_layer0.spare_slots) == (2, 2)
+    assert (bounded_layer1.capacity, bounded_layer1.spare_slots) == (2, 1)
+    assert bounded._moespresso_ssd_streaming_resolved_capacities == {0: 2, 1: 2}
 
 
 def test_install_pooled_switchglus_kquant_combines_gate_up_by_default(tmp_path):
@@ -1003,6 +1071,7 @@ def test_grow_ssd_streaming_capacity_applies_layer_overrides(tmp_path):
     assert switch.gate_proj.pool.resident_ids() == {1, 2}
     assert ssd_streaming_layer_stats(model)[0]["capacity"] == 6
     assert ssd_streaming_stats(model)["capacity_overrides"] == {0: 6}
+    assert model._moespresso_ssd_streaming_resolved_capacities == {0: 6}
 
 
 def test_grow_ssd_streaming_capacity_preserves_planner_order(
@@ -1279,6 +1348,7 @@ def test_install_pooled_switchglus_accepts_per_layer_capacity_overrides(tmp_path
     layer1 = model.language_model.model.layers[1].mlp.switch_mlp
     assert layer0.gate_proj.pool.capacity == 2
     assert layer1.gate_proj.pool.capacity == 4
+    assert model._moespresso_ssd_streaming_resolved_capacities == {0: 2, 1: 4}
 
 
 def test_install_pooled_switchglus_threads_eviction_policy(tmp_path):
@@ -1319,6 +1389,7 @@ def test_budget_payload_is_reported_verbatim():
         "usable_bytes": 4,
         "min_capacity": 2,
         "max_capacity": 8,
+        "full_resident_expert_bytes": None,
     }
 
 
@@ -3076,6 +3147,25 @@ def test_install_lookahead_reads_wrapped_router_weight(tmp_path):
     assert bool(mx.array_equal(switch.lookahead_w, inner.weight.astype(mx.float16)))
     assert switch.lookahead_b is None
     assert switch.lookahead_target is layers[1].mlp.switch_mlp
+
+
+def test_install_lookahead_gathers_compact_rows_from_source_width_router(tmp_path):
+    from moespresso.runtime.ssd_streaming_build import install_lookahead
+
+    source = _FakeDs4ScoreGateModule(n_experts=4, hidden=256)
+    target = _FakeDs4ScoreGateModule(n_experts=16, hidden=256)
+    compact_source_ids = mx.array([1, 5, 9, 14], dtype=mx.int32)
+    target._moespresso_compact_source_ids = compact_source_ids
+    model = _lookahead_chain_model(tmp_path, [source, target])
+
+    assert install_lookahead(model, 1) == 1
+    switch = model.model.layers[0].mlp.switch_mlp
+    expected_w = mx.take(target.weight, compact_source_ids, axis=0)
+    expected_b = mx.take(target.bias, compact_source_ids, axis=0)
+    mx.eval(switch.lookahead_w, switch.lookahead_b, expected_w, expected_b)
+    assert switch.lookahead_w.shape == (4, 256)
+    assert bool(mx.array_equal(switch.lookahead_w, expected_w))
+    assert bool(mx.array_equal(switch.lookahead_b, expected_b))
 
 
 def test_deepseek_v4_lookahead_export_uses_bias_aware_scoring(

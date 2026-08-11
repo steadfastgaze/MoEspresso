@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.probe import roundtrip, weight_io
 
 EXPERT_BITS = (1, 2, 4)
@@ -31,7 +31,7 @@ AFFINE_GROUP_SIZES = (32, 64, 128)
 DEFAULT_EXPERT_SAMPLE = 2     # fine-grained MoE: experts in a layer are equivalent
 DEFAULT_SAMPLE_ROWS = 256
 
-PRODUCER = {"tool": "moespresso.probe", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.probe")
 
 
 def imatrix_coverage_validations(

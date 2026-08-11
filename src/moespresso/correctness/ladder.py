@@ -20,10 +20,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.inventory.safetensors_header import read_header
 
-PRODUCER = {"tool": "moespresso.correctness", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.correctness")
 
 # Map manifest on-disk format -> the profile's quant-owner vocabulary.
 _FORMAT_TO_OWNER = {

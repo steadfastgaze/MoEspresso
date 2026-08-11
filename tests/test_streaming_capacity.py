@@ -15,6 +15,7 @@ from moespresso.runtime.streaming_capacity import (
     bytes_per_layer_slot,
     choose_capacity,
     choose_package_capacity,
+    full_resident_expert_bytes,
     is_routed_expert_payload_key,
     min_capacity,
     non_routed_payload_bytes,
@@ -38,6 +39,26 @@ def _package(tmp_path, *, n_layers=2, n_exp=4, out=8, cols=2):
     return pkg
 
 
+def _mixed_package(tmp_path):
+    from conftest import write_bundle_package
+
+    pkg = tmp_path / "mixed-pkg"
+    pkg.mkdir()
+    write_bundle_package(
+        pkg,
+        layers=(0,),
+        n_exp=8,
+        shard_name="model-00001-of-00002.safetensors",
+    )
+    write_bundle_package(
+        pkg,
+        layers=(1,),
+        n_exp=6,
+        shard_name="model-00002-of-00002.safetensors",
+    )
+    return pkg
+
+
 def test_bytes_per_capacity_unit_comes_from_index_geometry(tmp_path):
     index = build_expert_index(_package(tmp_path, n_layers=2, out=8, cols=2))
 
@@ -52,6 +73,15 @@ def test_bytes_per_layer_slot_comes_from_index_geometry(tmp_path):
         0: 3 * ((8 * 2 * 4) + (8 * 2)),
         1: 3 * ((8 * 2 * 4) + (8 * 2)),
     }
+
+
+def test_full_resident_bytes_sum_mixed_layer_counts(tmp_path):
+    index = build_expert_index(_mixed_package(tmp_path))
+    per_layer = bytes_per_layer_slot(index)
+
+    assert full_resident_expert_bytes(index) == (
+        (8 * per_layer[0]) + (6 * per_layer[1])
+    )
 
 
 def test_min_capacity_is_router_fanout_plus_staging():
@@ -101,6 +131,33 @@ def test_min_resident_experts_checks_per_layer_overrides():
             model,
             requested=33,
         )
+
+
+def test_min_resident_experts_uses_resolved_mixed_layer_capacities():
+    model = SimpleNamespace(
+        _moespresso_ssd_streaming_capacity=256,
+        _moespresso_ssd_streaming_capacity_overrides={},
+        _moespresso_ssd_streaming_resolved_capacities={
+            0: 256,
+            1: 256,
+            2: 256,
+            3: 64,
+        },
+    )
+
+    validate_min_resident_experts(model, requested=64)
+    with pytest.raises(StreamingCapacityError, match="capacity 64"):
+        validate_min_resident_experts(model, requested=200)
+
+
+def test_min_resident_experts_preserves_uniform_resolved_capacity():
+    model = SimpleNamespace(
+        _moespresso_ssd_streaming_capacity=256,
+        _moespresso_ssd_streaming_capacity_overrides={},
+        _moespresso_ssd_streaming_resolved_capacities={0: 256, 1: 256},
+    )
+
+    validate_min_resident_experts(model, requested=200)
 
 
 def test_choose_capacity_uses_remaining_budget_and_caps_at_num_experts():
@@ -201,6 +258,32 @@ def test_choose_package_capacity_uses_package_geometry_and_memory_budget(tmp_pat
     assert capacity == 7
 
 
+def test_mixed_package_uses_exact_full_fit_and_conservative_partial_fit(tmp_path):
+    pkg = _mixed_package(tmp_path)
+    index = build_expert_index(pkg)
+    exact = full_resident_expert_bytes(index)
+    non_routed = non_routed_payload_bytes(pkg)
+
+    assert choose_package_capacity(
+        index=index,
+        package_dir=pkg,
+        max_router_fanout=4,
+        available_bytes=non_routed + exact,
+        kv_activation_allowance_bytes=0,
+        safety_margin_bytes=0,
+        staging_slots=2,
+    ) == 8
+    assert choose_package_capacity(
+        index=index,
+        package_dir=pkg,
+        max_router_fanout=4,
+        available_bytes=non_routed + exact - 1,
+        kv_activation_allowance_bytes=0,
+        safety_margin_bytes=0,
+        staging_slots=2,
+    ) == 6
+
+
 def test_package_capacity_budget_exposes_budget_inputs(tmp_path):
     pkg = _package(tmp_path, n_layers=1, n_exp=8, out=8, cols=2)
     index = build_expert_index(pkg)
@@ -221,3 +304,6 @@ def test_package_capacity_budget_exposes_budget_inputs(tmp_path):
     assert budget.bytes_per_capacity_unit == bytes_per_capacity_unit(index)
     assert budget.min_capacity == 6
     assert budget.max_capacity == 8
+    assert budget.full_resident_expert_bytes == (
+        budget.bytes_per_capacity_unit * budget.max_capacity
+    )

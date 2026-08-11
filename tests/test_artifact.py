@@ -122,6 +122,18 @@ def test_required_features_default_empty_and_roundtrip():
     assert validate_base(a) == []  # known feature -> no issue
 
 
+def test_deepseek_v4_expert_selection_kind_and_feature_are_registered():
+    selection = make_artifact(
+        "deepseek_v4_expert_selection",
+        SUBJECT,
+        PRODUCER,
+        required_features=["deepseek_v4_per_layer_experts"],
+    )
+
+    assert selection["artifact_id"].startswith("select:")
+    assert validate_base(selection) == []
+
+
 def test_unknown_required_feature_fails_closed():
     # fail-closed at construction: make_artifact raises on an unknown feature.
     with pytest.raises(ArtifactError):
@@ -132,6 +144,17 @@ def test_unknown_required_feature_fails_closed():
     issues = validate_base(payload)
     assert any(v.code == "artifact.unknown_required_feature" and v.blocking
                for v in issues)
+
+
+def test_read_rejects_rehashed_artifact_with_unknown_required_feature(tmp_path):
+    payload = _artifact(value=1)
+    payload["required_features"] = ["teleportation"]
+    payload["artifact_id"] = compute_artifact_id(payload)
+    path = tmp_path / "unknown-feature.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ArtifactError, match="required feature 'teleportation'"):
+        read_artifact(path)
 
 
 def test_read_rejects_tampered_artifact(tmp_path):

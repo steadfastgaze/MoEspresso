@@ -19,6 +19,8 @@ import json
 import math
 from dataclasses import dataclass
 
+from moespresso import __version__
+
 SCHEMA_MAJOR = 1
 SCHEMA_MINOR = 0
 
@@ -28,6 +30,7 @@ ARTIFACT_KINDS = frozenset({
     "optimizer_decision",
     "package_plan",
     "package_manifest",
+    "deepseek_v4_expert_selection",
     # correctness ladder (standalone evidence; not wired into convert/serve/verify).
     "architecture_profile",   # the model-family contract consumed by L0-L4
     "correctness_evidence",   # what a ladder rung (L0/L1/...) actually found
@@ -40,6 +43,7 @@ _KIND_TAG = {
     "optimizer_decision": "dec",
     "package_plan": "plan",
     "package_manifest": "pkg",
+    "deepseek_v4_expert_selection": "select",
     "architecture_profile": "arch",
     "correctness_evidence": "correct",
 }
@@ -64,11 +68,21 @@ _HASH_EXCLUDED = ("artifact_id", "created_at")
 # like mjtq declares its requirements here (e.g. "calibration").
 KNOWN_FEATURES = frozenset({
     "calibration",  # probe_evidence carries calibration-dataset identity
+    # A DeepSeek-V4 package may store a different compact expert-id space in
+    # each routed layer while retaining the checkpoint's global source count.
+    "deepseek_v4_per_layer_experts",
 })
 
 
 class ArtifactError(Exception):
     """A base-contract violation: unknown kind, bad version, or failed hash check."""
+
+
+def artifact_producer(tool: str) -> dict[str, str]:
+    """Return artifact provenance stamped with the installed release version."""
+    if not isinstance(tool, str) or not tool:
+        raise ValueError("artifact producer tool must be a non-empty string")
+    return {"tool": tool, "version": __version__}
 
 
 @dataclass
@@ -235,5 +249,8 @@ def read_artifact(path) -> dict:
     actual = compute_artifact_id(payload)
     if stored != actual:
         raise ArtifactError(f"artifact_id mismatch: stored {stored} != computed {actual}")
-    validate_base(payload)  # raises on fail-closed conditions
+    issues = validate_base(payload)
+    blocking = [issue for issue in issues if issue.blocking]
+    if blocking:
+        raise ArtifactError("; ".join(issue.message for issue in blocking))
     return payload

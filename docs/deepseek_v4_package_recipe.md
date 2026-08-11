@@ -8,7 +8,7 @@ a recipe GGUF, or an importance matrix. The model card carries the download
 command for the published repository; verification is part of acquisition:
 
 ```bash
-uv run --locked moespresso-verify <package-dir>
+uv run --locked moespresso verify <package-dir>
 ```
 
 The rest of this document describes how packages are built.
@@ -114,7 +114,7 @@ layout is refused by name at install. Only the relayout output serves:
 
 ```bash
 uv run --locked moespresso-ds4-iqk-relayout <package-dir>
-uv run --locked moespresso-verify <package-dir>
+uv run --locked moespresso verify <package-dir>
 ```
 
 The step rewrites in place, or into `--output` when the package's own footprint
@@ -329,7 +329,7 @@ optimized DeepSeek runtime. It does not bypass format, shape, or runtime checks.
 Verify after every build, copy, or move:
 
 ```bash
-uv run --locked moespresso-verify <package-dir>
+uv run --locked moespresso verify <package-dir>
 ```
 
 The command checks manifest validity, declared files, sizes, sha256 hashes, and
@@ -339,10 +339,10 @@ means the package has a blocking integrity problem.
 After verification:
 
 ```bash
-uv run --locked moespresso-generate \
+uv run --locked moespresso generate \
   <package-dir> --prompt "Hello" --max-tokens 64
 
-uv run --locked moespresso-serve <package-dir>
+uv run --locked moespresso serve <package-dir>
 ```
 
 DeepSeek rendering is a runtime-owned contract. The generate and serve commands

@@ -192,7 +192,7 @@ class ExpertSlotPool:
         self.eviction_policy = eviction_policy
         self.geometry = index.geometry(layer=layer, projection=projection)
         self.bits = self.geometry.bits
-        self.num_experts = index.num_experts
+        self.num_experts = index.num_experts_for_layer(layer)
         if capacity + spare_slots > self.num_experts:
             raise ValueError("capacity+spare_slots cannot exceed num_experts")
         # One-pread miss path: the layer's shared BundleRowCache plus this

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import os
 import threading
 import time
+from types import MethodType
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,6 +62,12 @@ def _lookahead_executor() -> ThreadPoolExecutor:
         _LOOKAHEAD_EXECUTOR_BOX[0] = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="moespresso-ssd-lookahead")
     return _LOOKAHEAD_EXECUTOR_BOX[0]
+
+
+def _lookahead_top_ids(scores):
+    """Return at most sixteen predicted expert ids for a compact pool."""
+    top_k = min(16, int(scores.size))
+    return mx.argpartition(scores, kth=-top_k)[-top_k:].astype(mx.uint32)
 
 # On-device remap: after ensure() loads any missing experts, remap routed ids ->
 # pool slots via an on-device gather instead of rebuilding slot indices on the
@@ -226,6 +233,16 @@ _UNIFIED_SORTED_PREFILL = (
 # any partial-residency session (the certificate fails closed).
 _BARRIER_FREE_DECODE = (
     os.environ.get("MOESPRESSO_SSD_BARRIER_FREE_DECODE", "1") != "0"
+)
+
+# Compact IQ_K learned layers can submit the gate and up packed-byte GEMVs in
+# one Metal dispatch.  The kernel preserves each projection's incumbent
+# arithmetic and leaves SwiGLU, down projection, and route reduction unchanged.
+# Ordinary source-width packages and the compact package's hash layers retain
+# the established separate-dispatch path.  Default ON;
+# MOESPRESSO_DSV4_IQK_DUAL_GEMV=0 is the kill switch.
+_IQK_DUAL_GEMV = (
+    os.environ.get("MOESPRESSO_DSV4_IQK_DUAL_GEMV", "1") != "0"
 )
 
 # Qwen-style decode scheduling: when the full-residency certificate holds, the
@@ -2108,6 +2125,22 @@ class PooledSwitchGLU(nn.Module):
                 lock.release()
         return True
 
+    def _iqk_dual_gemv_engaged(self, compact_source_ids) -> bool:
+        """Whether the compact-only paired gate/up dispatch may run."""
+        if not _IQK_DUAL_GEMV or not self._all_iqk:
+            return False
+        if self._iqk_decode_identity_cached is not True:
+            return False
+        if compact_source_ids is None:
+            return False
+        compact_count = int(getattr(compact_source_ids, "size", 0) or 0)
+        if compact_count != int(self.gate_proj.pool.num_experts):
+            return False
+        return (
+            int(self.gate_proj.in_features) == int(self.up_proj.in_features)
+            and int(self.gate_proj.out_features) == int(self.up_proj.out_features)
+        )
+
     def build_barrier_free_decode(self, x, idx) -> mx.array:
         """Full-resident decode routed MLP over device-resident router ids.
 
@@ -2167,6 +2200,43 @@ class PooledSwitchGLU(nn.Module):
             self.activation(x_up, x_gate),
             down_idx,
             sorted_indices=False,
+        )
+        return out.squeeze(-2)
+
+    def build_compact_barrier_free_decode(self, x, idx) -> mx.array:
+        """Paired IQ_K decode installed only on compact learned layers."""
+        compact_source_ids = getattr(
+            self,
+            "_moespresso_compact_source_ids",
+            None,
+        )
+        if not self._iqk_dual_gemv_engaged(compact_source_ids):
+            return PooledSwitchGLU.build_barrier_free_decode(self, x, idx)
+
+        self.barrier_free_decode_calls += 1
+        self._record_iqk_route(int(idx.size))
+        elements = int(idx.size)
+        for projection in (
+            self.up_proj,
+            self.gate_proj,
+            self.down_proj,
+        ):
+            projection.matmul_slot_calls += 1
+            projection.matmul_slot_elements += elements
+        x4 = mx.expand_dims(x, (-2, -3))
+        from moespresso.runtime.deepseek_v4.iqk_decode_kernel import dual_gemv
+
+        x_gate, x_up = dual_gemv(
+            self.gate_proj.pool.iqk,
+            self.up_proj.pool.iqk,
+            x4,
+            idx,
+        )
+        self.iqk_dual_gemv_calls += 1
+        self.iqk_dual_gemv_pairs += elements
+        out = self.down_proj.pool.iqk.gemv(
+            self.activation(x_up, x_gate),
+            idx,
         )
         return out.squeeze(-2)
 
@@ -3051,6 +3121,35 @@ _RING_SEQ = [0]
 _GATE_PENDING: list = []
 
 
+def install_compact_iqk_dual_gemv(switch, compact_source_ids) -> bool:
+    """Install the paired decode method on one compact IQ_K switch."""
+    if (
+        not _IQK_DUAL_GEMV
+        or not isinstance(switch, PooledSwitchGLU)
+        or not switch._all_iqk
+    ):
+        return False
+    compact_count = int(getattr(compact_source_ids, "size", 0) or 0)
+    if compact_count <= 0 or any(
+        int(pool.num_experts) != compact_count
+        for pool in switch._projection_pools_lockstep()
+    ):
+        return False
+    object.__setattr__(
+        switch,
+        "_moespresso_compact_source_ids",
+        compact_source_ids,
+    )
+    object.__setattr__(switch, "iqk_dual_gemv_calls", 0)
+    object.__setattr__(switch, "iqk_dual_gemv_pairs", 0)
+    object.__setattr__(
+        switch,
+        "build_barrier_free_decode",
+        MethodType(PooledSwitchGLU.build_compact_barrier_free_decode, switch),
+    )
+    return True
+
+
 class PooledSparseMoeBlock(nn.Module):
     """Qwen3Next sparse MoE block that overlaps routed misses with shared expert.
 
@@ -3193,8 +3292,7 @@ class PooledSparseMoeBlock(nn.Module):
                     .astype(switch.lookahead_w.dtype)
                     @ switch.lookahead_w.T
                 ).reshape(-1)
-                la_top = mx.argpartition(la_logits, kth=-16)[-16:].astype(
-                    mx.uint32)
+                la_top = _lookahead_top_ids(la_logits)
                 la_token = switch.export_pred(la_top, seq)
                 # Order pin: without a dependency, the scheduler may encode
                 # this export behind a later layer's gate wait, and nothing
@@ -3461,8 +3559,7 @@ class PooledDeepseekV4MoEBlock(nn.Module):
                     mx.log1p(mx.exp(la_logits.astype(mx.float32))))
                 if switch.lookahead_b is not None:
                     la_scores = la_scores + switch.lookahead_b
-                la_top = mx.argpartition(la_scores, kth=-16)[-16:].astype(
-                    mx.uint32)
+                la_top = _lookahead_top_ids(la_scores)
                 la_token = switch.export_pred(la_top, seq)
                 token = token + la_token * 0
             t0 = time.perf_counter()

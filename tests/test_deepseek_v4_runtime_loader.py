@@ -2967,8 +2967,9 @@ def test_deepseek_v4_attention_fp16_qkv_patch_casts_attention_inputs():
     )
 
     def fake_attention(q, k, v, *args, **kwargs):
-        del args, kwargs
+        del args
         calls["dtypes"] = (q.dtype, k.dtype, v.dtype)
+        calls["mask_dtype"] = kwargs["mask"].dtype
         return (q + k + v).astype(mx.float32)
 
     try:
@@ -2978,10 +2979,18 @@ def test_deepseek_v4_attention_fp16_qkv_patch_casts_attention_inputs():
 
         assert _patch_deepseek_v4_attention_fp16_qkv(model) is True
         q = mx.ones((1, 1, 1, 2), dtype=mx.float32)
-        out = dsv4_model.scaled_dot_product_attention(q, q, q, scale=1.0)
+        mask = mx.zeros((1, 1), dtype=mx.float32)
+        out = dsv4_model.scaled_dot_product_attention(
+            q,
+            q,
+            q,
+            scale=1.0,
+            mask=mask,
+        )
         mx.eval(out)
 
         assert calls["dtypes"] == (mx.float16, mx.float16, mx.float16)
+        assert calls["mask_dtype"] == mx.float16
         assert out.dtype == mx.float32
         assert model._moespresso_dsv4_attention_qkv_dtype == "float16"
     finally:

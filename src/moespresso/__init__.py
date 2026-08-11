@@ -8,4 +8,9 @@ The public runtime serves explicit packages for DeepSeek-V4-Flash and Ornith
 1.0 35B, resident or through bounded routed-expert residency.
 """
 
-__version__ = "2.0.0"
+from importlib import metadata as importlib_metadata
+
+try:
+    __version__ = importlib_metadata.version("moespresso")
+except importlib_metadata.PackageNotFoundError:
+    __version__ = "0+unknown"

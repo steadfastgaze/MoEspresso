@@ -46,7 +46,7 @@ Then download the prebuilt package and verify it before loading any weights:
 ```bash
 hf download steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso \
   --local-dir <package-dir>
-moespresso-verify <package-dir>
+moespresso verify <package-dir>
 ```
 
 ## Why rebuilding from the published checkpoint is blocked
@@ -110,7 +110,7 @@ solely to satisfy the current inventory shape.
 Run the integrity gate after receiving, copying, or moving a package:
 
 ```bash
-uv run --locked moespresso-verify <package-dir>
+uv run --locked moespresso verify <package-dir>
 ```
 
 The command checks the package manifest, every declared file's path, size and
@@ -123,10 +123,10 @@ that the package matches the recorded byte-faithful artifact.
 ## Generate and serve
 
 ```bash
-uv run --locked moespresso-generate \
+uv run --locked moespresso generate \
   <package-dir> --prompt "Hello" --max-tokens 64 --thinking off
 
-uv run --locked moespresso-serve \
+uv run --locked moespresso serve \
   <package-dir> --thinking off
 ```
 
@@ -143,8 +143,8 @@ states otherwise.
 ## Memory policy
 
 The same package can run fully resident or with a bounded routed-expert pool.
-Pass `--max-memory-gb <budget>` to `moespresso-serve` or
-`moespresso-generate` to set the startup capacity-planner ceiling. Capacity is
+Pass `--max-memory-gb <budget>` to `moespresso serve` or
+`moespresso generate` to set the startup capacity-planner ceiling. Capacity is
 derived from the package's actual expert-row geometry after fixed runtime and
 KV/activation allowances. This selects pool geometry; it is not an RSS limit,
 and the pool does not shrink as context grows.
@@ -164,7 +164,7 @@ safety evidence live in [`disk_kv.md`](disk_kv.md).
 
 Before an Ornith package is described as supported:
 
-- `moespresso-verify` passes after the final copy;
+- `moespresso verify` passes after the final copy;
 - the manifest id and package file hashes are recorded;
 - the full gate in [`ornith_quality.md`](ornith_quality.md) passes;
 - resident and intended streamed modes are tested;

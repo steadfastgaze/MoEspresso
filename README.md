@@ -69,7 +69,7 @@ side, stored in q6_K.
 
 ## Install
 
-MoEspresso 2.0.0 requires an arm64 Apple Silicon Mac running macOS 26.2
+MoEspresso 2.1.0 requires an arm64 Apple Silicon Mac running macOS 26.2
 (Tahoe) or later.
 
 Install MoEspresso with Homebrew. The formula installs its required Python
@@ -77,6 +77,13 @@ runtime and native dependencies:
 
 ```bash
 brew install steadfastgaze/tap/moespresso
+```
+
+Check the installed release and list its user-facing commands:
+
+```bash
+moespresso --version
+moespresso --help
 ```
 
 ## Quick start
@@ -104,7 +111,7 @@ hf download steadfastgaze/DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2 \
 You can verify the package:
 
 ```bash
-moespresso-verify ./models/ornith-35b
+moespresso verify ./models/ornith-35b
 ```
 
 Verification checks the manifest's identity and validity, every declared
@@ -112,7 +119,7 @@ member's path, size, and SHA-256, the tensor keys in every shard, and the
 manifest-derived sidecars. Start the local server:
 
 ```bash
-moespresso-serve ./models/ornith-35b --thinking off
+moespresso serve ./models/ornith-35b --thinking off
 ```
 
 The server performs one short isolated warmup before announcing readiness,
@@ -195,7 +202,7 @@ For a fail-closed all-resident launch, request an explicit full prewarm:
 
 ```bash
 MOESPRESSO_SSD_PREWARM_EXPERTS=all \
-moespresso-serve ./models/ornith-35b --thinking off
+moespresso serve ./models/ornith-35b --thinking off
 ```
 
 This loads every expert before serving and fails when the planned pool cannot
@@ -236,16 +243,22 @@ rule: a proposed token is kept only when the target model's own verification
 accepts it, so no unverified token is ever emitted.
 
 ```bash
-MOESPRESSO_DS4_DRAFTER=off moespresso-serve ./models/deepseek-v4-flash  # no drafting
+MOESPRESSO_DS4_DRAFTER=off moespresso serve ./models/deepseek-v4-flash  # no drafting
 ```
 
-`MOESPRESSO_DS4_DRAFTER` also selects a sidecar explicitly, as
-`dspark:<sidecar-dir>` or `dflash:<sidecar-dir>`. DSpark is the bundled family
-and the only one automatic selection reaches. DFlash is explicit-selection
-only and greedy-only, so a request with temperature above 0 takes the plain
-path. The source tree retains an MTP research implementation for future
-checkpoints, but this release exposes no MTP builder or serving selector: the
-current weights cannot produce a valid sidecar for it.
+Use a separately downloaded DSpark sidecar by passing its directory to both
+verification and serving:
+
+```bash
+moespresso verify ./models/deepseek-v4-flash --drafter ./models/dspark
+moespresso serve ./models/deepseek-v4-flash --drafter ./models/dspark
+```
+
+The command recognizes the sidecar family from the manifest at the supplied
+root. This release accepts DSpark on the external command surface and refuses
+DFlash or MTP sidecars with a clear error. `--drafter` overrides
+`MOESPRESSO_DS4_DRAFTER` and bundled automatic selection. The source tree
+retains the DFlash and MTP implementations for future model packages.
 
 DSpark requests keep the in-memory prefix cache and the disk checkpoint tier
 described below, so a follow-up turn over a shared prefix resumes speculation
@@ -269,8 +282,8 @@ write-depth cap (checkpoints cover the shared-prefix region; deep
 conversation tails are not snapshotted):
 
 ```bash
-moespresso-serve ./models/ornith-35b --thinking off
-MOESPRESSO_DISK_KV=off moespresso-serve ./models/ornith-35b   # memory-only
+moespresso serve ./models/ornith-35b --thinking off
+MOESPRESSO_DISK_KV=off moespresso serve ./models/ornith-35b   # memory-only
 ```
 
 `MOESPRESSO_DISK_KV_ROOT`, `MOESPRESSO_DISK_KV_STRIDE`,

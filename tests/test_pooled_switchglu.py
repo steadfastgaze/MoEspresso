@@ -32,6 +32,7 @@ from moespresso.runtime.pooled_switchglu import (  # noqa: E402
     PooledSparseMoeBlock,
     PooledSwitchGLU,
     PooledTurboQuantSwitchLinear,
+    _lookahead_top_ids,
     _should_sort_routed_indices,
 )
 from moespresso.runtime.owned_switchglu import OwnedSwitchGLU  # noqa: E402
@@ -1480,6 +1481,16 @@ def test_route_trace_captures_prefill_and_decode(tmp_path):
     assert pre[2] == [[1, 2], [3, 4], [5, 1]]  # position-intact
     dec = next(t for t in trace if t[0] == "decode_direct")
     assert dec[2] == [[7, 2]]
+
+
+def test_lookahead_top_ids_accepts_fewer_than_sixteen_experts():
+    scores = mx.array([0.3, -1.0, 4.0, 2.0, 0.0, 8.0, 7.0, 1.0])
+
+    selected = _lookahead_top_ids(scores)
+    mx.eval(selected)
+
+    assert selected.shape == (8,)
+    assert set(np.asarray(selected).tolist()) == set(range(8))
 
 
 def test_lookahead_prefetch_keeps_outputs_identical(tmp_path, monkeypatch):

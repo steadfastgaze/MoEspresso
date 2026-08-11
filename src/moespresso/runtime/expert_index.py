@@ -137,10 +137,41 @@ class ExpertIndex:
     """Per-layer bundle byte geometry with per-component and whole-row ranges."""
 
     def __init__(self, bundles: dict[int, _LayerBundle],
-                 num_layers: int, num_experts: int):
+                 num_layers: int, num_experts: int | None = None):
         self._bundles = bundles
         self.num_layers = num_layers
-        self.num_experts = num_experts
+        counts = {bundle.num_experts for bundle in bundles.values()}
+        if not counts:
+            raise ValueError("expert index requires at least one layer bundle")
+        if num_experts is not None and counts != {int(num_experts)}:
+            raise ValueError(
+                f"declared num_experts {num_experts} does not match layer "
+                f"counts {sorted(counts)}"
+            )
+        self.max_num_experts = max(counts)
+        self.min_num_experts = min(counts)
+        self._uniform_num_experts = next(iter(counts)) if len(counts) == 1 else None
+
+    @property
+    def num_experts(self) -> int:
+        """The expert count of a uniform index.
+
+        Mixed per-layer packages must use :meth:`num_experts_for_layer`,
+        ``min_num_experts``, or ``max_num_experts``. Returning the maximum here
+        would make an unconverted global-count call site read beyond a shorter
+        layer's bundle instead of failing at the contract boundary.
+        """
+        if self._uniform_num_experts is None:
+            raise ValueError(
+                "expert index has mixed per-layer expert counts; use "
+                "num_experts_for_layer(layer), min_num_experts, or "
+                "max_num_experts"
+            )
+        return self._uniform_num_experts
+
+    def num_experts_for_layer(self, layer: int) -> int:
+        """The compact expert count declared by one layer's bundle."""
+        return self._bundle(layer).num_experts
 
     def _bundle(self, layer: int) -> _LayerBundle:
         b = self._bundles.get(layer)
@@ -306,8 +337,8 @@ class ExpertIndex:
         return tuple(sorted(self._bundles))
 
     def num_expert_slots(self) -> int:
-        """Total locatable (layer, expert) pairs = layers * experts per layer."""
-        return self.num_layers_indexed() * self.num_experts
+        """Total locatable ``(layer, expert)`` pairs across all bundles."""
+        return sum(bundle.num_experts for bundle in self._bundles.values())
 
     def validate(self) -> list[str]:
         """Cheap structural checks; returns a list of problems ([] == ok).
@@ -318,10 +349,6 @@ class ExpertIndex:
         """
         problems: list[str] = []
         for layer, b in sorted(self._bundles.items()):
-            if b.num_experts != self.num_experts:
-                problems.append(
-                    f"layer={layer}: num_experts {b.num_experts} "
-                    f"!= {self.num_experts}")
             if b.row_bytes * b.num_experts != b.total_bytes:
                 problems.append(
                     f"layer={layer}: rows {b.row_bytes}*{b.num_experts} "
@@ -360,7 +387,6 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
     """
     package_dir = Path(package_dir)
     bundles: dict[int, _LayerBundle] = {}
-    experts_seen: set[int] = set()
     stacked_keys_seen: list[str] = []
 
     for shard in sorted(package_dir.glob("model-*.safetensors")):
@@ -424,7 +450,6 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
                 projections=geo["projections"],
             )
             matched_layers.add(layer)
-            experts_seen.add(num_experts)
 
         unmatched = set(geometries) - matched_layers - set(bundles)
         if unmatched:
@@ -444,9 +469,4 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
         raise ValueError(
             f"{package_dir} mixes bundle and stacked expert tensors "
             f"(e.g. {stacked_keys_seen[0]}): corrupt or half-converted package")
-    if len(experts_seen) != 1:
-        raise ValueError(
-            f"inconsistent num_experts across routed tensors: {sorted(experts_seen)}")
-    num_experts = next(iter(experts_seen))
-    return ExpertIndex(bundles=bundles,
-                       num_layers=len(bundles), num_experts=num_experts)
+    return ExpertIndex(bundles=bundles, num_layers=len(bundles))

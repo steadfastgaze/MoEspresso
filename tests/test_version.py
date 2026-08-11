@@ -6,40 +6,39 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import moespresso
+from moespresso.core.artifact import artifact_producer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPOSITORY_ROOT / "src" / "moespresso"
 
 
-def _literal_assignments(path: Path, name: str):
+def _producer_assignments(path: Path):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     values = []
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
-            values.append(ast.literal_eval(node.value))
+        names = [
+            target.id
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id.endswith("PRODUCER")
+        ]
+        values.extend((name, node.value) for name in names)
     return values
 
 
-def _literal_assignment(path: Path, name: str):
-    values = _literal_assignments(path, name)
-    assert len(values) == 1, f"expected one literal {name} assignment in {path}"
-    return values[0]
-
-
 def _producer_modules():
-    """Every module that stamps a top-level PRODUCER dict into artifact provenance.
+    """Every module that stamps a top-level producer into artifact provenance.
 
     Discovered by scanning rather than listed, so a module added later cannot
-    keep stamping a stale version behind a hand-maintained tuple.
+    bypass the single release-version source behind a hand-maintained tuple.
     """
     modules = []
     for path in sorted(SOURCE_ROOT.rglob("*.py")):
         if "private" in path.relative_to(SOURCE_ROOT).parts:
             continue
-        if _literal_assignments(path, "PRODUCER"):
+        if _producer_assignments(path):
             modules.append(path)
     return modules
 
@@ -66,8 +65,18 @@ def test_lock_and_artifact_producers_match_release_version():
     producer_modules = _producer_modules()
 
     assert producer_modules, "no PRODUCER-stamping module found under src/moespresso"
+    assert artifact_producer("test.tool") == {
+        "tool": "test.tool",
+        "version": moespresso.__version__,
+    }
     for path in producer_modules:
-        producer = _literal_assignment(path, "PRODUCER")
-        assert producer["version"] == moespresso.__version__, str(
-            path.relative_to(REPOSITORY_ROOT)
-        )
+        for name, value in _producer_assignments(path):
+            assert isinstance(value, ast.Call), (
+                name,
+                str(path.relative_to(REPOSITORY_ROOT)),
+            )
+            assert isinstance(value.func, ast.Name)
+            assert value.func.id == "artifact_producer"
+            assert len(value.args) == 1 and not value.keywords
+            assert isinstance(value.args[0], ast.Constant)
+            assert isinstance(value.args[0].value, str) and value.args[0].value

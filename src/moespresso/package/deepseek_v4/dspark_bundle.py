@@ -5,7 +5,7 @@ package's shards and furniture plus the sidecar's shards and manifest, with
 the package manifest extended by a declared ``drafter`` component. The
 component carries the identity (path, size, sha256) of every sidecar file,
 the sidecar's own artifact id, and the source package's manifest id, so
-``moespresso-verify`` covers the drafter bytes and the runtime can resolve
+``moespresso verify`` covers the drafter bytes and the runtime can resolve
 the bundled drafter from the manifest alone.
 
 The component is declared ``optional``: a distribution of the same package
@@ -177,7 +177,7 @@ def _canonical_iqk_layouts(payload: dict, *, sidecar: bool) -> tuple[dict, bool]
 def _rewrite_compat_sidecars(out_dir: Path, manifest: dict, seed: int) -> bool:
     """Regenerate config.json/jang_config.json from the manifest that ships.
 
-    ``moespresso-verify`` re-derives them and compares; a package carrying
+    ``moespresso verify`` re-derives them and compares; a package carrying
     none keeps none (the relayout tool's convention).
     """
     config_path = out_dir / "config.json"

@@ -7,7 +7,12 @@ from fnmatch import fnmatchcase
 from copy import deepcopy
 import re
 
-from moespresso.core.artifact import Validation, compute_artifact_id, make_artifact
+from moespresso.core.artifact import (
+    Validation,
+    artifact_producer,
+    compute_artifact_id,
+    make_artifact,
+)
 
 
 class PackagePlanError(ValueError):
@@ -211,7 +216,7 @@ def force_override_preview_lines(plan: dict, *, limit: int = 20) -> list[str]:
     return lines
 
 
-PRODUCER = {"tool": "moespresso.package.plan", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.package.plan")
 
 
 def make_package_plan(

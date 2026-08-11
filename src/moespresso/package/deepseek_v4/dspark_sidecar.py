@@ -69,7 +69,11 @@ from mlx.utils import tree_flatten
 
 from jang_tools.dsv4.mlx_model import ModelArgs
 
-from moespresso.core.artifact import compute_artifact_id, write_artifact
+from moespresso.core.artifact import (
+    artifact_producer,
+    compute_artifact_id,
+    write_artifact,
+)
 from moespresso.inventory.safetensors_header import TensorHeader, read_headers_with_offsets
 from moespresso.package.bundle import IQK_CODEC, ds4_source_to_mxfp4_components
 from moespresso.package.deepseek_v4.iqk_relayout import _sample_row_indices
@@ -115,7 +119,7 @@ _IQK_PROJ_FILE = {"gate_proj": "gate", "up_proj": "up", "down_proj": "down"}
 IQK_BLOCKS_COMPONENT = "iqk_blocks"
 IQK_SAMPLE_ROWS = 64
 
-PRODUCER = {"tool": "moespresso.package.deepseek_v4.dspark_sidecar", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.package.deepseek_v4.dspark_sidecar")
 SUBJECT = {"family": "deepseek_v4_flash_dspark", "role": "draft_sidecar"}
 
 HUB_CACHE = Path("~/.cache/huggingface/hub").expanduser()

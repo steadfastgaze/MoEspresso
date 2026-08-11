@@ -13,6 +13,13 @@ from types import MethodType
 from typing import Any, Callable, Mapping, Sequence
 
 from moespresso.runtime.deepseek_v4 import fixed_decode_state as _fixed_decode_state
+from moespresso.runtime.deepseek_v4.expert_layout import (
+    NUM_HASH_LAYERS,
+    DeepseekV4ExpertLayout,
+    DeepseekV4ExpertLayoutError,
+    parse_deepseek_v4_expert_layout,
+    validate_expert_index_counts,
+)
 
 
 class DeepseekV4GraphError(ValueError):
@@ -192,6 +199,7 @@ def _install_deepseek_v4_pooled_bundles(
     )
 
     budget_payload = None
+    compact_router_reserve = _deepseek_v4_compact_router_reserve_bytes(model)
     if capacity_per_layer is None:
         args = getattr(model, "args", None)
         max_router_fanout = int(getattr(args, "num_experts_per_tok", 1) or 1)
@@ -200,9 +208,10 @@ def _install_deepseek_v4_pooled_bundles(
             package_dir=package_dir,
             max_router_fanout=max_router_fanout,
             available_bytes=_deterministic_available_bytes(),
+            runtime_resident_bytes=compact_router_reserve,
         )
-        if index.num_experts < budget.min_capacity:
-            capacity_per_layer = index.num_experts
+        if index.max_num_experts < budget.min_capacity:
+            capacity_per_layer = index.max_num_experts
         else:
             capacity_per_layer = choose_capacity(budget)
         budget_payload = _budget_payload(budget)
@@ -229,7 +238,7 @@ def _install_deepseek_v4_pooled_bundles(
                   "decode path is not live - DISABLED (no capacity carved)",
                   flush=True)
             lookahead_env = 0
-        elif capacity_per_layer >= index.num_experts:
+        elif capacity_per_layer >= index.max_num_experts:
             print("[ds4-streaming] lookahead requested at full residency - "
                   "DISABLED (no misses to hide; spares would break the "
                   "full-residency certificate)", flush=True)
@@ -317,6 +326,62 @@ def _install_deepseek_v4_pooled_bundles(
         )
     model.eval()
     return installed
+
+
+def _deepseek_v4_compact_router_reserve_bytes(model) -> int:
+    """Return resident bytes added when compact routers regain source width."""
+    compact_layers = getattr(
+        model,
+        "_moespresso_dsv4_compact_router_layers",
+        None,
+    )
+    if not compact_layers:
+        return 0
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    reserve = 0
+    seen = set()
+    for model_layer, layer in enumerate(layers):
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        layer_id = getattr(gate, "layer_id", model_layer)
+        if layer_id not in compact_layers:
+            continue
+        compact_count = int(compact_layers[layer_id])
+        args = getattr(gate, "args", None)
+        source_count = int(getattr(args, "n_routed_experts", 0) or 0)
+        if source_count <= 0 or not 0 < compact_count <= source_count:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has invalid counts"
+            )
+        if compact_count == source_count:
+            seen.add(layer_id)
+            continue
+        weight = getattr(gate, "weight", None)
+        bias = getattr(gate, "bias", None)
+        weight_bytes = int(getattr(weight, "nbytes", 0) or 0)
+        bias_bytes = int(getattr(bias, "nbytes", 0) or 0)
+        if weight_bytes <= 0 or bias_bytes <= 0:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has no byte geometry"
+            )
+        if weight_bytes % compact_count or bias_bytes % compact_count:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has uneven row bytes"
+            )
+        added_rows = source_count - compact_count
+        reserve += added_rows * (
+            weight_bytes // compact_count + bias_bytes // compact_count
+        )
+        seen.add(layer_id)
+    if seen != set(compact_layers):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 compact router byte reserve has an incomplete layer census"
+        )
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_compact_router_reserve_bytes",
+        reserve,
+    )
+    return reserve
 
 
 def _patch_deepseek_v4_hc_post_float32(model) -> int:
@@ -2682,6 +2747,16 @@ def _patch_deepseek_v4_attention_fp16_qkv(model) -> bool:
             stats_context = _DSV4_ATTENTION_STATS_CONTEXT.get()
             if stats_context is not None:
                 stats_context._record_sdpa(q, k, v)
+            positional = list(args)
+            if kwargs.get("mask") is not None:
+                mask = kwargs["mask"]
+                if getattr(mask, "dtype", None) != mx.bool_:
+                    kwargs = dict(kwargs)
+                    kwargs["mask"] = mask.astype(mx.float16)
+            elif len(positional) >= 3 and positional[2] is not None:
+                mask = positional[2]
+                if getattr(mask, "dtype", None) != mx.bool_:
+                    positional[2] = mask.astype(mx.float16)
             if kwargs.get("sinks") is not None:
                 kwargs = dict(kwargs)
                 kwargs["sinks"] = kwargs["sinks"].astype(mx.float16)
@@ -2689,7 +2764,7 @@ def _patch_deepseek_v4_attention_fp16_qkv(model) -> bool:
                 q.astype(mx.float16),
                 k.astype(mx.float16),
                 v.astype(mx.float16),
-                *args,
+                *positional,
                 **kwargs,
             )
             return out.astype(out_dtype)
@@ -4355,6 +4430,438 @@ def _load_deepseek_v4_regular_weights(
     return loaded, skipped_bundles
 
 
+def _resize_deepseek_v4_score_router_gates(
+    model,
+    layout: DeepseekV4ExpertLayout,
+    *,
+    zeros_fn: Callable[..., Any] | None = None,
+) -> int:
+    """Resize score-router parameters before compact weights are hydrated.
+
+    The stock JANG graph is still constructed with the source-wide global
+    expert count. Hash routers keep their full gate and token lookup arrays.
+    Score routers receive compact weight and bias placeholders whose row order
+    matches the repacked expert bundles. After hydration, the loader restores
+    source-width router numerics and maps selected source ids back to this
+    compact order.
+    """
+    if zeros_fn is None:
+        import mlx.core as mx
+
+        zeros_fn = mx.zeros
+
+    model_layers = getattr(getattr(model, "model", None), "layers", None)
+    if not isinstance(model_layers, (list, tuple)):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 compact expert layout requires model.model.layers"
+        )
+
+    gates: dict[int, Any] = {}
+    for model_layer, layer in enumerate(model_layers):
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        if gate is None:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact expert layout found no gate at layer {model_layer}"
+            )
+        layer_id = getattr(gate, "layer_id", model_layer)
+        if (
+            not isinstance(layer_id, int)
+            or isinstance(layer_id, bool)
+            or layer_id < 0
+        ):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router at model layer {model_layer} has an invalid layer id"
+            )
+        if layer_id in gates:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 graph has duplicate router layer id {layer_id}"
+            )
+        gates[layer_id] = gate
+
+    manifest_layers = set(layout.layers)
+    if set(gates) != manifest_layers:
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 graph router layers do not match the compact manifest: "
+            f"manifest={sorted(manifest_layers)}, graph={sorted(gates)}"
+        )
+
+    score_gates: list[tuple[int, Any, int, int]] = []
+    for layer_id, gate in sorted(gates.items()):
+        row = layout.layers[layer_id]
+        is_hash = layer_id < NUM_HASH_LAYERS
+        if getattr(gate, "hash", None) is not is_hash:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router layer {layer_id} hash mode disagrees with manifest"
+            )
+        args = getattr(gate, "args", None)
+        if getattr(args, "n_routed_experts", None) != layout.source_num_experts:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router layer {layer_id} must retain the global "
+                f"source count {layout.source_num_experts}"
+            )
+        weight = getattr(gate, "weight", None)
+        weight_shape = tuple(getattr(weight, "shape", ()))
+        if len(weight_shape) != 2 or weight_shape[0] not in {
+            layout.source_num_experts,
+            row.num_experts,
+        }:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router layer {layer_id} has incompatible weight "
+                f"shape {weight_shape}"
+            )
+        if is_hash:
+            if not hasattr(gate, "tid2eid"):
+                raise DeepseekV4RuntimeLoadError(
+                    f"DeepSeek V4 hash router layer {layer_id} has no tid2eid"
+                )
+            continue
+        bias = getattr(gate, "bias", None)
+        bias_shape = tuple(getattr(bias, "shape", ()))
+        if len(bias_shape) != 1 or bias_shape[0] not in {
+            layout.source_num_experts,
+            row.num_experts,
+        }:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router layer {layer_id} has incompatible bias "
+                f"shape {bias_shape}"
+            )
+        if weight_shape[0] != bias_shape[0]:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 router layer {layer_id} has mixed compact/source "
+                "weight and bias widths"
+            )
+        score_gates.append((layer_id, gate, weight_shape[1], row.num_experts))
+
+    resized = 0
+    for _layer_id, gate, hidden_size, num_experts in score_gates:
+        if int(gate.weight.shape[0]) == num_experts:
+            continue
+        gate.weight = zeros_fn(
+            (num_experts, hidden_size), dtype=gate.weight.dtype)
+        gate.bias = zeros_fn((num_experts,), dtype=gate.bias.dtype)
+        resized += 1
+    object.__setattr__(model, "_moespresso_dsv4_compact_router_layers", {
+        layer: row.num_experts for layer, row in sorted(layout.layers.items())
+    })
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_expert_selection_id",
+        layout.source_selection_artifact_id,
+    )
+    return resized
+
+
+def _validate_deepseek_v4_compact_router_shapes(
+    model,
+    layout: DeepseekV4ExpertLayout,
+) -> int:
+    """Reject a half-repacked router after regular weights are hydrated."""
+    model_layers = getattr(getattr(model, "model", None), "layers", None)
+    if not isinstance(model_layers, (list, tuple)):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 compact expert layout requires model.model.layers"
+        )
+
+    gates: dict[int, Any] = {}
+    for model_layer, layer in enumerate(model_layers):
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        layer_id = getattr(gate, "layer_id", model_layer)
+        if gate is None or not isinstance(layer_id, int) or isinstance(layer_id, bool):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router is invalid at model layer {model_layer}"
+            )
+        if layer_id in gates:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 graph has duplicate router layer id {layer_id}"
+            )
+        gates[layer_id] = gate
+    if set(gates) != set(layout.layers):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 post-load router layers do not match the compact manifest"
+        )
+
+    checked = 0
+    for layer_id, gate in sorted(gates.items()):
+        row = layout.layers[layer_id]
+        is_hash = layer_id < NUM_HASH_LAYERS
+        if getattr(gate, "hash", None) is not is_hash:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 post-load router layer {layer_id} has wrong hash mode"
+            )
+        args = getattr(gate, "args", None)
+        if getattr(args, "n_routed_experts", None) != layout.source_num_experts:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 post-load router layer {layer_id} changed the "
+                "global source expert count"
+            )
+        weight_shape = tuple(getattr(getattr(gate, "weight", None), "shape", ()))
+        expected_width = (
+            layout.source_num_experts if is_hash else row.num_experts
+        )
+        if len(weight_shape) != 2 or weight_shape[0] != expected_width:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 post-load router layer {layer_id} weight width "
+                f"{weight_shape[0] if weight_shape else None} != {expected_width}"
+            )
+        if is_hash:
+            tid2eid = getattr(gate, "tid2eid", None)
+            tid2eid_shape = tuple(getattr(tid2eid, "shape", ()))
+            vocab_size = getattr(args, "vocab_size", None)
+            if (
+                len(tid2eid_shape) != 2
+                or tid2eid_shape[1] != layout.top_k
+                or (
+                    isinstance(vocab_size, int)
+                    and not isinstance(vocab_size, bool)
+                    and tid2eid_shape[0] != vocab_size
+                )
+                or "int" not in str(getattr(tid2eid, "dtype", ""))
+            ):
+                raise DeepseekV4RuntimeLoadError(
+                    f"DeepSeek V4 hash router layer {layer_id} tid2eid was not "
+                    "preserved by compact hydration"
+                )
+        else:
+            bias_shape = tuple(getattr(getattr(gate, "bias", None), "shape", ()))
+            if len(bias_shape) != 1 or bias_shape[0] != row.num_experts:
+                raise DeepseekV4RuntimeLoadError(
+                    f"DeepSeek V4 post-load router layer {layer_id} bias width "
+                    f"{bias_shape[0] if bias_shape else None} != {row.num_experts}"
+                )
+            if weight_shape[0] != bias_shape[0]:
+                raise DeepseekV4RuntimeLoadError(
+                    f"DeepSeek V4 post-load router layer {layer_id} weight and "
+                    "bias widths disagree"
+                )
+        checked += 1
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_compact_router_shapes_checked",
+        checked,
+    )
+    return checked
+
+
+class _DeepseekV4CompactRouterProxy:
+    """Return compact expert ids from a source-width learned router."""
+
+    def __init__(self, contract, source_to_compact, compact_source_ids):
+        self._contract = contract
+        self._source_to_compact = source_to_compact
+        self._moespresso_compact_source_ids = compact_source_ids
+
+    def __getattr__(self, name: str):
+        return getattr(self._contract, name)
+
+    def __call__(self, x, input_ids=None):
+        ids, scores = self._contract(x, input_ids=input_ids)
+        compact = self._source_to_compact[ids.astype(self._mx.int32)]
+        return compact.astype(ids.dtype), scores
+
+    @property
+    def _mx(self):
+        return self._contract._mx
+
+
+def _deepseek_v4_router_projection_pools(switch) -> tuple[Any, Any, Any]:
+    pools = []
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        projection = getattr(switch, name, None)
+        pool = getattr(projection, "pool", None)
+        if pool is None:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact switch has no {name} expert pool"
+            )
+        pools.append(pool)
+    return tuple(pools)
+
+
+def _restore_deepseek_v4_source_width_routers(
+    model,
+    layout: DeepseekV4ExpertLayout,
+) -> int:
+    """Restore source-width router numerics over compact expert pools.
+
+    Compact packages store only retained learned-router rows. Running the
+    resulting narrower matrix can select a different Metal GEMM lattice than
+    the source 256-row router. Small score differences near a top-k boundary
+    then change the routed experts. Reconstructing the source width preserves
+    the source router's matrix geometry without putting removed expert weights
+    back in the package. Removed rows receive zero weights and negative-
+    infinity selection bias; a proxy maps the selected source ids to compact
+    pool ids.
+    """
+    try:
+        import mlx.core as mx
+    except ImportError as exc:  # pragma: no cover - loader already requires MLX
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 compact routers require MLX"
+        ) from exc
+
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if not isinstance(layers, (list, tuple)):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 compact expert layout requires model.model.layers"
+        )
+
+    routed: dict[int, tuple[Any, Any]] = {}
+    for model_layer, layer in enumerate(layers):
+        mlp = getattr(layer, "mlp", None)
+        gate = getattr(mlp, "gate", None)
+        switch = getattr(mlp, "switch_mlp", None)
+        layer_id = getattr(gate, "layer_id", model_layer)
+        if (
+            gate is None
+            or switch is None
+            or not isinstance(layer_id, int)
+            or isinstance(layer_id, bool)
+        ):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router is incomplete at layer {model_layer}"
+            )
+        if not isinstance(gate, _DeepseekV4RouterGateContract):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has no runtime contract"
+            )
+        if layer_id in routed:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 graph has duplicate router layer id {layer_id}"
+            )
+        routed[layer_id] = (mlp, switch)
+    if set(routed) != set(layout.layers):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 runtime router layers do not match the compact manifest"
+        )
+
+    full_ids = tuple(range(layout.source_num_experts))
+    learned = []
+    for layer_id, row in sorted(layout.layers.items()):
+        mlp, switch = routed[layer_id]
+        contract = mlp.gate
+        original = contract._original
+        pools = _deepseek_v4_router_projection_pools(switch)
+        is_hash = layer_id < NUM_HASH_LAYERS
+        if bool(getattr(original, "hash", False)) != is_hash:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has wrong hash mode"
+            )
+        args = getattr(original, "args", None)
+        if getattr(args, "n_routed_experts", None) != layout.source_num_experts:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} changed source count"
+            )
+        if is_hash:
+            if row.source_expert_ids != full_ids or any(
+                int(pool.num_experts) != layout.source_num_experts for pool in pools
+            ):
+                raise DeepseekV4RuntimeLoadError(
+                    f"DeepSeek V4 hash router layer {layer_id} is not source-width"
+                )
+            continue
+
+        compact_count = row.num_experts
+        weight = getattr(original, "weight", None)
+        bias = getattr(original, "bias", None)
+        weight_shape = tuple(getattr(weight, "shape", ()))
+        if len(weight_shape) != 2 or weight_shape[0] != compact_count:
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has invalid weight width"
+            )
+        if tuple(getattr(bias, "shape", ())) != (compact_count,):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} has invalid bias width"
+            )
+        if any(int(pool.num_experts) != compact_count for pool in pools):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 compact router layer {layer_id} disagrees with its pools"
+            )
+        learned.append((layer_id, row, mlp, contract, original, weight, bias))
+
+    from moespresso.runtime.pooled_switchglu import (
+        install_compact_iqk_dual_gemv,
+    )
+
+    restored = 0
+    dual_gemv_installed = 0
+    for layer_id, row, mlp, contract, original, weight, bias in learned:
+        safe_lookup = [0] * layout.source_num_experts
+        retained = [False] * layout.source_num_experts
+        source_to_compact = [0] * layout.source_num_experts
+        for compact_id, source_id in enumerate(row.source_expert_ids):
+            safe_lookup[source_id] = compact_id
+            retained[source_id] = True
+            source_to_compact[source_id] = compact_id
+        safe_lookup_mx = mx.array(safe_lookup, dtype=mx.int32)
+        retained_mx = mx.array(retained)
+        gathered_weight = mx.take(weight, safe_lookup_mx, axis=0)
+        expanded_weight = mx.where(
+            retained_mx[:, None],
+            gathered_weight,
+            mx.zeros(gathered_weight.shape, dtype=weight.dtype),
+        )
+        gathered_bias = mx.take(bias, safe_lookup_mx, axis=0)
+        expanded_bias = mx.where(
+            retained_mx,
+            gathered_bias,
+            mx.array(float("-inf"), dtype=bias.dtype),
+        )
+        source_to_compact_mx = mx.array(source_to_compact, dtype=mx.uint32)
+        source_ids_mx = mx.array(row.source_expert_ids, dtype=mx.int32)
+        weight_exact = mx.all(
+            mx.take(expanded_weight, source_ids_mx, axis=0) == weight
+        )
+        bias_exact = mx.all(mx.take(expanded_bias, source_ids_mx, axis=0) == bias)
+        mx.eval(
+            expanded_weight,
+            expanded_bias,
+            source_to_compact_mx,
+            weight_exact,
+            bias_exact,
+        )
+        if not bool(weight_exact.item()) or not bool(bias_exact.item()):
+            raise DeepseekV4RuntimeLoadError(
+                f"DeepSeek V4 source-width router reconstruction changed layer {layer_id}"
+            )
+
+        original.weight = expanded_weight
+        original.bias = expanded_bias
+        contract._precast_weight = None
+        contract._precast_ok_cached = None
+        contract._select_ok_cached = None
+        object.__setattr__(
+            mlp,
+            "gate",
+            _DeepseekV4CompactRouterProxy(
+                contract,
+                source_to_compact_mx,
+                source_ids_mx,
+            ),
+        )
+        if (
+            row.num_experts < layout.source_num_experts
+            and install_compact_iqk_dual_gemv(mlp.switch_mlp, source_ids_mx)
+        ):
+            dual_gemv_installed += 1
+        restored += 1
+
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_source_width_router_layers",
+        restored,
+    )
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_source_width_router_selection_id",
+        layout.source_selection_artifact_id,
+    )
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_compact_iqk_dual_gemv_layers",
+        dual_gemv_installed,
+    )
+    return restored
+
+
 def _validate_deepseek_v4_router_gate_dtypes(model) -> int:
     """Reject raw integer router-gate storage before it reaches routing math."""
     bad = []
@@ -4581,12 +5088,51 @@ def load_deepseek_v4_package_model(
         from moespresso.runtime.build import _apply_tensor_map
         apply_tensor_map_fn = _apply_tensor_map
 
+    try:
+        compact_layout = parse_deepseek_v4_expert_layout(manifest)
+    except DeepseekV4ExpertLayoutError as exc:
+        raise DeepseekV4RuntimeLoadError(
+            f"invalid DeepSeek V4 compact expert layout: {exc}"
+        ) from exc
+
     model_config = load_config_fn(package_dir)
     if model_config.get("model_type") != "deepseek_v4":
         raise DeepseekV4RuntimeLoadError(
             "DeepSeek V4 runtime requires config.json model_type='deepseek_v4'")
+    index = None
+    if compact_layout is not None:
+        if model_config.get("n_routed_experts") != compact_layout.source_num_experts:
+            raise DeepseekV4RuntimeLoadError(
+                "DeepSeek V4 compact packages must retain "
+                "config.json n_routed_experts=256"
+            )
+        if model_config.get("num_experts_per_tok") != compact_layout.top_k:
+            raise DeepseekV4RuntimeLoadError(
+                "DeepSeek V4 compact package router top-k disagrees with config.json"
+            )
+        if model_config.get("num_hash_layers") != 3:
+            raise DeepseekV4RuntimeLoadError(
+                "DeepSeek V4 compact packages require three full hash layers"
+            )
+        if model_config.get("num_hidden_layers") != len(compact_layout.layers):
+            raise DeepseekV4RuntimeLoadError(
+                "DeepSeek V4 compact manifest layer count disagrees with config.json"
+            )
+        index = expert_index_fn(package_dir)
+        if index is None:
+            raise DeepseekV4RuntimeLoadError(
+                "DeepSeek V4 compact package has no routed expert index"
+            )
+        try:
+            validate_expert_index_counts(compact_layout, index)
+        except DeepseekV4ExpertLayoutError as exc:
+            raise DeepseekV4RuntimeLoadError(
+                f"invalid DeepSeek V4 compact expert index: {exc}"
+            ) from exc
     model, _model_config = load_skeleton_fn(
         package_dir, lazy=True, strict=False, model_config=model_config)
+    if compact_layout is not None:
+        _resize_deepseek_v4_score_router_gates(model, compact_layout)
     if "kquant_dequant" in set(manifest.get("required_ops", [])):
         from moespresso.runtime.kquant_install import install_manifest_kquant_modules
 
@@ -4625,13 +5171,18 @@ def load_deepseek_v4_package_model(
 
     declared_shards = [
         str(entry["path"]) for entry in manifest.get("files", [])
-        if isinstance(entry, dict) and entry.get("path")
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("path", "")).endswith(".safetensors")
+        )
     ]
     loaded_regular, skipped_bundles = _load_deepseek_v4_regular_weights(
         model, package_dir, load_shard_fn=load_shard_fn,
         shard_names=declared_shards or None)
     if loaded_regular == 0:
         raise DeepseekV4RuntimeLoadError("DeepSeek V4 package loaded no regular tensors")
+    if compact_layout is not None:
+        _validate_deepseek_v4_compact_router_shapes(model, compact_layout)
     _validate_deepseek_v4_router_gate_dtypes(model)
     _patch_deepseek_v4_compressor_ape_float16(model)
     _patch_deepseek_v4_attention_compressor_fp8_kv(model)
@@ -4650,7 +5201,8 @@ def load_deepseek_v4_package_model(
     if tensor_map:
         apply_tensor_map_fn(model, tensor_map)
 
-    index = expert_index_fn(package_dir)
+    if index is None:
+        index = expert_index_fn(package_dir)
     if index is None and _manifest_requires_routed_bundles(manifest):
         raise DeepseekV4RuntimeLoadError(
             "DeepSeek V4 manifest declares routed experts but no expert index was found")
@@ -4666,6 +5218,9 @@ def load_deepseek_v4_package_model(
                 seed_expert_residency(model, package_dir),
             )
         wrap_switchglus_fn(model, required_mixed_layers=_mixed_gate_up_layers(index))
+
+    if compact_layout is not None:
+        _restore_deepseek_v4_source_width_routers(model, compact_layout)
 
     _patch_deepseek_v4_q8_ffn_hc_post(model)
 

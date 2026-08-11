@@ -7,7 +7,7 @@ compatibility views. The manifest remains the package source of truth and the
 runtime never performs source-model archaeology.
 
 The engine does not repeat whole-package verification on load. Run
-`moespresso-verify` after a build, download, copy, or move; the expensive
+`moespresso verify` after a build, download, copy, or move; the expensive
 integrity gate remains separate from the serve path. `build_fn(manifest,
 package_dir)` is the swappable backend seam.
 
@@ -323,13 +323,14 @@ def load_served_model(
     *,
     manifest: dict | None = None,
     build_fn: Callable[[dict, Path], tuple] = _manifest_driven_backend,
+    drafter: Path | None = None,
 ):
     """Build (model, tokenizer, manifest) from a mjtq package.
 
     Reads the manifest (content-hash-verified by read_artifact) and builds the
     model straight from it; the engine trusts the declared contract and does not
     repeat whole-package verification on load. Integrity is checked on demand by
-    `moespresso-verify` after a build, download, copy, or move, never on the serve
+    `moespresso verify` after a build, download, copy, or move, never on the serve
     path.
     `build_fn(manifest, package_dir)` is the swappable backend (default: the strict
     manifest-driven one).
@@ -361,7 +362,17 @@ def load_served_model(
     # that cannot load raises DrafterConfigError so startup refuses loudly.
     from moespresso.runtime.deepseek_v4.spec_serve import resolve_env_drafter
 
-    _, spec_state = resolve_env_drafter(model, manifest, package_dir=package_dir)
+    if drafter is None:
+        _, spec_state = resolve_env_drafter(
+            model, manifest, package_dir=package_dir
+        )
+    else:
+        _, spec_state = resolve_env_drafter(
+            model,
+            manifest,
+            package_dir=package_dir,
+            env_value=f"dspark:{drafter}",
+        )
     print(_runtime_truth_line(model, manifest, spec_state=spec_state), flush=True)
     return model, tokenizer, manifest
 
@@ -376,6 +387,21 @@ def _runtime_truth_line(
     if capacity is None:
         return (f"[serve] runtime=resident package="
                 f"{manifest.get('artifact_id', '?')[:16]}{spec}")
+    resolved_capacities = getattr(
+        model,
+        "_moespresso_ssd_streaming_resolved_capacities",
+        None,
+    ) or {}
+    if resolved_capacities:
+        capacity_min = min(int(value) for value in resolved_capacities.values())
+        capacity_max = max(int(value) for value in resolved_capacities.values())
+        capacity_label = (
+            str(capacity_min)
+            if capacity_min == capacity_max
+            else f"{capacity_min}-{capacity_max}"
+        )
+    else:
+        capacity_label = str(capacity)
     hot = getattr(model, "_moespresso_ssd_hotlist", None) or {}
     try:
         from moespresso.runtime.pooled_switchglu import (
@@ -396,7 +422,7 @@ def _runtime_truth_line(
     cap_note = _os_cap.environ.get("MOESPRESSO_SSD_MAX_MEMORY_GB")
     cap_note = f" max_memory={cap_note}GB" if cap_note else ""
     return (f"[serve] runtime=ssd-streaming package="
-            f"{manifest.get('artifact_id', '?')[:16]} capacity={capacity}"
+            f"{manifest.get('artifact_id', '?')[:16]} capacity={capacity_label}"
             f"{cap_note}"
             f" hotlist={hot.get('source')} seeded={hot.get('seeded', 0)}"
             f" decode={decode_path}"
@@ -996,21 +1022,29 @@ def validate_runtime_limit_arguments(parser, args) -> None:
         parser.error("--min-resident-experts must be >= 1")
 
 
-def main(argv: list[str] | None = None) -> int:
-    """`uv run moespresso-generate <package_dir> [--prompt ...]`: load + generate.
+def main(
+    argv: list[str] | None = None, *, prog: str = "moespresso-generate"
+) -> int:
+    """`moespresso generate <package_dir> [--prompt ...]`: load + generate.
 
     Generate-only entrypoint (prompt in, text out). Builds straight from the
-    manifest; does not verify (run `moespresso-verify` for the integrity gate). The
-    OpenAI-compatible HTTP server (`moespresso-serve`, runtime/http.py) is a thin
+    manifest; does not verify (run `moespresso verify` for the integrity gate). The
+    OpenAI-compatible HTTP server (`moespresso serve`, runtime/http.py) is a thin
     layer over the same load_served_model + generate_once seam; this CLI stays the
     minimal one-shot.
     """
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="moespresso-generate",
+        prog=prog,
         description="Load a MoEspresso package from its manifest, then generate.")
     parser.add_argument("package_dir", help="Path to the packaged model directory")
+    from moespresso.runtime.drafter_cli import (
+        add_external_drafter_argument,
+        parse_external_drafter_argument,
+    )
+
+    add_external_drafter_argument(parser)
     parser.add_argument("--max-memory-gb", type=float, default=None,
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry and "
@@ -1032,6 +1066,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Write structured generation metadata to this JSON file.")
     args = parser.parse_args(argv)
     validate_runtime_limit_arguments(parser, args)
+    external_drafter = parse_external_drafter_argument(parser, args.drafter)
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
@@ -1071,12 +1106,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if preflight_manifest is None:
-            model, tokenizer, manifest = load_served_model(pkg)
+            if external_drafter is None:
+                model, tokenizer, manifest = load_served_model(pkg)
+            else:
+                model, tokenizer, manifest = load_served_model(
+                    pkg, drafter=external_drafter
+                )
         else:
-            model, tokenizer, manifest = load_served_model(
-                pkg,
-                manifest=preflight_manifest,
-            )
+            load_kwargs = {"manifest": preflight_manifest}
+            if external_drafter is not None:
+                load_kwargs["drafter"] = external_drafter
+            model, tokenizer, manifest = load_served_model(pkg, **load_kwargs)
         validate_min_resident_experts(
             model,
             requested=args.min_resident_experts,
@@ -1184,8 +1224,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def verify_main(argv: list[str] | None = None) -> int:
-    """`uv run moespresso-verify <package_dir>`: the on-demand integrity gate.
+def verify_main(
+    argv: list[str] | None = None, *, prog: str = "moespresso-verify"
+) -> int:
+    """`moespresso verify <package_dir>`: the on-demand integrity gate.
 
     Runs the manifest-contract, declared-file, tensor-key, and generated-sidecar
     checks the serve hot path deliberately skips. Exit 0 = clean, 2 = failed.
@@ -1193,9 +1235,17 @@ def verify_main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="moespresso-verify",
+        prog=prog,
         description="Check a MoEspresso package matches its manifest contract.")
     parser.add_argument("package_dir", help="Path to the packaged model directory")
+    from moespresso.runtime.drafter_cli import (
+        ExternalDrafterError,
+        add_external_drafter_argument,
+        detect_external_drafter,
+        verify_external_dspark,
+    )
+
+    add_external_drafter_argument(parser)
     args = parser.parse_args(argv)
 
     pkg = Path(args.package_dir)
@@ -1213,11 +1263,27 @@ def verify_main(argv: list[str] | None = None) -> int:
     for v in issues:
         print(f"  [{v.severity}] {v.code}: {v.message}")
     blocking = [v for v in issues if v.blocking]
+    external_manifest = None
+    external_error = None
+    if args.drafter is not None:
+        try:
+            external = detect_external_drafter(args.drafter)
+            external_manifest = verify_external_dspark(manifest, external)
+        except ExternalDrafterError as exc:
+            external_error = exc
+            print(f"FAILED: external drafter: {exc}")
     if blocking:
         print(f"FAILED: {len(blocking)} blocking issue(s) in {pkg}")
         return 2
+    if external_error is not None:
+        return 2
     print(f"OK: {pkg} matches its manifest "
           f"({len(manifest['tensors'])} tensors, {len(manifest['files'])} shard(s)).")
+    if external_manifest is not None:
+        print(
+            "OK: external DSpark sidecar matches its manifest and package "
+            f"geometry ({external_manifest.get('artifact_id')})."
+        )
     return 0
 
 

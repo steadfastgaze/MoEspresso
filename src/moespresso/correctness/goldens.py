@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.correctness.tq_reference import (
     generate_random_signs,
     hadamard_inverse,
@@ -29,7 +29,7 @@ from moespresso.runtime.deepseek_v4.renderer import (
     render_deepseek_v4_prompt,
 )
 
-PRODUCER = {"tool": "moespresso.correctness", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.correctness")
 DS4_Q0_FIXTURE_ROOT = (
     Path(__file__).resolve().parent / "fixtures" / "deepseek_v4" / "test_vectors"
 )

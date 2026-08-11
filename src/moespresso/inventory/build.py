@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.inventory import roles
 from moespresso.inventory.deepseek_v4 import roles as deepseek_v4_roles
 from moespresso.inventory.safetensors_header import TensorHeader, scan_headers
@@ -24,7 +24,7 @@ _SKIP_SUBSTR = (
     "vision", "visual", "audio", "image", "mtp",
 )
 
-PRODUCER = {"tool": "moespresso.inventory", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.inventory")
 
 
 def _classify_deepseek_v4(h: TensorHeader) -> dict | None:

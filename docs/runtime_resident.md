@@ -168,18 +168,22 @@ mlx_lm kwargs here.
 
 ## 2. CLI entry points
 
-The four core console scripts, out of the full set declared in
-`pyproject.toml` (the model-specific builders, quality gates, and speed probes
-are listed in `DEVGUIDE.md`):
+`moespresso --help` lists the user-facing command group:
 
 | Command | Module entry | Job |
 |---|---|---|
-| `moespresso-convert` | `package.convert:main` | End-to-end conversion (inventory → probe → optimize → package). |
-| `moespresso-generate` | `runtime.serve:main` | One-shot: load a package, render once, generate, print. |
-| `moespresso-serve` | `runtime.http:main` | OpenAI-compatible HTTP server over the same load+generate seam. |
-| `moespresso-verify` | `runtime.serve:verify_main` | On-demand manifest, member-identity, tensor-key, and sidecar gate. |
+| `moespresso generate` | `runtime.serve:main` | One-shot: load a package, render once, generate, print. |
+| `moespresso serve` | `runtime.http:main` | OpenAI-compatible HTTP server over the same load+generate seam. |
+| `moespresso verify` | `runtime.serve:verify_main` | On-demand manifest, member-identity, tensor-key, and sidecar gate. |
 
-### `moespresso-convert`: end-to-end conversion
+The `moespresso-generate`, `moespresso-serve`, and `moespresso-verify`
+scripts remain compatibility aliases backed by the same parsers. A wheel or
+uv development install also exposes the package builders, conversion tools,
+quality gates, and speed probes declared in `pyproject.toml`; Homebrew keeps
+those engineering commands under its private environment instead of adding
+them to the user PATH. They are listed in `DEVGUIDE.md`.
+
+### Conversion tooling
 
 `package.convert` is the imperative shell that streams the whole pipeline
 (`inventory → probe → optimize → package`) on a few-GB machine and writes a
@@ -192,9 +196,9 @@ CLI always produces a calibrated package; producing an uncalibrated `mjtq` is a
 deliberate in-process library call (`allow_uniform=True`), never a CLI accident.
 This is the producer of the packages the rest of this document consumes.
 
-### `moespresso-generate`: one-shot
+### `moespresso generate`: one-shot
 
-`serve.main`: `moespresso-generate <package_dir> [--prompt ... --max-tokens ...
+`serve.main`: `moespresso generate <package_dir> [--prompt ... --max-tokens ...
 --temperature ... --top-p ... --thinking off|on|high|max --max-memory-gb ...]`.
 It loads via `load_served_model` (builds from the manifest, **does not
 verify**), renders the prompt **once** via `http.render_prompt` (the same
@@ -206,7 +210,7 @@ default), `on` renders thinking mode, and `max` adds the official maximum
 reasoning-effort preamble. `max` refuses loudly for families without an effort
 mechanism.
 
-### `moespresso-serve`: OpenAI-compatible HTTP
+### `moespresso serve`: OpenAI-compatible HTTP
 
 `http.main` → `http.serve`: load the package **once** at startup (no verify),
 prime one isolated deterministic four-token generation, then serve. The prime
@@ -225,12 +229,22 @@ maps onto the official encoder modes at startup and stays fixed for the
 server's lifetime; per-request render fields remain rejected, so the DS4
 cache/attention policy cannot change between requests.
 
-### `moespresso-verify`: the on-demand integrity gate
+Serving and one-shot generation accept `--drafter <sidecar-dir>`. The
+directory must contain exactly one recognized drafter manifest. The public
+command surface accepts a DSpark manifest and refuses recognized DFlash or MTP
+manifests in this release. The explicit argument overrides the drafter
+environment variable and the package's bundled automatic selection.
 
-`serve.verify_main`: `moespresso-verify <package_dir>`. Reads the manifest, runs
+### `moespresso verify`: the on-demand integrity gate
+
+`serve.verify_main`: `moespresso verify <package_dir>`. Reads the manifest, runs
 the package and generated-sidecar checks, prints each issue, and exits
 **0 = clean / 2 = failed**. This is the gate the serve hot path deliberately
 skips (§3).
+
+`--drafter <sidecar-dir>` additionally checks the external DSpark manifest
+identity, safe file containment, every recorded SHA-256, source checkpoint,
+and target geometry. It does not load the target model or the drafter.
 
 ---
 
@@ -251,7 +265,7 @@ fail-closed:
    manifest-derived runtime views semantically.
 
 The checks return `Validation` entries (empty means clean); any blocking entry
-makes `moespresso-verify` exit 2. Run it before loading an unverified package.
+makes `moespresso verify` exit 2. Run it before loading an unverified package.
 
 The full sha256 gate is kept off the serve hot path. Hashing the whole package
 (tens of GB) before the first token would dominate startup. So:
@@ -260,7 +274,7 @@ The full sha256 gate is kept off the serve hot path. Hashing the whole package
   manifest and **do not verify** on load. (The manifest itself is still
   content-hash-verified by `read_artifact`; it is the *shard sha256s* that are
   skipped.)
-- Integrity is a separate package-acquisition gate: run `moespresso-verify`
+- Integrity is a separate package-acquisition gate: run `moespresso verify`
   after building, downloading, copying, or moving a package; do not pay for the
   same whole-package hash pass on every cold start.
 
@@ -548,10 +562,12 @@ and expert-I/O counters.
 
 | File | Role |
 |---|---|
-| `serve.py` | Load `(model, tokenizer, manifest)` from the manifest; `generate_with_metadata` / `generate_once`; `moespresso-generate` + `moespresso-verify` CLIs; runtime truth line. |
+| `cli.py` | User-facing `moespresso` dispatcher and version output. |
+| `serve.py` | Load `(model, tokenizer, manifest)` from the manifest; `generate_with_metadata` / `generate_once`; generate and verify parsers; runtime truth line. |
 | `build.py` | Manifest-driven build via the proven jang loader; adapter selection; routed-expert install; mixed-bit wrapping; no dequant at load. |
 | `generation.py` | Pure `GenerationResult` contract shared by serve + HTTP. |
-| `http.py` | OpenAI-compatible HTTP: pure core + stdlib IO edge; the **single render site**; SSE streaming; startup warmup; `moespresso-serve` CLI. |
+| `http.py` | OpenAI-compatible HTTP: pure core + stdlib IO edge; the **single render site**; SSE streaming; startup warmup; serve parser. |
+| `drafter_cli.py` | External sidecar discovery and DSpark verification for the public command surface. |
 | `chat_stream.py` | `ReasoningSplitter`: incremental think-block/content splitting for streaming deltas. |
 | `verify.py` | Pure, fail-closed manifest, identity, tensor-key, and sidecar gate; off the hot path. |
 | `thinking.py` | Per-family thinking on/off resolution; refuse loudly. |

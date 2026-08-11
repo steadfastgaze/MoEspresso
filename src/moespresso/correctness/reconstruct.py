@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from moespresso.core.artifact import Validation, make_artifact
+from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.correctness.tq_reference import tq_decode_rows
 from moespresso.inventory.safetensors_header import read_shard_metadata
 from moespresso.package import bundle as bundle_mod
@@ -19,7 +19,7 @@ from moespresso.probe import weight_io
 from moespresso.probe.deepseek_v4.codec import load_dequantized_fp8_rows
 from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup
 
-PRODUCER = {"tool": "moespresso.correctness", "version": "2.0.0"}
+PRODUCER = artifact_producer("moespresso.correctness")
 
 DEFAULT_SAMPLE_POLICY = {
     "seed": 42,

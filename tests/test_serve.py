@@ -419,6 +419,32 @@ def test_load_served_model_prints_runtime_truth_line(tmp_path, capsys):
     assert "lookahead=off" in out
 
 
+def test_load_served_model_prints_mixed_resolved_capacity_range(tmp_path, capsys):
+    from moespresso.runtime.serve import load_served_model
+
+    manifest = {"artifact_id": "pkg:abcdef1234567890aa", "subject": {}}
+
+    class _M:
+        _moespresso_ssd_streaming_capacity = 256
+        _moespresso_ssd_streaming_resolved_capacities = {
+            0: 256,
+            1: 256,
+            2: 256,
+            3: 64,
+        }
+        _moespresso_ssd_hotlist = {"source": "all-default", "seeded": 960}
+
+    load_served_model(
+        tmp_path,
+        manifest=manifest,
+        build_fn=lambda _manifest, _path: (_M(), object()),
+    )
+
+    out = capsys.readouterr().out
+    assert "runtime=ssd-streaming" in out
+    assert "capacity=64-256" in out
+
+
 def test_load_served_model_missing_dir_is_a_clear_error(tmp_path):
     import pytest
 

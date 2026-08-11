@@ -187,7 +187,7 @@ the inventory. Keeping them out of the plan preserves optimizer purity.
 ### File identities (path + size + sha256): fail closed
 
 `file_identity()` records `{path, size_bytes, sha256}` for every written shard
-and copied package member. The on-demand `moespresso-verify` gate re-hashes
+and copied package member. The on-demand `moespresso verify` gate re-hashes
 every declared shard, tokenizer file, and agentic profile and fails if a file
 is missing, the size differs, or the sha256 differs. Run that gate after every
 build, download, copy, or move and before loading an unverified package. The
@@ -238,7 +238,7 @@ blocking validations for, among others:
   format, codec, or wire layout outside the declared vocabulary for its tensor
   class.
 
-`moespresso-verify` adds the integrity layer: it validates the manifest's
+`moespresso verify` adds the integrity layer: it validates the manifest's
 content id, status, package-format version, and embedded blocking findings;
 checks declared package-member identities; and confirms that every tensor's
 expanded keys (`expected_keys()`, expanding `key_prefix` by format) exist in a
@@ -518,7 +518,7 @@ sidecar's shards and manifest, and extends the package manifest with a
 declared `drafter` component (`package/deepseek_v4/dspark_bundle.py`). The
 component records the identity (path, size, sha256) of every sidecar file, the
 sidecar's own artifact id, and the source package's manifest id, so
-`moespresso-verify` covers the drafter bytes and the runtime resolves the
+`moespresso verify` covers the drafter bytes and the runtime resolves the
 drafter from the manifest alone. This is the step that lets a package select a
 drafter automatically; a package with no `drafter` key serves plain.
 

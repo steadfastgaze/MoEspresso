@@ -142,7 +142,7 @@ used `llama-server` with one slot. The full acquisition contract is in
 Operational serving and bounded-residency checks still use the public server:
 
 ```bash
-uv run --locked moespresso-serve \
+uv run --locked moespresso serve \
   <package-dir> --thinking off
 ```
 

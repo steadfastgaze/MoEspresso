@@ -1,6 +1,6 @@
 [project]
 name = "moespresso"
-version = "2.0.0"
+version = "2.1.0"
 description = "Run large Mixture-of-Experts language models well on the memory you have."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -52,6 +52,9 @@ build = [
 ]
 
 [project.scripts]
+# User-facing command group. The hyphenated runtime commands remain
+# compatibility aliases backed by the same parsers.
+moespresso = "moespresso.cli:main"
 # Streamed end-to-end conversion: inventory->probe->optimize->package -> SSD.
 moespresso-convert = "moespresso.package.convert:main"
 # One-shot generate from a package (prompt in, text out); no integrity
@@ -82,6 +85,9 @@ moespresso-ds4-iqk-package = "moespresso.package.deepseek_v4.iqk_package:main"
 # Manual relayout of a built IQ_K package's routed bundles onto the decode
 # kernels' wire, without re-encoding a byte.
 moespresso-ds4-iqk-relayout = "moespresso.package.deepseek_v4.iqk_relayout:main"
+# Build a new physical package containing only a validated per-layer IQ_K
+# expert selection, without decoding or re-encoding retained rows.
+moespresso-ds4-iqk-reap = "moespresso.package.deepseek_v4.iqk_reap:main"
 # Manual DSpark draft-model sidecar builder from the DSpark HF snapshot.
 moespresso-ds4-dspark-sidecar = "moespresso.package.deepseek_v4.dspark_sidecar:main"
 # Bundle a built DSpark sidecar into a DeepSeek-V4 package as the declared

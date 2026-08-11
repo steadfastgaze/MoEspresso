@@ -610,6 +610,9 @@ def iqk_switch_modules(model) -> list:
 
 def iqk_engagement(model) -> dict:
     """Route counters plus the kernels actually compiled in this process."""
+    from moespresso.runtime.deepseek_v4.iqk_decode_kernel import (
+        built_dual_gemv_kernels,
+    )
     from mlx_iqk.kernels import (
         built_dequant_kernels,
         built_dequant_range_kernels,
@@ -645,6 +648,12 @@ def iqk_engagement(model) -> dict:
             sum(b.iqk_verify_flush_calls for b in flush_blocks)
             + sum(int(getattr(s, "iqk_verify_flush_calls", 0)) for s in switches)
         ),
+        "iqk_dual_gemv_calls": sum(
+            int(getattr(s, "iqk_dual_gemv_calls", 0)) for s in switches
+        ),
+        "iqk_dual_gemv_pairs": sum(
+            int(getattr(s, "iqk_dual_gemv_pairs", 0)) for s in switches
+        ),
         "drafter_policy": drafter_policy,
         "ds4_drafter_policy_auto_on": int(
             policy_mode == "auto" and policy_decision == "on"),
@@ -655,7 +664,10 @@ def iqk_engagement(model) -> dict:
         "built_dequant_kernels": [list(k) for k in built_dequant_kernels()],
         "built_dequant_range_kernels": [
             list(k) for k in built_dequant_range_kernels()],
+        "built_iqk_dual_gemv_kernels": [
+            list(k) for k in built_dual_gemv_kernels()],
         # The same registry as an integer, so the census surfaces that hold
         # only counts can carry it and the phase splitter can subtract it.
         "built_dequant_range_kernel_count": len(built_dequant_range_kernels()),
+        "built_iqk_dual_gemv_kernel_count": len(built_dual_gemv_kernels()),
     }

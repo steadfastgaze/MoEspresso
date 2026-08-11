@@ -4,7 +4,7 @@ The model is built once from the manifest (via load_served_model) and held; each
 request renders a prompt, calls the same generate_once the CLI uses, and shapes an
 OpenAI chat-completions response. This module adds only request/response shaping +
 routing, no quantization, no loading logic. It does not verify on load (run
-moespresso-verify for the integrity gate).
+``moespresso verify`` for the integrity gate).
 
 Pure-core/IO-edge split: the request->response core is pure (a parsed request
 dict + an injected `generate(prompt, **opts) -> str` callable -> a response dict),
@@ -1398,13 +1398,14 @@ def serve(
     thinking: str | None = None,
     tool_dialect: str | None = None,
     startup_warmup: bool = True,
+    external_drafter: Path | None = None,
     load_model_fn: Callable | None = None,
     startup_warmup_fn: Callable | None = None,
 ) -> int:
     """Load and warm the package once, then serve OpenAI-compatible HTTP.
 
     Startup builds the model straight from the manifest and primes generation
-    before readiness; it does not verify (run moespresso-verify for the integrity
+    before readiness; it does not verify (run moespresso verify for the integrity
     gate). Needs the `compute` extra; imports are lazy so the pure core stays
     importable without mlx.
     """
@@ -1465,7 +1466,12 @@ def serve(
 
     try:
         try:
-            model, tokenizer, manifest = load_model_fn(package_dir)
+            if external_drafter is None:
+                model, tokenizer, manifest = load_model_fn(package_dir)
+            else:
+                model, tokenizer, manifest = load_model_fn(
+                    package_dir, drafter=external_drafter
+                )
             validate_min_resident_experts(
                 model,
                 requested=min_resident_experts,
@@ -1624,15 +1630,23 @@ def serve(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    """`uv run moespresso-serve <package_dir> [--host H --port P]` (not a bare exec)."""
+def main(
+    argv: list[str] | None = None, *, prog: str = "moespresso-serve"
+) -> int:
+    """`moespresso serve <package_dir> [--host H --port P]`."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="moespresso-serve",
+        prog=prog,
         description="Load a MoEspresso package from its manifest, then serve "
-                    "OpenAI-compatible HTTP (run moespresso-verify for the sha256 gate).")
+                    "OpenAI-compatible HTTP (run moespresso verify for the sha256 gate).")
     parser.add_argument("package_dir", help="Path to the packaged model directory")
+    from moespresso.runtime.drafter_cli import (
+        add_external_drafter_argument,
+        parse_external_drafter_argument,
+    )
+
+    add_external_drafter_argument(parser)
     parser.add_argument("--max-memory-gb", type=float, default=None,
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry; "
@@ -1681,6 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     validate_runtime_limit_arguments(parser, args)
+    external_drafter = parse_external_drafter_argument(parser, args.drafter)
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
@@ -1711,6 +1726,7 @@ def main(argv: list[str] | None = None) -> int:
         thinking=args.thinking,
         tool_dialect=None if args.tool_dialect == "auto" else args.tool_dialect,
         startup_warmup=args.startup_warmup != "off",
+        external_drafter=external_drafter,
     )
 
 

@@ -30,6 +30,7 @@ from moespresso.runtime.expert_index import (
     build_expert_index,
 )
 
+
 def _write_safetensors(path, tensors, metadata=None):
     """tensors: name -> (dtype_str, shape, bytes). Writes a minimal safetensors."""
     header, blob, off = {}, bytearray(), 0
@@ -109,6 +110,26 @@ def _tiny_package(tmp_path, *, n_layers=2, n_exp=4, out=8, cols=2, bits=2):
     return pkg, n_exp, out, cols
 
 
+def _mixed_package(tmp_path):
+    from conftest import write_bundle_package
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    write_bundle_package(
+        pkg,
+        layers=(0,),
+        n_exp=4,
+        shard_name="model-00001-of-00002.safetensors",
+    )
+    write_bundle_package(
+        pkg,
+        layers=(1,),
+        n_exp=3,
+        shard_name="model-00002-of-00002.safetensors",
+    )
+    return pkg
+
+
 def test_index_lists_every_layer_expert_projection(tmp_path):
     pkg, n_exp, out, cols = _tiny_package(tmp_path, n_layers=2, n_exp=4)
     idx = build_expert_index(pkg)
@@ -118,6 +139,26 @@ def test_index_lists_every_layer_expert_projection(tmp_path):
     assert idx.num_layers_indexed() == 2
     assert idx.layers_indexed() == (0, 1)
     assert idx.num_expert_slots() == 2 * 4
+
+
+def test_index_exposes_mixed_per_layer_expert_counts(tmp_path):
+    idx = build_expert_index(_mixed_package(tmp_path))
+
+    assert idx.num_experts_for_layer(0) == 4
+    assert idx.num_experts_for_layer(1) == 3
+    assert idx.max_num_experts == 4
+    assert idx.min_num_experts == 3
+    assert idx.num_expert_slots() == 7
+    assert idx.validate() == []
+    assert idx.locate(
+        layer=1,
+        expert=2,
+        projection="gate_proj",
+    ).nbytes > 0
+    with pytest.raises(IndexError, match=r"expert 3 out of range \[0, 3\)"):
+        idx.locate(layer=1, expert=3, projection="gate_proj")
+    with pytest.raises(ValueError, match="mixed per-layer expert counts"):
+        _ = idx.num_experts
 
 
 def test_index_accepts_deepseek_root_bundle_key(tmp_path):
@@ -329,7 +370,7 @@ def test_index_exposes_projection_geometry_and_bits(tmp_path):
     assert idx.bits(layer=0, projection="gate_proj") == 2
 
 
-def test_index_rejects_inconsistent_num_experts_across_layers(tmp_path):
+def test_index_accepts_mixed_num_experts_within_one_shard(tmp_path):
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     tensors, layer_geo = {}, {}
@@ -343,8 +384,11 @@ def test_index_rejects_inconsistent_num_experts_across_layers(tmp_path):
     _write_safetensors(pkg / "model-00001-of-00001.safetensors", tensors,
                        metadata={"expert_bundles": encode_bundle_metadata(layer_geo)})
 
-    with pytest.raises(ValueError, match="inconsistent num_experts"):
-        build_expert_index(pkg)
+    idx = build_expert_index(pkg)
+
+    assert idx.num_experts_for_layer(0) == 4
+    assert idx.num_experts_for_layer(1) == 5
+    assert idx.num_expert_slots() == 9
 
 
 def test_index_rejects_header_metadata_shape_mismatch(tmp_path):

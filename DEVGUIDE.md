@@ -35,7 +35,7 @@ converted expert artifacts  -----------/
 | artifact import | staged expert artifacts + source inventory | converted allocation | adopt already-encoded routed-expert bytes and the per-cell codec choice that produced them |
 | package plan | `optimizer_decision`, recipe allocation, or converted allocation | `package_plan` | normalize allocation, provenance, and explicit force overrides into the writer IR |
 | package | `package_plan` + weights | `package_manifest` | quantize, write shards, emit the package's self-description |
-| runtime | a package | (generation) | build the model from the manifest and serve; integrity verification is the separate `moespresso-verify` gate, kept off the serve path |
+| runtime | a package | (generation) | build the model from the manifest and serve; integrity verification is the separate `moespresso verify` gate, kept off the serve path |
 
 Every artifact carries a content-hashed id and a fail-closed version. The
 contract is one file: `src/moespresso/core/artifact.py`. It registers seven
@@ -100,7 +100,7 @@ readers, and it must not branch on which planning route produced the package.
 
 ## Serving surface
 
-`moespresso-serve` binds an OpenAI-compatible `POST /v1/chat/completions` plus
+`moespresso serve` binds an OpenAI-compatible `POST /v1/chat/completions` plus
 `GET /health`. The endpoint supports SSE streaming (`stream: true`) with
 `reasoning_content`/`content` deltas, sampling pass-through
 (`top_k`, `min_p`, `presence_penalty`), refusal of unsupported
@@ -153,10 +153,13 @@ checkpoint. They have no installed entry point or serving selector. See
 
 Declared in `pyproject.toml`:
 
-- `moespresso-convert`: end-to-end probe/optimizer conversion.
-- `moespresso-generate`: one-shot generate from a package.
-- `moespresso-serve`: OpenAI-compatible HTTP server.
-- `moespresso-verify`: on-demand integrity gate (kept off the serve hot path).
+- `moespresso generate`: one-shot generate from a package.
+- `moespresso serve`: OpenAI-compatible HTTP server.
+- `moespresso verify`: on-demand integrity gate (kept off the serve hot path).
+- `moespresso-generate`, `moespresso-serve`, and `moespresso-verify`: legacy
+  aliases backed by the same parsers.
+- `moespresso-convert`: end-to-end probe/optimizer conversion for development
+  and package construction; it is not part of the Homebrew user PATH.
 - `moespresso-hf-inspect` (alias `hf-model-inspect`): remote HF model header
   inspection without downloading.
 - `moespresso-ds4-kquant-package`: manual DeepSeek-V4 package builder from a GGUF K-quant recipe.
