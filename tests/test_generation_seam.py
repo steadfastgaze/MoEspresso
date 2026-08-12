@@ -177,6 +177,40 @@ def test_generate_with_metadata_passes_token_ids_cache_and_returns_metadata():
     assert result.prompt_cache is cache
 
 
+def test_generate_with_metadata_evaluates_cache_before_publication(monkeypatch):
+    from moespresso.runtime.deepseek_v4 import model as deepseek_model
+
+    cache = ["cache-object"]
+    evaluated = []
+
+    monkeypatch.setattr(
+        deepseek_model,
+        "evaluate_deepseek_v4_cache_state",
+        lambda caches, *, asynchronous: evaluated.append(
+            (caches, asynchronous)
+        ),
+    )
+
+    def fake_stream(**_kwargs):
+        yield _resp("ok", 17, finish_reason="stop")
+
+    model = SimpleNamespace(
+        _moespresso_dsv4_attention_cache_contract="required",
+    )
+    result = generate_with_metadata(
+        model,
+        "TOK",
+        [1],
+        prompt_cache=cache,
+        max_tokens=1,
+        stream_generate_fn=fake_stream,
+        sampler_factory=lambda **_kwargs: None,
+    )
+
+    assert result.prompt_cache is cache
+    assert evaluated == [(cache, False)]
+
+
 def test_generate_with_metadata_optionally_captures_top_logprobs():
     def fake_stream(**_kwargs):
         yield SimpleNamespace(
@@ -235,6 +269,76 @@ def test_generate_with_metadata_calls_response_callback_after_each_token():
 
     assert result.text == "ab"
     assert seen == [(1, 21), (2, 22)]
+
+
+def test_response_stop_callback_ends_plain_generation_at_committed_frontier():
+    class Cache:
+        offset = 0
+
+    cache = Cache()
+    pieces = ["before", "<outer>", "</outer>", "after"]
+    seen = []
+    terminal = False
+
+    def fake_stream(**_kwargs):
+        for index, piece in enumerate(pieces, 1):
+            cache.offset = index
+            yield _resp(
+                piece,
+                100 + index,
+                generation_tokens=index,
+            )
+
+    def capture(_step, response):
+        nonlocal terminal
+        seen.append(response.text)
+        terminal = "</outer>" in response.text
+
+    result = generate_with_metadata(
+        "MODEL",
+        "TOK",
+        [1],
+        prompt_cache=[cache],
+        stream_generate_fn=fake_stream,
+        sampler_factory=lambda **kwargs: None,
+        response_callback=capture,
+        response_stop_callback=lambda: terminal,
+    )
+
+    assert result.text == "before<outer></outer>"
+    assert result.finish_reason == "stop"
+    assert result.completion_tokens == 3
+    assert result.generated_token_ids == (101, 102, 103)
+    assert cache.offset == 3
+    assert seen == pieces[:3]
+
+
+def test_response_stop_callback_disables_installed_ds4_drafter(monkeypatch):
+    import mlx_lm
+    import moespresso.runtime.deepseek_v4.spec_serve as spec_serve
+
+    model = SimpleNamespace(
+        _moespresso_ds4_drafter=SimpleNamespace(
+            drafter=SimpleNamespace(greedy_only=False)))
+
+    def forbidden_spec(*_args, **_kwargs):
+        raise AssertionError("terminal tool request entered speculation")
+
+    def fake_stream(**_kwargs):
+        yield _resp("done", 7, finish_reason="stop")
+
+    monkeypatch.setattr(spec_serve, "spec_generation_result", forbidden_spec)
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream)
+    result = generate_with_metadata(
+        model,
+        "TOK",
+        [1],
+        temperature=0.0,
+        response_stop_callback=lambda: False,
+    )
+
+    assert result.text == "done"
+    assert result.speculative is None
 
 
 def test_generate_with_metadata_threads_q8_policy_to_mlx_stream_generate():

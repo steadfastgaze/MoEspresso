@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,8 @@ from moespresso.runtime.deepseek_v4.model import (  # noqa: E402
     _patch_deepseek_v4_attention_fp16_qkv,
     _patch_deepseek_v4_attention_shape_stats,
     _patch_deepseek_v4_banded_prefill_attention,
+    _patch_deepseek_v4_cache_state_dependencies,
+    _cache_state_evaluation_due,
     _patch_deepseek_v4_indexer_score_contract,
     _patch_deepseek_v4_indexer_pre_topk_visibility,
     _patch_deepseek_v4_ratio4_prefill_fast_path,
@@ -29,8 +32,111 @@ from moespresso.runtime.deepseek_v4.model import (  # noqa: E402
     build_deepseek_v4_graph_from_manifest,
     deepseek_v4_attention_layer_stats,
     deepseek_v4_indexer_layer_stats,
+    evaluate_deepseek_v4_cache_state,
 )
 from moespresso.package.sidecars import build_sidecars  # noqa: E402
+
+
+def test_model_output_depends_on_public_cache_state_at_interval():
+    class Array:
+        pass
+
+    class FakeMx:
+        array = Array
+        calls = []
+
+        @classmethod
+        def depends(cls, output, dependencies):
+            cls.calls.append((output, dependencies))
+            return ("dependent", output)
+
+    class CompositeCache:
+        def __init__(self, arrays):
+            self.compressor_state = {}
+            self.indexer_state = {}
+            self.state = (
+                arrays[0],
+                (None, arrays[1]),
+                {"pool": arrays[2], "same": arrays[1]},
+            )
+            self.offset = 64
+
+    class PlainCache:
+        def __init__(self, array):
+            self.state = (array,)
+
+    class FakeModel:
+        def __call__(self, input_ids, cache=None, mask=None):
+            return ("logits", input_ids, mask)
+
+    class Tokens:
+        shape = (1, 1)
+
+    dependencies = [Array(), Array(), Array(), Array()]
+    model = FakeModel()
+    assert _patch_deepseek_v4_cache_state_dependencies(
+        model, mx_module=FakeMx)
+
+    tokens = Tokens()
+    output = model(
+        tokens,
+        cache=[CompositeCache(dependencies), PlainCache(dependencies[3])],
+        mask="mask",
+    )
+
+    original = ("logits", tokens, "mask")
+    assert output == ("dependent", original)
+    assert FakeMx.calls == [(original, dependencies)]
+
+    cache = CompositeCache(dependencies)
+    cache.offset = 65
+    output = model(tokens, cache=[cache], mask="mask")
+    assert output == original
+    assert FakeMx.calls == [(original, dependencies)]
+
+
+def test_cache_state_interval_detects_crossing_after_forward():
+    cache = SimpleNamespace(offset=63)
+    one_token = SimpleNamespace(shape=(1, 1))
+
+    assert not _cache_state_evaluation_due([cache], one_token, 64)
+    cache.offset = 64
+    assert _cache_state_evaluation_due([cache], one_token, 64)
+
+    cache.offset = 128
+    eight_tokens = SimpleNamespace(shape=(1, 8))
+    assert _cache_state_evaluation_due([cache], eight_tokens, 64)
+    assert not _cache_state_evaluation_due([cache], eight_tokens, 0)
+
+
+def test_cache_state_boundary_evaluation_is_batched_and_synchronous():
+    class Array:
+        pass
+
+    class FakeMx:
+        array = Array
+        eval_calls = []
+        async_calls = []
+
+        @classmethod
+        def eval(cls, *arrays):
+            cls.eval_calls.append(arrays)
+
+        @classmethod
+        def async_eval(cls, *arrays):
+            cls.async_calls.append(arrays)
+
+    arrays = [Array(), Array()]
+    composite = SimpleNamespace(
+        compressor_state={},
+        indexer_state={},
+        state=(arrays[0], {"pool": arrays[1]}),
+    )
+
+    assert evaluate_deepseek_v4_cache_state(
+        [composite], asynchronous=False, mx_module=FakeMx) == 2
+    assert FakeMx.eval_calls == [tuple(arrays)]
+    assert FakeMx.async_calls == []
 
 
 def _tiny_manifest():

@@ -74,6 +74,15 @@ def test_decode_span_frontiers_stay_unwritten():
     assert 256 not in ledger.written_frontiers
 
 
+def test_write_depth_caps_expected_frontiers():
+    ledger = SessionLedger("a", stride=256, write_depth_tokens=512)
+    check = ledger.observe("t1", usage(
+        cached=0, suffix=1000, completion=10, event="miss", disk_written=2))
+    assert check.findings == ()
+    assert check.new_frontiers == (256, 512)
+    assert ledger.written_frontiers == {256, 512}
+
+
 def test_restart_expects_disk_hit_at_longest_written_frontier():
     ledger = SessionLedger("a", stride=256)
     ledger.observe("t1", usage(
@@ -164,6 +173,7 @@ def test_health_expectations_track_segment_counters():
         "enabled": True, "stride": 256, "restores": 0, "writes": 2,
         "evictions": 0, "quarantines": 0, "entries": 2,
         "payload_bytes": 123, "budget_bytes": 1000,
+        "write_depth_tokens": None,
     }}}
     assert health.verify("t1", payload, expected_entries=2) == []
 
@@ -176,6 +186,7 @@ def test_health_expectations_track_segment_counters():
         "enabled": True, "stride": 256, "restores": 1, "writes": 0,
         "evictions": 0, "quarantines": 0, "entries": 2,
         "payload_bytes": 123, "budget_bytes": 1000,
+        "write_depth_tokens": None,
     }}}
     assert health.verify("t2", payload, expected_entries=2) == []
 
@@ -186,6 +197,7 @@ def test_health_flags_eviction_quarantine_and_entry_drift():
         "enabled": True, "stride": 256, "restores": 0, "writes": 0,
         "evictions": 1, "quarantines": 2, "entries": 5,
         "payload_bytes": 0, "budget_bytes": None,
+        "write_depth_tokens": None,
     }}}
     codes = {f.code for f in health.verify("x", payload, expected_entries=3)}
     assert codes == {"health.evictions", "health.quarantines", "health.entries"}
@@ -196,6 +208,18 @@ def test_health_flags_disabled_disk():
     payload = {"prompt_cache": {"disk": {"enabled": False}}}
     codes = {f.code for f in health.verify("x", payload, expected_entries=0)}
     assert codes == {"health.disk_disabled"}
+
+
+def test_health_flags_write_depth_drift():
+    health = HealthExpectations(stride=256, write_depth_tokens=512)
+    payload = {"prompt_cache": {"disk": {
+        "enabled": True, "stride": 256, "restores": 0, "writes": 0,
+        "evictions": 0, "quarantines": 0, "entries": 0,
+        "payload_bytes": 0, "budget_bytes": None,
+        "write_depth_tokens": 768,
+    }}}
+    codes = {f.code for f in health.verify("x", payload, expected_entries=0)}
+    assert codes == {"health.write_depth_tokens"}
 
 
 def test_is_list_prefix():

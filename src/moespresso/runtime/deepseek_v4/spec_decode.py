@@ -49,6 +49,7 @@ import mlx.core as mx
 from moespresso.runtime.disk_kv import caches_all_at_offset
 
 from .dspark_rollback import capture_verify_state, restore_verify_state
+from .model import _cache_state_array_dependencies
 
 
 @dataclass
@@ -1161,6 +1162,9 @@ def spec_generate(
         snapshot = capture_verify_state(cache, 1 + offered)
         verify_hidden = model.model(verify_ids, cache=cache)
         target_logits = verify_logits_fn(verify_hidden).astype(mx.float32)
+        cache_dependencies = _cache_state_array_dependencies(mx, cache)
+        if cache_dependencies:
+            target_logits = mx.depends(target_logits, cache_dependencies)
         verify_rows = tap.take_rows()
 
         if temperature <= 0:

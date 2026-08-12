@@ -89,6 +89,7 @@ from moespresso.agentlib.subagent import (
     child_session_key,
 )
 from moespresso.agentlib.tools import build_core_registry
+from moespresso.runtime.disk_kv import DEFAULT_DISK_KV_WRITE_DEPTH
 from moespresso.toolcalls.dsml import parse_dsml_tool_calls
 from moespresso.toolcalls.repair import RepairTelemetry
 from moespresso.toolcalls.types import ToolCallParseError
@@ -131,6 +132,7 @@ class RunConfig:
     run_root: Path
     stride: int
     budget_bytes: int | None
+    write_depth_tokens: int | None = DEFAULT_DISK_KV_WRITE_DEPTH
     target_tokens: int = 110_000
     max_tokens: int = 700
     max_turn_steps: int = 6
@@ -234,7 +236,10 @@ class RoadtestRun:
         self.conversations: dict[str, Conversation] = {}
         self.ledgers: dict[str, SessionLedger] = {}
         self.health = HealthExpectations(
-            stride=config.stride, budget_bytes=config.budget_bytes)
+            stride=config.stride,
+            budget_bytes=config.budget_bytes,
+            write_depth_tokens=config.write_depth_tokens,
+        )
         self.findings: list[Finding] = []
         self.completed = False
         self.last_health: dict = {}
@@ -693,7 +698,8 @@ class RoadtestRun:
         expected_key = child_session_key(parent.session_cache_key, 1)
         self.ledgers["sub"] = SessionLedger(
             "sub", stride=self.health.stride,
-            disk_enabled=self.health.disk_enabled)
+            disk_enabled=self.health.disk_enabled,
+            write_depth_tokens=self.health.write_depth_tokens)
         self._last_sent["sub"] = None
         runner = SubagentRunner(
             parent,
@@ -758,12 +764,17 @@ class RoadtestRun:
                               system=self._system_prompt(SYSTEM_PROMPT_B)),
         }
         self.ledgers = {
-            "a": SessionLedger("a", stride=config.stride),
-            "b": SessionLedger("b", stride=config.stride),
+            "a": SessionLedger(
+                "a", stride=config.stride,
+                write_depth_tokens=config.write_depth_tokens),
+            "b": SessionLedger(
+                "b", stride=config.stride,
+                write_depth_tokens=config.write_depth_tokens),
         }
         self._init_nudges()
         self._event("start", run_root=str(config.run_root),
                     stride=config.stride, budget_bytes=config.budget_bytes,
+                    write_depth_tokens=config.write_depth_tokens,
                     target_tokens=config.target_tokens,
                     context_limit=config.context_limit,
                     **self._loop_record())
@@ -900,13 +911,17 @@ class RoadtestRun:
         self.health.attach_baseline(baseline)
         self.ledgers = {
             name: SessionLedger(name, stride=self.health.stride,
-                                disk_enabled=self.health.disk_enabled)
+                                disk_enabled=self.health.disk_enabled,
+                                write_depth_tokens=(
+                                    self.health.write_depth_tokens))
             for name in ("a", "b")
         }
         self._init_nudges()
         self._event("smoke_start", base_url=self.controller.base_url,
                     tag=tag, disk_enabled=self.health.disk_enabled,
-                    stride=self.health.stride, **self._loop_record())
+                    stride=self.health.stride,
+                    write_depth_tokens=self.health.write_depth_tokens,
+                    **self._loop_record())
         try:
             for turn in self.script.opening_a[:5]:
                 self.run_turn("a", turn)
@@ -988,6 +1003,20 @@ def _directory_bytes(root: Path) -> int:
     return total
 
 
+def _write_depth_arg(value: str) -> int | None:
+    if value == "unlimited":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "write depth must be a positive integer or 'unlimited'") from e
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "write depth must be a positive integer or 'unlimited'")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="moespresso-roadtest",
@@ -1009,6 +1038,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget-bytes", type=int, default=450_000_000_000,
                         help="Disk KV byte budget; sized so eviction never "
                              "fires during the run.")
+    parser.add_argument(
+        "--write-depth-tokens",
+        type=_write_depth_arg,
+        default=DEFAULT_DISK_KV_WRITE_DEPTH,
+        help="Deepest disk checkpoint frontier, or 'unlimited' "
+             f"(default: {DEFAULT_DISK_KV_WRITE_DEPTH}).",
+    )
     parser.add_argument("--target-tokens", type=int, default=110_000)
     parser.add_argument("--memory-budget-tokens", type=int, default=120_000,
                         help="Live-cache budget in token-equivalents; the "
@@ -1079,6 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
             run_root=run_root,
             stride=args.stride,
             budget_bytes=None,
+            write_depth_tokens=args.write_depth_tokens,
             target_tokens=0,
             max_tokens=args.max_tokens,
             request_timeout=args.request_timeout,
@@ -1121,6 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
         disk_root=disk_root,
         stride=args.stride,
         budget_bytes=args.budget_bytes,
+        write_depth_tokens=args.write_depth_tokens,
         log_dir=run_root / "logs",
         health_timeout=args.health_timeout,
     )
@@ -1128,6 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
         run_root=run_root,
         stride=args.stride,
         budget_bytes=args.budget_bytes,
+        write_depth_tokens=args.write_depth_tokens,
         target_tokens=args.target_tokens,
         max_tokens=args.max_tokens,
         request_timeout=args.request_timeout,

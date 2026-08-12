@@ -1062,6 +1062,51 @@ def test_resumable_dspark_cold_miss_publishes_frontier_pair_on_spec_rail(
     ) == CacheProbe("miss", 0, False)
 
 
+def test_terminal_response_callback_routes_installed_dspark_to_plain_cache(
+    monkeypatch,
+):
+    from moespresso.runtime.deepseek_v4 import spec_serve
+
+    monkeypatch.delenv(spec_serve.SPEC_SCHEDULE_ENV, raising=False)
+    store = _make_store()
+    seen = {}
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        seen.update(prompt=list(prompt), **kwargs)
+        return GenerationResult(
+            text="p",
+            generated_token_ids=(9,),
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    generator, served = _resume_generator(
+        [1, 2, 3, 4], store, fake_generate)
+    def stop():
+        return False
+    result = generator(
+        "prompt",
+        kv_policy=_raw_policy(),
+        effective_rendering_id="r",
+        temperature=0.0,
+        response_stop_callback=stop,
+    )
+
+    assert seen["prompt"] == [1, 2, 3, 4]
+    assert seen["prompt_cache"] is not None
+    assert seen["response_stop_callback"] is stop
+    assert "spec_continuation" not in seen
+    assert result.speculative is None
+    model_key = cache_model_key(generator.manifest, "r", _raw_policy())
+    assert store.probe_nearest_cache(
+        model_key, [1, 2, 3, 4, 9]
+    ) == CacheProbe("exact", 5, False)
+    assert store.probe_nearest_cache(
+        model_key,
+        [1, 2, 3, 4, 9],
+        producer_rail=spec_cache_producer_rail(served),
+    ) == CacheProbe("miss", 0, False)
+
+
 def test_resumable_dspark_quantized_live_kv_uses_plain_cache_rail(monkeypatch):
     from moespresso.runtime.deepseek_v4 import spec_serve
 
@@ -1743,6 +1788,53 @@ def test_stream_callback_failure_does_not_publish_partial_cache():
             response_callback=lambda step, response: None,
         )
     assert store.insert_calls == []
+
+
+def test_terminal_stream_stop_publishes_only_the_committed_token_frontier():
+    tok = _FakeTokenizer([1, 2, 3])
+    store = _FakeStore()
+
+    def fake_generate(model, tokenizer, prompt, **kwargs):
+        del model, tokenizer, prompt
+        generated = []
+        for step, (text, token) in enumerate(
+            (("call", 4), (" close", 5), (" late", 6)), 1
+        ):
+            generated.append(token)
+            response = SimpleNamespace(text=text, token=token)
+            kwargs["response_callback"](step, response)
+            if kwargs["response_stop_callback"]():
+                break
+        return GenerationResult(
+            text="call close",
+            finish_reason="stop",
+            completion_tokens=len(generated),
+            generated_token_ids=tuple(generated),
+            prompt_cache=kwargs["prompt_cache"],
+        )
+
+    terminal = False
+
+    def capture(_step, response):
+        nonlocal terminal
+        terminal = response.text == " close"
+
+    gen = PrefixCacheGenerator(
+        "MODEL", tok, {"artifact_id": "pkg"}, store,
+        make_prompt_cache_fn=lambda model: ["new"],
+        generate_fn=fake_generate,
+    )
+    result = gen(
+        "rendered prompt",
+        kv_policy=parse_kv_policy({"live_kv_format": "raw"}),
+        effective_rendering_id="render-id",
+        response_callback=capture,
+        response_stop_callback=lambda: terminal,
+    )
+
+    assert result.generated_token_ids == (4, 5)
+    assert result.completion_tokens == 2
+    assert store.insert_calls[0][1] == [1, 2, 3, 4, 5]
 
 
 def test_streaming_preserves_frontier_plan_writes_tokens_and_cache_key():

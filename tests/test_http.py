@@ -28,7 +28,7 @@ from moespresso.runtime.http import (
     serialized_generator,
     serialized_stats,
 )
-from moespresso.runtime.generation import GenerationResult
+from moespresso.runtime.generation import ContextLimitError, GenerationResult
 
 
 def _deepseek_v4_manifest():
@@ -477,8 +477,6 @@ def test_declared_context_limit_resolves_both_package_shapes():
 
 
 def test_chat_completion_maps_context_limit_error_to_a_400():
-    from moespresso.runtime.generation import ContextLimitError
-
     def refusing_generate(prompt, **opts):
         raise ContextLimitError(
             limit=262144, prompt_tokens=260000, max_tokens=4096)
@@ -490,6 +488,8 @@ def test_chat_completion_maps_context_limit_error_to_a_400():
             refusing_generate,
         )
     assert e.value.status == 400
+    assert e.value.code == "context_length_exceeded"
+    assert e.value.error_type == "invalid_request_error"
     assert "262144" in e.value.message
     assert "260000" in e.value.message
     assert "max_tokens 4096" in e.value.message
@@ -841,6 +841,97 @@ def test_bad_request_returns_400(server):
     assert "messages" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_context_limit_error_returns_machine_readable_code_before_stream(stream):
+    def refusing_generate(prompt, **opts):
+        raise ContextLimitError(
+            limit=131072,
+            prompt_tokens=99141,
+            max_tokens=32000,
+        )
+
+    handler = make_handler(refusing_generate, model_id="context-model")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32000,
+                "stream": stream,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(request)
+        assert exc.value.code == 400
+        body = json.loads(exc.value.read())
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert body == {"error": {
+        "message": (
+            "the request exceeds the served context limit of 131072 tokens: "
+            "99141 prompt tokens plus max_tokens 32000"
+        ),
+        "type": "invalid_request_error",
+        "code": "context_length_exceeded",
+    }}
+
+
+def test_context_limit_error_in_started_stream_uses_standard_error_event():
+    def started_then_refused(prompt, **opts):
+        opts["ready_callback"]()
+        raise ContextLimitError(
+            limit=131072,
+            prompt_tokens=99141,
+            max_tokens=32000,
+        )
+
+    handler = make_handler(started_then_refused, model_id="context-model")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32000,
+                "stream": True,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+            payload = response.read().decode()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    records = [
+        json.loads(line.removeprefix("data: "))
+        for line in payload.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert records[-1] == {
+        "type": "error",
+        "error": {
+            "message": (
+                "the request exceeds the served context limit of 131072 "
+                "tokens: 99141 prompt tokens plus max_tokens 32000"
+            ),
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+        },
+    }
+
+
 def test_invalid_json_returns_400(server):
     req = urllib.request.Request(
         server + "/v1/chat/completions", data=b"{not json",
@@ -1152,9 +1243,6 @@ def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):
     )
     events = []
 
-    class _Stop(Exception):
-        pass
-
     def fake_load_model(_package_dir):
         events.append("load")
         return "MODEL", "TOKENIZER", manifest
@@ -1164,25 +1252,79 @@ def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):
         assert (model, tokenizer) == ("MODEL", "TOKENIZER")
         return 1.25
 
+    class FakeCacheGenerator:
+        def __call__(self, *_args, **_kwargs):
+            return "generated"
+
+        def cache_stats(self):
+            return {}
+
+        def close(self):
+            events.append("cache-close")
+
     def fake_build_cache_generator(*_args, **_kwargs):
         events.append("cache")
-        raise _Stop
+        return FakeCacheGenerator()
+
+    class FakeHTTPServer:
+        def __init__(self, address, _handler):
+            events.append(("bind", address))
+
+        def serve_forever(self):
+            events.append("serve")
+
+        def server_close(self):
+            events.append("server-close")
 
     monkeypatch.setattr(h, "build_cache_generator", fake_build_cache_generator)
+    monkeypatch.setattr(h, "HTTPServer", FakeHTTPServer)
 
-    with pytest.raises(_Stop):
-        h.serve(
-            "/tmp/pkg",
-            load_model_fn=fake_load_model,
-            startup_warmup_fn=fake_warmup,
-        )
+    result = h.serve(
+        "/tmp/pkg",
+        load_model_fn=fake_load_model,
+        startup_warmup_fn=fake_warmup,
+        ready_callback=lambda: events.append("ready"),
+    )
 
-    assert events == ["load", "warmup", "cache"]
+    assert result == 0
+    assert events == [
+        "load",
+        "warmup",
+        "cache",
+        ("bind", ("127.0.0.1", 8080)),
+        "ready",
+        "serve",
+        "server-close",
+        "cache-close",
+    ]
     out = capsys.readouterr().out
     warming = out.index("warming up generation; server is not ready")
     ready = out.index("startup warmup 1.25s; generation ready")
     serving = out.index("serving on")
     assert warming < ready < serving
+
+
+def test_serve_does_not_announce_readiness_when_warmup_fails(capsys):
+    import moespresso.runtime.http as h
+
+    manifest = _deepseek_v4_manifest()
+    ready = []
+
+    def fail_warmup(*_args, **_kwargs):
+        raise RuntimeError("warmup failed")
+
+    result = h.serve(
+        "/tmp/pkg",
+        load_model_fn=lambda _package: ("MODEL", "TOKENIZER", manifest),
+        startup_warmup_fn=fail_warmup,
+        ready_callback=lambda: ready.append(True),
+    )
+
+    assert result == 2
+    assert ready == []
+    out = capsys.readouterr().out
+    assert "FAILED: startup warmup: warmup failed" in out
+    assert "serving on" not in out
 
 
 def test_main_passes_deepseek_v4_thinking_selection_to_serve(

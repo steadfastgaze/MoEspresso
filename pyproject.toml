@@ -1,6 +1,6 @@
 [project]
 name = "moespresso"
-version = "2.1.0"
+version = "2.1.1"
 description = "Run large Mixture-of-Experts language models well on the memory you have."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -61,7 +61,7 @@ moespresso-convert = "moespresso.package.convert:main"
 # verification, see moespresso-verify.
 moespresso-generate = "moespresso.runtime.serve:main"
 # Same seam, exposed as a long-running OpenAI-compatible HTTP server.
-moespresso-serve = "moespresso.runtime.http:main"
+moespresso-serve = "moespresso.serve_supervisor:main"
 # On-demand integrity gate (sha256)
 moespresso-verify = "moespresso.runtime.serve:verify_main"
 # Remote Hugging Face model/header inspection without downloading full weights.

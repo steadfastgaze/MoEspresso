@@ -40,7 +40,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _command(command: str) -> tuple[Callable, str]:
     if command == "serve":
-        from moespresso.runtime.http import main
+        from moespresso.serve_supervisor import main
 
         return main, "moespresso serve"
     if command == "generate":

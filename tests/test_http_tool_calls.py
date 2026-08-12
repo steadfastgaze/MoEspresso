@@ -13,6 +13,7 @@ replayed tool turns that prefix reuse depends on.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,6 +70,32 @@ DSML_EMISSION = (
 def _generate_returning(text, finish_reason="stop", **fields):
     def generate(prompt, **opts):
         return GenerationResult(text=text, finish_reason=finish_reason, **fields)
+    return generate
+
+
+def _generate_incrementally(pieces):
+    """Fake the plain decode loop, including its terminal callback contract."""
+    def generate(prompt, **opts):
+        del prompt
+        accepted = []
+        token_ids = []
+        for index, piece in enumerate(pieces, 1):
+            accepted.append(piece)
+            token_ids.append(100 + index)
+            callback = opts.get("response_callback")
+            if callback is not None:
+                callback(index, SimpleNamespace(text=piece, token=100 + index))
+            stop = opts.get("response_stop_callback")
+            if stop is not None and stop():
+                break
+        return GenerationResult(
+            text="".join(accepted),
+            finish_reason="stop",
+            prompt_tokens=7,
+            completion_tokens=len(token_ids),
+            generated_token_ids=tuple(token_ids),
+        )
+
     return generate
 
 
@@ -555,6 +582,94 @@ def test_dsml_swap_parses_dsml_emission_with_typed_values():
     calls = choice["message"]["tool_calls"]
     assert json.loads(calls[0]["function"]["arguments"]) == {
         "filePath": "/proj/README.md", "limit": 5}
+
+
+def test_dsml_outer_block_stops_streaming_and_nonstreaming_at_same_boundary():
+    duplicate = DSML_EMISSION.replace("/proj/README.md", "/proj/LATE.md")
+    pieces = [
+        "planning</think>\n",
+        DSML_EMISSION[:-8],
+        DSML_EMISSION[-8:],
+        "</think>late text\n",
+        duplicate,
+    ]
+    request = _tool_request()
+    config = http.ToolCallConfig(dialect="dsml")
+
+    plain = http.chat_completion(
+        request,
+        _generate_incrementally(pieces),
+        tool_config=config,
+    )
+    deltas = []
+    call_deltas = []
+    streamed = http.chat_completion(
+        request,
+        _generate_incrementally(pieces),
+        tool_config=config,
+        delta_callback=lambda kind, text: deltas.append((kind, text)),
+        tool_delta_callback=lambda index, entry: call_deltas.append(
+            (index, entry)),
+    )
+
+    assert plain["choices"] == streamed["choices"]
+    choice = plain["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    assert choice["message"]["reasoning_content"] == "planning"
+    assert len(choice["message"]["tool_calls"]) == 1
+    assert json.loads(
+        choice["message"]["tool_calls"][0]["function"]["arguments"]
+    )["filePath"] == "/proj/README.md"
+    assert plain["usage"]["completion_tokens"] == 3
+    assert len(call_deltas) == 1
+    assert all("late" not in text.lower() for _kind, text in deltas)
+
+
+def test_qwen_tool_stream_has_no_terminal_generation_callback():
+    seen = {}
+
+    def generate(prompt, **opts):
+        del prompt
+        seen.update(opts)
+        return GenerationResult(text=QWEN_EMISSION)
+
+    response = http.chat_completion(_tool_request(), generate)
+
+    assert "response_stop_callback" not in seen
+    assert len(response["choices"][0]["message"]["tool_calls"]) == 2
+
+
+def test_dsml_swap_keeps_qwen_bleed_nonterminal_until_outer_dsml_block():
+    pieces = [QWEN_EMISSION, "\n", DSML_EMISSION, "late"]
+    response = http.chat_completion(
+        _tool_request(),
+        _generate_incrementally(pieces),
+        tool_config=http.ToolCallConfig(dialect="dsml"),
+    )
+
+    choice = response["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert [
+        entry["function"]["name"]
+        for entry in choice["message"]["tool_calls"]
+    ] == ["read", "read", "read"]
+    assert response["usage"]["completion_tokens"] == 3
+
+
+def test_repaired_naked_dsml_stops_nonstreaming_before_late_duplicate():
+    naked = DSML_EMISSION.removeprefix(
+        f"<{DSML_TOKEN}tool_calls>\n").removesuffix(
+            f"\n</{DSML_TOKEN}tool_calls>")
+    pieces = ["plan</think>\n", naked[:-5], naked[-5:], "\n", DSML_EMISSION]
+    response = http.chat_completion(
+        _tool_request(),
+        _generate_incrementally(pieces),
+        tool_config=http.ToolCallConfig(dialect="dsml"),
+    )
+
+    assert len(response["choices"][0]["message"]["tool_calls"]) == 1
+    assert response["usage"]["completion_tokens"] == 3
 
 
 def test_dsml_swap_still_parses_native_xml_bleed():

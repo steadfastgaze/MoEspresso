@@ -1180,6 +1180,16 @@ def spec_generation_result(
         on_commit=emitter.feed,
         **schedule_kwargs,
     )
+    target_cache = getattr(generation, "target_cache", None)
+    if target_cache is not None:
+        from moespresso.runtime.deepseek_v4.model import (
+            evaluate_deepseek_v4_cache_state,
+        )
+
+        evaluate_deepseek_v4_cache_state(
+            target_cache,
+            asynchronous=False,
+        )
     generation_seconds = time.perf_counter() - t_start
     text, finish_reason = emitter.finish()
     stats = generation.stats

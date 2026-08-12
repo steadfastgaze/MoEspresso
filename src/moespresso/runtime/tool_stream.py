@@ -50,7 +50,9 @@ class ToolDialect:
     they cannot accept. ``attempt_blocks`` are additional (open, close)
     marker pairs that delimit a call attempt outside a complete block (a
     naked function element); a buffered attempt fails the strict parse and
-    goes through repair like any malformed block.
+    goes through repair like any malformed block. ``terminal_primary_block``
+    makes the first primary or repaired naked block that yields valid calls
+    end generation. DSML enables it for both shapes; Qwen XML enables neither.
     """
 
     name: str
@@ -59,6 +61,8 @@ class ToolDialect:
     parse: Callable[[str, dict], list[ToolCall]]
     repair: Callable[[str, dict], list[ToolCall]]
     attempt_blocks: tuple[tuple[str, str], ...] = ()
+    terminal_primary_block: bool = False
+    terminal_attempt_block: bool = False
 
 
 QWENXML_DIALECT = ToolDialect(
@@ -79,6 +83,8 @@ DSML_DIALECT = ToolDialect(
     attempt_blocks=(
         (dsml.INVOKE_OPEN_PREFIX, f"</{dsml.DSML_TOKEN}invoke>"),
     ),
+    terminal_primary_block=True,
+    terminal_attempt_block=True,
 )
 
 
@@ -126,13 +132,14 @@ class ToolCallStreamer:
         self.coercion_misses = 0
         self.content_parts: list[str] = []
         self.buffer = ""
-        # While buffering a block: the owning dialect and the close marker
-        # of the specific (primary or attempt) block that opened.
-        self.active: tuple[ToolDialect, str] | None = None
+        # While buffering a block: the owning dialect, its close marker, and
+        # whether the outer primary marker rather than an attempt opened it.
+        self.active: tuple[ToolDialect, str, bool] | None = None
         self._held_ws = ""
         self._line_start = True
         self._scan_from = 0
         self._finished = False
+        self.terminal = False
 
     @property
     def content(self) -> str:
@@ -179,8 +186,8 @@ class ToolCallStreamer:
             if self.emit_tool_call is not None:
                 self.emit_tool_call(index, entry)
 
-    def _repair_or_flush(self, dialect: ToolDialect, text: str) -> None:
-        """Repair a strict-parse failure; text that still fails is content."""
+    def _repair_or_flush(self, dialect: ToolDialect, text: str) -> bool:
+        """Repair a strict-parse failure and report whether calls survived."""
         if self.repair_enabled:
             try:
                 salvaged = dialect.repair(text, self.schemas)
@@ -189,18 +196,20 @@ class ToolCallStreamer:
             self.telemetry.record(salvaged=bool(salvaged))
             if salvaged:
                 self._emit_calls(salvaged)
-                return
+                return True
         self._flush_content(text)
+        return False
 
-    def _handle_block(self, dialect: ToolDialect, block: str) -> None:
+    def _handle_block(self, dialect: ToolDialect, block: str) -> bool:
+        """Handle one block and report whether strict parsing accepted it."""
         try:
             parsed = dialect.parse(block, self.schemas)
         except ToolCallParseError:
             parsed = []
         if parsed:
             self._emit_calls(parsed)
-            return
-        self._repair_or_flush(dialect, block)
+            return True
+        return self._repair_or_flush(dialect, block)
 
     # --- marker scanning -------------------------------------------------
 
@@ -241,12 +250,14 @@ class ToolCallStreamer:
     def push(self, text: str) -> None:
         if self._finished:
             raise RuntimeError("push after finish")
+        if self.terminal:
+            return
         if not text:
             return
         self.buffer += text
         while True:
             if self.active is not None:
-                dialect, close_marker = self.active
+                dialect, close_marker, primary = self.active
                 end = self.buffer.find(close_marker, self._scan_from)
                 if end < 0:
                     # Resume the next scan where this one left off; a close
@@ -260,7 +271,18 @@ class ToolCallStreamer:
                     return
                 block = self._consume(end + len(close_marker))
                 self.active = None
-                self._handle_block(dialect, block)
+                accepted = self._handle_block(dialect, block)
+                terminal_block = (
+                    dialect.terminal_primary_block
+                    if primary
+                    else dialect.terminal_attempt_block
+                )
+                if accepted and terminal_block:
+                    # DeepSeek ends the assistant turn at the first valid DSML
+                    # call unit. The repaired naked-invoke form is an accepted
+                    # bounded substitute for the missing outer wrapper.
+                    self.terminal = True
+                    return
                 # The character after a close marker is a block boundary;
                 # counting it as a line start lets a glued next block parse.
                 self._line_start = True
@@ -269,7 +291,11 @@ class ToolCallStreamer:
             if found is not None:
                 index, dialect, open_marker, close_marker = found
                 self._flush_content(self._consume(index))
-                self.active = (dialect, close_marker)
+                self.active = (
+                    dialect,
+                    close_marker,
+                    open_marker == dialect.open_marker,
+                )
                 self._scan_from = len(open_marker)
                 continue
             hold = self._hold_length()
@@ -287,13 +313,15 @@ class ToolCallStreamer:
         if self._finished:
             return
         if self.active is not None:
-            dialect, _close_marker = self.active
+            dialect, _close_marker, _primary = self.active
             raw, self.buffer = self.buffer, ""
             self.active = None
             if truncated:
                 self._flush_content(raw)
             else:
                 self._repair_or_flush(dialect, raw)
+        elif self.terminal:
+            self.buffer = ""
         elif self.buffer:
             self._flush_content(self._consume(len(self.buffer)))
         if self._held_ws:

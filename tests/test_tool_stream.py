@@ -470,25 +470,24 @@ def _finish_with(text, *, dialects=(DSML_DIALECT,), truncated):
 
 def test_dsml_orphan_close_after_naked_invoke_still_fires_the_call():
     # The wrapper open is dropped and the wrapper close is kept. The naked
-    # invoke buffers as an attempt and repair salvages the call. The
-    # orphaned close has no open to anchor to, so it is ordinary prose and
-    # currently leaks the marker text into visible content.
+    # invoke buffers as an attempt and repair salvages the call. That call
+    # unit terminates DSML, so the orphaned wrapper close cannot leak.
     streamer, content_deltas, _ = _run(
         DSML_NAKED_INVOKE + f"\n</{T}tool_calls>", dialects=(DSML_DIALECT,))
     assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
-    assert streamer.content == f"\n</{T}tool_calls>"
-    assert "".join(content_deltas) == f"\n</{T}tool_calls>"
+    assert streamer.content == ""
+    assert content_deltas == []
     assert streamer.telemetry.as_dict() == {
         "fires": 1, "salvaged": 1, "failed": 0}
 
 
 def test_dsml_orphan_close_duplicated_after_block_still_fires_the_call():
-    # A well-formed block followed by a second close marker: the block parses
-    # strictly and the surplus close leaks the same way.
+    # A well-formed outer block terminates DSML at its own close marker, so a
+    # second close cannot leak into the served turn.
     streamer, _, _ = _run(
         DSML_BASH_BLOCK + f"\n</{T}tool_calls>", dialects=(DSML_DIALECT,))
     assert _names_and_arguments(streamer) == [("bash", {"command": "ls"})]
-    assert streamer.content == f"\n</{T}tool_calls>"
+    assert streamer.content == ""
     assert streamer.telemetry.fires == 0
 
 

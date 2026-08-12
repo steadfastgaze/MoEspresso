@@ -619,6 +619,7 @@ def generate_with_metadata(
     prefill_plan: list[int] | None = None,
     prompt_progress_callback: Callable[[int, int], None] | None = None,
     response_callback: Callable[[int, object], None] | None = None,
+    response_stop_callback: Callable[[], bool] | None = None,
     first_token_callback: Callable[[], None] | None = None,
     spec_continuation_ready_callback: Callable[[], None] | None = None,
     spec_continuation=None,
@@ -648,6 +649,12 @@ def generate_with_metadata(
     of the plain disk writer's plan and callback. They are accepted only by an
     eligible speculative request and cannot silently fall through to the plain
     stream.
+
+    ``response_stop_callback`` is evaluated after the matching
+    ``response_callback`` for each committed token. A true result ends the
+    plain stream at that token and publishes only that generated prefix. Its
+    presence makes the request ineligible for speculative decoding because a
+    speculative round has no arbitrary text-boundary rollback contract.
 
     ``prefill_plan`` gives the leading prompt tokens variable-size prefill
     chunks (the disk-KV frontier writer sizes them so a chunk end lands on
@@ -758,6 +765,7 @@ def generate_with_metadata(
         and prompt_cache is None
         and kv_kwargs.get("kv_bits") is None
         and int(max_tokens) >= 1
+        and response_stop_callback is None
     ):
         from moespresso.runtime.deepseek_v4.spec_serve import (
             spec_generation_result,
@@ -865,6 +873,7 @@ def generate_with_metadata(
             min_p=min_p,
         )
 
+    stopped_by_response = False
     for response in stream_generate_fn(
         model=model,
         tokenizer=tokenizer,
@@ -889,6 +898,19 @@ def generate_with_metadata(
             token_logprobs.append(_logprob_at(response_logprobs, token_id))
         if response_callback is not None:
             response_callback(len(generated), response)
+        if response_stop_callback is not None and response_stop_callback():
+            stopped_by_response = True
+            break
+    # A DS4 forward updates local KV plus compressor/indexer state. Some
+    # partial-window updates are not otherwise on the logits graph, so commit
+    # the public cache tree before it can enter an in-memory or disk tier.
+    if getattr(model, "_moespresso_dsv4_attention_cache_contract", None):
+        from moespresso.runtime.deepseek_v4.model import (
+            evaluate_deepseek_v4_cache_state,
+        )
+
+        evaluate_deepseek_v4_cache_state(prompt_cache, asynchronous=False)
+
     generation_seconds = time.perf_counter() - t_start
 
     if persist_expert_demand:
@@ -911,9 +933,11 @@ def generate_with_metadata(
 
     return GenerationResult(
         text="".join(text_parts),
-        finish_reason=last.finish_reason or "length",
+        finish_reason=(
+            "stop" if stopped_by_response else last.finish_reason or "length"
+        ),
         prompt_tokens=int(last.prompt_tokens) + plan_consumed,
-        completion_tokens=int(last.generation_tokens),
+        completion_tokens=len(generated),
         cached_tokens=cached_tokens,
         generated_token_ids=tuple(generated),
         token_logprobs=tuple(token_logprobs),

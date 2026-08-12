@@ -806,6 +806,37 @@ def test_spec_generation_result_length_flushes_final_segment():
     assert seen == [(1, 5, "5", None), (2, 6, " 6", "length")]
 
 
+def test_spec_generation_materializes_target_cache_before_return(monkeypatch):
+    import moespresso.runtime.deepseek_v4.model as ds4_model
+
+    target_cache = [object()]
+    calls = []
+    monkeypatch.setattr(
+        ds4_model,
+        "evaluate_deepseek_v4_cache_state",
+        lambda caches, *, asynchronous: calls.append(
+            (caches, asynchronous)),
+    )
+
+    def fake_run(model, **kwargs):
+        kwargs["on_commit"]([5])
+        generation = _generation([5])
+        generation.target_cache = target_cache
+        return generation
+
+    spec_generation_result(
+        "MODEL",
+        _DecodeTokenizer(),
+        _served(),
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=0.0,
+        spec_generate_fn=fake_run,
+    )
+
+    assert calls == [(target_cache, False)]
+
+
 @pytest.mark.parametrize(
     ("token", "max_tokens", "expected_reason"),
     [(99, 4, "stop"), (5, 1, "length")],

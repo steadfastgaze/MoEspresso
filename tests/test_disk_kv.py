@@ -31,6 +31,7 @@ from moespresso.runtime.disk_kv import (
     DiskKVError,
     DiskKVIndex,
     DiskKVMetadataMismatch,
+    DiskKVRestoreUnavailable,
     DiskKVRootLock,
     DiskKVRootLocked,
     DiskKVStrideError,
@@ -471,6 +472,83 @@ def test_restore_normalizes_a_corrupt_index_to_diskkverror(tmp_path):
     assert stats["enabled"] is True
     assert "index unreadable" in stats["error"]
     assert stats["writes_disabled"] is True
+
+
+def test_runtime_restore_failure_retains_checkpoint_until_reopen(
+    tmp_path, monkeypatch,
+):
+    import mlx.core as mx
+
+    scope = _scope()
+    writer = DiskCheckpointStore(
+        tmp_path,
+        save_payload_fn=_file_save_fn(100),
+        log_fn=lambda line: None,
+    )
+    entry = _write(writer, scope, [1, 2, 3])
+    metadata = build_safety_metadata(entry)
+    payload = tmp_path / entry.payload_path
+
+    class KVCache:
+        state = None
+        meta_state = None
+
+    load_calls = 0
+
+    def load_payload(root, payload_path):
+        nonlocal load_calls
+        load_calls += 1
+        return [[mx.array([1.0])]], [[]], metadata
+
+    store = DiskCheckpointStore(
+        tmp_path,
+        load_payload_fn=load_payload,
+        log_fn=lambda line: None,
+    )
+
+    def fail_eval(*arrays):
+        raise RuntimeError("[Event::Event] Failed to create Metal shared event.")
+
+    monkeypatch.setattr(mx, "eval", fail_eval)
+    with pytest.raises(DiskKVRestoreUnavailable, match="restore unavailable"):
+        store.restore(
+            scope,
+            [1, 2, 3, 4],
+            make_cache_fn=lambda: [KVCache()],
+            registry={"KVCache"},
+        )
+
+    assert store.restores_disabled is True
+    assert store.quarantines == 0
+    assert payload.exists()
+    assert store.index.find_exact(scope, [1, 2, 3]) == entry
+    assert store.restore(
+        scope,
+        [1, 2, 3, 4],
+        make_cache_fn=lambda: [KVCache()],
+        registry={"KVCache"},
+    ) is None
+    assert load_calls == 1
+    stats = store.stats()
+    assert stats["restores_disabled"] is True
+    assert "Metal shared event" in stats["restores_disabled_reason"]
+
+    monkeypatch.undo()
+    reopened = DiskCheckpointStore(
+        tmp_path,
+        load_payload_fn=load_payload,
+        log_fn=lambda line: None,
+    )
+    hit = reopened.restore(
+        scope,
+        [1, 2, 3, 4],
+        make_cache_fn=lambda: [KVCache()],
+        registry={"KVCache"},
+    )
+    assert hit is not None
+    assert hit.cached_tokens == 3
+    assert reopened.restores_disabled is False
+    assert reopened.quarantines == 0
 
 
 def test_stats_alone_confirms_the_fault_and_disables_writes(tmp_path):
@@ -1181,6 +1259,7 @@ def test_stats_counters_reflect_writes_evictions_and_quarantines(tmp_path):
     scope = _scope()
     store = DiskCheckpointStore(
         tmp_path, save_payload_fn=_file_save_fn(100), budget_bytes=150,
+        write_depth_tokens=2048,
         log_fn=lambda line: None)
     first = _write(store, scope, [1, 2], now=1)
     _write(store, scope, [1, 2, 3], now=2)  # evicts the first (budget 150)
@@ -1191,6 +1270,7 @@ def test_stats_counters_reflect_writes_evictions_and_quarantines(tmp_path):
     assert stats["quarantines"] == 0
     assert stats["budget_bytes"] == 150
     assert stats["stride"] is None
+    assert stats["write_depth_tokens"] == 2048
     assert stats["payload_bytes"] == 100
 
     # Quarantine bumps its counter.

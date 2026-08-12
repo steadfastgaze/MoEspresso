@@ -31,9 +31,24 @@ from moespresso.agentlib.roadtest.run import (
     RunConfig,
     _package_run_settings,
 )
+from moespresso.agentlib.roadtest.server import _process_tree_rss_bytes
+from moespresso.runtime.disk_kv import DEFAULT_DISK_KV_WRITE_DEPTH
 from moespresso.toolcalls.dsml import render_dsml_tool_calls
 
 STRIDE = 256
+
+
+def test_process_tree_rss_includes_supervised_worker_session():
+    listing = """
+      10   1  100
+      11  10  200
+      12  11  300
+      13   1  400
+      bad row
+    """
+
+    assert _process_tree_rss_bytes(listing, 10) == 600 * 1024
+    assert _process_tree_rss_bytes(listing, 99) is None
 
 
 def test_package_run_settings_use_default_served_context_limit(tmp_path):
@@ -125,8 +140,13 @@ class FakeEngineState:
     assert the request policy fields the driver sent.
     """
 
-    def __init__(self, stride: int = STRIDE):
+    def __init__(
+        self,
+        stride: int = STRIDE,
+        write_depth_tokens: int | None = DEFAULT_DISK_KV_WRITE_DEPTH,
+    ):
         self.stride = stride
+        self.write_depth_tokens = write_depth_tokens
         self.disk: dict[tuple, bool] = {}
         self.memory: list[tuple] = []
         self.restores = 0
@@ -165,6 +185,9 @@ class FakeEngineState:
         written = 0
         frontier = (cached // self.stride + 1) * self.stride
         while frontier < len(full):
+            if (self.write_depth_tokens is not None
+                    and frontier > self.write_depth_tokens):
+                break
             key = full[:frontier]
             if key not in self.disk:
                 self.disk[key] = True
@@ -219,6 +242,7 @@ class FakeEngineState:
                     "entries": len(self.disk),
                     "payload_bytes": sum(len(k) for k in self.disk),
                     "budget_bytes": None,
+                    "write_depth_tokens": self.write_depth_tokens,
                     "restores": self.restores,
                     "writes": self.writes,
                     "evictions": 0,

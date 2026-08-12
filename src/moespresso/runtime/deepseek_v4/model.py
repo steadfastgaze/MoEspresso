@@ -72,6 +72,8 @@ _DSV4_Q8_FFN_HC_POST_CONTEXT: ContextVar[Any] = ContextVar(
     default=None,
 )
 
+_CACHE_STATE_EVAL_INTERVAL = 64
+
 
 def declared_mtp_block_count(config: Mapping[str, Any]) -> int:
     """How many next-token-prediction blocks the config declares.
@@ -654,6 +656,120 @@ def _patch_deepseek_v4_cache_store_nbytes(cache_cls) -> bool:
         return False
     cache_cls.nbytes = property(_deepseek_v4_cache_store_nbytes)
     cache_cls._moespresso_dsv4_store_nbytes = True
+    return True
+
+
+def _cache_state_array_dependencies(mx, caches) -> list:
+    """Collect unique arrays from every DS4 cache's public state."""
+    caches = tuple(caches or ())
+    if not any(
+        hasattr(cache, "compressor_state")
+        and hasattr(cache, "indexer_state")
+        for cache in caches
+        if cache is not None
+    ):
+        return []
+    arrays = []
+    seen = set()
+
+    def visit(value) -> None:
+        if isinstance(value, mx.array):
+            identity = id(value)
+            if identity not in seen:
+                seen.add(identity)
+                arrays.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for cache in caches:
+        if cache is not None:
+            visit(cache.state)
+    return arrays
+
+
+def _cache_state_evaluation_due(caches, input_ids, interval: int) -> bool:
+    if interval <= 0:
+        return False
+    shape = tuple(getattr(input_ids, "shape", ()))
+    rows = int(shape[-1]) if shape else 1
+    if rows <= 0:
+        return False
+    for cache in caches or ():
+        offset = getattr(cache, "offset", None)
+        if isinstance(offset, int) and not isinstance(offset, bool):
+            start = max(0, offset - rows)
+            return start // interval != offset // interval
+    return False
+
+
+def evaluate_deepseek_v4_cache_state(
+    caches,
+    *,
+    asynchronous: bool,
+    mx_module=None,
+) -> int:
+    """Evaluate the public DS4 cache state and return its array count."""
+    if mx_module is None:
+        import mlx.core as mx_module
+
+    arrays = _cache_state_array_dependencies(mx_module, caches)
+    if arrays:
+        evaluator = (
+            mx_module.async_eval if asynchronous else mx_module.eval
+        )
+        evaluator(*arrays)
+    return len(arrays)
+
+
+def _patch_deepseek_v4_cache_state_dependencies(model, *, mx_module=None) -> bool:
+    """Materialize public cache state at bounded decode intervals.
+
+    DS4 updates local KV, compressor, and indexer state in one forward. Some
+    partial-window updates do not otherwise contribute to that forward's
+    logits. Leaving them outside the evaluated graph retains their input
+    buffers until a later window boundary, and fixed-capacity decode repeats
+    that pattern across layers. The process can consequently exhaust MLX's
+    live Metal-buffer limit during a sustained session.
+
+    The periodic output dependency matches mlx-lm's prefill evaluation
+    contract without synchronizing the generation loop or adding another
+    asynchronous event. This changes no values and works for fixed, stock,
+    restored, and forked caches.
+    """
+    if not callable(model):
+        return False
+    if mx_module is None:
+        import mlx.core as mx_module
+
+    model_cls = type(model)
+    marker = "_moespresso_dsv4_cache_state_dependency_patch"
+    if not model_cls.__dict__.get(marker, False):
+        original_call = model_cls.__call__
+
+        def call_with_cache_state(self, input_ids, cache=None, mask=None):
+            output = original_call(self, input_ids, cache=cache, mask=mask)
+            interval = int(getattr(
+                self,
+                "_moespresso_dsv4_cache_state_eval_interval",
+                0,
+            ) or 0)
+            if _cache_state_evaluation_due(cache, input_ids, interval):
+                dependencies = _cache_state_array_dependencies(mx_module, cache)
+                if dependencies:
+                    output = mx_module.depends(output, dependencies)
+            return output
+
+        model_cls.__call__ = call_with_cache_state
+        setattr(model_cls, marker, True)
+    object.__setattr__(
+        model,
+        "_moespresso_dsv4_cache_state_eval_interval",
+        _CACHE_STATE_EVAL_INTERVAL,
+    )
     return True
 
 
@@ -5166,6 +5282,7 @@ def load_deepseek_v4_package_model(
     _patch_deepseek_v4_hc_fused(model)
     _patch_deepseek_v4_q8_hc_post(model)
     _patch_deepseek_v4_required_attention_cache(model)
+    _patch_deepseek_v4_cache_state_dependencies(model)
     _patch_deepseek_v4_attention_fp16_qkv(model)
     _patch_deepseek_v4_attention_seam_rope(model)
 

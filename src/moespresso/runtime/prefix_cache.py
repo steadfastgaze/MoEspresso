@@ -915,6 +915,7 @@ class PrefixCacheGenerator:
         ready_callback: Callable[[], None] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
         response_callback: Callable[[int, object], None] | None = None,
+        response_stop_callback: Callable[[], bool] | None = None,
     ) -> GenerationResult:
         validate_manifest_cache_policy(self.manifest, kv_policy)
 
@@ -955,6 +956,11 @@ class PrefixCacheGenerator:
             min_p=min_p,
             presence_penalty=presence_penalty,
         )
+        if response_stop_callback is not None:
+            # The speculative loop may commit several accepted tokens at once.
+            # Until it can roll back to an arbitrary text-detected boundary,
+            # terminal tool-call requests use the one-token plain stream.
+            spec_engaged = False
         spec_rail = self._spec_producer_rail() if spec_engaged else None
         enhanced_spec = (
             spec_rail is not None
@@ -1265,6 +1271,8 @@ class PrefixCacheGenerator:
             )
         if response_callback is not None:
             generate_kwargs["response_callback"] = response_callback
+        if response_stop_callback is not None:
+            generate_kwargs["response_stop_callback"] = response_stop_callback
         generate_kwargs["first_token_callback"] = first_token_callback
 
         call_kwargs = dict(

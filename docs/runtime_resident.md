@@ -170,11 +170,11 @@ mlx_lm kwargs here.
 
 `moespresso --help` lists the user-facing command group:
 
-| Command | Module entry | Job |
-|---|---|---|
-| `moespresso generate` | `runtime.serve:main` | One-shot: load a package, render once, generate, print. |
-| `moespresso serve` | `runtime.http:main` | OpenAI-compatible HTTP server over the same load+generate seam. |
-| `moespresso verify` | `runtime.serve:verify_main` | On-demand manifest, member-identity, tensor-key, and sidecar gate. |
+| Command | Job |
+|---|---|
+| `moespresso generate` | One-shot: load a package, render once, generate, print. |
+| `moespresso serve` | OpenAI-compatible HTTP server over the same load+generate seam. |
+| `moespresso verify` | On-demand manifest, member-identity, tensor-key, and sidecar gate. |
 
 The `moespresso-generate`, `moespresso-serve`, and `moespresso-verify`
 scripts remain compatibility aliases backed by the same parsers. A wheel or
@@ -212,16 +212,17 @@ mechanism.
 
 ### `moespresso serve`: OpenAI-compatible HTTP
 
-`http.main` → `http.serve`: load the package **once** at startup (no verify),
-prime one isolated deterministic four-token generation, then serve. The prime
+The server loads the package **once** at startup (no verify), primes one
+isolated deterministic four-token generation, then serves. The prime
 moves first-use model wiring and MLX graph setup before readiness. It bypasses
 the prompt-cache manager, publishes no memory or disk KV entry, and does not
 persist its synthetic expert demand; in-memory expert residency and runtime
 counters may still reflect it. `--startup-warmup off` restores lazy
 first-request setup for cold-start measurements. The server prints an explicit
-not-ready warmup line and announces readiness only after the prime finishes.
-It then binds an OpenAI chat-completions endpoint over the same load+generate
-seam (§3). `--thinking off|on|high|max` is resolved to the family's mechanism
+not-ready warmup line and announces readiness only after the prime, cache
+generator, handler, and socket bind finish. It then exposes an OpenAI
+chat-completions endpoint over the same load+generate seam (§3).
+`--thinking off|on|high|max` is resolved to the family's mechanism
 **before** the warmup and socket bind (§4). Cache sizing is via
 `--prompt-cache-size` / `--prompt-cache-bytes` (both in-memory; §6); these are
 host resource bounds and apply to every family. For DeepSeek-V4 the selection
@@ -423,10 +424,12 @@ drafter families are resumable and the provenance a rail identity covers.
    limit, whichever is smaller, unless `--max-context-tokens` explicitly
    selects another positive value up to the architecture limit. It raises
    `ContextLimitError` when prompt tokens plus the requested `max_tokens`
-   exceed that limit; the HTTP layer maps the error to a 400. The check runs
-   before `fetch_nearest_cache` because the store hands entries out by move: a
-   refusal after the fetch would cost the session its chain entry. A package
-   without a declared architecture limit uses the 128K default.
+   exceed that limit; the HTTP layer maps the error to a 400 with the
+   `context_length_exceeded` code. Agent clients use that code to compact the
+   conversation and replay the interrupted turn. The check runs before
+   `fetch_nearest_cache` because the store hands entries out by move: a refusal
+   after the fetch would cost the session its chain entry. A package without a
+   declared architecture limit uses the 128K default.
 3. **Bucket** under `cache_model_key` = `(artifact_id, effective_rendering_id,
    live_kv_format, kv_group_size, quantized_kv_start)`. Token ids alone aren't
    enough: the same tokens under another package, render policy, or KV format
@@ -480,9 +483,12 @@ testable without a socket, MLX, or jang:
   `effective_rendering_id`, **render once** (§4), call the injected
   `generate(prompt, ...) -> str | GenerationResult`, and shape an OpenAI
   `chat.completion` dict. A `ContextLimitError` from the generator (§6) maps to
-  a 400 client error. Usage includes `prompt_tokens_details.cached_tokens`, a
-  `prompt_cache` block (the cache event, entry/byte counts, and, when disk KV
-  is on, the `disk_hit` event and a `disk_checkpoints_written` count). DSpark
+  a 400 client error with `type=invalid_request_error` and
+  `code=context_length_exceeded`. A stream that has already started emits the
+  same fields in an error event. Usage includes
+  `prompt_tokens_details.cached_tokens`, a `prompt_cache` block (the cache
+  event, entry/byte counts, and, when disk KV is on, the `disk_hit` event and a
+  `disk_checkpoints_written` count). DSpark
   disk use adds an independent `drafter_state.event` (`hit`, `missing`,
   `invalid`, or `unavailable`) and a `disk_drafter_states_written` count.
   `disk_checkpoint_write_seconds` and `disk_drafter_state_write_seconds` carry
@@ -563,6 +569,7 @@ and expert-I/O counters.
 | File | Role |
 |---|---|
 | `cli.py` | User-facing `moespresso` dispatcher and version output. |
+| `serve_supervisor.py` | Server readiness handshake and bounded startup recovery. |
 | `serve.py` | Load `(model, tokenizer, manifest)` from the manifest; `generate_with_metadata` / `generate_once`; generate and verify parsers; runtime truth line. |
 | `build.py` | Manifest-driven build via the proven jang loader; adapter selection; routed-expert install; mixed-bit wrapping; no dequant at load. |
 | `generation.py` | Pure `GenerationResult` contract shared by serve + HTTP. |

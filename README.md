@@ -69,7 +69,7 @@ side, stored in q6_K.
 
 ## Install
 
-MoEspresso 2.1.0 requires an arm64 Apple Silicon Mac running macOS 26.2
+MoEspresso 2.1.1 requires an arm64 Apple Silicon Mac running macOS 26.2
 (Tahoe) or later.
 
 Install MoEspresso with Homebrew. The formula installs its required Python
@@ -140,6 +140,8 @@ moecode() {
         "models": {
           "MoEspresso": {
             "name": "model @ MoEspresso",
+            "temperature": true,
+            "interleaved": "reasoning_content",
             "limit": { "context": 131072, "output": 32768 }
           }
         }
@@ -152,6 +154,11 @@ moecode() {
 
 moecode
 ```
+
+The model declaration lets OpenCode forward an agent temperature and preserve
+assistant reasoning in `reasoning_content` across turns. Thinking remains a
+server-startup choice through `moespresso serve --thinking`; the declaration
+does not advertise per-request reasoning-effort variants.
 
 The main serving controls are:
 

@@ -29,6 +29,34 @@ DEFAULT_GPU_LOCKDIR = "/private/tmp/ornith_gpu.lockdir"
 GPU_LOCK_HOLDER = "roadtest"
 
 
+def _process_tree_rss_bytes(listing: str, root_pid: int) -> int | None:
+    """Sum RSS for one process and every descendant in a ``ps`` listing."""
+    rss_by_pid: dict[int, int] = {}
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, parent_pid, rss_kb = (int(field) for field in fields)
+        except ValueError:
+            continue
+        rss_by_pid[pid] = rss_kb
+        children.setdefault(parent_pid, []).append(pid)
+
+    stack = [root_pid]
+    seen: set[int] = set()
+    total_kb = 0
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total_kb += rss_by_pid.get(pid, 0)
+        stack.extend(children.get(pid, ()))
+    return total_kb * 1024 if total_kb else None
+
+
 class GpuLock:
     """Atomic-mkdir GPU lock following the shared measurement convention."""
 
@@ -104,6 +132,7 @@ class ServerController:
         disk_root: Path,
         stride: int,
         budget_bytes: int | None,
+        write_depth_tokens: int | None,
         log_dir: Path,
         health_timeout: float = 2700.0,
     ):
@@ -113,6 +142,7 @@ class ServerController:
         self.disk_root = Path(disk_root)
         self.stride = int(stride)
         self.budget_bytes = budget_bytes
+        self.write_depth_tokens = write_depth_tokens
         self.log_dir = Path(log_dir)
         self.health_timeout = float(health_timeout)
         self.base_url = f"http://127.0.0.1:{self.port}"
@@ -125,6 +155,11 @@ class ServerController:
         env["MOESPRESSO_DISK_KV"] = "frontier"
         env["MOESPRESSO_DISK_KV_ROOT"] = str(self.disk_root)
         env["MOESPRESSO_DISK_KV_STRIDE"] = str(self.stride)
+        env["MOESPRESSO_DISK_KV_WRITE_DEPTH"] = (
+            "unlimited"
+            if self.write_depth_tokens is None
+            else str(self.write_depth_tokens)
+        )
         if self.budget_bytes is not None:
             env["MOESPRESSO_DISK_KV_BYTES"] = str(self.budget_bytes)
         return env
@@ -153,29 +188,21 @@ class ServerController:
     def rss_bytes(self) -> int | None:
         """Resident set size of the serve process tree, in bytes.
 
-        The serve command runs through a wrapper, so the model process is a
-        child; the sum covers the whole process group the controller
-        started. Returns None when no process is running or ``ps`` fails.
+        The serve command runs through a supervisor, and the model worker has
+        its own signal group. The descendant sum includes both without relying
+        on process-group membership. Returns None when no process is running or
+        ``ps`` fails.
         """
         process = self._process
         if process is None or process.poll() is not None:
             return None
         try:
-            pgid = os.getpgid(process.pid)
             listing = subprocess.run(
-                ["ps", "-axo", "pgid=,rss="],
+                ["ps", "-axo", "pid=,ppid=,rss="],
                 capture_output=True, text=True, timeout=10.0, check=True)
         except (OSError, subprocess.SubprocessError):
             return None
-        total_kb = 0
-        for line in listing.stdout.splitlines():
-            fields = line.split()
-            if len(fields) == 2 and fields[0] == str(pgid):
-                try:
-                    total_kb += int(fields[1])
-                except ValueError:
-                    continue
-        return total_kb * 1024 if total_kb else None
+        return _process_tree_rss_bytes(listing.stdout, process.pid)
 
     def wait_healthy(self, *, timeout: float | None = None) -> dict:
         """Poll ``/health`` until the server answers; return the payload."""

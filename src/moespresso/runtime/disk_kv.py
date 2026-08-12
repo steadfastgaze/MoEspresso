@@ -23,7 +23,9 @@ Boundaries this module keeps explicit:
   does not equal the claimed key (no rounding a key down), refuses a class list
   the registry does not know, and refuses a corrupt or truncated payload before
   any cache reaches the model. A refusal quarantines the entry and returns the
-  engine to cold serving.
+  engine to cold serving. A later runtime failure while reconstructing valid
+  bytes retains the checkpoint and disables further restore attempts until the
+  process restarts.
 - Optional companion capsules live in a separate attachment-v1 index and
   payload tree. Their identity binds the validated target frontier and the
   companion provenance. Attachment misses and failures return an independent
@@ -93,6 +95,15 @@ class DiskKVMetadataMismatch(DiskKVError):
 
     This is a trust failure: the file loaded, but its safety key disagrees with
     what the index claims, so the checkpoint is not the one the caller asked for.
+    """
+
+
+class DiskKVRestoreUnavailable(DiskKVError):
+    """The live runtime could not reconstruct an otherwise valid checkpoint.
+
+    This is a process-local availability failure, not evidence that the stored
+    payload is corrupt. The payload stays indexed so a fresh process can try it
+    again after the runtime resource failure clears.
     """
 
 
@@ -1314,10 +1325,11 @@ class DiskCheckpointStore:
     ``find_longest`` selects the longest exact token-prefix checkpoint in scope.
     ``restore`` loads and validates one, reconstructs the live caches through the
     model's own ``make_cache`` (the explicit registry), grafts the state, and
-    returns the suffix to prefill. Any validation failure quarantines the entry
-    and raises, and the caller falls back to cold serving. Attachment reads and
-    writes use a separate index and quarantine path, so an optional companion
-    failure cannot invalidate a target checkpoint.
+    returns the suffix to prefill. Persisted validation failures quarantine the
+    entry and raise. Runtime reconstruction failures retain the payload, disable
+    restores until reopen, and return the caller to cold serving. Attachment
+    reads and writes use a separate index and quarantine path, so an optional
+    companion failure cannot invalidate a target checkpoint.
     """
 
     def __init__(
@@ -1388,6 +1400,8 @@ class DiskCheckpointStore:
         # never re-load a known-bad payload.
         self.writes_disabled = False
         self._writes_disabled_reason: str | None = None
+        self.restores_disabled = False
+        self._restores_disabled_reason: str | None = None
         self._dead_cache_ids: set[str] = set()
         self._dead_attachment_ids: set[str] = set()
         self._attachment_accounting_failure_logged = False
@@ -1459,6 +1473,20 @@ class DiskCheckpointStore:
         self._writes_disabled_reason = reason
         self._log(f"[disk_kv] writes disabled until restart: {reason}")
 
+    def disable_restores(self, reason: str) -> None:
+        """Stop target restores until the store reopens, logging once.
+
+        A live MLX or Metal failure can make cache reconstruction unavailable
+        without saying anything about the checkpoint bytes. Retaining the first
+        reason keeps the health snapshot useful and avoids retrying the same
+        expensive operation on every request in a damaged process.
+        """
+        if self.restores_disabled:
+            return
+        self.restores_disabled = True
+        self._restores_disabled_reason = reason
+        self._log(f"[disk_kv] restores disabled until restart: {reason}")
+
     def stats(self, *, last_event: str | None = None) -> dict:
         try:
             entries = self.index.entries()
@@ -1468,8 +1496,13 @@ class DiskCheckpointStore:
                 "enabled": True,
                 "root": str(self.root),
                 "error": f"index unreadable: {e}",
+                "stride": self.stride,
+                "budget_bytes": self.budget_bytes,
+                "write_depth_tokens": self.write_depth_tokens,
                 "writes_disabled": self.writes_disabled,
                 "writes_disabled_reason": self._writes_disabled_reason,
+                "restores_disabled": self.restores_disabled,
+                "restores_disabled_reason": self._restores_disabled_reason,
                 "restores": self.restores,
                 "writes": self.writes,
                 "evictions": self.evictions,
@@ -1509,7 +1542,9 @@ class DiskCheckpointStore:
             "attachment_payload_bytes": attachment_payload_bytes,
             "attachment_accounting": attachment_accounting,
             "budget_bytes": self.budget_bytes,
+            "write_depth_tokens": self.write_depth_tokens,
             "writes_disabled": self.writes_disabled,
+            "restores_disabled": self.restores_disabled,
             "restores": self.restores,
             "writes": self.writes,
             "evictions": self.evictions,
@@ -1526,6 +1561,8 @@ class DiskCheckpointStore:
         }
         if self.writes_disabled:
             out["writes_disabled_reason"] = self._writes_disabled_reason
+        if self.restores_disabled:
+            out["restores_disabled_reason"] = self._restores_disabled_reason
         if not self.attachments_available:
             out["attachments_unavailable_reason"] = (
                 self._attachments_unavailable_reason)
@@ -1556,7 +1593,9 @@ class DiskCheckpointStore:
         Fail-closed order: find the longest exact prefix entry; load and validate
         the payload (integrity, then embedded metadata vs the index, then the
         prefix-length and class-list gates); reconstruct live caches and graft the
-        state. A refusal quarantines the entry and re-raises the domain error.
+        state. A persisted-data refusal quarantines the entry and re-raises the
+        domain error. A live runtime failure retains the entry and disables
+        restores until the store reopens.
 
         Every fault on this path surfaces as ``DiskKVError`` so the caller's
         cold-serve fallback always fires: a corrupt index or an unreadable
@@ -1565,6 +1604,8 @@ class DiskCheckpointStore:
         absorbed, because index bookkeeping must not invalidate a good
         checkpoint.
         """
+        if self.restores_disabled:
+            return None
         try:
             # Dead ids are entries a previous quarantine could not drop from
             # the index; excluding them during selection lets the next valid
@@ -1590,13 +1631,19 @@ class DiskCheckpointStore:
             )
             prompt_cache = self._reconstruct(
                 make_cache_fn, state_trees, meta_state_trees, entry)
-        except DiskKVError:
+        except (DiskKVInvalidPayload, DiskKVMetadataMismatch):
             self.quarantine(entry)
             raise
+        except DiskKVError:
+            raise
         except Exception as e:  # noqa: BLE001 - normalize to the fallback type
-            self.quarantine(entry)
-            raise DiskKVError(
-                f"disk KV restore failed for token_count={entry.token_count}: "
+            reason = (
+                f"runtime reconstruction failed cache_id={entry.cache_id} "
+                f"token_count={entry.token_count}: {e!r}"
+            )
+            self.disable_restores(reason)
+            raise DiskKVRestoreUnavailable(
+                f"disk KV restore unavailable for token_count={entry.token_count}: "
                 f"{e}") from e
         try:
             updated = self.index.mark_used(entry)

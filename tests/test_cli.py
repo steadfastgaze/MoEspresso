@@ -99,7 +99,7 @@ def test_top_level_cli_help_and_version(capsys):
 
 
 def test_spaced_cli_delegates_to_the_existing_parser(monkeypatch):
-    import moespresso.runtime.http as http
+    import moespresso.serve_supervisor as supervisor
     from moespresso.cli import main
 
     seen = {}
@@ -108,7 +108,7 @@ def test_spaced_cli_delegates_to_the_existing_parser(monkeypatch):
         seen.update(argv=argv, prog=prog)
         return 7
 
-    monkeypatch.setattr(http, "main", fake_main)
+    monkeypatch.setattr(supervisor, "main", fake_main)
     assert main(["serve", "pkg", "--port", "9000"]) == 7
     assert seen == {
         "argv": ["pkg", "--port", "9000"],

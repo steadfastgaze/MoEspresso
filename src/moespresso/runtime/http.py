@@ -85,10 +85,27 @@ REQUEST_KV_POLICY_FIELDS = {
 class RequestError(Exception):
     """A malformed request. Carries the HTTP status to return."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        code: str | None = None,
+        error_type: str | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = code
+        self.error_type = error_type
+
+    def payload(self) -> dict:
+        error = {"message": self.message}
+        if self.error_type is not None:
+            error["type"] = self.error_type
+        if self.code is not None:
+            error["code"] = self.code
+        return {"error": error}
 
 
 class ClientDisconnected(ConnectionError):
@@ -883,6 +900,7 @@ def chat_completion(
 
     splitter = None
     response_callback = None
+    response_stop_callback = None
     if streamer is not None or delta_callback is not None:
 
         def route_delta(kind: str, text: str) -> None:
@@ -895,14 +913,26 @@ def chat_completion(
             thinking_enabled=thinking_enabled,
             emit=route_delta,
         )
-        # Incremental pushes exist for delta consumers only. A non-streaming
-        # tool request classifies the completed text once after generation
-        # (the splitter's saw_input fallback below) instead of paying a
-        # callback inside every decode step.
-        if delta_callback is not None or tool_delta_callback is not None:
+        terminal_tools = any(
+            dialect.terminal_primary_block or dialect.terminal_attempt_block
+            for dialect in (parse_dialects or ())
+        )
+        # DSML needs incremental classification even for a non-streaming HTTP
+        # response because its first valid outer tool_calls block terminates
+        # generation. Other non-streaming dialects retain the complete-text
+        # classification path.
+        if (
+            delta_callback is not None
+            or tool_delta_callback is not None
+            or terminal_tools
+        ):
 
             def response_callback(_step: int, response: object) -> None:
                 splitter.push(str(getattr(response, "text", "")))
+
+        if terminal_tools:
+            def response_stop_callback() -> bool:
+                return streamer.terminal
 
     generate_kwargs = {
         "max_tokens": int(request.get("max_tokens", DEFAULT_MAX_TOKENS)),
@@ -919,6 +949,8 @@ def chat_completion(
         generate_kwargs["progress_callback"] = progress_callback
     if response_callback is not None:
         generate_kwargs["response_callback"] = response_callback
+    if response_stop_callback is not None:
+        generate_kwargs["response_stop_callback"] = response_stop_callback
 
     try:
         generated = as_generation_result(generate(
@@ -926,7 +958,12 @@ def chat_completion(
             **generate_kwargs,
         ))
     except ContextLimitError as e:
-        raise RequestError(400, str(e)) from e
+        raise RequestError(
+            400,
+            str(e),
+            code="context_length_exceeded",
+            error_type="invalid_request_error",
+        ) from e
     if splitter is not None:
         if not splitter.saw_input:
             splitter.push(generated.text)
@@ -1176,10 +1213,19 @@ class _ChatSSEWriter:
             self._event(self._chunk([], usage=response.get("usage") or {}))
         self._write(b"data: [DONE]\n\n")
 
-    def error(self, message: str) -> None:
+    def error(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        error_type: str = "server_error",
+    ) -> None:
         if not self.started:
             return
-        self._event({"error": {"message": message, "type": "server_error"}})
+        error = {"message": message, "type": error_type}
+        if code is not None:
+            error["code"] = code
+        self._event({"type": "error", "error": error})
 
 
 def build_cache_generator(
@@ -1309,11 +1355,15 @@ def make_handler(
             except RequestError as e:
                 if stream_writer is not None and stream_writer.started:
                     try:
-                        stream_writer.error(e.message)
+                        stream_writer.error(
+                            e.message,
+                            code=e.code,
+                            error_type=e.error_type or "server_error",
+                        )
                     except ClientDisconnected:
                         pass
                 else:
-                    self._send_json(e.status, {"error": {"message": e.message}})
+                    self._send_json(e.status, e.payload())
             except json.JSONDecodeError:
                 self._send_json(400, {"error": {"message": "invalid JSON body"}})
             except Exception as e:
@@ -1401,6 +1451,7 @@ def serve(
     external_drafter: Path | None = None,
     load_model_fn: Callable | None = None,
     startup_warmup_fn: Callable | None = None,
+    ready_callback: Callable[[], None] | None = None,
 ) -> int:
     """Load and warm the package once, then serve OpenAI-compatible HTTP.
 
@@ -1554,9 +1605,6 @@ def serve(
                 flush=True,
             )
 
-        print(f"  loaded ({len(manifest['tensors'])} tensors); serving on "
-              f"http://{host}:{port}")
-
         cache_generator = build_cache_generator(
             model,
             tokenizer,
@@ -1617,6 +1665,13 @@ def serve(
         # handler loop, so idle connections time out and close.
         handler.timeout = 10.0
         httpd = HTTPServer((host, port), handler)
+        print(
+            f"  loaded ({len(manifest['tensors'])} tensors); serving on "
+            f"http://{host}:{port}",
+            flush=True,
+        )
+        if ready_callback is not None:
+            ready_callback()
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down")
@@ -1631,7 +1686,10 @@ def serve(
 
 
 def main(
-    argv: list[str] | None = None, *, prog: str = "moespresso-serve"
+    argv: list[str] | None = None,
+    *,
+    prog: str = "moespresso-serve",
+    ready_callback: Callable[[], None] | None = None,
 ) -> int:
     """`moespresso serve <package_dir> [--host H --port P]`."""
     import argparse
@@ -1727,8 +1785,21 @@ def main(
         tool_dialect=None if args.tool_dialect == "auto" else args.tool_dialect,
         startup_warmup=args.startup_warmup != "off",
         external_drafter=external_drafter,
+        ready_callback=ready_callback,
     )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from moespresso.serve_supervisor import (
+        install_parent_watchdog_from_env,
+        ready_callback_from_env,
+        worker_prog_from_env,
+    )
+
+    install_parent_watchdog_from_env()
+    raise SystemExit(
+        main(
+            prog=worker_prog_from_env(),
+            ready_callback=ready_callback_from_env(),
+        )
+    )

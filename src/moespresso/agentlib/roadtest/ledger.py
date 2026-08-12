@@ -65,14 +65,26 @@ class SessionLedger:
 
     ``disk_enabled=False`` models a server without the disk store: no
     frontier writes are expected and no restore expectations form.
+    ``write_depth_tokens`` mirrors the serve-side cap; ``None`` is unlimited.
     """
 
-    def __init__(self, name: str, *, stride: int, disk_enabled: bool = True):
+    def __init__(
+        self,
+        name: str,
+        *,
+        stride: int,
+        disk_enabled: bool = True,
+        write_depth_tokens: int | None = None,
+    ):
         if stride <= 0:
             raise ValueError("stride must be positive")
+        if write_depth_tokens is not None and write_depth_tokens <= 0:
+            raise ValueError("write_depth_tokens must be positive when set")
         self.name = name
         self.stride = int(stride)
         self.disk_enabled = bool(disk_enabled)
+        self.write_depth_tokens = (
+            None if write_depth_tokens is None else int(write_depth_tokens))
         self.written_frontiers: set[int] = set()
         self.requests = 0
         # Expected in-memory prefix on the current server process: the token
@@ -115,6 +127,9 @@ class SessionLedger:
         out = []
         frontier = first
         while frontier < full:
+            if (self.write_depth_tokens is not None
+                    and frontier > self.write_depth_tokens):
+                break
             if frontier not in self.written_frontiers:
                 out.append(frontier)
             frontier += self.stride
@@ -213,6 +228,7 @@ class HealthExpectations:
 
     stride: int
     budget_bytes: int | None = None
+    write_depth_tokens: int | None = None
     disk_enabled: bool = True
     segment_restores: int = 0
     segment_writes: int = 0
@@ -229,6 +245,7 @@ class HealthExpectations:
             return
         self.stride = int(disk.get("stride") or self.stride)
         self.budget_bytes = disk.get("budget_bytes")
+        self.write_depth_tokens = disk.get("write_depth_tokens")
         self.baseline_restores = int(disk.get("restores") or 0)
         self.baseline_writes = int(disk.get("writes") or 0)
         self.baseline_entries = int(disk.get("entries") or 0)
@@ -263,6 +280,8 @@ class HealthExpectations:
             return findings
         checks = {
             "stride": (disk.get("stride"), self.stride),
+            "write_depth_tokens": (
+                disk.get("write_depth_tokens"), self.write_depth_tokens),
             "restores": (disk.get("restores"),
                          self.baseline_restores + self.segment_restores),
             "writes": (disk.get("writes"),

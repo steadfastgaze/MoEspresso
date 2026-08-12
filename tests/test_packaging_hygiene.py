@@ -64,6 +64,14 @@ def test_dependency_resolution_has_no_local_sources():
     assert list(_local_source_paths(sources)) == []
 
 
+def test_public_serve_alias_uses_the_startup_supervisor():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert config["project"]["scripts"]["moespresso-serve"] == (
+        "moespresso.serve_supervisor:main"
+    )
+
+
 def test_mlx_iqk_is_an_ordinary_published_pinned_requirement():
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     requirements = [

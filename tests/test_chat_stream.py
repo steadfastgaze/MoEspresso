@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from moespresso.runtime.chat_stream import ReasoningSplitter, split_complete_text
-from moespresso.runtime.tool_stream import DSML_DIALECT, ToolCallStreamer
+from moespresso.runtime.tool_stream import (
+    DSML_DIALECT,
+    QWENXML_DIALECT,
+    ToolCallStreamer,
+)
 from moespresso.toolcalls.dsml import DSML_TOKEN
 
 T = DSML_TOKEN
@@ -18,6 +24,17 @@ DSML_BASH_BLOCK = (
     f"<{T}tool_calls>\n"
     f'<{T}invoke name="bash">\n'
     f'<{T}parameter name="command" string="true">ls</{T}parameter>\n'
+    f"</{T}invoke>\n"
+    f"</{T}tool_calls>"
+)
+
+DSML_MULTI_BLOCK = (
+    f"<{T}tool_calls>\n"
+    f'<{T}invoke name="bash">\n'
+    f'<{T}parameter name="command" string="true">ls</{T}parameter>\n'
+    f"</{T}invoke>\n"
+    f'<{T}invoke name="bash">\n'
+    f'<{T}parameter name="command" string="true">pwd</{T}parameter>\n'
     f"</{T}invoke>\n"
     f"</{T}tool_calls>"
 )
@@ -152,3 +169,67 @@ def test_dsml_unclosed_think_close_marker_after_the_block_routes_zero_calls():
     assert streamer.calls == []
     assert streamer.content == "Done."
     assert DSML_BASH_BLOCK in splitter.reasoning
+
+
+def test_first_valid_outer_dsml_block_is_terminal_and_keeps_all_invokes():
+    streamer = ToolCallStreamer(
+        (DSML_DIALECT,), parameter_schemas=_TOOL_SCHEMAS)
+    text = DSML_MULTI_BLOCK + "\n</think>ignored" + DSML_BASH_BLOCK
+
+    for char in text:
+        streamer.push(char)
+    streamer.finish()
+
+    assert streamer.terminal
+    assert [entry["function"]["name"] for entry in streamer.calls] == [
+        "bash", "bash"]
+    assert [
+        json.loads(entry["function"]["arguments"])["command"]
+        for entry in streamer.calls
+    ] == ["ls", "pwd"]
+    assert streamer.content == ""
+
+
+def test_repaired_naked_dsml_invoke_is_terminal_before_late_duplicate():
+    naked = (
+        f'<{T}invoke name="bash">\n'
+        f'<{T}parameter name="command" string="true">ls</{T}parameter>\n'
+        f"</{T}invoke>"
+    )
+    streamer = ToolCallStreamer(
+        (DSML_DIALECT,), parameter_schemas=_TOOL_SCHEMAS)
+    for char in naked + "\n" + DSML_BASH_BLOCK:
+        streamer.push(char)
+
+    assert len(streamer.calls) == 1
+    assert streamer.terminal
+
+
+def test_repaired_outer_dsml_block_is_terminal_before_late_duplicate():
+    malformed_outer = DSML_BASH_BLOCK.replace(' string="true"', "")
+    streamer = ToolCallStreamer(
+        (DSML_DIALECT,), parameter_schemas=_TOOL_SCHEMAS)
+    streamer.push(malformed_outer + "\n" + DSML_BASH_BLOCK)
+    streamer.finish()
+
+    assert streamer.terminal
+    assert len(streamer.calls) == 1
+    assert json.loads(streamer.calls[0]["function"]["arguments"]) == {
+        "command": "ls"}
+    assert streamer.telemetry.as_dict() == {
+        "fires": 1, "salvaged": 1, "failed": 0}
+
+
+def test_qwen_xml_blocks_remain_nonterminal():
+    first = (
+        "<tool_call>\n<function=bash>\n<parameter=command>\n"
+        "ls\n</parameter>\n</function>\n</tool_call>"
+    )
+    second = first.replace("ls", "pwd")
+    streamer = ToolCallStreamer(
+        (QWENXML_DIALECT,), parameter_schemas=_TOOL_SCHEMAS)
+    streamer.push(first + "\n" + second)
+    streamer.finish()
+
+    assert len(streamer.calls) == 2
+    assert not streamer.terminal

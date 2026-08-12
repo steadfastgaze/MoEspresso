@@ -39,16 +39,27 @@ back only the longest tail that could begin a marker, and buffers each
 block until its close marker. A completed block goes to the strict parser;
 the parsed calls stream out as `tool_calls` deltas (one complete call per
 delta) and land on the response message with `finish_reason:
-"tool_calls"`. Text around blocks flows as ordinary content, and a marker
-quoted mid-sentence stays prose.
+"tool_calls"`. An outer DSML block that yields valid calls, either directly
+or after bounded repair, ends the assistant turn at its close marker. Every
+invoke inside that one block is retained, while text and duplicate blocks
+after it are not generated. A repaired naked DSML invoke is also terminal:
+the bounded repair accepts it as the call unit when the model drops the outer
+wrapper, and later duplicates cannot execute. Qwen XML remains nonterminal,
+so multiple sibling
+`<tool_call>` blocks are collected normally. Text around nonterminal blocks
+flows as ordinary content, and a marker quoted mid-sentence stays prose.
 
 Parsing adds no model work: logits, sampling, and decode arithmetic are
 untouched, and a request without `tools` skips the whole path and serves
 byte-identically to a server without it. A streaming request classifies
 each decoded chunk between decode steps, exactly like the reasoning
 splitter it chains onto, at the cost of a string scan over a few bytes per
-step. A non-streaming request parses the completed text once after
-generation.
+step. A non-streaming DSML tool request uses the same incremental classifier
+so generation can stop at the outer close marker. Other non-streaming
+dialects parse the completed text once after generation. Terminal DSML
+requests use plain decoding because a speculative round may commit several
+tokens before the text boundary is visible; the speculative path does not yet
+provide an arbitrary-boundary rollback contract.
 
 Failure handling is strict-parse-first:
 

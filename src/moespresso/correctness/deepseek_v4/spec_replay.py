@@ -88,6 +88,11 @@ def plain_greedy_generate(
         logits = model(mx.array([[token]], dtype=mx.int64), cache=cache)
         token = int(mx.argmax(logits[0, -1].astype(mx.float32)))
         out.append(token)
+    from moespresso.runtime.deepseek_v4.model import (
+        evaluate_deepseek_v4_cache_state,
+    )
+
+    evaluate_deepseek_v4_cache_state(cache, asynchronous=False)
     t2 = time.perf_counter()
     return out, t1 - t0, t2 - t1
 
