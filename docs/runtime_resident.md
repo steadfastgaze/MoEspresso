@@ -421,8 +421,9 @@ drafter families are resumable and the provenance a rail identity covers.
    token stream exactly.
 2. **Refuse an over-limit request** before any cache access. The generator uses
    the effective served context limit: 128K or the package's architecture
-   limit, whichever is smaller, unless `--max-context-tokens` explicitly
-   selects another positive value up to the architecture limit. It raises
+   limit, whichever is smaller. A lower automatic DeepSeek-V4 memory limit may
+   cap that default, while `--max-context-tokens` explicitly selects another
+   positive value up to the architecture limit. It raises
    `ContextLimitError` when prompt tokens plus the requested `max_tokens`
    exceed that limit; the HTTP layer maps the error to a 400 with the
    `context_length_exceeded` code. Agent clients use that code to compact the

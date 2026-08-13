@@ -152,10 +152,9 @@ class ToolCallConfig:
     which text dialect the serve layer parses back: ``native`` keeps the
     vendored template's own tool rendering (Qwen XML for the Qwen families),
     ``dsml`` teaches the DSML dialect through the system block instead.
-    DeepSeek-V4 ignores the dialect: its renderer owns DSML as part of the
-    model contract. ``parse`` off restores the pre-parsing behavior (tool
-    markup returns verbatim as content); ``repair`` off keeps parsing
-    strict-only.
+    A family renderer may own its dialect directly instead. ``parse`` off
+    restores the pre-parsing behavior (tool markup returns verbatim as
+    content); ``repair`` off keeps parsing strict-only.
     """
 
     dialect: str = TOOL_DIALECT_NATIVE
@@ -168,22 +167,19 @@ DEFAULT_TOOL_CALL_CONFIG = ToolCallConfig()
 
 def resolve_tool_call_config(
     package_dir: Path | None = None,
-    *,
-    dialect: str | None = None,
 ) -> ToolCallConfig:
     """Resolve the served tool-call policy for one server process.
 
-    Precedence: env kill switches, then the explicit ``dialect`` selection
-    (the ``--tool-dialect`` flag), then the package's agentic profile
-    sidecar, then native. ``MOESPRESSO_TOOL_CALLS=0`` disables served
-    tool-call parsing entirely and ``MOESPRESSO_TOOL_REPAIR=0`` keeps
-    parsing strict-only; both default on.
+    The package's agentic profile selects the dialect, with native rendering
+    as the fallback for packages without a profile. ``MOESPRESSO_TOOL_CALLS=0``
+    disables served tool-call parsing entirely and
+    ``MOESPRESSO_TOOL_REPAIR=0`` keeps parsing strict-only; both default on.
     """
     if os.environ.get("MOESPRESSO_TOOL_CALLS") == "0":
         return ToolCallConfig(parse=False)
     repair_enabled = os.environ.get("MOESPRESSO_TOOL_REPAIR") != "0"
-    resolved = dialect
-    if resolved is None and package_dir is not None:
+    resolved = None
+    if package_dir is not None:
         from moespresso.package.agentic_profile import read_agentic_profile
 
         profile = read_agentic_profile(package_dir)
@@ -1409,19 +1405,18 @@ def normalize_thinking_selection(thinking) -> str | None:
 def thinking_effort_option_error(
     thinking: str | None,
     *,
-    is_deepseek_v4: bool,
+    supports_reasoning_effort: bool,
 ) -> str | None:
     """Refuse `--thinking max` for families without an effort mechanism.
 
-    `max` maps to DeepSeek-V4's official reasoning-effort preamble. No other
-    ported family has an effort mechanism, so the flag refuses loudly there
-    instead of silently serving plain thinking mode.
+    The package contract must implement a distinct reasoning-effort mechanism;
+    otherwise the flag refuses instead of silently serving plain thinking mode.
     """
-    if thinking != "max" or is_deepseek_v4:
+    if thinking != "max" or supports_reasoning_effort:
         return None
     return (
-        "FAILED: --thinking max is a DeepSeek-V4 reasoning-effort level; "
-        "this model family has no reasoning-effort mechanism."
+        "FAILED: --thinking max requires a package-supported reasoning-effort "
+        "mechanism; this package does not provide one."
     )
 
 
@@ -1446,7 +1441,6 @@ def serve(
     max_context_tokens: int | None = None,
     min_resident_experts: int | None = None,
     thinking: str | None = None,
-    tool_dialect: str | None = None,
     startup_warmup: bool = True,
     external_drafter: Path | None = None,
     load_model_fn: Callable | None = None,
@@ -1463,7 +1457,8 @@ def serve(
     import threading
     import time
 
-    if load_model_fn is None:
+    default_load_model = load_model_fn is None
+    if default_load_model:
         from moespresso.runtime.serve import load_served_model as load_model_fn
 
     thinking = normalize_thinking_selection(thinking)
@@ -1517,8 +1512,19 @@ def serve(
 
     try:
         try:
-            if external_drafter is None:
+            if external_drafter is None and default_load_model:
+                model, tokenizer, manifest = load_model_fn(
+                    package_dir,
+                    max_context_tokens=max_context_tokens,
+                )
+            elif external_drafter is None:
                 model, tokenizer, manifest = load_model_fn(package_dir)
+            elif default_load_model:
+                model, tokenizer, manifest = load_model_fn(
+                    package_dir,
+                    drafter=external_drafter,
+                    max_context_tokens=max_context_tokens,
+                )
             else:
                 model, tokenizer, manifest = load_model_fn(
                     package_dir, drafter=external_drafter
@@ -1541,15 +1547,28 @@ def serve(
             context_limit = effective_context_limit(
                 manifest,
                 requested=max_context_tokens,
+                runtime_default=getattr(
+                    model, "_moespresso_auto_context_limit", None),
             )
         except ValueError as e:
             print(f"FAILED: {e}", flush=True)
             return 2
+        auto_from = getattr(model, "_moespresso_auto_context_limit_from", None)
+        auto_note = (
+            f" auto_reduced_from={int(auto_from)}"
+            if auto_from is not None
+            else ""
+        )
         print(
             f"[serve] context_limit={context_limit} "
-            f"package_limit={declared_context_limit(manifest) or 'unknown'}",
+            f"package_limit={declared_context_limit(manifest) or 'unknown'}"
+            f"{auto_note}",
             flush=True,
         )
+        from moespresso.runtime.prefix_cache import context_limit_warning_lines
+
+        for line in context_limit_warning_lines(context_limit):
+            print(f"[serve] {line}", flush=True)
 
         resolved_prompt_cache_size = (
             DEFAULT_PROMPT_CACHE_SIZE
@@ -1562,7 +1581,7 @@ def serve(
         # startup, never silently serves the template default.
         ds4_contract = is_deepseek_v4_manifest(manifest)
         option_error = thinking_effort_option_error(
-            thinking, is_deepseek_v4=ds4_contract)
+            thinking, supports_reasoning_effort=ds4_contract)
         if option_error is not None:
             print(option_error, flush=True)
             return 2
@@ -1628,8 +1647,7 @@ def serve(
             except SSDStreamingBuildError:
                 return {"enabled": False}
 
-        tool_config = resolve_tool_call_config(
-            package_dir, dialect=tool_dialect)
+        tool_config = resolve_tool_call_config(package_dir)
         if tool_config.parse:
             dialect_label = (
                 "dsml(renderer)" if ds4_contract else tool_config.dialect)
@@ -1725,25 +1743,12 @@ def main(
                              "(host resource bound, any family)")
     parser.add_argument("--thinking", choices=("off", "on", "high", "max"),
                         default=None,
-                        help="Select the model family's own thinking mode: "
-                             "off, on (high is the same), or max (DeepSeek-V4 "
-                             "reasoning-effort preamble; DeepSeek-V4 only). "
-                             "Refuses at startup if the family has no "
-                             "mechanism. Default: the template's own default "
-                             "(DeepSeek-V4: off). Per-request render fields "
-                             "remain enforced by the model contract.")
-    parser.add_argument(
-        "--tool-dialect",
-        choices=("auto", "native", "dsml"),
-        default="auto",
-        help="Tool-call dialect served to template families: native keeps "
-             "the vendored template's own tool rendering, dsml teaches the "
-             "DSML dialect through the system block. auto (the default) "
-             "takes the package agentic profile's dialect of record, "
-             "falling back to native. DeepSeek-V4 ignores this flag; its "
-             "renderer owns the dialect. MOESPRESSO_TOOL_CALLS=0 disables "
-             "served tool-call parsing entirely.",
-    )
+                        help="Select the package's thinking mode: off, on "
+                             "(high is the same), or max. Unsupported modes "
+                             "refuse at startup. Default: the package "
+                             "template's declared behavior. Per-request "
+                             "render fields remain enforced by the model "
+                             "contract.")
     parser.add_argument(
         "--startup-warmup",
         choices=("auto", "off"),
@@ -1769,7 +1774,9 @@ def main(
         except ValueError as e:
             parser.error(str(e))
         option_error = thinking_effort_option_error(
-            args.thinking, is_deepseek_v4=is_deepseek_v4_manifest(manifest))
+            args.thinking,
+            supports_reasoning_effort=is_deepseek_v4_manifest(manifest),
+        )
         if option_error is not None:
             print(option_error, flush=True)
             return 2
@@ -1782,7 +1789,6 @@ def main(
         max_context_tokens=args.max_context_tokens,
         min_resident_experts=args.min_resident_experts,
         thinking=args.thinking,
-        tool_dialect=None if args.tool_dialect == "auto" else args.tool_dialect,
         startup_warmup=args.startup_warmup != "off",
         external_drafter=external_drafter,
         ready_callback=ready_callback,

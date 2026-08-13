@@ -134,11 +134,21 @@ clamped to `[min_capacity, max_capacity]`:
 
 `package_capacity_budget(...)` assembles the budget for a package. The
 `resident_base_bytes` is measured from the package, so refusals scale with the
-model. Two allowances are environment knobs:
+model. The generic allowances are environment knobs:
 
 - `MOESPRESSO_SSD_KV_ALLOWANCE_GB` (default 1): reserved for KV cache /
   activations.
 - `MOESPRESSO_SSD_SAFETY_MARGIN_GB` (default 2): headroom floor.
+
+DeepSeek-V4 publishes enough attention geometry to price its composite cache
+directly: 366,120,960 fixed bytes plus the manifest-derived per-token growth.
+Unless `MOESPRESSO_SSD_KV_ALLOWANCE_GB` is explicit, the planner reserves that
+exact amount for the served context. If the default 128K context cannot fit
+beside the minimum expert pool, the runtime selects the largest safe
+1K-aligned context and reports the reduction. An explicit
+`--max-context-tokens` value is never reduced. Every resolved context below
+128K emits a prominent usability warning, regardless of model family or whether
+the lower limit was automatic or explicit.
 
 ### Memory budget at build time
 
@@ -151,6 +161,9 @@ model. Two allowances are environment knobs:
   of the deterministic number, the gap is treated as reclaimable cache and the
   deterministic number is trusted; under genuine memory pressure the budget
   clamps to live `available`.
+- A family loader that has already hydrated the measured non-routed core adds
+  those bytes back to the live reading. The capacity budget subtracts the core
+  separately, so this prevents pressure-clamped starts from charging it twice.
 - `MOESPRESSO_SSD_MAX_MEMORY_GB` (the `--max-memory-gb` CLI flag) caps the
   startup capacity-planner input. It selects a smaller routed-expert pool, but
   it is not an RSS limit and does not resize the pool as the context grows.
@@ -544,7 +557,7 @@ message. `MOESPRESSO_ALLOW_PARALLEL_SSD_STREAMING=1` overrides the guard;
 | --- | --- | --- |
 | `MOESPRESSO_SSD_MAX_MEMORY_GB` (`--max-memory-gb`) | unset | Startup capacity-planner ceiling used to select expert-pool geometry; RSS is measured separately. |
 | `MOESPRESSO_SSD_OS_RESERVE_GB` | 5 | RAM held back from the deterministic budget. |
-| `MOESPRESSO_SSD_KV_ALLOWANCE_GB` | 1 | KV-cache / activation allowance in the capacity budget. |
+| `MOESPRESSO_SSD_KV_ALLOWANCE_GB` | unset | Explicit fixed KV-cache / activation allowance. Without it, DeepSeek-V4 derives the exact served-context reservation; other families use 1 GiB. |
 | `MOESPRESSO_SSD_SAFETY_MARGIN_GB` | 2 | Safety headroom in the capacity budget. |
 | `MOESPRESSO_SSD_HOTLIST` | 1 | Cold-start residency seeding (`0` disables). |
 | `MOESPRESSO_SSD_PREWARM_EXPERTS` | unset | `all` forces a full expert prewarm at load (fails closed below full capacity); `none` skips explicit and default full prewarm, then uses the hotlist tiers unless `MOESPRESSO_SSD_HOTLIST=0`. |

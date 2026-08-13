@@ -138,6 +138,8 @@ def test_hc_split_weighted_sum_tail_bit_identical(hidden, iters):
 
 def test_hc_tail_eligibility_and_gate_delegation(monkeypatch):
     mx = _require_metal()
+    assert hc_kernel._TAIL_THREADS_PER_GROUP == 512
+    assert hc_kernel._TAIL_LOGICAL_THREADS == 1024
     hidden = 1024
     x = mx.zeros((1, 1, 4, hidden), dtype=mx.float32)
     fn = mx.zeros((24, 4 * hidden), dtype=mx.float32)

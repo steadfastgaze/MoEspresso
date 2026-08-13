@@ -173,6 +173,64 @@ def _manifest_requires_routed_bundles(manifest: dict) -> bool:
     )
 
 
+_AUTO_CONTEXT_QUANTUM = 1024
+_MIN_AUTO_CONTEXT_TOKENS = 4096
+
+
+def _deepseek_v4_cache_allowance_bytes(
+    architecture: Mapping[str, Any],
+    context_tokens: int,
+) -> int:
+    from moespresso.runtime.deepseek_v4.drafter_policy import (
+        deepseek_v4_cache_state_bytes,
+    )
+
+    return deepseek_v4_cache_state_bytes(dict(architecture), int(context_tokens))
+
+
+def _deepseek_v4_auto_context_limit(budget, architecture) -> int:
+    """Largest 1K-aligned context that retains the minimum expert pool."""
+    fixed = _deepseek_v4_cache_allowance_bytes(architecture, 0)
+    slope = _deepseek_v4_cache_allowance_bytes(architecture, 1) - fixed
+    if slope <= 0:
+        raise ValueError("DeepSeek V4 cache growth must be positive")
+    cache_budget = (
+        budget.available_bytes
+        - budget.resident_base_bytes
+        - budget.runtime_resident_bytes
+        - budget.safety_margin_bytes
+        - budget.min_capacity * budget.bytes_per_capacity_unit
+    )
+    tokens = max(0, (cache_budget - fixed) // slope)
+    return int(tokens // _AUTO_CONTEXT_QUANTUM * _AUTO_CONTEXT_QUANTUM)
+
+
+def _deepseek_v4_capacity_error(budget, *, context_tokens: int) -> Exception:
+    from moespresso.runtime.streaming_capacity import StreamingCapacityError
+
+    gib = float(1 << 30)
+    minimum_pool = budget.min_capacity * budget.bytes_per_capacity_unit
+    required = (
+        budget.resident_base_bytes
+        + budget.runtime_resident_bytes
+        + budget.kv_activation_allowance_bytes
+        + budget.safety_margin_bytes
+        + minimum_pool
+    )
+    return StreamingCapacityError(
+        "DeepSeek-V4 cannot fit its minimum SSD expert pool for a "
+        f"{int(context_tokens):,}-token context: the planner has "
+        f"{budget.available_bytes / gib:.2f} GiB and needs "
+        f"{required / gib:.2f} GiB "
+        f"(core {budget.resident_base_bytes / gib:.2f}, "
+        f"router {budget.runtime_resident_bytes / gib:.2f}, "
+        f"KV/activations {budget.kv_activation_allowance_bytes / gib:.2f}, "
+        f"safety {budget.safety_margin_bytes / gib:.2f}, "
+        f"experts {minimum_pool / gib:.2f}). Close other applications or "
+        "choose a smaller --max-context-tokens value."
+    )
+
+
 def _install_deepseek_v4_pooled_bundles(
     model,
     package_dir: Path,
@@ -182,6 +240,9 @@ def _install_deepseek_v4_pooled_bundles(
     capacity_per_layer: int | None = None,
     capacity_overrides: Mapping[int, int] | None = None,
     eviction_policy: str = "lfu",
+    architecture: Mapping[str, Any] | None = None,
+    context_limit: int | None = None,
+    context_limit_explicit: bool = False,
 ) -> int:
     """Install DS4 routed experts as SSD-backed pooled SwitchGLUs.
 
@@ -196,7 +257,9 @@ def _install_deepseek_v4_pooled_bundles(
         install_pooled_switchglus,
     )
     from moespresso.runtime.streaming_capacity import (
+        StreamingCapacityError,
         choose_capacity,
+        non_routed_payload_bytes,
         package_capacity_budget,
     )
 
@@ -205,18 +268,80 @@ def _install_deepseek_v4_pooled_bundles(
     if capacity_per_layer is None:
         args = getattr(model, "args", None)
         max_router_fanout = int(getattr(args, "num_experts_per_tok", 1) or 1)
+        resident_base = non_routed_payload_bytes(package_dir)
+        requested_context = int(context_limit or 0)
+        exact_context_allowance = (
+            requested_context > 0
+            and architecture is not None
+            and "MOESPRESSO_SSD_KV_ALLOWANCE_GB" not in os.environ
+        )
+        kv_allowance = None
+        if exact_context_allowance:
+            try:
+                kv_allowance = _deepseek_v4_cache_allowance_bytes(
+                    architecture, requested_context)
+            except (KeyError, TypeError, ValueError):
+                exact_context_allowance = False
         budget = package_capacity_budget(
             index=index,
             package_dir=package_dir,
             max_router_fanout=max_router_fanout,
-            available_bytes=_deterministic_available_bytes(),
+            available_bytes=_deterministic_available_bytes(
+                already_resident_bytes=resident_base,
+            ),
+            kv_activation_allowance_bytes=kv_allowance,
             runtime_resident_bytes=compact_router_reserve,
         )
         if index.max_num_experts < budget.min_capacity:
             capacity_per_layer = index.max_num_experts
         else:
-            capacity_per_layer = choose_capacity(budget)
+            try:
+                capacity_per_layer = choose_capacity(budget)
+            except StreamingCapacityError as exc:
+                auto_limit = 0
+                if exact_context_allowance and not context_limit_explicit:
+                    auto_limit = _deepseek_v4_auto_context_limit(
+                        budget, architecture)
+                if auto_limit >= _MIN_AUTO_CONTEXT_TOKENS:
+                    kv_allowance = _deepseek_v4_cache_allowance_bytes(
+                        architecture, auto_limit)
+                    budget = package_capacity_budget(
+                        index=index,
+                        package_dir=package_dir,
+                        max_router_fanout=max_router_fanout,
+                        available_bytes=budget.available_bytes,
+                        kv_activation_allowance_bytes=kv_allowance,
+                        runtime_resident_bytes=compact_router_reserve,
+                    )
+                    try:
+                        capacity_per_layer = choose_capacity(budget)
+                    except StreamingCapacityError as reduced_exc:
+                        raise _deepseek_v4_capacity_error(
+                            budget,
+                            context_tokens=auto_limit,
+                        ) from reduced_exc
+                    object.__setattr__(
+                        model, "_moespresso_auto_context_limit", auto_limit)
+                    object.__setattr__(
+                        model,
+                        "_moespresso_auto_context_limit_from",
+                        requested_context,
+                    )
+                else:
+                    if requested_context <= 0:
+                        raise
+                    raise _deepseek_v4_capacity_error(
+                        budget,
+                        context_tokens=requested_context,
+                    ) from exc
         budget_payload = _budget_payload(budget)
+        if exact_context_allowance:
+            budget_payload["context_limit"] = int(
+                getattr(model, "_moespresso_auto_context_limit", None)
+                or requested_context
+            )
+            budget_payload["context_limit_auto_reduced_from"] = getattr(
+                model, "_moespresso_auto_context_limit_from", None)
     capacity_per_layer = int(capacity_per_layer)
     # Cross-layer decode lookahead (opt-in, MOESPRESSO_SSD_LOOKAHEAD=<delta>).
     # The prediction export exists only on the native-gate decode path, and
@@ -5150,6 +5275,8 @@ def load_deepseek_v4_package_model(
     capacity_per_layer: int | None = None,
     capacity_overrides: Mapping[int, int] | None = None,
     eviction_policy: str = "lfu",
+    context_limit: int | None = None,
+    context_limit_explicit: bool = False,
 ) -> tuple[Any, Any]:
     """Load a MoEspresso DS4 package into the JANG DS4 graph."""
     architecture = manifest.get("architecture") or {}
@@ -5190,6 +5317,9 @@ def load_deepseek_v4_package_model(
                 capacity_per_layer=capacity_per_layer,
                 capacity_overrides=capacity_overrides,
                 eviction_policy=eviction_policy,
+                architecture=architecture,
+                context_limit=context_limit,
+                context_limit_explicit=context_limit_explicit,
             )
     if wrap_switchglus_fn is None:
         if default_pooled_install:

@@ -573,7 +573,7 @@ def _budget_payload(budget) -> dict:
     }
 
 
-def _deterministic_available_bytes() -> int:
+def _deterministic_available_bytes(*, already_resident_bytes: int = 0) -> int:
     """Capacity-budget input: min(total RAM - OS reserve, available now).
 
     Budgeting from instantaneous available RAM made auto capacity a
@@ -583,14 +583,25 @@ def _deterministic_available_bytes() -> int:
     binding term, so capacity becomes deterministic (run-to-run
     reproducible); under memory pressure the live available clamps it (never
     budget memory someone else is using). MOESPRESSO_SSD_OS_RESERVE_GB tunes
-    the reserve (default 5 GiB for macOS + page cache + apps headroom)."""
+    the reserve (default 5 GiB for macOS + page cache + apps headroom).
+
+    Some family loaders hydrate the non-routed core before installing expert
+    pools. ``already_resident_bytes`` adds that package-owned allocation back
+    to the live reading because the capacity budget subtracts it separately.
+    The result remains capped by physical memory, the deterministic budget,
+    and any explicit memory ceiling.
+    """
     import os
 
     import psutil
 
     reserve_gb = float(os.environ.get("MOESPRESSO_SSD_OS_RESERVE_GB", "5"))
+    already_resident_bytes = int(already_resident_bytes)
+    if already_resident_bytes < 0:
+        raise ValueError("already_resident_bytes must be >= 0")
     vm = psutil.virtual_memory()
     deterministic = int(vm.total - reserve_gb * (1 << 30))
+    live_budget = min(int(vm.total), int(vm.available) + already_resident_bytes)
     # Lower-memory-budget simulation: MOESPRESSO_SSD_MAX_MEMORY_GB (and
     # the --max-memory-gb CLI flags) cap the startup capacity-planner input.
     # This selects expert-pool geometry; it is not an RSS limit. Hit-vs-
@@ -600,17 +611,17 @@ def _deterministic_available_bytes() -> int:
     cap_gb = os.environ.get("MOESPRESSO_SSD_MAX_MEMORY_GB")
     if cap_gb:
         return int(min(deterministic, float(cap_gb) * (1 << 30),
-                       vm.available))
-    
+                       live_budget))
+
     # macOS counts reclaimable page cache inconsistently in `available`
     # (observed: an idle system, available wobbling 9.5-11 GB after heavy
     # file IO, still capacity 95 vs 101 across minutes). When live
     # availability is within 25% of the deterministic budget, the gap is
     # reclaimable cache: trust the deterministic number. Only genuine memory
     # pressure (apps holding the RAM) clamps to live availability.
-    if vm.available >= deterministic * 0.75:
+    if live_budget >= deterministic * 0.75:
         return deterministic
-    return int(vm.available)
+    return int(live_budget)
 
 
 def build_ssd_streaming_model(

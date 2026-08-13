@@ -24,9 +24,10 @@ behavior.
   expert pool covers both fully resident and SSD-backed execution. Streaming
   covers the K-quant, TurboQuant, and IQ_K routed formats.
 - **Defaults favor quality at long context.** A package fixes a quality-gated
-  quantization recipe. Serving defaults to a broadly usable 128K context
-  window, and on the pooled runtime a memory shortfall streams routed experts
-  instead of shrinking that window.
+  quantization recipe. Serving uses a broadly useful 128K context window when
+  the runtime can reserve it. On lower-memory DeepSeek-V4 hosts it reports a
+  smaller safe default. The pooled runtime streams routed experts instead of
+  changing weight precision or silently reducing model quality.
 - **Speculative decoding ships and engages on its own.** A package can declare
   a bundled drafter. The DeepSeek-V4-Flash package carries one, and serving
   enables it when the memory budget covers it. See
@@ -69,7 +70,7 @@ side, stored in q6_K.
 
 ## Install
 
-MoEspresso 2.1.1 requires an arm64 Apple Silicon Mac running macOS 26.2
+MoEspresso 2.1.2 requires an arm64 Apple Silicon Mac running macOS 26.2
 (Tahoe) or later.
 
 Install MoEspresso with Homebrew. The formula installs its required Python
@@ -179,7 +180,8 @@ The main serving controls are:
   Its exact meaning matters, so it is described below.
 - `--max-context-tokens` selects any positive context limit up to the package's
   architecture limit. The default is 128K or the package limit, whichever is
-  smaller.
+  smaller. DeepSeek-V4 may report a lower automatic default when the exact
+  cache reservation would otherwise leave no usable expert pool.
 - `--min-resident-experts` sets a floor on the pooled routed runtime's
   per-layer expert capacity and fails at startup when the loaded capacity is
   smaller. A package whose runtime reports no expert pool refuses to start
@@ -216,23 +218,31 @@ This loads every expert before serving and fails when the planned pool cannot
 hold all 256 experts. It exercises the same pooled routed graph as SSD
 streaming; the only difference is that every row is already resident.
 
-Serving defaults to a 128K context limit. Each package retains its larger
+Serving targets a 128K context limit. Each package retains its larger
 architecture limit, which can be selected explicitly with
-`--max-context-tokens`. The operator-configured fixed KV/activation allowance
-is accounted for before extra expert residency, and the planner does not infer
-future context growth from incoming requests.
+`--max-context-tokens`. For DeepSeek-V4, the default planner prices the cache
+from the package's attention geometry and the served context. When 128K cannot
+coexist with the minimum expert pool, it chooses the largest safe 1K-aligned
+default and prints `auto_reduced_from=131072`. An explicit context limit is not
+reduced; startup fails with a memory breakdown if it cannot fit. Any resolved
+limit below 128K prints a prominent warning because usability is substantially
+reduced for long conversations and agentic work.
+
+`MOESPRESSO_SSD_KV_ALLOWANCE_GB` remains the explicit fixed-allowance override.
+Other model families use that fixed allowance because they do not yet publish a
+family-specific cache-size contract.
 
 `--max-memory-gb` caps the input to that startup capacity calculation. It is
 **not an RSS limit**. It selects a smaller or larger base expert-pool capacity
-after subtracting the resident base, the configured fixed KV/activation
+after subtracting the resident base, the resolved KV/activation
 allowance, and a safety margin. Serving can grow selected layers after a
 completed request when the adaptive-growth and replacement-memory budgets
 allow it. Pools never shrink as context grows, so operators must choose the
 ceiling and allowance for the context workload they intend to serve.
-`MOESPRESSO_SSD_KV_ALLOWANCE_GB` sets that fixed allowance (default: 1 GiB)
-before startup. A capacity-capped run on a larger Mac reproduces pool geometry
-and hit behavior, but its SSD miss cost can be optimistic because macOS may
-retain the whole package in page cache.
+`MOESPRESSO_SSD_KV_ALLOWANCE_GB` sets a fixed allowance (default: 1 GiB where
+the family has no exact contract). A capacity-capped run on a larger Mac
+reproduces pool geometry and hit behavior, but its SSD miss cost can be
+optimistic because macOS may retain the whole package in page cache.
 
 See [SSD streaming](docs/ssd_streaming.md) for the capacity formula, runtime
 controls, direct-read path, and measurement caveats.

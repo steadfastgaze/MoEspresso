@@ -125,7 +125,7 @@ under a non-native dialect carries `tool_dialect` inside its rendering
 identity, and every identity minted before the field existed stays
 byte-identical.
 
-## Dialect selection
+## Dialect resolution
 
 Per server process, resolved at startup and printed as a `[serve]` line:
 
@@ -134,8 +134,7 @@ Per server process, resolved at startup and printed as a `[serve]` line:
    and the pre-parsing request contract applies (every message needs a
    content key, `tool_choice` is not interpreted).
    `MOESPRESSO_TOOL_REPAIR=0` keeps parsing strict-only. Both default on.
-2. `--tool-dialect native|dsml` selects explicitly.
-3. Otherwise the package's `agentic_profile.json` dialect of record
+2. The package's `agentic_profile.json` dialect of record
    applies (`native` for the Ornith family, from the recorded emission
    study in `docs/package_format.md#agentic-profile-records`). A missing
    or unreadable profile, or a schema version above the supported one,
@@ -146,11 +145,8 @@ block into the system region instead of passing `tools` to the template,
 serializes past assistant `tool_calls` into DSML text, and parses DSML
 from the emission. The native XML parser stays active second: the family's
 trained format can bleed through, and catching it costs nothing. Tool
-results still travel as `role: "tool"` messages either way. The swap
-remains a supported selection for measurement and for a model whose
-recorded evidence favors it; it is no longer any template family's
-default, because the Ornith emission study measures the taught DSML form
-malformed at the parameter open tag on every artifact tested.
+results still travel as `role: "tool"` messages either way. A package may
+declare the swap only when its recorded evidence favors it.
 
 `tool_choice` accepts `auto` (default behavior) and `none` (tools are
 withheld from the render; note that flipping between `none` and `auto`

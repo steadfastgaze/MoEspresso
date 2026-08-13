@@ -33,6 +33,19 @@ DEFAULT_CONTEXT_LIMIT = 128 * 1024
 PLAIN_CACHE_RAIL = ("plain",)
 
 
+def context_limit_warning_lines(context_limit: int) -> tuple[str, ...]:
+    """Prominent product warning for a served context below the 128K target."""
+    limit = int(context_limit)
+    if limit >= DEFAULT_CONTEXT_LIMIT:
+        return ()
+    return (
+        "WARNING: served context is below the 128K usability target.",
+        f"WARNING: context_limit={limit} usability_target={DEFAULT_CONTEXT_LIMIT}.",
+        "WARNING: usability is substantially reduced for long conversations "
+        "and agentic work.",
+    )
+
+
 def encode_rendered_prompt(tokenizer, rendered_prompt: str) -> list[int]:
     """Encode a rendered prompt with the same string rules MLX uses.
 
@@ -78,20 +91,29 @@ def declared_context_limit(manifest: dict) -> int | None:
 def effective_context_limit(
     manifest: dict,
     requested: int | None = None,
+    runtime_default: int | None = None,
 ) -> int:
     """Resolve the served limit without changing the package contract.
 
     Packages retain their architecture limit. Serving defaults to 128K or the
-    package limit, whichever is smaller; an explicit operator value may select
-    any positive limit up to the package maximum.
+    package limit, whichever is smaller. A runtime may lower that default when
+    its exact memory contract cannot admit the default context alongside the
+    minimum execution state. An explicit operator value remains authoritative
+    and may select any positive limit up to the package maximum.
     """
     declared = declared_context_limit(manifest)
     if requested is None:
-        return (
+        default_limit = (
             min(DEFAULT_CONTEXT_LIMIT, declared)
             if declared
             else DEFAULT_CONTEXT_LIMIT
         )
+        if runtime_default is None:
+            return default_limit
+        runtime_default = int(runtime_default)
+        if runtime_default < 1:
+            raise ValueError("runtime context default must be >= 1")
+        return min(default_limit, runtime_default)
 
     limit = int(requested)
     if limit < 1:

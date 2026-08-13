@@ -41,14 +41,11 @@ and `LICENSE-APACHE-2.0`.
 The mix GEMM stays a composed MLX op at every shape. On multi-row
 prefill chunks the flattened-row rsqrt chain also stays composed. At the
 single-row decode shape the tail kernel absorbs the rsqrt chain and the
-mixer scale into the split dispatch: the composed
-``mx.mean(x_flat.square(), ...)`` at ``[1, 1, W]`` with the last axis
-reduced is a ContiguousReduce that dispatches ``row_reduce_looped`` with
-a 1024-thread threadgroup for ``W >= 4096``, and that order transcribes
-exactly (each thread sums four sequential squared elements per block at
-block stride 4096 from a zero accumulator, the same per-thread window
-for the tail elements, one ``simd_sum`` per simdgroup, lane-ordered
-``simd_sum`` over the 32 partials), followed by ``sum * float32(1/W)``
+mixer scale into the split dispatch. It preserves the composed reduction's
+1,024 logical lanes while dispatching 512 physical threads, so devices with a
+lower threadgroup limit retain the same arithmetic. Each physical thread
+computes two independent logical-lane partials; the same 32 simdgroup sums are
+then combined in the original order. This is followed by ``sum * float32(1/W)``
 (the mean normalizer), ``+ rms_norm_eps``, and
 ``metal::precise::rsqrt``. The mixer scale rounds once per element like
 the composed broadcast multiply. Measured 0/1400 mismatched trials
@@ -79,9 +76,11 @@ _DECODE_TAIL_ENV_FLAG = "MOESPRESSO_DSV4_HC_DECODE_TAIL"
 _HC = 4
 _MIX = (2 + _HC) * _HC
 _THREADS_PER_GROUP = 256
-# The tail kernel mirrors the composed reduce's threadgroup: at one row
-# and W >= 4096 the ContiguousReduce dispatches 1024 threads.
-_TAIL_THREADS_PER_GROUP = 1024
+# The tail kernel preserves the composed reduce's 1,024 logical lanes using
+# two independent logical-lane partials per physical thread. A 512-thread
+# dispatch stays within the lower Apple GPU threadgroup limit.
+_TAIL_THREADS_PER_GROUP = 512
+_TAIL_LOGICAL_THREADS = 1024
 _TAIL_MIN_WIDTH = 4096
 
 # One thread runs the whole 24-value split chain per row. The math below
@@ -245,27 +244,20 @@ _PRE_SOURCE = """
 """
 
 # Transcription of the composed sum-of-squares reduce at the single-row
-# decode shape. mx.mean(x_flat.square(), axis=-1) on [1, 1, W] resolves
-# to a ContiguousReduce and dispatches row_reduce_looped with a
-# 1024-thread threadgroup for W >= 4096: each thread accumulates
-# N_READS=4 sequential squared elements per block at block stride
-# lsize.x * N_READS = 4096 from a zero accumulator, handles the tail
-# elements through the same per-thread window, reduces each simdgroup
-# with simd_sum, and combines the 32 simdgroup partials with a
-# lane-ordered simd_sum. The square rounds per element exactly like the
-# composed unary square dispatch. fp contraction is disabled so the
-# product cannot fuse into the accumulate.
+# decode shape. The composed operation uses 1,024 logical threads. A physical
+# thread computes logical ids ``tid`` and ``tid + 512`` independently, then
+# publishes their simdgroup sums to the same 32 slots as the original launch.
+# Per-lane windows, block stride, simd sums, and the final lane-ordered sum are
+# unchanged. fp contraction is disabled so the product cannot fuse into the
+# accumulate.
 _TAIL_REDUCE_HEADER = """
-METAL_FUNC float moespresso_dsv4_hc_row_sumsq(
+METAL_FUNC float moespresso_dsv4_hc_logical_partial(
         const device float* xrow,
-        threadgroup float* shared_vals,
-        uint tid,
-        uint simd_gid,
-        uint simd_lid,
+        uint logical_tid,
         int W) {
     int blocks = W / (1024 * 4);
     int extra = W - blocks * (1024 * 4);
-    const device float* in = xrow + tid * 4;
+    const device float* in = xrow + logical_tid * 4;
     float total = 0.0f;
     for (int b = 0; b < blocks; b++) {
         #pragma clang fp contract(off)
@@ -275,7 +267,7 @@ METAL_FUNC float moespresso_dsv4_hc_row_sumsq(
         }
         in += 1024 * 4;
     }
-    int index = (int)tid * 4;
+    int index = (int)logical_tid * 4;
     if (index + 4 <= extra) {
         #pragma clang fp contract(off)
         for (int i = 0; i < 4; i++) {
@@ -289,9 +281,23 @@ METAL_FUNC float moespresso_dsv4_hc_row_sumsq(
             total = (v * v) + total;
         }
     }
-    total = metal::simd_sum(total);
+    return total;
+}
+
+METAL_FUNC float moespresso_dsv4_hc_row_sumsq(
+        const device float* xrow,
+        threadgroup float* shared_vals,
+        uint tid,
+        uint simd_gid,
+        uint simd_lid,
+        int W) {
+    float lower = moespresso_dsv4_hc_logical_partial(xrow, tid, W);
+    float upper = moespresso_dsv4_hc_logical_partial(xrow, tid + 512u, W);
+    lower = metal::simd_sum(lower);
+    upper = metal::simd_sum(upper);
     if (simd_lid == 0) {
-        shared_vals[simd_gid] = total;
+        shared_vals[simd_gid] = lower;
+        shared_vals[simd_gid + 16u] = upper;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float val = (tid < 32) ? shared_vals[tid] : 0.0f;
@@ -675,8 +681,8 @@ def hc_split_weighted_sum_tail_eligible(
 
     On top of the split eligibility this requires the single-row decode
     shape, the tail gate, and a flattened width of at least 4096 so the
-    composed reduce's 1024-thread dispatch shape holds. Anything else
-    falls back to the fused split with the composed rsqrt tail.
+    composed reduce's 1,024-logical-lane shape holds. Anything else falls back
+    to the fused split with the composed rsqrt tail.
     """
     if not hc_split_weighted_sum_eligible(
             x, fn, scale, base, hc_mult=hc_mult, iters=iters):

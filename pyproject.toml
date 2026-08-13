@@ -1,6 +1,6 @@
 [project]
 name = "moespresso"
-version = "2.1.1"
+version = "2.1.2"
 description = "Run large Mixture-of-Experts language models well on the memory you have."
 readme = "README.md"
 license = "MIT OR Apache-2.0"

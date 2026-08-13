@@ -172,6 +172,15 @@ def test_http_cli_threads_external_dspark_to_serve(tmp_path, monkeypatch):
     assert seen["external_drafter"] == sidecar
 
 
+def test_http_cli_does_not_expose_a_tool_dialect_override(capsys):
+    import moespresso.runtime.http as http
+
+    with pytest.raises(SystemExit) as exc:
+        http.main(["--help"])
+    assert exc.value.code == 0
+    assert "--tool-dialect" not in capsys.readouterr().out
+
+
 def test_verify_cli_checks_external_dspark_without_loading(
     tmp_path, monkeypatch, capsys
 ):

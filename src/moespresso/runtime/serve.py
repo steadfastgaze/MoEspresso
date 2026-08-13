@@ -119,6 +119,8 @@ def build_manifest_runtime(
     *,
     resident_builder: Callable[[dict, Path], tuple] | None = None,
     streaming_builder: Callable[[Path], tuple] | None = None,
+    context_limit: int | None = None,
+    context_limit_explicit: bool = False,
 ):
     """Build the runtime declared by the manifest.
 
@@ -138,13 +140,21 @@ def build_manifest_runtime(
 
     if resident_builder is None:
         from moespresso.runtime.build import build_model
-        resident_builder = build_model
+        return build_model(
+            manifest,
+            package_dir,
+            context_limit=context_limit,
+            context_limit_explicit=context_limit_explicit,
+        )
     return resident_builder(manifest, package_dir)
 
 
 def _manifest_driven_backend(
     manifest: dict,
     package_dir: Path,
+    *,
+    context_limit: int | None = None,
+    context_limit_explicit: bool = False,
 ):
     """The mjtq backend: build via the proven jang loader (runtime.build).
 
@@ -153,7 +163,12 @@ def _manifest_driven_backend(
     (TQ experts -> metal-kernel modules, affine -> mlx QuantizedLinear, per-tensor
     bits via tensor_map): no dequant at load. Returns (model, tokenizer); the
     tokenizer is loaded from the package by mlx_lm."""
-    return build_manifest_runtime(manifest, package_dir)
+    return build_manifest_runtime(
+        manifest,
+        package_dir,
+        context_limit=context_limit,
+        context_limit_explicit=context_limit_explicit,
+    )
 
 
 def _apple_silicon_generation() -> int | None:
@@ -324,6 +339,7 @@ def load_served_model(
     manifest: dict | None = None,
     build_fn: Callable[[dict, Path], tuple] = _manifest_driven_backend,
     drafter: Path | None = None,
+    max_context_tokens: int | None = None,
 ):
     """Build (model, tokenizer, manifest) from a mjtq package.
 
@@ -352,7 +368,21 @@ def load_served_model(
 
     default_ornith_mlx_command_buffer_limit(manifest)
     default_kq_seg_tile_for_hardware()
-    model, tokenizer = build_fn(manifest, package_dir)
+    if build_fn is _manifest_driven_backend:
+        from moespresso.runtime.prefix_cache import effective_context_limit
+
+        context_limit = effective_context_limit(
+            manifest,
+            requested=max_context_tokens,
+        )
+        model, tokenizer = build_fn(
+            manifest,
+            package_dir,
+            context_limit=context_limit,
+            context_limit_explicit=max_context_tokens is not None,
+        )
+    else:
+        model, tokenizer = build_fn(manifest, package_dir)
     _install_detokenizer_clone_factory(tokenizer)
     # Speculative-drafter resolution (DeepSeek-V4 packages only; other
     # families resolve to no drafter). An absent or empty
@@ -1027,7 +1057,9 @@ def add_runtime_limit_arguments(parser) -> None:
         type=int,
         default=None,
         help="Maximum prompt-plus-output context tokens. Default: "
-             f"{DEFAULT_CONTEXT_LIMIT:,} or the package limit, whichever is smaller.",
+             f"{DEFAULT_CONTEXT_LIMIT:,} or the package limit, whichever is "
+             "smaller; DeepSeek-V4 may lower the automatic default to fit "
+             "the minimum expert pool.",
     )
     parser.add_argument(
         "--min-resident-experts",
@@ -1080,12 +1112,10 @@ def main(
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--thinking", choices=("off", "on", "high", "max"),
                         default=None,
-                        help="Select the model family's own thinking mode: "
-                             "off, on (high is the same), or max (DeepSeek-V4 "
-                             "reasoning-effort preamble; DeepSeek-V4 only). "
-                             "Refuses if the family has no mechanism. "
-                             "Default: the template's own default "
-                             "(DeepSeek-V4: off).")
+                        help="Select the package's thinking mode: off, on "
+                             "(high is the same), or max. Unsupported modes "
+                             "refuse. Default: the package template's "
+                             "declared behavior.")
     parser.add_argument("--json-out", type=Path,
                         help="Write structured generation metadata to this JSON file.")
     args = parser.parse_args(argv)
@@ -1116,7 +1146,9 @@ def main(
 
         option_error = thinking_effort_option_error(
             args.thinking,
-            is_deepseek_v4=is_deepseek_v4_manifest(preflight_manifest))
+            supports_reasoning_effort=is_deepseek_v4_manifest(
+                preflight_manifest),
+        )
         if option_error is not None:
             print(option_error)
             return 2
@@ -1131,13 +1163,21 @@ def main(
     try:
         if preflight_manifest is None:
             if external_drafter is None:
-                model, tokenizer, manifest = load_served_model(pkg)
+                model, tokenizer, manifest = load_served_model(
+                    pkg,
+                    max_context_tokens=args.max_context_tokens,
+                )
             else:
                 model, tokenizer, manifest = load_served_model(
-                    pkg, drafter=external_drafter
+                    pkg,
+                    drafter=external_drafter,
+                    max_context_tokens=args.max_context_tokens,
                 )
         else:
-            load_kwargs = {"manifest": preflight_manifest}
+            load_kwargs = {
+                "manifest": preflight_manifest,
+                "max_context_tokens": args.max_context_tokens,
+            }
             if external_drafter is not None:
                 load_kwargs["drafter"] = external_drafter
             model, tokenizer, manifest = load_served_model(pkg, **load_kwargs)
@@ -1157,19 +1197,31 @@ def main(
         effective_context_limit,
     )
 
-    if context_limit is None:
-        try:
-            context_limit = effective_context_limit(
-                manifest,
-                requested=args.max_context_tokens,
-            )
-        except ValueError as e:
-            print(f"FAILED: {e}")
-            return 2
+    try:
+        context_limit = effective_context_limit(
+            manifest,
+            requested=args.max_context_tokens,
+            runtime_default=getattr(
+                model, "_moespresso_auto_context_limit", None),
+        )
+    except ValueError as e:
+        print(f"FAILED: {e}")
+        return 2
+    auto_from = getattr(model, "_moespresso_auto_context_limit_from", None)
+    auto_note = (
+        f" auto_reduced_from={int(auto_from)}"
+        if auto_from is not None
+        else ""
+    )
     print(
         f"[generate] context_limit={context_limit} "
         f"package_limit={declared_context_limit(manifest) or 'unknown'}"
+        f"{auto_note}"
     )
+    from moespresso.runtime.prefix_cache import context_limit_warning_lines
+
+    for line in context_limit_warning_lines(context_limit):
+        print(f"[generate] {line}")
     print(f"  loaded ({len(manifest['tensors'])} tensors, "
           f"{len(manifest['files'])} shard(s)).")
 
@@ -1186,7 +1238,7 @@ def main(
     selection = normalize_thinking_selection(args.thinking)
     ds4_contract = is_deepseek_v4_manifest(manifest)
     option_error = thinking_effort_option_error(
-        selection, is_deepseek_v4=ds4_contract)
+        selection, supports_reasoning_effort=ds4_contract)
     if option_error is not None:
         print(option_error)
         return 2

@@ -1853,6 +1853,16 @@ def test_deterministic_available_bytes_quiet_vs_busy(monkeypatch):
     monkeypatch.setattr(_psutil, "virtual_memory",
                         lambda: _VM(16 << 30, 6 << 30))
     assert ssb._deterministic_available_bytes() == 6 << 30
+    # A family loader may have already hydrated a 5 GiB resident core. The
+    # package capacity budget subtracts that core separately, so adding it back
+    # to the live reading restores the same 11 GiB planner input instead of
+    # charging the allocation twice.
+    assert (
+        ssb._deterministic_available_bytes(already_resident_bytes=5 << 30)
+        == 11 << 30
+    )
+    with pytest.raises(ValueError, match="already_resident_bytes"):
+        ssb._deterministic_available_bytes(already_resident_bytes=-1)
 
 
 def test_lookahead_decision_is_single_sourced(tmp_path, monkeypatch):

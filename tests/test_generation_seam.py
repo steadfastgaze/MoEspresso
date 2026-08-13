@@ -823,8 +823,9 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
 
     expected_manifest = manifest
 
-    def fake_load(package_dir, *, manifest):
+    def fake_load(package_dir, *, manifest, max_context_tokens=None):
         assert manifest is expected_manifest
+        assert max_context_tokens == 30000
         return "MODEL", _Tokenizer(), manifest
 
     monkeypatch.setattr(serve, "_preflight_manifest_for_cli", fake_preflight)
@@ -864,7 +865,10 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
     ])
 
     assert rc == 0
-    assert "generated text" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "generated text" in output
+    assert "WARNING: served context is below the 128K usability target" in output
+    assert "WARNING: context_limit=30000 usability_target=131072" in output
     payload = json.loads(json_out.read_text())
     assert payload["text"] == "generated text"
     assert payload["finish_reason"] == "stop"
@@ -890,7 +894,7 @@ def test_generate_main_rejects_span_beyond_explicit_context_limit(
     monkeypatch.setattr(
         serve,
         "load_served_model",
-        lambda package_dir: ("MODEL", _Tokenizer(), manifest),
+        lambda package_dir, **_kwargs: ("MODEL", _Tokenizer(), manifest),
     )
     monkeypatch.setattr(
         http,
@@ -976,7 +980,7 @@ def test_generate_main_rejects_deepseek_below_minimum_residency(
     monkeypatch.setattr(
         serve,
         "load_served_model",
-        lambda package_dir: (_Model(), _Tokenizer(), manifest),
+        lambda package_dir, **_kwargs: (_Model(), _Tokenizer(), manifest),
     )
 
     rc = main([
@@ -1005,7 +1009,7 @@ def test_generate_main_maps_deepseek_v4_thinking_selections(
 
     monkeypatch.setattr(
         serve, "load_served_model",
-        lambda package_dir: ("MODEL", _Tokenizer(), manifest))
+        lambda package_dir, **_kwargs: ("MODEL", _Tokenizer(), manifest))
 
     def fake_render(messages, tokenizer, template_kwargs=None, **kwargs):
         seen["template_kwargs"] = template_kwargs

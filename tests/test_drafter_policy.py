@@ -25,6 +25,10 @@ from moespresso.runtime.deepseek_v4.drafter_policy import (
     evaluate_bundled_drafter_budget,
     working_set_margin_bytes,
 )
+from moespresso.runtime.deepseek_v4.model import (
+    _deepseek_v4_auto_context_limit,
+)
+from moespresso.runtime.streaming_capacity import CapacityBudget
 
 ARCHITECTURE = {
     "num_hidden_layers": 43,
@@ -74,6 +78,22 @@ def test_cache_state_bytes_fails_on_ratio_count_mismatch():
     broken["compress_ratios"] = [0, 0, 4]
     with pytest.raises(ValueError, match="compress ratios"):
         deepseek_v4_cache_state_bytes(broken, 1024)
+
+
+def test_low_memory_context_keeps_the_minimum_expert_pool():
+    gib = 1 << 30
+    budget = CapacityBudget(
+        available_bytes=11 * gib,
+        resident_base_bytes=int(6.002493788488209 * gib),
+        runtime_resident_bytes=int(0.04273653030395508 * gib),
+        kv_activation_allowance_bytes=0,
+        safety_margin_bytes=2 * gib,
+        bytes_per_capacity_unit=int(266.86328125 * (1 << 20)),
+        min_capacity=8,
+        max_capacity=256,
+    )
+
+    assert _deepseek_v4_auto_context_limit(budget, ARCHITECTURE) == 16384
 
 
 def test_dspark_state_is_fixed_and_context_independent():

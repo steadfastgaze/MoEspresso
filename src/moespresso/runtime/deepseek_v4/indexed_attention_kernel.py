@@ -453,7 +453,7 @@ _PREFILL_LIVE_V2_F16_SOURCE = """
     uint sg = thread_position_in_threadgroup.y;
     uint tid = sg * 32u + lane;
     uint token = threadgroup_position_in_grid.x;
-    uint head = threadgroup_position_in_grid.y * 32u + sg;
+    uint head = threadgroup_position_in_grid.y * 16u + sg;
     uint batch = threadgroup_position_in_grid.z;
 
     uint batch_size = meta[0];
@@ -469,15 +469,16 @@ _PREFILL_LIVE_V2_F16_SOURCE = """
     uint window     = meta[10];
     uint ratio      = meta[11];
 
-    // The wrapper requires n_head % 32 == 0, so every simdgroup owns a valid
+    // The wrapper requires n_head % 16 == 0, so every simdgroup owns a valid
     // head and the batch/token guards below are threadgroup-uniform: no
     // thread returns while others still hit threadgroup barriers.
     if (batch >= batch_size || token >= n_tokens || head >= n_head) return;
 
-    // 8 staged KV rows per barrier round, 32 heads sharing each staged tile.
-    threadgroup half4 kv_shared[8u * 128u];
-    threadgroup int staged_ok[8];
-    threadgroup int staged_stop[8];
+    // Four staged KV rows per barrier round, 16 heads sharing each staged tile.
+    // The 512-thread shape remains below the lower Apple GPU threadgroup limit.
+    threadgroup half4 kv_shared[4u * 128u];
+    threadgroup int staged_ok[4];
+    threadgroup int staged_stop[4];
 
     uint srow = tid >> 7u;
     uint selem = tid & 127u;
@@ -567,8 +568,8 @@ _PREFILL_LIVE_V2_F16_SOURCE = """
     uint last = min(qpos, raw_last_pos);
 
     if (first <= last) {
-        for (uint base = first; base <= last; base += 8u) {
-            uint count = min(last - base + 1u, 8u);
+        for (uint base = first; base <= last; base += 4u) {
+            uint count = min(last - base + 1u, 4u);
             if (srow < count) {
                 uint pos = base + srow;
                 uint logical = pos - first_raw_pos;
@@ -594,8 +595,8 @@ _PREFILL_LIVE_V2_F16_SOURCE = """
     uint64_t topk_base =
         (uint64_t)batch * (uint64_t)topk_strides[0] +
         (uint64_t)token * (uint64_t)topk_strides[1];
-    for (uint i = 0u; i < top_k; i += 8u) {
-        uint count = min(top_k - i, 8u);
+    for (uint i = 0u; i < top_k; i += 4u) {
+        uint count = min(top_k - i, 4u);
         if (srow < count) {
             int idx = topk[topk_base + i + srow];
             bool ok = idx >= 0 && (uint)idx < visible;
@@ -625,7 +626,7 @@ _PREFILL_LIVE_V2_F16_SOURCE = """
                 row_update(r, row_score(r));
             }
         }
-        for (uint r = 0u; r < 8u; r++) {
+        for (uint r = 0u; r < 4u; r++) {
             all_stop = all_stop && staged_stop[r] != 0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1399,7 +1400,7 @@ def _get_prefill_live_v2_f32_kernel(n_heads: int, head_dim: int):
 
 
 def _prefill_live_v2_enabled() -> bool:
-    """Gate for the 8-row-staged, 32-heads-per-threadgroup prefill consumer.
+    """Gate for the 4-row-staged, 16-heads-per-threadgroup prefill consumer.
 
     The v2 kernel is bit-identical to the one-row kernel (same per-row dot
     structure, simd_sum order, and row visit order); the gate exists so the
@@ -1653,15 +1654,15 @@ def indexed_mixed_attention_prefill_live_f16(
             threadgroup=(256, 1, 1),
         )
         return out
-    if n_heads % 32 == 0 and _prefill_live_v2_enabled():
+    if n_heads % 16 == 0 and _prefill_live_v2_enabled():
         kernel = _get_prefill_live_v2_f16_kernel(n_heads, head_dim)
         _CONSUMER_CALL_COUNTS["v2"] += 1
         out, = kernel(
             inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
             output_shapes=[(batch, n_heads, n_tokens, head_dim)],
             output_dtypes=[mx.float32],
-            grid=(32 * n_tokens, 32 * (n_heads // 32), batch),
-            threadgroup=(32, 32, 1),
+            grid=(32 * n_tokens, 16 * (n_heads // 16), batch),
+            threadgroup=(32, 16, 1),
         )
         return out
     kernel = _get_prefill_live_f16_kernel(n_heads, head_dim)
@@ -1756,15 +1757,15 @@ def indexed_mixed_attention_prefill_live_f32(
             threadgroup=(256, 1, 1),
         )
         return out
-    if n_heads % 32 == 0 and _prefill_live_v2_enabled():
+    if n_heads % 16 == 0 and _prefill_live_v2_enabled():
         kernel = _get_prefill_live_v2_f32_kernel(n_heads, head_dim)
         _CONSUMER_CALL_COUNTS["v2"] += 1
         out, = kernel(
             inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
             output_shapes=[(batch, n_heads, n_tokens, head_dim)],
             output_dtypes=[mx.float32],
-            grid=(32 * n_tokens, 32 * (n_heads // 32), batch),
-            threadgroup=(32, 32, 1),
+            grid=(32 * n_tokens, 16 * (n_heads // 16), batch),
+            threadgroup=(32, 16, 1),
         )
         return out
     kernel = _get_prefill_live_f32_kernel(n_heads, head_dim)

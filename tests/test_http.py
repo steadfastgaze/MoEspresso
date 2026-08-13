@@ -464,6 +464,13 @@ def test_declared_context_limit_resolves_both_package_shapes():
     assert declared_context_limit({}) is None
 
     assert effective_context_limit(ds4) == 131072
+    assert effective_context_limit(ds4, runtime_default=16384) == 16384
+    # An explicit operator limit wins over the runtime's lower default.
+    assert effective_context_limit(
+        ds4, requested=30000, runtime_default=16384
+    ) == 30000
+    with pytest.raises(ValueError, match="runtime context default"):
+        effective_context_limit(ds4, runtime_default=0)
     assert effective_context_limit(ornith) == 131072
     assert effective_context_limit(
         {"architecture": {"config": {"max_position_embeddings": 65536}}}
@@ -474,6 +481,20 @@ def test_declared_context_limit_resolves_both_package_shapes():
         effective_context_limit(ornith, requested=0)
     with pytest.raises(ValueError, match="exceeds the package context limit"):
         effective_context_limit(ornith, requested=262145)
+
+
+def test_context_limit_warning_is_generic_and_only_below_128k():
+    from moespresso.runtime.prefix_cache import context_limit_warning_lines
+
+    assert context_limit_warning_lines(131072) == ()
+    assert context_limit_warning_lines(262144) == ()
+    warning = context_limit_warning_lines(65536)
+    assert warning == (
+        "WARNING: served context is below the 128K usability target.",
+        "WARNING: context_limit=65536 usability_target=131072.",
+        "WARNING: usability is substantially reduced for long conversations "
+        "and agentic work.",
+    )
 
 
 def test_chat_completion_maps_context_limit_error_to_a_400():
@@ -1227,6 +1248,43 @@ def test_serve_uses_default_context_limit(monkeypatch):
         )
 
     assert seen["context_limit"] == 131072
+
+
+def test_serve_reports_runtime_reduced_context_limit(monkeypatch, capsys):
+    import moespresso.runtime.http as h
+
+    manifest = _deepseek_v4_manifest()
+    seen = {}
+
+    class _Model:
+        _moespresso_auto_context_limit = 16384
+        _moespresso_auto_context_limit_from = 131072
+
+    class _Stop(Exception):
+        pass
+
+    def fake_build_cache_generator(model, tokenizer, _manifest, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(h, "build_cache_generator", fake_build_cache_generator)
+    with pytest.raises(_Stop):
+        h.serve(
+            "/tmp/pkg",
+            startup_warmup=False,
+            load_model_fn=lambda package_dir: (_Model(), "TOKENIZER", manifest),
+        )
+
+    assert seen["context_limit"] == 16384
+    output = capsys.readouterr().out
+    assert (
+        "[serve] context_limit=16384 package_limit=unknown "
+        "auto_reduced_from=131072"
+        in output
+    )
+    assert "WARNING: served context is below the 128K usability target" in output
+    assert "WARNING: context_limit=16384 usability_target=131072" in output
+    assert "WARNING: usability is substantially reduced" in output
 
 
 def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):

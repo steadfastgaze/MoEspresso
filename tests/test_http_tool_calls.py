@@ -782,16 +782,6 @@ def test_tool_free_render_is_byte_identical_to_pre_tool_serving():
 # --- config resolution --------------------------------------------------
 
 
-def test_resolve_config_prefers_cli_dialect(tmp_path):
-    # The flag selects against the profile, in the direction the fallback
-    # cannot produce on its own.
-    (tmp_path / "agentic_profile.json").write_text(json.dumps({
-        "schema_version": 1, "family": "qwen3_5_moe", "dialect": "native",
-    }), encoding="utf-8")
-    config = http.resolve_tool_call_config(tmp_path, dialect="dsml")
-    assert config == http.ToolCallConfig(dialect="dsml")
-
-
 def test_resolve_config_reads_profile_dialect(tmp_path):
     # A DSML-declaring sidecar is what makes the read observable: the native
     # selection is also the fallback, so it proves nothing on its own.

@@ -105,10 +105,11 @@ readers, and it must not branch on which planning route produced the package.
 `reasoning_content`/`content` deltas, sampling pass-through
 (`top_k`, `min_p`, `presence_penalty`), refusal of unsupported
 `repetition_penalty` values, and refusal of requests over the effective served
-context limit. Serving defaults to 128K or the package's architecture limit,
-whichever is smaller; `--max-context-tokens` selects any positive limit up to
-that architecture limit. The server warms generation before announcing
-readiness. Prefix reuse is in-memory first, with the disk KV checkpoint
+context limit. Serving targets 128K or the package's architecture limit,
+whichever is smaller; DeepSeek-V4 may lower that default to retain its minimum
+expert pool on a constrained host. `--max-context-tokens` selects any positive
+limit up to the architecture limit. The server warms generation before
+announcing readiness. Prefix reuse is in-memory first, with the disk KV checkpoint
 tier on by default under a per-package root in the user cache directory
 (`MOESPRESSO_DISK_KV=off` disables it). Speculative decoding is on by default
 where the package supports it: a package that declares a bundled drafter

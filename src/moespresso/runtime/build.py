@@ -448,6 +448,8 @@ def build_model(
     load_jang_fn=None,
     load_dsv4_fn=None,
     load_qwen_kquant_fn=None,
+    context_limit: int | None = None,
+    context_limit_explicit: bool = False,
 ):
     """Build (model, tokenizer) from a mjtq package via the jang loader.
 
@@ -464,6 +466,12 @@ def build_model(
         if load_dsv4_fn is None:
             from moespresso.runtime.deepseek_v4.model import load_deepseek_v4_package_model
             load_dsv4_fn = load_deepseek_v4_package_model
+            return load_dsv4_fn(
+                manifest,
+                package_dir,
+                context_limit=context_limit,
+                context_limit_explicit=context_limit_explicit,
+            )
         return load_dsv4_fn(manifest, package_dir)
 
     if adapter == "regular_jang_v2":

@@ -361,8 +361,8 @@ def test_qwen_kquant_loader_swaps_modules_before_loading_weights(tmp_path):
 def test_build_model_uses_dsv4_loader_for_deepseek_manifest(tmp_path):
     calls = []
 
-    def fake_dsv4(manifest, package_dir):
-        calls.append((manifest["architecture"]["family"], package_dir))
+    def fake_dsv4(manifest, package_dir, **kwargs):
+        calls.append((manifest["architecture"]["family"], package_dir, kwargs))
         return "DS4", "TOK"
 
     man = _manifest(
@@ -370,7 +370,11 @@ def test_build_model_uses_dsv4_loader_for_deepseek_manifest(tmp_path):
         ["affine_dequant", "tq_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
     )
     assert build_model(man, tmp_path, load_dsv4_fn=fake_dsv4) == ("DS4", "TOK")
-    assert calls == [("deepseek_v4_flash", tmp_path)]
+    assert calls == [(
+        "deepseek_v4_flash",
+        tmp_path,
+        {},
+    )]
 
 
 def test_build_model_uses_default_dsv4_loader_for_deepseek(tmp_path, monkeypatch):
@@ -378,8 +382,8 @@ def test_build_model_uses_default_dsv4_loader_for_deepseek(tmp_path, monkeypatch
 
     calls = []
 
-    def fake_dsv4(manifest, package_dir):
-        calls.append((manifest["architecture"]["family"], package_dir))
+    def fake_dsv4(manifest, package_dir, **kwargs):
+        calls.append((manifest["architecture"]["family"], package_dir, kwargs))
         return "DS4", "TOK"
 
     monkeypatch.setattr(dsv4_model, "load_deepseek_v4_package_model", fake_dsv4)
@@ -388,8 +392,17 @@ def test_build_model_uses_default_dsv4_loader_for_deepseek(tmp_path, monkeypatch
         "deepseek_v4_flash",
         ["affine_dequant", "tq_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
     )
-    assert build_model(man, tmp_path) == ("DS4", "TOK")
-    assert calls == [("deepseek_v4_flash", tmp_path)]
+    assert build_model(
+        man,
+        tmp_path,
+        context_limit=16384,
+        context_limit_explicit=True,
+    ) == ("DS4", "TOK")
+    assert calls == [(
+        "deepseek_v4_flash",
+        tmp_path,
+        {"context_limit": 16384, "context_limit_explicit": True},
+    )]
 
 
 def _write_safetensors(path, tensors, metadata=None):
