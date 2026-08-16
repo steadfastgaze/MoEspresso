@@ -49,17 +49,13 @@ agreement and decode throughput are better:
 [accuracy](#accuracy-focus), [performance](#performance-focus), and the
 [comparison protocol](docs/benchmark_reproduction.md#deepseek-v4-flash-quality-comparison).
 
-**Ornith 1.0 35B**, full-resident on an M3 Max with 40 GPU cores and 128 GB
-unified memory:
-
-<img src="docs/assets/ornith-benchmarks.svg" alt="Ornith comparison: at 37,000 tokens with Q8 KV, MoEspresso decodes at 67.31 tokens per second, mlx-lm at 48.09, and llama.cpp at 43.52; perplexity for the compared Q4_K_M and oQ4e artifacts is 6.2442 for llama.cpp, 6.2661 for MoEspresso, and 6.2897 for mlx-lm" width="100%">
-
 ## Supported models
 
 | Model | Public package | Serving mode |
 |---|---|---|
 | DeepSeek-V4-Flash-0731 | [DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-0731-2.37bpw-MoEspressoV2) | Built from the 0731 release. 84.35 GB (78.56 GiB) of model shards, 90.74 GB (84.51 GiB) with the bundled DSpark drafter. IQ_K routed experts use the pooled runtime in full-resident or SSD-streaming mode. |
-| Ornith 1.0 35B | [Ornith-1.0-35B-Q4_K_M-MoEspresso](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso) | K-quant routed experts on the pooled routed runtime. Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 32 GB memory configuration on a 128 GB host. |
+| DeepSeek-V4-Flash-0731 Coder | [DeepSeek-V4-Flash-0731-Coder-56.8GB-MoEspressoV2](https://huggingface.co/steadfastgaze/DeepSeek-V4-Flash-0731-Coder-56.8GB-MoEspressoV2) | Coding-specialized 56.83 GB package. It removes about 80B routed-expert parameters, leaving about 204B total and 13B active per token. IQ_K routed experts use the pooled runtime in full-resident or SSD-streaming mode. |
+| Ornith 1.0 35B | [Ornith-1.0-35B-Q4_K_M-MoEspresso](https://huggingface.co/steadfastgaze/Ornith-1.0-35B-Q4_K_M-MoEspresso) | The published package is V1 and uses V1-generation K-quant routed-expert bundles on the pooled runtime. Tested in full-resident and SSD-streaming modes. The SSD-streaming test simulated a 32 GB memory configuration on a 128 GB host. |
 
 The DeepSeek-V4-Flash package is a whole-model 2.37 bits per weight over the
 served model's 284.335e9 parameters, with the drafter excluded from both sides
