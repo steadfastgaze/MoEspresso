@@ -14,9 +14,8 @@ import pytest
 
 from moespresso.package.bundle import (
     KQUANT_CODEC,
-    ROW_ORDER,
     BundleFormatError,
-    assemble_layer_bundle,
+    assemble_layer_bundle as _assemble_layer_bundle,
     component_array,
     decode_bundle_metadata,
     ds4_source_to_mxfp4_components,
@@ -25,20 +24,18 @@ from moespresso.package.bundle import (
 )
 
 
-def _components(n_exp=4, out=8, cols=2, down_out=6, down_cols=3, seed=7):
-    """Deterministic stacked components with distinct values everywhere."""
-    rng = np.random.default_rng(seed)
-    comps = {
-        ("gate_proj", "packed"): rng.integers(0, 2**32, (n_exp, out, cols), dtype=np.uint32),
-        ("gate_proj", "norms"): rng.standard_normal((n_exp, out)).astype(np.float16),
-        ("up_proj", "packed"): rng.integers(0, 2**32, (n_exp, out, cols), dtype=np.uint32),
-        ("up_proj", "norms"): rng.standard_normal((n_exp, out)).astype(np.float16),
-        ("down_proj", "packed"): rng.integers(0, 2**32, (n_exp, down_out, down_cols),
-                                              dtype=np.uint32),
-        ("down_proj", "norms"): rng.standard_normal((n_exp, down_out)).astype(np.float16),
-    }
-    bits = {"gate_proj": 2, "up_proj": 2, "down_proj": 3}
-    return comps, bits
+_MXFP4_CODECS = {p: "mxfp4" for p in ("gate_proj", "up_proj", "down_proj")}
+ROW_ORDER = row_order_for_codecs(_MXFP4_CODECS)
+
+
+def assemble_layer_bundle(components, bits, codecs=None, **kwargs):
+    return _assemble_layer_bundle(components, bits, codecs or _MXFP4_CODECS, **kwargs)
+
+
+def _components(n_exp=4, out=8, cols=4, down_out=6, down_cols=8, seed=7):
+    from conftest import make_layer_components
+    specs = {"gate_proj": (out, cols), "up_proj": (out, cols), "down_proj": (down_out, down_cols)}
+    return make_layer_components(n_exp, specs=specs, seed=seed), {p: 4 for p in specs}
 
 
 def test_assemble_round_trips_every_component_byte_exact():
@@ -71,26 +68,26 @@ def test_metadata_round_trip_through_json():
     layers = decode_bundle_metadata(text)
     assert sorted(layers) == [0, 7]
     assert layers[7]["row_bytes"] == geo["row_bytes"]
-    assert layers[0]["projections"]["down_proj"]["bits"] == 3
+    assert layers[0]["projections"]["down_proj"]["bits"] == 4
 
 
 def test_assemble_rejects_missing_component_and_bad_dtype():
     comps, bits = _components()
     broken = dict(comps)
-    del broken[("up_proj", "norms")]
+    del broken[("up_proj", "scales")]
     with pytest.raises(BundleFormatError, match="missing"):
         assemble_layer_bundle(broken, bits)
 
     wrong = dict(comps)
-    wrong[("gate_proj", "norms")] = comps[("gate_proj", "norms")].astype(np.float32)
-    with pytest.raises(BundleFormatError, match="float16"):
+    wrong[("gate_proj", "scales")] = comps[("gate_proj", "scales")].astype(np.float32)
+    with pytest.raises(BundleFormatError, match="uint8"):
         assemble_layer_bundle(wrong, bits)
 
 
 def test_assemble_rejects_inconsistent_num_experts_and_bits():
     comps, bits = _components()
     bad = dict(comps)
-    bad[("down_proj", "norms")] = np.zeros((5, 6), dtype=np.float16)
+    bad[("down_proj", "scales")] = np.zeros((5, 6, 2), dtype=np.uint8)
     with pytest.raises(BundleFormatError, match="num_experts"):
         assemble_layer_bundle(bad, bits)
 
@@ -120,7 +117,7 @@ def test_decode_rejects_version_gaps_and_tampered_offsets():
 def test_component_array_rejects_out_of_range_slice():
     comps, bits = _components()
     bundle, geo = assemble_layer_bundle(comps, bits)
-    c = dict(geo["projections"]["down_proj"]["norms"])
+    c = dict(geo["projections"]["down_proj"]["scales"])
     c["offset"] = geo["row_bytes"]  # push past the end
     with pytest.raises(BundleFormatError, match="exceeds"):
         component_array(bundle, c)
@@ -161,31 +158,14 @@ def test_mxfp4_projection_uses_packed_and_scales_without_norms():
             np.testing.assert_array_equal(got, comps[(proj, comp)])
 
 
-def test_mixed_tq_and_mxfp4_bundle_metadata_round_trips():
-    comps, bits = _components()
-    codecs = {"gate_proj": "mxfp4", "up_proj": "tq", "down_proj": "tq"}
-    bits = {**bits, "gate_proj": 4}
-    del comps[("gate_proj", "norms")]
-    comps[("gate_proj", "packed")] = np.zeros((4, 8, 8), dtype=np.uint32)
-    comps[("gate_proj", "scales")] = np.zeros((4, 8, 2), dtype=np.uint8)
-
-    _, geo = assemble_layer_bundle(comps, bits, codecs=codecs)
-    decoded = decode_bundle_metadata(encode_bundle_metadata({0: geo}))[0]
-
-    assert decoded["projections"]["gate_proj"]["codec"] == "mxfp4"
-    assert decoded["projections"]["up_proj"]["codec"] == "tq"
-    assert "scales" in decoded["projections"]["gate_proj"]
-    assert "norms" in decoded["projections"]["up_proj"]
-
-
 def test_kquant_projection_uses_wire_weight_and_placeholder_scales():
     rng = np.random.default_rng(19)
     comps, bits = _components()
-    codecs = {"gate_proj": KQUANT_CODEC, "up_proj": "tq", "down_proj": "tq"}
+    codecs = {"gate_proj": KQUANT_CODEC, "up_proj": "mxfp4", "down_proj": "mxfp4"}
     kquant_codecs = {"gate_proj": "q2_k"}
     bits = {**bits, "gate_proj": 2}
     del comps[("gate_proj", "packed")]
-    del comps[("gate_proj", "norms")]
+    del comps[("gate_proj", "scales")]
     comps[("gate_proj", "weight")] = rng.integers(
         0,
         256,
@@ -218,10 +198,10 @@ def test_kquant_projection_uses_wire_weight_and_placeholder_scales():
 
 def test_kquant_projection_rejects_unknown_codec_and_bad_placeholder_shape():
     comps, bits = _components()
-    codecs = {"gate_proj": KQUANT_CODEC, "up_proj": "tq", "down_proj": "tq"}
+    codecs = {"gate_proj": KQUANT_CODEC, "up_proj": "mxfp4", "down_proj": "mxfp4"}
     bits = {**bits, "gate_proj": 2}
     del comps[("gate_proj", "packed")]
-    del comps[("gate_proj", "norms")]
+    del comps[("gate_proj", "scales")]
     comps[("gate_proj", "weight")] = np.zeros((4, 8, 84), dtype=np.uint8)
     comps[("gate_proj", "scales")] = np.zeros((4, 1), dtype=np.uint8)
 

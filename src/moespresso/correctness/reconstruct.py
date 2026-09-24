@@ -12,12 +12,8 @@ from pathlib import Path
 import numpy as np
 
 from moespresso.core.artifact import Validation, artifact_producer, make_artifact
-from moespresso.correctness.tq_reference import tq_decode_rows
-from moespresso.inventory.safetensors_header import read_shard_metadata
-from moespresso.package import bundle as bundle_mod
 from moespresso.probe import weight_io
 from moespresso.probe.deepseek_v4.codec import load_dequantized_fp8_rows
-from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup
 
 PRODUCER = artifact_producer("moespresso.correctness")
 
@@ -25,15 +21,12 @@ DEFAULT_SAMPLE_POLICY = {
     "seed": 42,
     "affine_tensors": 8,
     "rows_per_tensor": 32,
-    "tq_tensors": 24,
-    "tq_experts": 2,
     "rows_per_expert": 8,
 }
 
 DEFAULT_TOLERANCES = {
     "passthrough_max_abs": 2e-3,
     "affine_relative_rms": 1.25,
-    "tq_relative_rms": 1.25,
 }
 
 _HIGH_RISK = (
@@ -406,229 +399,7 @@ def _check_mx_dense(t, src_cat, pkg_cat, source_dir, package_dir, policy, out, m
     counts[fmt] += 1
 
 
-def _source_rows_for_projection(source_rows: int, projection: str, sampled_rows: np.ndarray):
-    if projection in ("gate", "up"):
-        mid = source_rows // 2
-        if projection == "gate":
-            return sampled_rows, mid
-        return sampled_rows + mid, mid
-    return sampled_rows, source_rows
-
-
-def _bundle_projection_geometry(t, bundle_h, package_dir, out):
-    """The (layer, projection) geometry from the bundle shard's metadata.
-
-    Returns the projection's geometry dict or None (with a blocking validation
-    appended). This is the same metadata the runtime's expert index loads from,
-    so L1 verifies the exact contract the loader will follow.
-    """
-    key = f"/{t['key_prefix']}.{bundle_mod.BUNDLE_KEY_SUFFIX}"
-    meta_text = read_shard_metadata(
-        Path(package_dir) / bundle_h.shard).get(bundle_mod.METADATA_KEY)
-    if meta_text is None:
-        out.append(Validation(
-            "error", "correctness.missing_bundle_metadata",
-            f"shard {bundle_h.shard} carries {bundle_h.name} but no "
-            f"{bundle_mod.METADATA_KEY} metadata",
-            path=key, phase="L1", blocking=True))
-        return None
-    try:
-        layers = bundle_mod.decode_bundle_metadata(meta_text)
-    except bundle_mod.BundleFormatError as e:
-        out.append(Validation(
-            "error", "correctness.bad_bundle_metadata", str(e),
-            path=key, phase="L1", blocking=True))
-        return None
-    layer = t.get("layer_index")
-    geo = layers.get(int(layer)) if layer is not None else None
-    if geo is None:
-        out.append(Validation(
-            "error", "correctness.missing_bundle_metadata",
-            f"{bundle_mod.METADATA_KEY} metadata has no layer-{layer} entry "
-            f"for {t['source_name']}",
-            path=key, phase="L1", blocking=True))
-        return None
-    proj = t.get("projection", "")
-    proj_key = proj if proj.endswith("_proj") else f"{proj}_proj"
-    return geo["projections"].get(proj_key)
-
-
-def _check_tq(t, src_cat, pkg_cat, source_dir, package_dir, policy, out, metrics, counts):
-    name = t["source_name"]
-    src_h = src_cat.get(name)
-    if src_h is None:
-        _source_missing(out, name)
-        return
-    (bundle_key,) = _sidecar_keys(t, (bundle_mod.BUNDLE_KEY_SUFFIX,))
-    bundle_h = pkg_cat.get(bundle_key)
-    if bundle_h is None:
-        _missing(out, bundle_key, t)
-        return
-    pgeo = _bundle_projection_geometry(t, bundle_h, package_dir, out)
-    if pgeo is None:
-        return
-    params = t.get("format_params", {})
-    expected_bits = int(params.get("bits", 0))
-    seed = int(params.get("seed", policy["seed"]))
-    stored_bits = int(pgeo["bits"])
-    if stored_bits != expected_bits:
-        out.append(Validation(
-            "error", "correctness.tq_bits_mismatch",
-            f"{name} manifest bits {expected_bits} but bundle metadata stores "
-            f"{stored_bits}",
-            path=f"/{bundle_key}", phase="L1", blocking=True,
-            expected=expected_bits, actual=stored_bits))
-        return
-    n_experts, source_rows, in_features = src_h.shape
-    expert_idx = weight_io.sample_indices(n_experts, int(policy["tq_experts"]),
-                                          _stable_seed(policy["seed"], name, "experts"))
-    projection = t.get("projection", "")
-    row_limit = int(pgeo["packed"]["shape"][0])  # out_features in the package
-    row_idx = weight_io.sample_indices(row_limit, int(policy["rows_per_expert"]),
-                                       _stable_seed(policy["seed"], name, projection, "rows"))
-    source_row_idx, out_features = _source_rows_for_projection(source_rows, projection, row_idx)
-    if out_features != row_limit:
-        out.append(Validation(
-            "error", "correctness.shape_mismatch",
-            f"{name} projection {projection!r} package rows {row_limit} do not match "
-            f"source projection rows {out_features}",
-            path=f"/{name}", phase="L1", blocking=True,
-            expected=out_features, actual=row_limit))
-        return
-    source = weight_io.load_3d_rows(source_dir, src_h, expert_idx, source_row_idx)
-    source = source.reshape(-1, in_features)
-    # One read per sampled expert: the bundle row is the expert's payload (the
-    # exact byte ranges the runtime preads), then slice components per metadata.
-    bundle_rows = weight_io.load_2d_rows_raw(package_dir, bundle_h, expert_idx)
-    try:
-        packed_all = bundle_mod.component_array(bundle_rows, pgeo["packed"])
-        norms_all = bundle_mod.component_array(bundle_rows, pgeo["norms"])
-    except bundle_mod.BundleFormatError as e:
-        out.append(Validation(
-            "error", "correctness.bad_bundle_metadata", str(e),
-            path=f"/{bundle_key}", phase="L1", blocking=True))
-        return
-    packed = packed_all[:, row_idx, :].reshape(-1, packed_all.shape[-1])
-    norms = norms_all[:, row_idx].reshape(-1)
-    try:
-        recon = tq_decode_rows(packed, norms, stored_bits, in_features, seed)
-    except ValueError as e:
-        out.append(Validation(
-            "error", "correctness.tq_decode_failed", str(e),
-            path=f"/{name}", phase="L1", blocking=True))
-        return
-    err = _errors(source, recon)
-    _record_metric(metrics, t, "tq", err, rows=row_idx.tolist(), experts=expert_idx.tolist())
-    _block_on_error(out, t, err, DEFAULT_TOLERANCES["tq_relative_rms"])
-    counts["tq"] += 1
-
-
-def _check_deepseek_v4_tq(
-    t,
-    group: DecodedExpertGroup,
-    pkg_cat,
-    package_dir,
-    policy,
-    out,
-    metrics,
-    counts,
-):
-    name = t["source_name"]
-    (bundle_key,) = _sidecar_keys(t, (bundle_mod.BUNDLE_KEY_SUFFIX,))
-    bundle_h = pkg_cat.get(bundle_key)
-    if bundle_h is None:
-        _missing(out, bundle_key, t)
-        return
-    pgeo = _bundle_projection_geometry(t, bundle_h, package_dir, out)
-    if pgeo is None:
-        return
-    params = t.get("format_params", {})
-    expected_bits = int(params.get("bits", 0))
-    seed = int(params.get("seed", policy["seed"]))
-    stored_bits = int(pgeo["bits"])
-    if stored_bits != expected_bits:
-        out.append(Validation(
-            "error", "correctness.tq_bits_mismatch",
-            f"{name} manifest bits {expected_bits} but bundle metadata stores "
-            f"{stored_bits}",
-            path=f"/{bundle_key}", phase="L1", blocking=True,
-            expected=expected_bits, actual=stored_bits))
-        return
-
-    layer = int(t["layer_index"])
-    projection = str(t.get("projection", ""))
-    source_experts = group.experts(layer)
-    available = min(len(source_experts), int(bundle_h.shape[0]))
-    if available <= 0:
-        out.append(Validation(
-            "error", "correctness.missing_source_tensor",
-            f"{name} has no DS4 expert rows available for reconstruction",
-            path=f"/{name}", phase="L1", blocking=True))
-        return
-    expert_rows = weight_io.sample_indices(
-        available,
-        int(policy["tq_experts"]),
-        _stable_seed(policy["seed"], name, "experts"),
-    )
-    row_limit = int(pgeo["packed"]["shape"][0])
-    row_idx = weight_io.sample_indices(
-        row_limit,
-        int(policy["rows_per_expert"]),
-        _stable_seed(policy["seed"], name, projection, "rows"),
-    )
-    source_parts = []
-    for row in expert_rows:
-        expert_index = source_experts[int(row)]
-        decoded = group.decode(
-            layer=layer,
-            expert_index=expert_index,
-            projection=projection,
-            out_dtype=np.float32,
-        )
-        if decoded.shape[0] != row_limit:
-            out.append(Validation(
-                "error", "correctness.shape_mismatch",
-                f"{name} projection {projection!r} package rows {row_limit} do not "
-                f"match source projection rows {decoded.shape[0]}",
-                path=f"/{name}", phase="L1", blocking=True,
-                expected=decoded.shape[0], actual=row_limit))
-            return
-        source_parts.append(decoded[row_idx])
-    source = np.concatenate(source_parts, axis=0)
-    in_features = int(source.shape[1])
-
-    bundle_rows = weight_io.load_2d_rows_raw(package_dir, bundle_h, expert_rows)
-    try:
-        packed_all = bundle_mod.component_array(bundle_rows, pgeo["packed"])
-        norms_all = bundle_mod.component_array(bundle_rows, pgeo["norms"])
-    except bundle_mod.BundleFormatError as e:
-        out.append(Validation(
-            "error", "correctness.bad_bundle_metadata", str(e),
-            path=f"/{bundle_key}", phase="L1", blocking=True))
-        return
-    packed = packed_all[:, row_idx, :].reshape(-1, packed_all.shape[-1])
-    norms = norms_all[:, row_idx].reshape(-1)
-    try:
-        recon = tq_decode_rows(packed, norms, stored_bits, in_features, seed)
-    except ValueError as e:
-        out.append(Validation(
-            "error", "correctness.tq_decode_failed", str(e),
-            path=f"/{name}", phase="L1", blocking=True))
-        return
-    err = _errors(source, recon)
-    _record_metric(
-        metrics,
-        t,
-        "tq",
-        err,
-        rows=row_idx.tolist(),
-        experts=expert_rows.tolist(),
-    )
-    _block_on_error(out, t, err, DEFAULT_TOLERANCES["tq_relative_rms"])
-    counts["tq"] += 1
-
-
-def _provenance(tq_seen: bool, affine_seen: bool, passthrough_seen: bool) -> list[dict]:
+def _provenance(affine_seen: bool, passthrough_seen: bool) -> list[dict]:
     out = []
     if passthrough_seen:
         out.append({"component": "passthrough", "kind": "independent",
@@ -638,10 +409,6 @@ def _provenance(tq_seen: bool, affine_seen: bool, passthrough_seen: bool) -> lis
         out.append({"component": "affine", "kind": "external_codec",
                     "identity": "mlx.core.dequantize",
                     "shared_with": ["mlx affine codec"]})
-    if tq_seen:
-        out.append({"component": "tq", "kind": "independent",
-                    "identity": "moespresso.correctness.tq_reference",
-                    "shared_with": []})
     return out
 
 
@@ -670,7 +437,6 @@ def l1_tensor_reconstruction(
         "affine": 0,
         "mxfp4": 0,
         "mxfp8": 0,
-        "tq": 0,
     }
     smoke_max_experts = _smoke_max_experts(manifest)
 
@@ -687,17 +453,6 @@ def l1_tensor_reconstruction(
         ],
         int(policy["affine_tensors"]),
     )
-    tq = _limit([t for t in tensors if t.get("format") == "tq"], int(policy["tq_tensors"]))
-    ds4_expert_group = None
-    family = manifest.get("architecture", {}).get("family")
-    if family == "deepseek_v4_flash" and tq:
-        try:
-            ds4_expert_group = DecodedExpertGroup.from_inventory(inventory, source_dir)
-        except ValueError as e:
-            validations.append(Validation(
-                "error", "correctness.source_adapter_unavailable",
-                f"DeepSeek V4 expert reconstruction needs a valid source adapter: {e}",
-                phase="L1", blocking=True))
 
     for t in passthrough:
         _check_passthrough(t, src_cat, pkg_cat, source_dir, package_dir,
@@ -714,23 +469,11 @@ def l1_tensor_reconstruction(
     for t in mx_dense:
         _check_mx_dense(t, src_cat, pkg_cat, source_dir, package_dir, policy,
                         validations, metrics, counts)
-    for t in tq:
-        if (ds4_expert_group is not None
-                and t.get("source_name", "").startswith("layers.")
-                and ".ffn.experts." in t.get("source_name", "")):
-            _check_deepseek_v4_tq(
-                t, ds4_expert_group, pkg_cat, package_dir, policy,
-                validations, metrics, counts)
-        else:
-            _check_tq(t, src_cat, pkg_cat, source_dir, package_dir, policy,
-                      validations, metrics, counts)
-
     for fmt, present in (
         ("affine", any(t.get("format") == "affine" for t in tensors)),
         ("mxfp4", any(t.get("format") == "mxfp4" and t.get("kind") != "expert"
                       for t in tensors)),
         ("mxfp8", any(t.get("format") == "mxfp8" for t in tensors)),
-        ("tq", any(t.get("format") == "tq" for t in tensors)),
         ("fp16", any(t.get("format") == "fp16" for t in tensors)),
         ("f32_passthrough", any(t.get("format") == "f32_passthrough" for t in tensors)),
         ("raw_dtype_passthrough", any(t.get("format") == "raw_dtype_passthrough"
@@ -746,7 +489,7 @@ def l1_tensor_reconstruction(
     worst = {}
     for fmt in (
         "fp16", "f32_passthrough", "raw_dtype_passthrough",
-        "affine", "mxfp4", "mxfp8", "tq",
+        "affine", "mxfp4", "mxfp8",
     ):
         vals = [m for m in metrics if m["format"] == fmt]
         if vals:
@@ -765,7 +508,6 @@ def l1_tensor_reconstruction(
         sample_policy=policy,
         tolerances=dict(DEFAULT_TOLERANCES),
         reference_provenance=_provenance(
-            bool(tq),
             bool(affine or mx_dense),
             bool(passthrough or f32_passthrough or raw_passthrough),
         ),

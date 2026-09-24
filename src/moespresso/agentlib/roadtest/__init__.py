@@ -1,4 +1,4 @@
-"""Engine road-test: a long cumulative agentic session with counter assertions.
+"""Engine road-test: a multi-hour cumulative certification soak.
 
 The road-test drives a really served model through agentlib for dozens of
 turns, executes the tool calls the model makes on a generated fixture
@@ -7,7 +7,10 @@ workspace, and asserts the engine's cache evidence after every request:
 writes at 256-aligned frontiers, and the ``/health`` cumulative counters. It
 manages the server lifecycle itself, including mid-session restarts that must
 resume from disk checkpoints, and an interleaved second session under its own
-cache key. Opt-in via ``make roadtest``; never part of ``make test``.
+cache key. The fixed protocol can exceed 50k tokens before the optional growth
+phase. ``--target-tokens`` controls only that optional phase and is not a total
+context or runtime bound; its default is 110k tokens. Opt-in via ``make
+roadtest``; never part of ``make test``.
 
 Modules:
 

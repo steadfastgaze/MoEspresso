@@ -136,7 +136,7 @@ def test_hc_split_weighted_sum_tail_bit_identical(hidden, iters):
         _assert_bit_equal(mx, y_ref, y, f"tail y seed={seed}")
 
 
-def test_hc_tail_eligibility_and_gate_delegation(monkeypatch):
+def test_hc_tail_eligibility():
     mx = _require_metal()
     assert hc_kernel._TAIL_THREADS_PER_GROUP == 512
     assert hc_kernel._TAIL_LOGICAL_THREADS == 1024
@@ -158,20 +158,6 @@ def test_hc_tail_eligibility_and_gate_delegation(monkeypatch):
     assert not tail_ok(
         mx.zeros((1, 1, 4, 512), dtype=mx.float32),
         mx.zeros((24, 4 * 512), dtype=mx.float32))
-
-    # The tail kill switch disables only the tail.
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_TAIL", "0")
-    assert not hc_kernel.hc_decode_tail_enabled()
-    assert not tail_ok(x, fn)
-    assert hc_kernel.hc_split_weighted_sum_eligible(
-        x, fn, scale, base, hc_mult=4, iters=20)
-
-    # The decode gate closes the tail regardless of the tail flag.
-    monkeypatch.delenv("MOESPRESSO_DSV4_HC_DECODE_TAIL")
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_FUSED", "0")
-    assert not hc_kernel.hc_decode_tail_enabled()
-    assert not tail_ok(x, fn)
-
 
 def test_hc_tail_rejects_multi_row_and_bad_widths():
     mx = _require_metal()
@@ -268,7 +254,7 @@ def test_eligibility_accepts_decode_and_rejects_bad_shapes():
         xp, residual, post.astype(mx.bfloat16), comb)
 
 
-def test_eligibility_gates_by_phase(monkeypatch):
+def test_eligibility_accepts_decode_and_prefill_shapes():
     mx = _require_metal()
     hidden = 64
     x = mx.zeros((1, 8, 4, hidden), dtype=mx.float32)
@@ -288,32 +274,10 @@ def test_eligibility_gates_by_phase(monkeypatch):
         return hc_kernel.hc_post_recombine_eligible(
             xp[:, :rows], residual[:, :rows], post[:, :rows], comb[:, :rows])
 
-    # Prefill gate off: multi-row falls back, single-row still engages.
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_PREFILL_FUSED", "0")
-    assert not hc_kernel.hc_prefill_fused_enabled()
-    assert hc_kernel.hc_decode_fused_enabled()
-    assert not pre_ok(8)
-    assert pre_ok(1)
-    assert not post_ok(8)
-    assert post_ok(1)
-
-    # Decode gate off: single-row falls back, multi-row still engages.
-    monkeypatch.delenv("MOESPRESSO_DSV4_HC_PREFILL_FUSED")
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_FUSED", "0")
-    assert hc_kernel.hc_prefill_fused_enabled()
-    assert not hc_kernel.hc_decode_fused_enabled()
     assert pre_ok(8)
-    assert not pre_ok(1)
+    assert pre_ok(1)
     assert post_ok(8)
-    assert not post_ok(1)
-
-    # Both gates off: nothing engages.
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_PREFILL_FUSED", "0")
-    assert not hc_kernel.hc_fused_enabled()
-    assert not pre_ok(8)
-    assert not pre_ok(1)
-    assert not post_ok(8)
-    assert not post_ok(1)
+    assert post_ok(1)
 
 
 class _HcLayer:
@@ -416,79 +380,9 @@ def test_patched_layer_fuses_decode_shape(dtype_name):
     assert fused_layer._moespresso_dsv4_hc_fused_post_fallback_calls == 0
 
 
-def test_patched_layer_tail_kill_switch_keeps_fused_split(monkeypatch):
-    mx = _require_metal()
-    jm = _jang_model()
-    hidden = 4096
-    fused_layer, composed_layer = _patched_pair(jm, hidden)
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_TAIL", "0")
-
-    x, fn, scale, base = _tail_inputs(mx, hidden, 21)
-    y_f, post_f, comb_f = fused_layer._hc_pre(x, fn, scale, base)
-    y_c, post_c, comb_c = composed_layer._hc_pre(x, fn, scale, base)
-    mx.eval(y_f, post_f, comb_f, y_c, post_c, comb_c)
-    _assert_bit_equal(mx, y_c, y_f, "tail-off pre y")
-    _assert_bit_equal(mx, post_c, post_f, "tail-off pre post")
-    _assert_bit_equal(mx, comb_c, comb_f, "tail-off pre comb")
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_calls == 1
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_decode_calls == 1
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_tail_decode_calls == 0
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_fallback_calls == 0
-
-
-def test_patched_layer_decode_kill_switch_falls_back(monkeypatch):
-    mx = _require_metal()
-    jm = _jang_model()
-    hidden = 128
-    fused_layer, composed_layer = _patched_pair(jm, hidden)
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_FUSED", "0")
-
-    mx.random.seed(4)
-    x = (mx.random.normal((1, 1, 4, hidden)) * 3.0).astype(mx.float32)
-    fn = (mx.random.normal((24, 4 * hidden)) * 0.02).astype(mx.float32)
-    scale = mx.array([1.3, 0.7, 0.9], dtype=mx.float32)
-    base = (mx.random.normal((24,)) * 0.5).astype(mx.float32)
-
-    y_f, post_f, comb_f = fused_layer._hc_pre(x, fn, scale, base)
-    y_c, post_c, comb_c = composed_layer._hc_pre(x, fn, scale, base)
-    mx.eval(y_f, post_f, comb_f, y_c, post_c, comb_c)
-    _assert_bit_equal(mx, y_c, y_f, "decode pre y")
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_calls == 0
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_fallback_calls == 1
-
-    block_out = (mx.random.normal((1, 1, hidden)) * 2.0).astype(mx.float32)
-    out_f = fused_layer._hc_post(block_out, x, post_f, comb_f)
-    out_c = composed_layer._hc_post(block_out, x, post_c, comb_c)
-    mx.eval(out_f, out_c)
-    _assert_bit_equal(mx, out_c, out_f, "decode post")
-    assert fused_layer._moespresso_dsv4_hc_fused_post_calls == 0
-    assert fused_layer._moespresso_dsv4_hc_fused_post_fallback_calls == 1
-
-    # Multi-row prefill shapes still engage under their own gate.
-    xw = (mx.random.normal((1, 6, 4, hidden)) * 3.0).astype(mx.float32)
-    y_w, post_w, comb_w = fused_layer._hc_pre(xw, fn, scale, base)
-    mx.eval(y_w, post_w, comb_w)
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_calls == 1
-    assert fused_layer._moespresso_dsv4_hc_fused_pre_decode_calls == 0
-
-
-def test_patch_disabled_by_kill_switches(monkeypatch):
+def test_patch_installs_for_supported_model():
     _require_metal()
     jm = _jang_model()
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_PREFILL_FUSED", "0")
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_DECODE_FUSED", "0")
-    model = _WrappedModel([_HcLayer(jm, 64)])
-    _patch_deepseek_v4_hc_post_float32(model)
-    assert _patch_deepseek_v4_hc_fused(model) == 0
-    assert model._moespresso_dsv4_hc_fused_layers == 0
-    assert not getattr(
-        model.model.layers[0], "_moespresso_dsv4_hc_fused", False)
-
-
-def test_patch_installs_with_only_decode_gate(monkeypatch):
-    _require_metal()
-    jm = _jang_model()
-    monkeypatch.setenv("MOESPRESSO_DSV4_HC_PREFILL_FUSED", "0")
     model = _WrappedModel([_HcLayer(jm, 64)])
     _patch_deepseek_v4_hc_post_float32(model)
     assert _patch_deepseek_v4_hc_fused(model) == 1

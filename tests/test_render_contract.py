@@ -13,9 +13,11 @@ import json
 from pathlib import Path
 
 import pytest
+import moespresso.runtime.http as http
 
 from moespresso.runtime.http import (
     DEFAULT_TEMPLATE_KWARGS,
+    PackageRequestContract,
     chat_completion,
     rendering_identity,
     render_prompt,
@@ -174,6 +176,190 @@ def test_chat_completion_renders_exactly_once_no_double_template():
                     tokenizer=tok)
     assert len(tok.calls) == 1, "template applied more than once"
     assert seen["prompt"] == "RENDERED[1]", "generate got a non-rendered or re-rendered prompt"
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "medium", "low"])
+def test_qwen4_top_level_reasoning_effort_reaches_one_render(effort):
+    tok = _CapturingTokenizer()
+    contract = PackageRequestContract(family="qwen4_exp", modality="text")
+
+    chat_completion(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        },
+        lambda prompt, **opts: "ok",
+        tokenizer=tok,
+        request_contract=contract,
+    )
+
+    assert len(tok.calls) == 1
+    assert tok.calls[0]["kwargs"]["reasoning_effort"] == effort
+
+
+def test_qwen4_effort_levels_have_distinct_rendering_identities():
+    identities = []
+    contract = PackageRequestContract(family="qwen4_exp", modality="text")
+
+    def generate(prompt, **opts):
+        identities.append(opts["effective_rendering_id"])
+        return "ok"
+
+    for effort in ("xhigh", "medium", "low"):
+        chat_completion(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            },
+            generate,
+            tokenizer=_CapturingTokenizer(),
+            rendering_id="files",
+            request_contract=contract,
+        )
+
+    assert len(set(identities)) == 3
+
+
+def test_qwen4_omitted_and_explicit_medium_share_rendering_identity():
+    tok = _CapturingTokenizer()
+    identities = []
+    contract = PackageRequestContract(family="qwen4_exp", modality="text")
+
+    def generate(prompt, **opts):
+        identities.append(opts["effective_rendering_id"])
+        return "ok"
+
+    base = {"messages": [{"role": "user", "content": "hi"}]}
+    chat_completion(
+        base, generate, tokenizer=tok, rendering_id="files",
+        request_contract=contract)
+    chat_completion(
+        {**base, "reasoning_effort": "medium"},
+        generate,
+        tokenizer=tok,
+        rendering_id="files",
+        request_contract=contract,
+    )
+
+    assert identities[0] == identities[1]
+    assert tok.calls[0]["kwargs"]["reasoning_effort"] == "medium"
+
+
+def test_qwen4_thinking_on_uses_medium_and_keeps_its_cache_identity():
+    tok = _CapturingTokenizer()
+    identities = []
+    contract = PackageRequestContract(family="qwen4_exp", modality="text")
+
+    def generate(prompt, **opts):
+        identities.append(opts["effective_rendering_id"])
+        return "ok"
+
+    request = {"messages": [{"role": "user", "content": "hi"}]}
+    chat_completion(
+        request,
+        generate,
+        tokenizer=tok,
+        rendering_id="files",
+        request_contract=contract,
+    )
+    chat_completion(
+        request,
+        generate,
+        tokenizer=tok,
+        rendering_id="files",
+        server_template_kwargs={"enable_thinking": True},
+        request_contract=contract,
+    )
+
+    assert identities[0] == identities[1]
+    assert tok.calls[1]["kwargs"]["enable_thinking"] is True
+    assert tok.calls[1]["kwargs"]["reasoning_effort"] == "medium"
+
+
+def test_qwen4_top_level_reasoning_effort_wins_over_nested_value():
+    tok = _CapturingTokenizer()
+    chat_completion(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"reasoning_effort": "medium"},
+        },
+        lambda prompt, **opts: "ok",
+        tokenizer=tok,
+        request_contract=PackageRequestContract(family="qwen4_exp"),
+    )
+    assert tok.calls[0]["kwargs"]["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize("value", ["max", "high", True, None])
+def test_qwen4_invalid_reasoning_effort_is_400_before_render(value):
+    tok = _CapturingTokenizer()
+    with pytest.raises(http.RequestError) as error:
+        chat_completion(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": value,
+            },
+            lambda prompt, **opts: "ok",
+            tokenizer=tok,
+            request_contract=PackageRequestContract(family="qwen4_exp"),
+        )
+    assert error.value.status == 400
+    assert not tok.calls
+
+
+def test_top_level_reasoning_effort_is_rejected_for_unsupported_package():
+    tok = _CapturingTokenizer()
+    with pytest.raises(http.RequestError, match="not supported"):
+        chat_completion(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "medium",
+            },
+            lambda prompt, **opts: "ok",
+            tokenizer=tok,
+            request_contract=PackageRequestContract(family="qwen3_5_moe"),
+        )
+    assert not tok.calls
+
+
+@pytest.mark.parametrize("part", [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    {"image": "local"},
+    {"type": "input_image", "image_url": "local"},
+    {"type": "video", "video": "local"},
+    {"video_url": "local"},
+])
+def test_text_only_package_rejects_media_before_render(part):
+    tok = _CapturingTokenizer()
+    generated = []
+    with pytest.raises(http.RequestError, match="text-only package"):
+        chat_completion(
+            {"messages": [{"role": "user", "content": [part]}]},
+            lambda prompt, **opts: generated.append(prompt) or "ok",
+            tokenizer=tok,
+            request_contract=PackageRequestContract(
+                family="qwen4_exp", modality="text"),
+        )
+    assert not tok.calls
+    assert not generated
+
+
+def test_text_only_package_allows_text_parts_without_normalizing_them():
+    tok = _CapturingTokenizer()
+    parts = [
+        {"type": "text", "text": "one"},
+        {"type": "input_text", "text": "two"},
+    ]
+    chat_completion(
+        {"messages": [{"role": "user", "content": parts}]},
+        lambda prompt, **opts: "ok",
+        tokenizer=tok,
+        request_contract=PackageRequestContract(
+            family="qwen4_exp", modality="text"),
+    )
+    assert len(tok.calls) == 1
+    assert tok.calls[0]["messages"][0]["content"] == parts
 
 
 # --- Step 4: rendering identity includes the resolved template kwargs ---
@@ -592,55 +778,3 @@ def test_thinking_on_replay_gains_no_scaffold():
 
 
 # --- integration: the real convert pipeline installs the template (needs the runtime stack) ---
-
-def test_real_convert_installs_froggeric_template(tmp_path):
-    import struct
-
-    import numpy as np
-    import pytest
-    pytest.importorskip("mlx.core")
-    pytest.importorskip("jang_tools.turboquant")
-    from moespresso.package.convert import convert
-
-    def _st(path, tensors):
-        header, blob, off = {}, bytearray(), 0
-        for name, arr in tensors.items():
-            a = np.ascontiguousarray(arr, dtype=np.float32)
-            b = a.tobytes()
-            header[name] = {"dtype": "F32", "shape": list(a.shape),
-                            "data_offsets": [off, off + len(b)]}
-            blob += b
-            off += len(b)
-        hjson = json.dumps(header).encode()
-        with open(path, "wb") as f:
-            f.write(struct.pack("<Q", len(hjson)))
-            f.write(hjson)
-            f.write(blob)
-
-    src = tmp_path / "src"
-    src.mkdir()
-    rng = np.random.default_rng(0)
-    _st(src / "model-00001.safetensors", {
-        "model.language_model.layers.0.self_attn.q_proj.weight":
-            rng.standard_normal((128, 128)).astype(np.float32),
-        "model.language_model.layers.0.mlp.experts.gate_up_proj":
-            rng.standard_normal((8, 256, 128)).astype(np.float32),
-        "model.language_model.layers.0.mlp.experts.down_proj":
-            rng.standard_normal((8, 128, 128)).astype(np.float32),
-    })
-    (src / "config.json").write_text(json.dumps(
-        {"model_type": "qwen3_moe",
-         "text_config": {"num_hidden_layers": 1, "hidden_size": 128, "num_experts": 8,
-                         "num_experts_per_tok": 2, "moe_intermediate_size": 128,
-                         "layer_types": ["full_attention"], "vocab_size": 256}}))
-    # a minimal source tokenizer with an OLD template (both sources)
-    (src / "tokenizer.json").write_text('{"x": 1}')
-    (src / "tokenizer_config.json").write_text(json.dumps({"chat_template": "OLD"}))
-
-    out = tmp_path / "pkg"
-    man = convert(src, out, allow_uniform=True, target_quality=0.5, shard_size_gb=0.0)
-
-    froggeric = chat_template_for("qwen3_5_moe")
-    assert (out / "chat_template.jinja").read_text(encoding="utf-8") == froggeric
-    assert json.loads((out / "tokenizer_config.json").read_text())["chat_template"] == froggeric
-    assert man["tokenizer"]["chat_template_source"] == "family:qwen3_5_moe"

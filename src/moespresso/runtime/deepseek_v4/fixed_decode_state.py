@@ -44,9 +44,7 @@ multi-token chunks, batch sizes other than one, overlap accumulation at
 offset zero, dtype mismatches, capacity exhaustion, and any external
 replacement of a legacy dict value (detected by object-identity mirrors)
 all drop the fixed representation and fall back to the stock concat
-path, which remains authoritative. `MOESPRESSO_DSV4_DECODE_FIXED_STATE=0`
-is the kill switch: the cache wrapper becomes a no-op and the stock
-contract is untouched.
+path, which remains authoritative.
 
 Engagement
 ----------
@@ -67,7 +65,6 @@ import math
 import os
 from types import MethodType
 
-_FIXED_STATE_ENV = "MOESPRESSO_DSV4_DECODE_FIXED_STATE"
 _MAX_CONTEXT_ENV = "MOESPRESSO_DSV4_DECODE_MAX_CONTEXT"
 _DEFAULT_MAX_CONTEXT = 4096
 
@@ -82,12 +79,6 @@ _BRANCHES_ATTR = "_moespresso_dsv4_fixed_branches"
 _ORIGINALS_ATTR = "_moespresso_dsv4_fixed_originals"
 _INSTALLED_ATTR = "_moespresso_dsv4_fixed_decode_state"
 _MAX_CONTEXT_ATTR = "_moespresso_dsv4_fixed_max_context"
-
-
-def fixed_decode_state_enabled() -> bool:
-    """Kill switch: `MOESPRESSO_DSV4_DECODE_FIXED_STATE=0` restores the
-    stock concat-growth cache contract exactly."""
-    return os.environ.get(_FIXED_STATE_ENV, "1") != "0"
 
 
 def fixed_decode_max_context() -> int:
@@ -657,12 +648,10 @@ def _fixed_trim(self, n):
 def install_fixed_decode_state(cache):
     """Install the fixed-shape decode state overrides on a DS4 cache.
 
-    Returns the cache unchanged when the kill switch is set, when the
-    capacity configuration is unusable, or when the cache does not carry
+    Returns the cache unchanged when the capacity configuration is unusable
+    or when the cache does not carry
     the expected composite-state surface.
     """
-    if not fixed_decode_state_enabled():
-        return cache
     if getattr(cache, _INSTALLED_ATTR, False):
         return cache
     max_context = fixed_decode_max_context()

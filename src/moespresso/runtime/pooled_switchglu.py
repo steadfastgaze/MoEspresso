@@ -8,10 +8,10 @@ are loaded directly into MLX buffers via `pread_into`.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 import os
-import threading
 import time
 from types import MethodType
 
@@ -24,7 +24,9 @@ from moespresso.runtime.expert_slot_pool import ExpertCapacityExceeded
 from moespresso.runtime.expert_slot_pool import ExpertSlotPool
 from moespresso.runtime.expert_slot_pool import grow_expert_slot_pools
 from moespresso.runtime.expert_slot_pool import seed_hot_expert_slot_pools
-from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.runtime.pooled_load_batch import LoadBatch, submit_loads, submit_loads_and_wait
+from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC
+from moespresso.package.iqk_format import IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1
 
 _PROJECTION_LOAD_EXECUTOR = ThreadPoolExecutor(
     max_workers=3,
@@ -37,86 +39,6 @@ _PIPELINE_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="moespresso-ssd-pipe",
 )
-
-# Speculative prefetch runs off the ordered pipeline worker so a
-# slow speculative pread can never delay a demand ensure. Lazy: most
-# sessions never enable lookahead.
-_LOOKAHEAD_EXECUTOR_BOX: list = [None]
-
-# Load shedding for the speculative executor: predictions arrive once per
-# routed layer per decode step, but a placement task preads up to sixteen
-# expert rows, which on large-expert models takes longer than a layer
-# step. An unbounded queue makes every placement land steps late (stale
-# speculation) and leaves a backlog the process must drain at exit, so a
-# submission is dropped instead of queued whenever the executor already
-# holds this many in-flight tasks (one running plus one queued keeps the
-# worker fed without building a backlog). Dropped predictions cost
-# nothing: the next layer step submits a fresh, current one.
-_LOOKAHEAD_MAX_PENDING = 2
-_LOOKAHEAD_PENDING_LOCK = threading.Lock()
-_LOOKAHEAD_PENDING = [0]
-
-
-def _lookahead_executor() -> ThreadPoolExecutor:
-    if _LOOKAHEAD_EXECUTOR_BOX[0] is None:
-        _LOOKAHEAD_EXECUTOR_BOX[0] = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="moespresso-ssd-lookahead")
-    return _LOOKAHEAD_EXECUTOR_BOX[0]
-
-
-def _lookahead_top_ids(scores):
-    """Return at most sixteen predicted expert ids for a compact pool."""
-    top_k = min(16, int(scores.size))
-    return mx.argpartition(scores, kth=-top_k)[-top_k:].astype(mx.uint32)
-
-# On-device remap: after ensure() loads any missing experts, remap routed ids ->
-# pool slots via an on-device gather instead of rebuilding slot indices on the
-# host for each projection. This is an exact seam cleanup; e2e speed impact has
-# measured roughly neutral so far. Default ON; set MOESPRESSO_SSD_ONDEVICE_REMAP=0
-# to fall back to the proven host remap_loaded.
-_ONDEVICE_REMAP = os.environ.get("MOESPRESSO_SSD_ONDEVICE_REMAP", "1") != "0"
-
-# Fused gate+up: jang's fused_gate_up_swiglu_matmul computes SiLU(gate)*up in one
-# Metal dispatch (vs the pooled path's 2 separate gather kernels + a Python
-# `activation(x_up, x_gate)`). Restores a fast path the pre-pooled streaming seam
-# had and the pooled rewrite dropped. This restores the previous behavior.
-# Default ON; MOESPRESSO_SSD_FUSED_GATE_UP=0 falls back to the exact separate path.
-# Precondition (guarded in PooledSwitchGLU.__init__): gate and up share codebook,
-# signs and bits, which is true for real mjtq packages (same in_features/bits/seed).
-_FUSED_GATE_UP = os.environ.get("MOESPRESSO_SSD_FUSED_GATE_UP", "1") != "0"
-
-# Compiled-island decode path: for decode tokens, run the
-# whole routed MLP (slot remap x2 + rotate + fused gate/up/SwiGLU + rotate +
-# down gather) as one mx.compile'd closure, following jang's own decode patch
-# shape (jangrt/switchglu_decode.py). Slot-bank mutation (ensure/pread, slot
-# table rebuilds) stays outside the island; only stable MLX arrays enter.
-# Default ON; MOESPRESSO_SSD_COMPILED_ISLAND=0 falls back to the eager path.
-_COMPILED_ISLAND = os.environ.get("MOESPRESSO_SSD_COMPILED_ISLAND", "1") != "0"
-
-# Cross-chunk predictive expert prefetch for streamed prefill. On the
-# over-capacity sorted-chunked path a layer's demand set is nearly stationary
-# across prompt chunks, and the whole prompt chunk of GPU work between a
-# layer's consecutive MoE calls is an unused overlap window. After a layer's
-# over-capacity call for prompt chunk N finishes, this submits a background
-# best-effort prefetch of the experts that call used, keyed on the block. The
-# next call for the same layer (prompt chunk N+1) awaits the prefetch before
-# its own chunk-ahead path runs, so slots that would miss are already warm.
-# Per-layer pools make the prefetch the only pool mutator between the two
-# calls, and prefetch protects the last demand set, so the still-executing
-# final chunk's slots are never evicted. The prefetch pre-fills slots and never
-# substitutes for the per-call sync and ensure; a mismatched or stale ticket is
-# counted and discarded, and the normal path services any difference.
-# Served A/B at cap-192: 37K prefill 516.7 to 560.8 t/s (+8.5%), 4K prefill
-# 620.2 to 677.4 t/s (+9.2%), miss volume down about 30 percent, token-identical
-# across capacities and 9/9 on the quality gate. The full-capacity certificate
-# path never dispatches over capacity, so it never submits or consumes a ticket
-# and stays untouched (826 t/s at 37K, unchanged). A consumption-order-aligned
-# variant that truncated the prediction to the lowest-id non-resident slice
-# sized to the free-plus-evictable budget measured slower (525.6 vs 560.8 t/s:
-# it warms only the non-resident actives, 123k vs 299k experts per run), so the
-# whole-set submission ships. Default ON; MOESPRESSO_SSD_PREFETCH=0 is the
-# kill switch.
-_PREFILL_PREFETCH = os.environ.get("MOESPRESSO_SSD_PREFETCH", "1") != "0"
 
 # Spec-prefetch oracle study: opt-in route tracing. When started, every
 # layer's routed expert ids are recorded (decode from the ring worker, the
@@ -151,128 +73,6 @@ def _should_sort_routed_indices(indices) -> bool:
 # path stays; the per-pair vector kernel wins at decode scale.
 _SEGMENTED_PREFILL_MIN_ROWS = 4096
 
-# Barrier-free full-resident bulk prefill: when every projection pool holds its
-# whole expert set (capacity == num_experts, the prewarm-all serving
-# configuration), the per-layer blocking np.asarray(indices) host read exists
-# only to feed miss handling and the host-built sort/segment table, and neither
-# is needed: there are no misses to load, routing can stay on device (argsort
-# plus a slot-table gather), and mlx_kquant.gather_qmm_sorted derives each
-# expert's row range in-kernel from the sorted slot ids, so the entire prefill
-# queues as one lazy graph with no per-layer drain.
-#
-# Measured on the 3844-token bounded served checkpoint, alternating arms in
-# one session (all thermal Nominal, GPU 43-54C): route on 25.107 / 25.306 /
-# 25.068 s TTFT, route off 26.810 s taken between the second and third on-arm,
-# with the off arm running cooler than the last on arm. Engagement counters
-# prove the arms differ: on-arm index_sync_calls and index_resync_calls both 0
-# (off-arm 43 each), barrier_free_prefill_calls 43, routed gate/down 43 calls
-# each, bundle_row_preads 0. Net ~1.5-1.7 s TTFT at matched warmth. Full
-# 64-token A/B/A with the route on: TTFT 25.009 / 25.478 s (certified
-# pre-change anchors 26.048 / 26.251 s), decode 15.25 / 14.38 tok/s, both arms
-# 46 tokens with stop and token-identical to the certified anchor
-# continuation. Gates with the route engaged: Q1 16/17 (blocking 2, the known
-# anchor), Q2 avg_nll 0.3914699462823993 bit-identical, Q3 16/16. This
-# constant is the route's kill switch; the eligibility check fails closed to
-# the segmented path when it is False or when any precondition (combined
-# K-quant gate/up, K-quant down, full residency, kernel availability) does not
-# hold.
-_BARRIER_FREE_PREFILL = True
-
-# Fused sorted SwiGLU for the barrier-free identity route: when mlx_kquant
-# ships gather_qmm_sorted_swiglu, the combined gate/up GEMM and the SwiGLU
-# activation collapse into one kernel whose epilogue applies the activation
-# on the float32 accumulators, so the [rows, 2N] intermediate and the
-# elementwise activation pass disappear. Same formula as the activation
-# module (gate upper-clamped to swiglu_limit, up clamped symmetrically,
-# silu(gate) * up in float32), but the epilogue skips the intermediate
-# rounding to the row dtype, so fused-on/off is numerically equivalent
-# rather than bit-identical for f16 rows. Identity-slot route only: the
-# route already shares one sorted id array between both GEMMs there.
-# Default ON; MOESPRESSO_SSD_FUSED_SORTED_SWIGLU=0 is the kill switch back
-# to the unfused gather_qmm_sorted + activation pair.
-_FUSED_SORTED_SWIGLU = (
-    os.environ.get("MOESPRESSO_SSD_FUSED_SORTED_SWIGLU", "1") != "0"
-)
-
-# Unified sorted prefill: run the partial-residency sorted-chunked prefill
-# through the same fused sorted K-quant kernels the full-resident barrier-free
-# route uses (gather_qmm_sorted_swiglu for gate/up + SwiGLU, gather_qmm_sorted
-# for down), over slot ids, per capacity-chunk. Without this the chunked
-# prefill computes each chunk through the unfused segmented f32 GEMM (or the
-# general gather) plus a separate activation, whose reconstruction and SwiGLU
-# epilogue differ from the fused kernel, so partial residency forks the served
-# tokens from the full-residency rail. Prefill routed MoE carries no cross-row
-# reduction (each output row is one token against one expert), so splitting an
-# expert's rows across capacity-chunks and running the same fused sorted kernel
-# per chunk yields the identical per-row output as one un-split segment. This
-# is the residency-decides-where-not-how contract: the misses are filled into
-# slots first, then the compute is the same kernel the full path runs.
-#
-# Engages only when the combined K-quant gate/up pool, the K-quant down pool,
-# and the fused sorted SwiGLU kernel are all present; anything else falls back
-# to the segmented/general chunked compute. Default ON;
-# MOESPRESSO_SSD_UNIFIED_PREFILL=0 restores the pre-unification chunked compute
-# (the kill switch, and the pre-unification OFF arm for the price A/B).
-_UNIFIED_SORTED_PREFILL = (
-    os.environ.get("MOESPRESSO_SSD_UNIFIED_PREFILL", "1") != "0"
-)
-
-# Barrier-free full-resident decode: the decode analog of the barrier-free
-# prefill route. When the one-shot residency certificate holds (every
-# projection pool has capacity == num_experts and a fully populated slot
-# table, read under the pool bookkeeping locks), the DS4 MoE block skips the
-# ring export kernel, the event gate, the worker submit, and the per-layer
-# kick, and consumes router indices on device (identity slot tables on the
-# prewarm-all fill order, else one on-device slot-table gather per pool).
-# The routed math uses the same codec-native gate, up, activation, and down
-# operations as the pipelined builder, so only scheduling and the index source
-# change. K-quant uses _DECODE_FLUSH_LAYERS for intermediate commits; IQ_K uses
-# its shared decode and verify cadence.
-# Default ON; MOESPRESSO_SSD_BARRIER_FREE_DECODE=0 is the kill switch back
-# to the ring/native-gate decode, which also remains the product path for
-# any partial-residency session (the certificate fails closed).
-_BARRIER_FREE_DECODE = (
-    os.environ.get("MOESPRESSO_SSD_BARRIER_FREE_DECODE", "1") != "0"
-)
-
-# Compact IQ_K learned layers can submit the gate and up packed-byte GEMVs in
-# one Metal dispatch.  The kernel preserves each projection's incumbent
-# arithmetic and leaves SwiGLU, down projection, and route reduction unchanged.
-# Ordinary source-width packages and the compact package's hash layers retain
-# the established separate-dispatch path.  Default ON;
-# MOESPRESSO_DSV4_IQK_DUAL_GEMV=0 is the kill switch.
-_IQK_DUAL_GEMV = (
-    os.environ.get("MOESPRESSO_DSV4_IQK_DUAL_GEMV", "1") != "0"
-)
-
-# Qwen-style decode scheduling: when the full-residency certificate holds, the
-# Qwen sparse MoE block takes the barrier-free full-resident decode route that
-# the DS4 block already runs, instead of the ring-export + native-gate pipeline.
-# The pipeline exists to overlap expert-miss service with compute; at full
-# residency there are no misses to hide, so its per-layer block-exit kick emits
-# forty async_eval graph flushes per token where the resident runtime builds one
-# lazy graph. The barrier-free route queues the token graph lazily and commits
-# every _DECODE_FLUSH_LAYERS layers, with no ring export, no event gate, and no
-# worker submit. The routed math is the same combined gate/up gather, activation,
-# and down gather build_pipelined's separate-kernel branch emits, so the route is
-# bit-identical to the ring path (only the index source and the scheduling
-# differ). Gated by the shared `_barrier_free_decode_ready` certificate, which
-# fails closed to the ring path for any partial-residency session. Default ON;
-# MOESPRESSO_SSD_DECODE_SCHED=0 restores the current pipelined Qwen decode
-# scheduling exactly, without touching the DS4 route.
-_QWEN_DECODE_SCHED = (
-    os.environ.get("MOESPRESSO_SSD_DECODE_SCHED", "1") != "0"
-)
-
-# Ornith's routed Q6_K down projections have the dedicated gathered-QMV
-# geometry: one token, eight expert rows, 512 inputs, and 2,048 outputs. The
-# dedicated leaf preserves the generic gather's BF16 result while avoiding its
-# shape-general wrapper. Set MOESPRESSO_QWEN_DOWN_Q6_QMV=0 to restore the
-# generic gather.
-_QWEN_DOWN_Q6_QMV = (
-    os.environ.get("MOESPRESSO_QWEN_DOWN_Q6_QMV", "1") == "1"
-)
-
 # Flush depth for the barrier-free decode route: commit the queued token
 # graph after every N MoE layers; the generator's own async_eval commits the
 # tail. Depth 4 mirrors the DS4-c split-after-an-early-layer shape; depth 1
@@ -287,53 +87,6 @@ _QWEN_DOWN_Q6_QMV = (
 # below 1 disable the intermediate flushes entirely.
 _DECODE_FLUSH_LAYERS = int(
     os.environ.get("MOESPRESSO_DSV4_DECODE_FLUSH_LAYERS", "4")
-)
-
-# Fused decode routed matvec family (the DS4-c decode MoE contract): on the
-# barrier-free decode route, the routed block collapses to two dispatches.
-# gather_qmv_pair_swiglu runs one matvec per routed expert over the combined
-# gate/up pool with the SwiGLU applied to the float32 accumulators and the
-# route weight baked into the stored intermediate; gather_qmv_expert_sum runs
-# the down matvec with the sum over the token's routed experts inside the
-# kernel, which removes the separate route-weighted-sum reduction outright.
-# Math-affecting by construction: route weights multiply before the down
-# matvec instead of after, the cross-expert sum accumulates per output
-# element in float32, and the intermediate skips the bfloat16 round-trip the
-# unfused composition takes, so fused-on/off is numerically equivalent rather
-# than bit-identical and the change is judged by the full quality campaign.
-# Engages only when the barrier-free decode certificate holds, both slot
-# tables are the identity map, and the pool codecs match the instantiated
-# kernels (iq2_xxs combined gate/up, q2_k down); anything else falls back to
-# the unfused barrier-free route. Against an f64 reference of the routed
-# block on real served states the fused form reads rel ~2.5e-7 versus the
-# composition's ~4.5e-3 (the bf16 intermediate lattice), and the served
-# 64-token anchor A/B measured decode 20.33-20.34 to 21.92-21.93 tok/s with
-# token identity on the anchor rail. Default ON;
-# MOESPRESSO_DSV4_DECODE_ROUTED_FUSED=0 is the kill switch back to the
-# unfused barrier-free route.
-_DECODE_ROUTED_FUSED = (
-    os.environ.get("MOESPRESSO_DSV4_DECODE_ROUTED_FUSED", "1") != "0"
-)
-
-# Ring-path fused decode routed matvec (the bounded-residency decode
-# unification): the fused pair above does not require full residency, only
-# correct row indices into the pool stacks, and the ring worker already
-# publishes per-layer slot-id buffers in router order after ensure(). At
-# partial residency the DS4 block therefore runs the same two kernels over
-# the published slot ids, with the route weights in the same router order,
-# so per-token math is identical to the full-resident fused route by
-# construction: same kernels, same entry order (gather_qmv_expert_sum
-# accumulates in id-array order, which the worker preserves), same float32
-# accumulation, and the indexed rows hold the same bytes. Residency decides
-# which pool row holds an expert; it never touches the dispatch or the
-# math. This closes the residency-keyed decode route split that left the
-# streamed tier off the full-resident rail (bounded arms forked at decode
-# knife-edges). Default ON; MOESPRESSO_DSV4_DECODE_RING_FUSED=0 restores
-# the unfused ring composition at partial residency only, and the family
-# switch MOESPRESSO_DSV4_DECODE_ROUTED_FUSED=0 keeps killing the fused
-# kernels everywhere.
-_DECODE_RING_FUSED = (
-    os.environ.get("MOESPRESSO_DSV4_DECODE_RING_FUSED", "1") != "0"
 )
 
 
@@ -555,13 +308,14 @@ def _ring_visibility_ok() -> bool:
 @dataclass
 class _ProjectionLoadTicket:
     active: set[int]
-    futures: list
+    batch: LoadBatch
     started_at: float
+    load_owner: object | None = None
     used: bool = False
 
     @property
     def has_work(self) -> bool:
-        return bool(self.futures)
+        return bool(self.batch.futures)
 
 
 @dataclass
@@ -570,7 +324,7 @@ class _PrefetchTicket:
 
     `predicted` is the demand set of the prompt chunk that submitted it, warmed
     on the IO executor so the layer's next call finds those slots resident.
-    `futures` complete when every pool's prefetch has published. The consumer
+    `batch` completes when every pool's prefetch has published. The consumer
     awaits them before its chunk-ahead path touches the pools, then discards the
     ticket. A submitted set that does not match the consumer's actual demand is
     counted as a mismatch but still awaited, because the prefetch's bytes are
@@ -579,8 +333,7 @@ class _PrefetchTicket:
     """
 
     predicted: frozenset[int]
-    futures: list
-    submitted_at: float
+    batch: LoadBatch
 
 
 def _token_layers(x) -> int:
@@ -618,68 +371,6 @@ def _record_switch_seconds(switch, attr: str, seconds: float) -> None:
 
 def _deepseek_v4_weighted_sum(y, scores):
     return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-
-
-class PooledTurboQuantSwitchLinear(nn.Module):
-    """A routed TQ projection backed by an `ExpertSlotPool`."""
-
-    def __init__(
-        self,
-        *,
-        package_dir,
-        index: ExpertIndex,
-        layer: int,
-        projection: str,
-        capacity: int,
-        codebook,
-        signs,
-        eviction_policy: str = "lfu",
-        row_cache=None,
-        spare_slots: int = 0,
-    ):
-        super().__init__()
-        self.pool = ExpertSlotPool(
-            package_dir=package_dir,
-            index=index,
-            layer=layer,
-            projection=projection,
-            capacity=capacity,
-            eviction_policy=eviction_policy,
-            row_cache=row_cache,
-            spare_slots=spare_slots,
-        )
-        if self.pool.codec != TQ_CODEC:
-            raise ValueError(
-                f"{projection} declares codec {self.pool.codec!r}, expected 'tq'")
-        self.codec = TQ_CODEC
-        self.bits = self.pool.bits
-        self.num_experts = self.pool.num_experts
-        self.out_features = self.pool.geometry.out_features
-        self.in_features = self.pool.geometry.packed_cols * (32 // self.bits)
-        self.codebook = codebook
-        self.signs = signs
-        self.matmul_slot_calls = 0
-        self.matmul_slot_elements = 0
-
-    def __call__(self, x, indices, *, sorted_indices: bool = False):
-        remapped = self.pool.remap(indices)
-        return self.matmul_slots(x, remapped, sorted_indices=sorted_indices)
-
-    def matmul_slots(self, x, remapped_indices, *, sorted_indices: bool = False):
-        from jang_tools.turboquant.gather_tq_kernel import gather_tq_matmul
-
-        self.matmul_slot_calls += 1
-        self.matmul_slot_elements += int(np.prod(remapped_indices.shape))
-        return gather_tq_matmul(
-            x,
-            self.pool.packed,
-            self.pool.norms,
-            self.codebook,
-            self.signs,
-            remapped_indices,
-            bits=self.bits,
-            sorted_indices=sorted_indices,
-        )
 
 
 class PooledMxfp4SwitchLinear(nn.Module):
@@ -860,8 +551,7 @@ class PooledKQuantSwitchLinear(nn.Module):
         self.matmul_slot_calls += 1
         self.matmul_slot_elements += int(np.prod(remapped_indices.shape))
         if (
-            _QWEN_DOWN_Q6_QMV
-            and not sorted_indices
+            not sorted_indices
             and self.pool.projection == "down_proj"
             and self.kquant_type == "q6_k"
             and self.in_features == 512
@@ -1029,23 +719,31 @@ class PooledSwitchGLU(nn.Module):
         self.up_proj = up_proj
         self.down_proj = down_proj
         self.activation = activation
-        # Fused gate+up: SiLU(gate)*up in one Metal dispatch (vs two gather kernels
-        # plus a Python `activation(x_up, x_gate)`). Restores a fast path the
-        # pre-pooled streaming seam had and the pooled rewrite dropped. This restores
-        # the previous behavior.
-        # Precondition: jang's fused kernel takes one codebook+signs+bits for both
-        # gate and up, so they must match. Real mjtq packages share them (gate/up have
-        # the same in_features/bits/seed); guard so anything else falls back to the
-        # exact separate path (correctness over speed).
+        self.hidden_size = int(gate_proj.in_features)
+        self.intermediate_size = int(gate_proj.out_features)
+        self.num_experts = int(gate_proj.num_experts)
+        projection_geometry = (
+            int(up_proj.in_features),
+            int(up_proj.out_features),
+            int(up_proj.num_experts),
+            int(down_proj.in_features),
+            int(down_proj.out_features),
+            int(down_proj.num_experts),
+        )
+        expected_geometry = (
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_experts,
+            self.intermediate_size,
+            self.hidden_size,
+            self.num_experts,
+        )
+        if projection_geometry != expected_geometry:
+            raise ValueError("pooled SwitchGLU projection geometry is inconsistent")
         self._all_mxfp4 = (
             getattr(gate_proj, "codec", None) == MXFP4_CODEC
             and getattr(up_proj, "codec", None) == MXFP4_CODEC
             and getattr(down_proj, "codec", None) == MXFP4_CODEC
-        )
-        self._all_tq = (
-            getattr(gate_proj, "codec", None) == TQ_CODEC
-            and getattr(up_proj, "codec", None) == TQ_CODEC
-            and getattr(down_proj, "codec", None) == TQ_CODEC
         )
         self._all_iqk = (
             getattr(gate_proj, "codec", None) == IQK_CODEC
@@ -1058,7 +756,7 @@ class PooledSwitchGLU(nn.Module):
         # evicts the demand residency needed by decode. Keep the proven
         # K-quant policy; IQ_K stays demand-driven until a multi-chunk served
         # arm establishes a codec-specific win.
-        self._prefill_prefetch_enabled = _PREFILL_PREFETCH and not self._all_iqk
+        self._prefill_prefetch_enabled = not self._all_iqk
         self.layer = int(gate_proj.pool.layer)
         self.iqk_ordinal = 0
         self.members = (
@@ -1070,21 +768,9 @@ class PooledSwitchGLU(nn.Module):
             if self._all_iqk
             else {}
         )
-        self._gate_up_tq = (
-            getattr(gate_proj, "codec", None) == TQ_CODEC
-            and getattr(up_proj, "codec", None) == TQ_CODEC
-        )
         self._combined_gate_up_kquant = (
             isinstance(gate_proj, PooledCombinedGateUpKQuantLinear)
             and getattr(up_proj, "_parent", None) is gate_proj
-        )
-        self._fused_gate_up = (
-            _FUSED_GATE_UP
-            and not self._all_mxfp4
-            and self._gate_up_tq
-            and gate_proj.bits == up_proj.bits
-            and bool(mx.array_equal(gate_proj.codebook, up_proj.codebook).item())
-            and bool(mx.array_equal(gate_proj.signs, up_proj.signs).item())
         )
         self.fused_gate_up_calls = 0
         self.total_calls = 0
@@ -1129,6 +815,8 @@ class PooledSwitchGLU(nn.Module):
         self.projection_no_miss_calls = 0
         self.projection_load_wait_seconds = 0.0
         self.projection_load_parallel_calls = 0
+        self.projection_sync_join_calls = 0
+        self.projection_tracked_join_calls = 0
         self.overlap_load_started_calls = 0
         self.overlap_load_wait_calls = 0
         self.overlap_load_wait_seconds = 0.0
@@ -1140,7 +828,7 @@ class PooledSwitchGLU(nn.Module):
         self.overlap_no_miss_calls = 0
         self.overlap_skipped_over_capacity_calls = 0
         self.overlap_ticket_mismatch_calls = 0
-        # Cross-chunk predictive prefetch (see _PREFILL_PREFETCH). One ticket
+        # Cross-chunk predictive prefetch. One ticket
         # per layer at a time; submitted after an over-capacity call, consumed
         # (awaited) at the layer's next over-capacity call, then discarded.
         self._prefetch_ticket: _PrefetchTicket | None = None
@@ -1175,31 +863,11 @@ class PooledSwitchGLU(nn.Module):
         self.routed_weighted_sum_output_elements = 0
         self.compiled_island_calls = 0
         self.block_exit_kick_calls = 0
-        self._island_cache: dict = {}
         self._mxfp4_kernel_cache: dict = {}
-        # Cross-layer lookahead state (install_lookahead wires these):
-        # lookahead_w = fp16 router weight of layer L+Delta; lookahead_target
-        # = that layer's PooledSwitchGLU (whose pools get the prefetch);
-        # lookahead_b = that layer's per-expert selection bias when its gate
-        # carries one (the DS4 score gate), None otherwise. The hot path only
-        # checks `lookahead_w is not None`.
-        self.lookahead_w = None
-        self.lookahead_b = None
-        self.lookahead_target = None
-        self._pred_ring_buf = None
-        self._pred_ring_np = None
-        self._last_active: set[int] = set()
-        self._spare_rr = 0
-        self.lookahead_exports = 0
-        self.lookahead_prefetch_loads = 0
-        self.lookahead_ring_misses = 0
-        self.lookahead_errors = 0
-        self.lookahead_dropped = 0
         # Pipelined builder state (see build_pipelined)
         self.pipelined_layers = 0
         self.pipeline_read_seconds = 0.0
         self.pipeline_join_seconds = 0.0
-        self._pipe_island_cache: dict = {}
         self._pipe_buf_cache: dict = {}
         # v3 ring-export state (see _RING_DECODE)
         self._ring_buf = None
@@ -1246,6 +914,67 @@ class PooledSwitchGLU(nn.Module):
 
     def _projection_pools_lockstep(self):
         return self._unique_projection_pools(lockstep=True)
+
+    def _join_projection_loads(self, calls) -> None:
+        """Run one immediate projection group with the safe join fallback."""
+        if submit_loads_and_wait(_PROJECTION_LOAD_EXECUTOR, calls):
+            self.projection_sync_join_calls += 1
+        else:
+            self.projection_tracked_join_calls += 1
+
+    def _ensure_stream_major_projection_batches(
+        self,
+        active: set[int],
+        *,
+        protect: set[int],
+        fence: bool,
+    ) -> bool:
+        """Load a sorted-prefill active set within the shared row-cache window.
+
+        Stream-major copies can let one projection consume rows substantially
+        faster than the other two. If the active set exceeds the shared cache,
+        that producer can evict rows before the remaining projections consume
+        them. Coordinating the existing projection ensures in cache-sized
+        rounds preserves one row read per expert without changing pool
+        publication or routed compute.
+
+        This helper is deliberately limited to the Qwen stream-major package
+        layout. Other layouts retain their established scheduling.
+        """
+        pools = self._projection_pools_lockstep()
+        if len(pools) != 3:
+            return False
+        row_cache = pools[0].row_cache
+        if (
+            row_cache is None
+            or row_cache.max_rows < 1
+            or len(active) <= row_cache.max_rows
+            or any(pool.row_cache is not row_cache for pool in pools[1:])
+            or any(
+                pool.geometry.layout != IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1
+                for pool in pools
+            )
+        ):
+            return False
+
+        ordered = sorted(active)
+        for start in range(0, len(ordered), row_cache.max_rows):
+            batch = set(ordered[start:start + row_cache.max_rows])
+            # The unbatched ensure protects its complete active set while it
+            # chooses victims. Preserve that eligibility: a later sub-round's
+            # resident expert must not be evicted by an earlier sub-round.
+            batch_protect = set(protect) | (active - batch)
+            try:
+                self._join_projection_loads(
+                    partial(pool.ensure, batch, protect=batch_protect, fence=fence)
+                    for pool in pools
+                )
+            finally:
+                # Submission and execution failures drain active writers before
+                # returning. Cached rows no longer have projection consumers.
+                for expert in batch:
+                    row_cache.discard(expert)
+        return True
 
     @staticmethod
     def _iqk_sorted_threshold() -> int:
@@ -1425,6 +1154,8 @@ class PooledSwitchGLU(nn.Module):
             lock.acquire()
         try:
             for pool in pools:
+                if getattr(pool, "_staging_owner", None) is not None:
+                    raise RuntimeError("expert pool is owned by staged verification")
                 if len(active) > pool.capacity:
                     return False
                 for expert in active:
@@ -1444,7 +1175,12 @@ class PooledSwitchGLU(nn.Module):
             for lock in reversed(locks):
                 lock.release()
 
-    def begin_projection_load(self, indices) -> _ProjectionLoadTicket | None:
+    def begin_projection_load(
+        self,
+        indices,
+        *,
+        load_owner=None,
+    ) -> _ProjectionLoadTicket | None:
         """Start routed expert loads before the routed matmul needs them.
 
         This is the overlap seam. It intentionally starts after router
@@ -1475,14 +1211,20 @@ class PooledSwitchGLU(nn.Module):
             return None
 
         self.overlap_load_started_calls += 1
-        futures = [
-            _PROJECTION_LOAD_EXECUTOR.submit(pool.ensure, active)
-            for pool in pools
-        ]
+        if load_owner is None:
+            batch = submit_loads(
+                _PROJECTION_LOAD_EXECUTOR,
+                (partial(pool.ensure, active) for pool in pools),
+            )
+        else:
+            batch = load_owner.begin_load_batch(_PROJECTION_LOAD_EXECUTOR)
+            for pool in pools:
+                batch.submit(partial(pool.ensure, active))
         return _ProjectionLoadTicket(
             active=active,
-            futures=futures,
+            batch=batch,
             started_at=time.perf_counter(),
+            load_owner=load_owner,
         )
 
     def _wait_projection_ticket(
@@ -1490,10 +1232,15 @@ class PooledSwitchGLU(nn.Module):
         active: set[int],
         ticket: _ProjectionLoadTicket | None,
     ) -> bool:
-        if ticket is None or ticket.used or ticket.active != active:
-            if ticket is not None:
-                self.overlap_ticket_mismatch_calls += 1
+        if ticket is None:
             return False
+        if ticket.used:
+            self.overlap_ticket_mismatch_calls += 1
+            return False
+
+        matches = ticket.active == active
+        if not matches:
+            self.overlap_ticket_mismatch_calls += 1
 
         ticket.used = True
         self.projection_load_wait_calls += 1
@@ -1501,8 +1248,10 @@ class PooledSwitchGLU(nn.Module):
         self.overlap_load_wait_calls += 1
         wait_started = time.perf_counter()
         try:
-            for future in ticket.futures:
-                future.result()
+            if ticket.load_owner is None:
+                ticket.batch.wait()
+            else:
+                ticket.load_owner.drain()
         finally:
             done = time.perf_counter()
             wait_seconds = done - wait_started
@@ -1511,7 +1260,8 @@ class PooledSwitchGLU(nn.Module):
             self.overlap_load_wait_seconds += wait_seconds
             self.overlap_load_total_seconds += total_seconds
             self.overlap_load_hidden_seconds += max(0.0, total_seconds - wait_seconds)
-        return True
+        # A different demand cannot touch the pools until the old writers stop.
+        return matches
 
     def _ensure_projection_pools(
         self,
@@ -1549,12 +1299,7 @@ class PooledSwitchGLU(nn.Module):
 
         self.projection_load_parallel_calls += 1
         try:
-            futures = [
-                _PROJECTION_LOAD_EXECUTOR.submit(pool.ensure, active)
-                for pool in pools
-            ]
-            for future in futures:
-                future.result()
+            self._join_projection_loads(partial(pool.ensure, active) for pool in pools)
         finally:
             self.projection_load_wait_seconds += time.perf_counter() - t0
 
@@ -1580,50 +1325,6 @@ class PooledSwitchGLU(nn.Module):
         finally:
             self.routed_build_seconds += time.perf_counter() - build_t0
 
-    def _get_compiled_island(self, K: int):
-        """Build (once per K) the mx.compile'd routed-MLP closure.
-
-        Follows jang's decode patch (jangrt/switchglu_decode.py:_mlp): the
-        traced graph is remap-gather x2 -> rotate -> fused gate/up/SwiGLU ->
-        rotate -> down gather. The decode factories bake shapes/meta as traced
-        constants; pool buffers, slot tables and indices are runtime inputs, so
-        residency changes outside the island never invalidate the trace."""
-        island = self._island_cache.get(K)
-        if island is not None:
-            return island
-        from jang_tools.turboquant.fused_gate_up_kernel import (
-            make_fused_gate_up_swiglu_decode,
-        )
-        from jang_tools.turboquant.gather_tq_kernel import (
-            make_gather_tq_decode_per_row,
-        )
-        from jang_tools.turboquant.hadamard_kernel import hadamard_rotate_metal
-
-        in_f = self.gate_proj.in_features
-        out_f = self.gate_proj.out_features
-        swiglu_limit = getattr(self.activation, "swiglu_limit", 0.0) or 0.0
-        fused_gu = make_fused_gate_up_swiglu_decode(
-            in_f, out_f, self.gate_proj.bits, K, swiglu_limit=swiglu_limit)
-        gather_dn = make_gather_tq_decode_per_row(
-            out_f, in_f, self.down_proj.bits, K)
-
-        def _island(x_flat, gate_table, down_table, idx_flat,
-                    pg, ng, pu, nu, pd, nd, cb_g, cb_d, s_in, s_dn):
-            slot_g = gate_table[idx_flat]
-            slot_d = down_table[idx_flat]
-            x_rot = hadamard_rotate_metal(x_flat, s_in)
-            x_act = fused_gu(x_rot, pg, ng, pu, nu, cb_g, slot_g)
-            # fp16 bottleneck on purpose: the eager path converts the fused
-            # output to the activation dtype before the down gather. Keeping
-            # the same conversion makes island-on/off bit-exact (kill-switch
-            # A/Bs compare equal), at negligible compiled cost.
-            x_act = x_act.astype(mx.float16).astype(mx.float32)
-            x_act_rot = hadamard_rotate_metal(x_act, s_dn)
-            return gather_dn(x_act_rot, pd, nd, cb_d, slot_d)
-
-        island = mx.compile(_island)
-        self._island_cache[K] = island
-        return island
 
     def _get_mxfp4_kernel(self, K: int):
         kernel = self._mxfp4_kernel_cache.get(K)
@@ -1651,9 +1352,7 @@ class PooledSwitchGLU(nn.Module):
         # K experts), unsorted, on-device remap, fused preconditions hold.
         K = idx_shape[-1] if len(idx_shape) > 0 else 0
         if (
-            _COMPILED_ISLAND
-            and self._all_mxfp4
-            and _ONDEVICE_REMAP
+            self._all_mxfp4
             and not sorted_indices
             and K > 0
             and idx.size == K
@@ -1685,40 +1384,11 @@ class PooledSwitchGLU(nn.Module):
                 if out.dtype != x.dtype:
                     out = out.astype(x.dtype)
                 return out
-        if (
-            _COMPILED_ISLAND
-            and self._fused_gate_up
-            and self._all_tq
-            and _ONDEVICE_REMAP
-            and not sorted_indices
-            and K > 0
-            and idx.size == K
-            and not self.training
-        ):
-            self.compiled_island_calls += 1
-            self.fused_gate_up_calls += 1  # the fused kernel runs inside the island
-            island = self._get_compiled_island(K)
-            gate_table = self.gate_proj.pool._ensure_slot_table()
-            down_table = self.down_proj.pool._ensure_slot_table()
-            x_flat = x.reshape(-1, self.gate_proj.in_features).astype(mx.float32)
-            y = island(
-                x_flat,
-                gate_table, down_table, idx.reshape(-1),
-                self.gate_proj.pool.packed, self.gate_proj.pool.norms,
-                self.up_proj.pool.packed, self.up_proj.pool.norms,
-                self.down_proj.pool.packed, self.down_proj.pool.norms,
-                self.gate_proj.codebook, self.down_proj.codebook,
-                self.gate_proj.signs, self.down_proj.signs,
-            )
-            out = y.reshape(*idx_shape[:-1], K, 1, self.down_proj.out_features)
-            if out.dtype != x.dtype:
-                out = out.astype(x.dtype)
-            return out
         # Unified sorted prefill: the partial-residency chunked path computes
         # each pre-ensured, expert-sorted chunk through the same fused sorted
         # kernels the full-resident barrier-free route runs, so the served
-        # tokens match the full-residency rail at any capacity (see
-        # _UNIFIED_SORTED_PREFILL). Covers both the large-chunk (segmented) and
+        # tokens match the full-residency rail at any capacity. Covers both
+        # the large-chunk (segmented) and
         # small-chunk (general gather) cases with one kernel, since prefill
         # carries no cross-row reduction.
         if (
@@ -1731,9 +1401,8 @@ class PooledSwitchGLU(nn.Module):
             return self._call_sorted_fused(x, idx_host)
         # Bulk sorted prefill: per-expert segments read each expert's weights
         # once (see _SEGMENTED_PREFILL_MIN_ROWS). Slot lookup is host-side, so
-        # this path needs no remapped index tensors at all. This is the
-        # pre-unification compute, reached with MOESPRESSO_SSD_UNIFIED_PREFILL=0
-        # or when the fused sorted kernel is unavailable.
+        # this path needs no remapped index tensors at all. It serves shapes
+        # or dependencies unsupported by the fused sorted path.
         if (
             sorted_indices
             and self._combined_gate_up_kquant
@@ -1750,15 +1419,10 @@ class PooledSwitchGLU(nn.Module):
         # After _ensure_projection_pools, every active expert is resident in all three
         # pools, so the on-device gather is exact (no sentinel). It keeps the index
         # tensors on-device into the kernel instead of the 3x host round-trip.
-        if _ONDEVICE_REMAP:
-            self.remap_ondevice_calls += 1
-            up_idx = self.up_proj.pool.remap_ondevice(idx)
-            gate_idx = self.gate_proj.pool.remap_ondevice(idx)
-            down_idx = self.down_proj.pool.remap_ondevice(idx)
-        else:
-            up_idx = self.up_proj.pool.remap_loaded(idx_host, idx_shape)
-            gate_idx = self.gate_proj.pool.remap_loaded(idx_host, idx_shape)
-            down_idx = self.down_proj.pool.remap_loaded(idx_host, idx_shape)
+        self.remap_ondevice_calls += 1
+        up_idx = self.up_proj.pool.remap_ondevice(idx)
+        gate_idx = self.gate_proj.pool.remap_ondevice(idx)
+        down_idx = self.down_proj.pool.remap_ondevice(idx)
 
         if self._all_iqk and sorted_indices:
             rows = int(idx.size)
@@ -1783,27 +1447,6 @@ class PooledSwitchGLU(nn.Module):
             )
             return out
 
-        if self._fused_gate_up:
-            # One Metal dispatch for SiLU(gate)*up (vs 2 gather kernels + a Python
-            # activation). gate/up pools are loaded together so slot N holds the same
-            # expert in both (pinned by test); gate_idx indexes packed_gate and
-            # packed_up. Norms are slotted. Down stays on the gather path.
-            from jang_tools.turboquant.fused_gate_up_kernel import (
-                fused_gate_up_swiglu_matmul,
-            )
-            self.fused_gate_up_calls += 1
-            swiglu_limit = getattr(self.activation, "swiglu_limit", 0.0) or 0.0
-            x_act = fused_gate_up_swiglu_matmul(
-                x,
-                self.gate_proj.pool.packed, self.gate_proj.pool.norms,
-                self.up_proj.pool.packed, self.up_proj.pool.norms,
-                self.gate_proj.codebook, self.gate_proj.signs,
-                gate_idx,
-                bits=self.gate_proj.bits,
-                swiglu_limit=swiglu_limit,
-            )
-            return self.down_proj.matmul_slots(
-                x_act, down_idx, sorted_indices=sorted_indices)
 
         x_up = self.up_proj.matmul_slots(
             x,
@@ -1825,7 +1468,7 @@ class PooledSwitchGLU(nn.Module):
     def _unified_sorted_ready(self) -> bool:
         """Whether the unified fused sorted prefill compute is usable.
 
-        Static preconditions only: the kill switch, the combined K-quant
+        Static preconditions only: the combined K-quant
         gate/up pool, the K-quant down pool, and the installed
         gather_qmm_sorted_swiglu / gather_qmm_sorted kernels. A False verdict
         falls back to the pre-unification chunked compute (segmented f32 GEMM
@@ -1833,9 +1476,7 @@ class PooledSwitchGLU(nn.Module):
         direction. Decided per call rather than cached because it depends only
         on process-stable facts and the check is a handful of attribute reads.
         """
-        if not _UNIFIED_SORTED_PREFILL:
-            return False
-        if not (_FUSED_SORTED_SWIGLU and self._combined_gate_up_kquant):
+        if not self._combined_gate_up_kquant:
             return False
         if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
             return False
@@ -1946,8 +1587,6 @@ class PooledSwitchGLU(nn.Module):
         return ready
 
     def _barrier_free_eligible(self) -> bool:
-        if not _BARRIER_FREE_PREFILL:
-            return False
         if not self._all_iqk:
             if not self._combined_gate_up_kquant:
                 return False
@@ -1976,7 +1615,7 @@ class PooledSwitchGLU(nn.Module):
         same lazy graph as the rest of prefill. On the identity route the
         gate/up GEMM and the SwiGLU fuse into the single
         gather_qmm_sorted_swiglu kernel when the installed mlx_kquant ships
-        it (see _FUSED_SORTED_SWIGLU). Rows keep their incoming
+        it. Rows keep their incoming
         dtype end to end (the kernel stages weights in f32 for every I/O
         dtype), preserving the segmented path's f32 weight-decode contract.
         Callers guaranteed full residency, so no ensure(), no miss handling,
@@ -2022,11 +1661,10 @@ class PooledSwitchGLU(nn.Module):
         gate_n = self.gate_proj.gate_out_features
         # Fused gate/up + SwiGLU on the identity route: one kernel replaces
         # the combined GEMM plus the elementwise activation, applying the
-        # same formula in its epilogue on the float32 accumulators (see
-        # _FUSED_SORTED_SWIGLU for the numerics note).
+        # same formula in its epilogue on float32 accumulators, without an
+        # intermediate rounding to the row dtype.
         if (
             identity
-            and _FUSED_SORTED_SWIGLU
             and getattr(kq, "gather_qmm_sorted_swiglu", None) is not None
         ):
             self.barrier_free_fused_swiglu_calls += 1
@@ -2088,8 +1726,6 @@ class PooledSwitchGLU(nn.Module):
         return ready
 
     def _barrier_free_decode_eligible(self) -> bool:
-        if not _BARRIER_FREE_DECODE:
-            return False
         if not self._all_iqk:
             if not self._combined_gate_up_kquant:
                 return False
@@ -2127,7 +1763,7 @@ class PooledSwitchGLU(nn.Module):
 
     def _iqk_dual_gemv_engaged(self, compact_source_ids) -> bool:
         """Whether the compact-only paired gate/up dispatch may run."""
-        if not _IQK_DUAL_GEMV or not self._all_iqk:
+        if not self._all_iqk:
             return False
         if self._iqk_decode_identity_cached is not True:
             return False
@@ -2244,13 +1880,12 @@ class PooledSwitchGLU(nn.Module):
         """One-shot fail-closed eligibility check for the fused decode
         routed matvec family.
 
-        Static facts only (env flag, pool layout, codecs, kernel geometry,
+        Static facts only (pool layout, codecs, kernel geometry,
         installed mlx_kquant surface); the verdict is decided once and
-        cached. The per-call identity-slot condition lives in
-        `decode_routed_fused_engaged`, and callers only reach either check
-        while holding the `_barrier_free_decode_ready` certificate. A False
-        verdict keeps the unfused barrier-free route, which is the
-        fail-closed direction."""
+        cached. Resident calls also require the full-residency certificate
+        and the identity-slot check in `decode_routed_fused_engaged`. Ring
+        calls use the worker-published slot indices after demand loading.
+        Unsupported kernels or layouts retain the composed route."""
         ready = self._decode_routed_fused_ready_cached
         if ready is None:
             ready = self._decode_routed_fused_eligible()
@@ -2258,8 +1893,6 @@ class PooledSwitchGLU(nn.Module):
         return ready
 
     def _decode_routed_fused_eligible(self) -> bool:
-        if not _DECODE_ROUTED_FUSED:
-            return False
         if not self._combined_gate_up_kquant:
             return False
         if getattr(self.down_proj, "codec", None) != KQUANT_CODEC:
@@ -2483,7 +2116,8 @@ class PooledSwitchGLU(nn.Module):
             self.prefetch_ticket_mismatched += 1
         wait_started = time.perf_counter()
         try:
-            for future in ticket.futures:
+            ticket.batch.wait()
+            for future in ticket.batch.futures:
                 self.prefetch_ticket_loaded += int(future.result())
         finally:
             self.prefetch_ticket_wait_seconds += (
@@ -2500,7 +2134,8 @@ class PooledSwitchGLU(nn.Module):
             return
         self._prefetch_ticket = None
         self.prefetch_ticket_stale += 1
-        for future in ticket.futures:
+        ticket.batch.wait()
+        for future in ticket.batch.futures:
             self.prefetch_ticket_loaded += int(future.result())
 
     def _submit_prefetch_ticket(
@@ -2531,16 +2166,14 @@ class PooledSwitchGLU(nn.Module):
         # _demand_protect regardless of the explicit set.
         capacity = min(pool.capacity for pool in pools)
         reserve_floor = min(16, capacity // 2)
-        futures = [
-            _PROJECTION_LOAD_EXECUTOR.submit(
-                pool.prefetch, ordered, protect=protect,
-                reserve_floor=reserve_floor)
-            for pool in pools
-        ]
+        batch = submit_loads(
+            _PROJECTION_LOAD_EXECUTOR,
+            (partial(pool.prefetch, ordered, protect=protect,
+                     reserve_floor=reserve_floor) for pool in pools),
+        )
         self._prefetch_ticket = _PrefetchTicket(
             predicted=frozenset(predicted),
-            futures=futures,
-            submitted_at=time.perf_counter(),
+            batch=batch,
         )
         self.prefetch_ticket_submitted += 1
         self.prefetch_ticket_experts += len(predicted)
@@ -2613,15 +2246,19 @@ class PooledSwitchGLU(nn.Module):
         def _ensure_ahead(active_set, protect_set):
             # fence=False: a worker thread cannot fence stream 0 (thread_local
             # streams). The targeted main-thread wait below replaces it.
-            return [
-                _PROJECTION_LOAD_EXECUTOR.submit(
-                    pool.ensure, active_set, protect=protect_set, fence=False)
+            if self._ensure_stream_major_projection_batches(
+                active_set,
+                protect=protect_set,
+                fence=False,
+            ):
+                return
+            self._join_projection_loads(
+                partial(pool.ensure, active_set, protect=protect_set, fence=False)
                 for pool in pools
-            ]
+            )
 
         # chunk 0 loads up front (nothing to overlap with yet)
-        for future in _ensure_ahead(chunk_sets[0], set()):
-            future.result()
+        _ensure_ahead(chunk_sets[0], set())
 
         # Loop invariants (the correctness story of the overlap):
         #  - the ahead ensure is the only pool mutator and is fully awaited
@@ -2647,8 +2284,7 @@ class PooledSwitchGLU(nn.Module):
                 if i >= 1:
                     mx.eval(outputs[i - 1])  # victims' readers are done
                 t0 = time.perf_counter()
-                for future in _ensure_ahead(chunk_sets[i + 1], chunk_sets[i]):
-                    future.result()
+                _ensure_ahead(chunk_sets[i + 1], chunk_sets[i])
                 self.projection_load_wait_seconds += time.perf_counter() - t0
         # Cross-chunk prefetch submit, under the loop's own targeted-drain
         # invariant extended across calls: a pool mutation that can evict
@@ -2716,7 +2352,7 @@ class PooledSwitchGLU(nn.Module):
 
         The builder wires these into the routed graph before the slot values
         exist; the worker writes the values in place (memoryview, the same
-        mechanism the pools use for packed/norms) before committing the layer,
+        mechanism the pools use for encoded weights) before committing the layer,
         so kernels always execute against post-ensure slots."""
         bufs = self._pipe_buf_cache.get(K)
         if bufs is None:
@@ -2730,39 +2366,6 @@ class PooledSwitchGLU(nn.Module):
             self._pipe_buf_cache[K] = bufs
         return bufs
 
-    def _get_pipe_island(self, K: int):
-        """Compiled routed-MLP closure taking slot IDS directly (no table
-        gather): the pipelined path resolves slots on the worker, host-side."""
-        island = self._pipe_island_cache.get(K)
-        if island is not None:
-            return island
-        from jang_tools.turboquant.fused_gate_up_kernel import (
-            make_fused_gate_up_swiglu_decode,
-        )
-        from jang_tools.turboquant.gather_tq_kernel import (
-            make_gather_tq_decode_per_row,
-        )
-        from jang_tools.turboquant.hadamard_kernel import hadamard_rotate_metal
-
-        in_f = self.gate_proj.in_features
-        out_f = self.gate_proj.out_features
-        swiglu_limit = getattr(self.activation, "swiglu_limit", 0.0) or 0.0
-        fused_gu = make_fused_gate_up_swiglu_decode(
-            in_f, out_f, self.gate_proj.bits, K, swiglu_limit=swiglu_limit)
-        gather_dn = make_gather_tq_decode_per_row(
-            out_f, in_f, self.down_proj.bits, K)
-
-        def _island(x_flat, slot_g, slot_d,
-                    pg, ng, pu, nu, pd, nd, cb_g, cb_d, s_in, s_dn):
-            x_rot = hadamard_rotate_metal(x_flat, s_in)
-            x_act = fused_gu(x_rot, pg, ng, pu, nu, cb_g, slot_g)
-            x_act = x_act.astype(mx.float16).astype(mx.float32)
-            x_act_rot = hadamard_rotate_metal(x_act, s_dn)
-            return gather_dn(x_act_rot, pd, nd, cb_d, slot_d)
-
-        island = mx.compile(_island)
-        self._pipe_island_cache[K] = island
-        return island
 
     def build_pipelined(self, x, idx, *, event_gate=None) -> mx.array:
         """Build the routed MLP graph without any host read (builder thread).
@@ -2805,24 +2408,7 @@ class PooledSwitchGLU(nn.Module):
                 if out.dtype != x.dtype:
                     out = out.astype(x.dtype)
                 return out.squeeze(-2)
-        if self._fused_gate_up and self._all_tq:
-            self.compiled_island_calls += 1
-            self.fused_gate_up_calls += 1
-            island = self._get_pipe_island(K)
-            x_flat = x4.reshape(-1, self.gate_proj.in_features).astype(mx.float32)
-            y = island(
-                x_flat, gate_buf, down_buf,
-                self.gate_proj.pool.packed, self.gate_proj.pool.norms,
-                self.up_proj.pool.packed, self.up_proj.pool.norms,
-                self.down_proj.pool.packed, self.down_proj.pool.norms,
-                self.gate_proj.codebook, self.down_proj.codebook,
-                self.gate_proj.signs, self.down_proj.signs,
-            )
-            out = y.reshape(*idx.shape[:-1], K, 1, self.down_proj.out_features)
-            if out.dtype != x.dtype:
-                out = out.astype(x.dtype)
-            return out.squeeze(-2)
-        # separate-kernel build (non-matching codebooks): gate/up pools share
+        # Separate projections: gate/up pools share
         # slot assignment (pinned by test), down uses its own buffer
         gate_idx = gate_buf.reshape(idx.shape)
         down_idx = down_buf.reshape(idx.shape)
@@ -2840,17 +2426,6 @@ class PooledSwitchGLU(nn.Module):
         out = self.down_proj.matmul_slots(
             self.activation(x_up, x_gate), down_idx, sorted_indices=False)
         return out.squeeze(-2)
-
-    def pipelined_decode_fused_engaged(self) -> bool:
-        """Engagement check for the ring-path fused decode routed matvec:
-        the family's static eligibility (`_decode_routed_fused_ready`) plus
-        the ring-scoped kill switch. No residency or slot-table condition:
-        the worker-published slot-id buffers already carry valid resident
-        rows for the token's experts. A False verdict keeps the unfused
-        ring composition, the fail-closed direction."""
-        if not _DECODE_RING_FUSED:
-            return False
-        return self._decode_routed_fused_ready()
 
     def build_pipelined_fused(self, x, idx, scores, *, event_gate=None):
         """Fused decode routed MLP on the ring path (builder thread).
@@ -2926,100 +2501,7 @@ class PooledSwitchGLU(nn.Module):
         )
         return token
 
-    def export_pred(self, pred_ids, seq: int):
-        """Export the lookahead's predicted ids into the prediction ring
-        (same kernel/protocol as export_inds, separate buffer). Returns the
-        export token; it rides the same per-layer kick as the island."""
-        n = int(pred_ids.shape[-1])
-        if self._pred_ring_buf is None:
-            self._pred_ring_buf = mx.array(np.zeros(8 + n, dtype=np.uint32))
-            mx.eval(self._pred_ring_buf)
-            self._pred_ring_np = np.frombuffer(
-                memoryview(self._pred_ring_buf).cast("B"), dtype=np.uint32)
-        target = mx.array(np.array([seq], dtype=np.uint32))
-        token, = _get_export_kernel()(
-            inputs=[pred_ids.reshape(-1), self._pred_ring_buf, target],
-            output_shapes=[(1,)],
-            output_dtypes=[mx.uint32],
-            grid=(n, 1, 1),
-            threadgroup=(n, 1, 1),
-        )
-        self.lookahead_exports += 1
-        return token
-
-    def _read_pred_ring(self, seq: int, n: int, deadline_s: float = 0.05):
-        """Seqlock+checksum read of the prediction ring; None on timeout
-        (prefetch is best-effort, a missed read skips one prefetch)."""
-        ring = self._pred_ring_np
-        if ring is None:
-            return None
-        deadline = time.perf_counter() + deadline_s
-        while True:
-            if int(ring[0]) == seq:
-                ids = ring[8:8 + n].copy()
-                if (int(ring[0]) == seq
-                        and int(ring[1]) == _ring_checksum(ids, seq)):
-                    return ids
-            if time.perf_counter() > deadline:
-                self.lookahead_ring_misses += 1
-                return None
-            time.sleep(0)
-
-    def _maybe_lookahead(self, seq: int) -> None:
-        """Worker-side: hand both the prediction-ring read and the prefetch
-        to the lookahead executor. The ordered pipeline worker must never
-        block on the prediction ring: its progress is what signals the
-        gates the GPU (and thus the export) may be queued behind. The
-        submission is dropped when the executor already holds
-        `_LOOKAHEAD_MAX_PENDING` tasks (see the load-shedding note on the
-        executor): stale queued speculation is worthless and its backlog
-        outlives the request."""
-        if self.lookahead_w is None or self.lookahead_target is None:
-            return
-        with _LOOKAHEAD_PENDING_LOCK:
-            if _LOOKAHEAD_PENDING[0] >= _LOOKAHEAD_MAX_PENDING:
-                self.lookahead_dropped += 1
-                return
-            _LOOKAHEAD_PENDING[0] += 1
-        _lookahead_executor().submit(self._lookahead_task, seq)
-
-    def _lookahead_task(self, seq: int) -> None:
-        try:
-            ids = self._read_pred_ring(seq, 16)
-            if ids is not None:
-                self.lookahead_target._prefetch_pools(ids)
-        finally:
-            with _LOOKAHEAD_PENDING_LOCK:
-                _LOOKAHEAD_PENDING[0] -= 1
-
-    def _prefetch_pools(self, pred_ids) -> None:
-        """Executor-side: load predicted experts into the layer's
-        dedicated spare slots via the atomic trio placement (same spare
-        index across gate/up/down, the islands' slot-map lockstep holds by
-        construction), round-robin over the spare ring, never evicting the
-        live LFU pool. The pools are deduplicated: a combined K-quant
-        gate/up projection shares one physical pool behind both aliases,
-        and the trio placement would otherwise pread the same combined
-        row twice per placement."""
-        from moespresso.runtime.expert_slot_pool import place_spare_trio
-
-        try:
-            gate = self.gate_proj.pool
-            if gate.spare_slots <= 0:
-                return
-            pools = self._unique_projection_pools(lockstep=True)
-            for expert in pred_ids:
-                expert = int(expert)
-                if expert in gate._slot_of:
-                    continue
-                spare = self._spare_rr % gate.spare_slots
-                self._spare_rr += 1
-                if place_spare_trio(pools, expert, spare):
-                    self.lookahead_prefetch_loads += 1
-        except Exception:
-            self.lookahead_errors += 1  # speculative path: never fail decode
-
-    def ring_install(self, seq: int, K: int, gate_mod=None) -> None:
+    def ring_install(self, seq: int, K: int, gate_mod=None, *, cancelled=None) -> None:
         """Worker-side per-layer step, zero MLX calls on the read path:
         seqlock-poll the ring for this layer's seq, read the expert ids from
         raw memory, then ensure() the misses and publish the slot-id buffers
@@ -3031,19 +2513,25 @@ class PooledSwitchGLU(nn.Module):
         re-raises and surfaces at the once-per-token future drain."""
         if gate_mod is not None:
             try:
-                self._ring_install_body(seq, K)
+                if cancelled is None:
+                    self._ring_install_body(seq, K)
+                else:
+                    self._ring_install_body(seq, K, cancelled=cancelled)
             finally:
                 gate_mod.signal_event(seq)
-            self._maybe_lookahead(seq)
             return
-        self._ring_install_body(seq, K)
-        self._maybe_lookahead(seq)
+        if cancelled is None:
+            self._ring_install_body(seq, K)
+        else:
+            self._ring_install_body(seq, K, cancelled=cancelled)
 
-    def _ring_install_body(self, seq: int, K: int) -> None:
+    def _ring_install_body(self, seq: int, K: int, *, cancelled=None) -> None:
         ring = self._ring_np
         t0 = time.perf_counter()
         deadline = t0 + _RING_TIMEOUT
         while True:
+            if cancelled is not None and cancelled():
+                raise CancelledError("pooled route publication was cancelled")
             if int(ring[0]) == seq:
                 ids = ring[8:8 + K].copy()
                 checksum = int(ring[1])
@@ -3062,7 +2550,6 @@ class PooledSwitchGLU(nn.Module):
             time.sleep(0)
         self.pipeline_read_seconds += time.perf_counter() - t0
         idx_host = ids
-        self._last_active = {int(e) for e in ids.tolist()}
         if _ROUTE_TRACE is not None:
             _ROUTE_TRACE.append(
                 ("decode", seq, self.gate_proj.pool.layer, ids.tolist()))
@@ -3070,6 +2557,13 @@ class PooledSwitchGLU(nn.Module):
         self.seen_experts.update(active)
         self.decode_seen_experts.update(active)
         self._ensure_projection_pools(active)
+        if cancelled is not None and cancelled():
+            raise CancelledError("pooled route publication was cancelled")
+        self._publish_pipe_slots(idx_host)
+
+    def _publish_pipe_slots(self, idx_host: np.ndarray) -> None:
+        """Publish the shared gate/up and independent down slot indices."""
+        K = int(idx_host.size)
         _gb, gate_view, _db, down_view = self._pipe_bufs(K)
         gate_view[:] = np.fromiter(
             (self.gate_proj.pool._slot_of[e] for e in idx_host),
@@ -3090,42 +2584,19 @@ class PooledSwitchGLU(nn.Module):
         self.seen_experts.update(active)
         self.decode_seen_experts.update(active)
         self._ensure_projection_pools(active)
-        K = idx_host.shape[0]
-        _gb, gate_view, _db, down_view = self._pipe_bufs(K)
-        gate_slots = np.fromiter(
-            (self.gate_proj.pool._slot_of[e] for e in idx_host),
-            dtype=np.uint32, count=K)
-        down_slots = np.fromiter(
-            (self.down_proj.pool._slot_of[e] for e in idx_host),
-            dtype=np.uint32, count=K)
-        gate_view[:] = gate_slots.tobytes()
-        down_view[:] = down_slots.tobytes()
+        self._publish_pipe_slots(idx_host.astype(np.uint32, copy=False))
 
 
-# Ring-decode cross-layer state (decode is single-threaded on the builder
-# side). _PIPE_PREV holds the previous MoE layer's worker future: the next
-# layer waits it before committing, which is the moment the previous layer's
-# routed graph gets committed, guaranteeing publish(L) precedes
-# commit-of-routed(L). The last MoE layer drains it synchronously.
-_PIPE_PREV: list = []
-
-# v3 ring-decode shares the ordering discipline; a monotonically increasing
-# sequence number distinguishes layer-steps across tokens in the ring buffers
-# and doubles as the MTLSharedEvent value in v4 (Metal requires monotonic
-# nondecreasing signal values; one global counter provides that).
+# A monotonically increasing sequence number distinguishes layer-steps across
+# tokens in the ring buffers. The shared request session also binds this value
+# to its native event domain.
 _RING_SEQ = [0]
-
-# v4 gate-decode worker futures for the once-per-token error drain at the
-# last MoE layer (workers signal the gates independently; the drain exists
-# so worker exceptions surface on the builder thread every token).
-_GATE_PENDING: list = []
 
 
 def install_compact_iqk_dual_gemv(switch, compact_source_ids) -> bool:
     """Install the paired decode method on one compact IQ_K switch."""
     if (
-        not _IQK_DUAL_GEMV
-        or not isinstance(switch, PooledSwitchGLU)
+        not isinstance(switch, PooledSwitchGLU)
         or not switch._all_iqk
     ):
         return False
@@ -3178,235 +2649,9 @@ class PooledSparseMoeBlock(nn.Module):
         self.sharding_group = getattr(original, "sharding_group", None)
 
     def __call__(self, x: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            from mlx.nn.layers.distributed import sum_gradients
-            x = sum_gradients(self.sharding_group)(x)
+        from moespresso.runtime.pooled_moe_blocks import _run
 
-        # Study capture: decode-only capture of the router input hidden state
-        # (the residual-stream view each layer's router actually sees). One
-        # host sync per layer per step, study runs only, gated twice.
-        if (_ROUTE_TRACE is not None and _ROUTE_TRACE_HIDDEN
-                and _token_layers(x) == 1):
-            _ROUTE_TRACE.append((
-                "hidden",
-                self.switch_mlp.gate_proj.pool.layer,
-                np.asarray(x).reshape(-1).astype(np.float16),
-            ))
-
-        # Decode-only block wall time (host side; includes the blocking index
-        # sync + IO wait + graph building). The denominator for phase shares.
-        block_t0 = time.perf_counter() if _token_layers(x) == 1 else None
-
-        gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
-        k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
-
-        # Barrier-free full-resident decode: when the certificate holds every
-        # projection pool is full-resident, so the routed ids never leave the
-        # device and the layer emits no ring export, no event gate, no worker
-        # submit, and no per-layer block-exit kick. The token graph queues
-        # lazily; the flush knob commits after every _DECODE_FLUSH_LAYERS
-        # layers, so the forty-layer decode builds one lazy graph the way the
-        # resident runtime does instead of forty async_eval flushes. The routed
-        # math is the same separate-kernel combined gate/up gather, activation,
-        # and down gather that build_pipelined emits, so this route is
-        # bit-identical to the ring path; only the index source (router ids on
-        # device instead of worker-published slot buffers) and the scheduling
-        # change. Route tracing needs the host read this route removes, so
-        # study runs keep the ring path.
-        switch = self.switch_mlp
-        barrier_free_ready = getattr(
-            switch, "_barrier_free_decode_ready", None)
-        if (
-            _QWEN_DECODE_SCHED
-            and block_t0 is not None
-            and not self.training
-            and _ROUTE_TRACE is None
-            and barrier_free_ready is not None
-            and barrier_free_ready()
-        ):
-            bf_inds = inds.astype(mx.uint32)
-            y = switch.build_barrier_free_decode(x, bf_inds)
-            _record_routed_weighted_sum(
-                switch, scores, out_features=int(y.shape[-1]))
-            y = (y * scores[..., None]).sum(axis=-2)
-            shared_y = self.shared_expert(x)
-            y = y + mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-            if _PIPE_PREV or _GATE_PENDING:
-                # Mixed-path session: an earlier partial-residency layer took
-                # the ring path this token. Its worker must publish before any
-                # commit that can reach its routed island (the ring ordering
-                # contract), and its errors must still surface once per token,
-                # so drain here. Both lists stay empty on a pure barrier-free
-                # run and this branch never executes.
-                while _PIPE_PREV:
-                    _PIPE_PREV.pop(0).result()
-                if self.pipeline_is_last:
-                    pending, _GATE_PENDING[:] = list(_GATE_PENDING), []
-                    for future in pending:
-                        future.result()
-            if (
-                _DECODE_FLUSH_LAYERS > 0
-                and (int(switch.gate_proj.pool.layer) + 1)
-                % _DECODE_FLUSH_LAYERS == 0
-            ):
-                _kick_eval(y)
-                switch.barrier_free_decode_flush_calls += 1
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        if (
-            _RING_DECODE
-            and block_t0 is not None
-            and not self.training
-            and _ring_visibility_ok()
-            and _gate_module() is not None
-        ):
-            # v4 gate-decode: main never waits per layer at all. The
-            # island sits behind an in-stream event wait (encoded after the
-            # ring export via the token dependency); the worker signals after
-            # ensure+publish. Commit the whole layer immediately and move on;
-            # worker errors surface at the once-per-token future drain.
-            gate_mod = _gate_module()
-            switch = self.switch_mlp
-            K = int(inds.shape[-1])
-            _RING_SEQ[0] += 1
-            seq = _RING_SEQ[0]
-            token = switch.export_inds(inds, seq)
-            # Cross-layer lookahead: run layer L+Delta's router on
-            # this layer's input hidden, export top-16 predicted experts via
-            # the prediction ring. Pre-gate (depends only on x), so the GPU
-            # can execute it immediately; the worker hands the prefetch to
-            # its own executor. Measured offline: catches ~59% of real
-            # decode misses at Delta=4 with ~10 ms of lead.
-            la_token = None
-            if switch.lookahead_w is not None:
-                la_logits = (
-                    x.reshape(-1, switch.gate_proj.in_features)
-                    .astype(switch.lookahead_w.dtype)
-                    @ switch.lookahead_w.T
-                ).reshape(-1)
-                la_top = _lookahead_top_ids(la_logits)
-                la_token = switch.export_pred(la_top, seq)
-                # Order pin: without a dependency, the scheduler may encode
-                # this export behind a later layer's gate wait, and nothing
-                # signals that gate before the export is needed. Folding
-                # la_token into the gate's token input pins both exports
-                # strictly before the gate wait.
-                token = token + la_token * 0
-            y = switch.build_pipelined(
-                x, inds, event_gate=(gate_mod, token, seq))
-            _record_routed_weighted_sum(
-                switch, scores, out_features=int(y.shape[-1]))
-            y = (y * scores[..., None]).sum(axis=-2)
-            shared_y = self.shared_expert(x)
-            y = y + mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-            _kick_eval(y)
-            switch.block_exit_kick_calls += 1
-            _GATE_PENDING.append(_PIPELINE_EXECUTOR.submit(
-                switch.ring_install, seq, K, gate_mod))
-            if self.pipeline_is_last:
-                t0 = time.perf_counter()
-                pending, _GATE_PENDING[:] = list(_GATE_PENDING), []
-                for future in pending:
-                    future.result()  # error drain; gates already signaled
-                switch.pipeline_join_seconds += time.perf_counter() - t0
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        if (
-            _RING_DECODE
-            and block_t0 is not None
-            and not self.training
-            and _ring_visibility_ok()
-        ):
-            # v3: zero MLX on the worker, zero per-layer blocking MLX on main.
-            switch = self.switch_mlp
-            K = int(inds.shape[-1])
-            _RING_SEQ[0] += 1
-            seq = _RING_SEQ[0]
-            token = switch.export_inds(inds, seq)
-            y = switch.build_pipelined(x, inds)
-            _record_routed_weighted_sum(
-                switch, scores, out_features=int(y.shape[-1]))
-            y = (y * scores[..., None]).sum(axis=-2)
-            shared_y = self.shared_expert(x)
-            y = y + mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-            t0 = time.perf_counter()
-            while _PIPE_PREV:
-                _PIPE_PREV.pop(0).result()  # publish(L-1) precedes the commit
-            switch.pipeline_join_seconds += time.perf_counter() - t0
-            # Commits L-1's routed graph (via attention_L), this layer's
-            # attention+router chain, and the export, but not this layer's
-            # routed island (token does not depend on it).
-            _kick_eval(token)
-            switch.block_exit_kick_calls += 1
-            future = _PIPELINE_EXECUTOR.submit(switch.ring_install, seq, K)
-            if self.pipeline_is_last:
-                t1 = time.perf_counter()
-                future.result()
-                switch.pipeline_join_seconds += time.perf_counter() - t1
-                _kick_eval(y)  # commit the last routed island post-publish
-            else:
-                _PIPE_PREV.append(future)
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        # Committing the router chain early via async_eval(inds) and building
-        # the shared graph before the host read moved ~0.4 ms/layer between
-        # counters but left e2e flat (5.46 vs 5.48 tok/s): the read must wait
-        # for the same GPU chain wherever it sits. Do not retry the reorder;
-        # the round-trip cost itself is the native-scheduling target.
-        # Whole-MoE overlap: start routed expert loads as soon as the router
-        # indices are known, then compute the always-resident shared expert
-        # while those reads are in flight.
-        load_ticket = self.switch_mlp.begin_projection_load(inds)
-
-        shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-
-        if load_ticket is not None and load_ticket.has_work:
-            # Extending this kick to all-hit decode layers as well measured
-            # flat (5.42 vs 5.48 tok/s): the routed graph builds fast enough
-            # that the no-miss idle window is tiny once the block-exit kick
-            # exists, so the gate stays miss-only. Prefill does not force the
-            # eval: the intermediate can be large and the prefill path already
-            # has different scheduling pressure.
-            if _token_layers(x) == 1:
-                t0 = time.perf_counter()
-                _kick_eval(shared_y)
-                self.switch_mlp.overlap_shared_eval_calls += 1
-                self.switch_mlp.overlap_shared_eval_seconds += time.perf_counter() - t0
-            else:
-                self.switch_mlp.overlap_prefill_no_eval_calls += 1
-
-        y = self.switch_mlp(x, inds, load_ticket=load_ticket)
-        _record_routed_weighted_sum(
-            self.switch_mlp, scores, out_features=int(y.shape[-1]))
-        y = (y * scores[..., None]).sum(axis=-2)
-        y = y + shared_y
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
-        if block_t0 is not None:
-            # Block-exit kick: commit the finished block so the GPU runs layer
-            # L's routed work while python builds layer L+1's graph.
-            _kick_eval(y)
-            self.switch_mlp.block_exit_kick_calls += 1
-            self.switch_mlp.decode_moe_block_calls += 1
-            self.switch_mlp.decode_moe_block_seconds += (
-                time.perf_counter() - block_t0)
-
-        return y
+        return _run(self, x, deepseek=False)
 
 
 class PooledDeepseekV4MoEBlock(nn.Module):
@@ -3429,307 +2674,6 @@ class PooledDeepseekV4MoEBlock(nn.Module):
         self.sharding_group = getattr(original, "sharding_group", None)
 
     def __call__(self, x: mx.array, input_ids=None) -> mx.array:
-        if self.sharding_group is not None:
-            from mlx.nn.layers.distributed import sum_gradients
-            x = sum_gradients(self.sharding_group)(x)
+        from moespresso.runtime.pooled_moe_blocks import _run
 
-        if (_ROUTE_TRACE is not None and _ROUTE_TRACE_HIDDEN
-                and _token_layers(x) == 1):
-            _ROUTE_TRACE.append((
-                "hidden",
-                self.switch_mlp.gate_proj.pool.layer,
-                np.asarray(x).reshape(-1).astype(np.float16),
-            ))
-
-        block_t0 = time.perf_counter() if _token_layers(x) == 1 else None
-
-        switch = self.switch_mlp
-        gate_t0 = time.perf_counter() if block_t0 is not None else None
-        inds, scores = self.gate(x, input_ids=input_ids)
-        if gate_t0 is not None:
-            _record_switch_seconds(
-                switch, "router_gate_seconds", time.perf_counter() - gate_t0)
-        inds = inds.astype(mx.uint32)
-        supports_ring = all(hasattr(switch, name) for name in (
-            "build_pipelined",
-            "export_inds",
-            "ring_install",
-        ))
-
-        # Barrier-free full-resident decode: the certificate holds, so the
-        # routed ids never leave the device and the layer emits no ring
-        # export, no event gate, no worker submit, and no per-layer kick.
-        # The token graph queues lazily; the flush knob commits after every
-        # _DECODE_FLUSH_LAYERS layers. Route tracing needs the host read
-        # this route removes, so study runs keep the ring path.
-        barrier_free_ready = getattr(
-            switch, "_barrier_free_decode_ready", None)
-        if (
-            block_t0 is not None
-            and not self.training
-            and _ROUTE_TRACE is None
-            and barrier_free_ready is not None
-            and barrier_free_ready()
-        ):
-            t0 = time.perf_counter()
-            # Fused decode routed matvec family: route weights bake into the
-            # pair+SwiGLU intermediate and the down kernel sums the experts,
-            # so this arm emits no route-weighted sum at all (its counters
-            # staying at zero is the engagement evidence, next to
-            # decode_routed_fused_calls).
-            fused_engaged = getattr(
-                switch, "decode_routed_fused_engaged", None)
-            if fused_engaged is not None and fused_engaged():
-                y = switch.build_barrier_free_decode_fused(x, inds, scores)
-            else:
-                y = switch.build_barrier_free_decode(x, inds)
-                _record_routed_weighted_sum(
-                    switch, scores, out_features=int(y.shape[-1]))
-                y = _deepseek_v4_weighted_sum(y, scores).reshape(x.shape)
-            _record_switch_seconds(
-                switch, "routed_build_seconds", time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            y = y + self.shared_experts(x)
-            _record_switch_seconds(
-                switch,
-                "shared_experts_build_seconds",
-                time.perf_counter() - t0,
-            )
-            if _PIPE_PREV or _GATE_PENDING:
-                # Mixed-path session: an earlier partial-residency layer took
-                # the ring path this token. Its worker must publish before
-                # any commit that can reach its routed island (the ring
-                # ordering contract), and its errors must still surface once
-                # per token, so drain here. Both lists stay empty on a pure
-                # barrier-free run and this branch never executes.
-                t0 = time.perf_counter()
-                while _PIPE_PREV:
-                    _PIPE_PREV.pop(0).result()
-                if self.pipeline_is_last:
-                    pending, _GATE_PENDING[:] = list(_GATE_PENDING), []
-                    for future in pending:
-                        future.result()
-                switch.pipeline_join_seconds += time.perf_counter() - t0
-            if bool(getattr(switch, "_all_iqk", False)):
-                if switch.commit_iqk_output(y, rows=1):
-                    switch.barrier_free_decode_flush_calls += 1
-            elif (
-                _DECODE_FLUSH_LAYERS > 0
-                and (int(switch.gate_proj.pool.layer) + 1)
-                % _DECODE_FLUSH_LAYERS == 0
-            ):
-                _kick_eval(y)
-                switch.barrier_free_decode_flush_calls += 1
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        if (
-            supports_ring
-            and _RING_DECODE
-            and block_t0 is not None
-            and not self.training
-            and _ring_visibility_ok()
-            and _gate_module() is not None
-        ):
-            gate_mod = _gate_module()
-            K = int(inds.shape[-1])
-            _RING_SEQ[0] += 1
-            seq = _RING_SEQ[0]
-            t0 = time.perf_counter()
-            token = switch.export_inds(inds, seq)
-            _record_switch_seconds(
-                switch, "router_export_seconds", time.perf_counter() - t0)
-            # Cross-layer lookahead: run layer L+Delta's router scoring on
-            # this layer's input hidden and export the top-16 predicted
-            # experts via the prediction ring. The DS4 selection form is the
-            # monotone softplus transform plus a per-expert bias
-            # (sqrt(log1p(exp(logits))) + bias); the bias reorders
-            # candidates, so ranking raw logits would mispredict. Pre-gate
-            # (depends only on x), and the token dependency pins both
-            # exports strictly before the event-gate wait, mirroring the
-            # Qwen block's order pin.
-            if switch.lookahead_w is not None:
-                la_logits = (
-                    x.reshape(-1, switch.gate_proj.in_features)
-                    .astype(switch.lookahead_w.dtype)
-                    @ switch.lookahead_w.T
-                ).reshape(-1)
-                la_scores = mx.sqrt(
-                    mx.log1p(mx.exp(la_logits.astype(mx.float32))))
-                if switch.lookahead_b is not None:
-                    la_scores = la_scores + switch.lookahead_b
-                la_top = _lookahead_top_ids(la_scores)
-                la_token = switch.export_pred(la_top, seq)
-                token = token + la_token * 0
-            t0 = time.perf_counter()
-            # Ring-path fused decode: the same matvec pair the full-resident
-            # certificate route runs, over the worker-published slot ids, so
-            # bounded residency serves the full-resident decode lattice. The
-            # fused kernels bake the route weights and sum the experts, so
-            # this arm emits no route-weighted sum (its counters staying at
-            # zero is the engagement evidence, next to
-            # pipelined_decode_fused_calls).
-            ring_fused = getattr(
-                switch, "pipelined_decode_fused_engaged", None)
-            if ring_fused is not None and ring_fused():
-                y = switch.build_pipelined_fused(
-                    x,
-                    inds,
-                    scores,
-                    event_gate=(gate_mod, token, seq),
-                ).reshape(x.shape)
-            else:
-                y = switch.build_pipelined(
-                    x,
-                    inds,
-                    event_gate=(gate_mod, token, seq),
-                )
-                _record_routed_weighted_sum(
-                    switch, scores, out_features=int(y.shape[-1]))
-                y = _deepseek_v4_weighted_sum(y, scores).reshape(x.shape)
-            _record_switch_seconds(
-                switch, "routed_build_seconds", time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            y = y + self.shared_experts(x)
-            _record_switch_seconds(
-                switch,
-                "shared_experts_build_seconds",
-                time.perf_counter() - t0,
-            )
-            t0 = time.perf_counter()
-            _kick_eval(y)
-            _record_switch_seconds(
-                switch, "block_exit_kick_seconds", time.perf_counter() - t0)
-            switch.block_exit_kick_calls += 1
-            _GATE_PENDING.append(_PIPELINE_EXECUTOR.submit(
-                switch.ring_install, seq, K, gate_mod))
-            if self.pipeline_is_last:
-                t0 = time.perf_counter()
-                pending, _GATE_PENDING[:] = list(_GATE_PENDING), []
-                for future in pending:
-                    future.result()
-                switch.pipeline_join_seconds += time.perf_counter() - t0
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        if (
-            supports_ring
-            and _RING_DECODE
-            and block_t0 is not None
-            and not self.training
-            and _ring_visibility_ok()
-        ):
-            K = int(inds.shape[-1])
-            _RING_SEQ[0] += 1
-            seq = _RING_SEQ[0]
-            t0 = time.perf_counter()
-            token = switch.export_inds(inds, seq)
-            _record_switch_seconds(
-                switch, "router_export_seconds", time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            # Ring-path fused decode, v3 scheduling: same unification as the
-            # v4 branch above; publish-before-commit orders the kernels
-            # after the worker's slot writes.
-            ring_fused = getattr(
-                switch, "pipelined_decode_fused_engaged", None)
-            if ring_fused is not None and ring_fused():
-                y = switch.build_pipelined_fused(
-                    x, inds, scores).reshape(x.shape)
-            else:
-                y = switch.build_pipelined(x, inds)
-                _record_routed_weighted_sum(
-                    switch, scores, out_features=int(y.shape[-1]))
-                y = _deepseek_v4_weighted_sum(y, scores).reshape(x.shape)
-            _record_switch_seconds(
-                switch, "routed_build_seconds", time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            y = y + self.shared_experts(x)
-            _record_switch_seconds(
-                switch,
-                "shared_experts_build_seconds",
-                time.perf_counter() - t0,
-            )
-            t0 = time.perf_counter()
-            while _PIPE_PREV:
-                _PIPE_PREV.pop(0).result()
-            switch.pipeline_join_seconds += time.perf_counter() - t0
-            _kick_eval(token)
-            switch.block_exit_kick_calls += 1
-            future = _PIPELINE_EXECUTOR.submit(switch.ring_install, seq, K)
-            if self.pipeline_is_last:
-                t1 = time.perf_counter()
-                future.result()
-                switch.pipeline_join_seconds += time.perf_counter() - t1
-                _kick_eval(y)
-            else:
-                _PIPE_PREV.append(future)
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += time.perf_counter() - block_t0
-            return y
-
-        # Whole-MoE overlap: start routed expert loads as soon as the router
-        # indices are known, then compute the always-resident shared experts
-        # while those reads are in flight.
-        load_ticket = switch.begin_projection_load(inds)
-
-        t0 = time.perf_counter() if block_t0 is not None else None
-        shared_y = self.shared_experts(x)
-        if t0 is not None:
-            _record_switch_seconds(
-                switch,
-                "shared_experts_build_seconds",
-                time.perf_counter() - t0,
-            )
-        if load_ticket is not None and load_ticket.has_work:
-            if _token_layers(x) == 1:
-                t0 = time.perf_counter()
-                _kick_eval(shared_y)
-                switch.overlap_shared_eval_calls += 1
-                switch.overlap_shared_eval_seconds += time.perf_counter() - t0
-            else:
-                switch.overlap_prefill_no_eval_calls += 1
-
-        weighted_output = getattr(switch, "weighted_output", None)
-        t0 = time.perf_counter() if block_t0 is not None else None
-        if callable(weighted_output):
-            y = weighted_output(
-                x,
-                inds,
-                scores,
-                load_ticket=load_ticket,
-            ).reshape(x.shape)
-        else:
-            y = switch(x, inds)
-            y = _deepseek_v4_weighted_sum(y, scores).reshape(x.shape)
-        if t0 is not None:
-            _record_switch_seconds(
-                switch, "routed_build_seconds", time.perf_counter() - t0)
-        y = y + shared_y
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
-        if bool(getattr(switch, "_all_iqk", False)) and block_t0 is None:
-            rows = 1
-            for dim in x.shape[:-1]:
-                rows *= int(dim)
-            switch.commit_iqk_output(y, rows=rows)
-
-        if block_t0 is not None:
-            # Block-exit kick: commit the finished block so the GPU runs layer
-            # L's routed work while python builds layer L+1's graph.
-            t0 = time.perf_counter()
-            _kick_eval(y)
-            _record_switch_seconds(
-                switch,
-                "block_exit_kick_seconds",
-                time.perf_counter() - t0,
-            )
-            switch.block_exit_kick_calls += 1
-            switch.decode_moe_block_calls += 1
-            switch.decode_moe_block_seconds += (
-                time.perf_counter() - block_t0)
-
-        return y
+        return _run(self, x, deepseek=True, input_ids=input_ids)

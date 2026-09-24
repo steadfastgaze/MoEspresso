@@ -36,6 +36,19 @@ from moespresso.runtime.deepseek_v4.expert_layout import (
     validate_expert_index_counts,
 )
 from moespresso.runtime.expert_index import build_expert_index
+from moespresso.runtime.qwen4.expert_layout import (
+    EXPERT_SELECTION_FILENAME as QWEN4_EXPERT_SELECTION_FILENAME,
+    PER_LAYER_EXPERTS_FEATURE as QWEN4_PER_LAYER_EXPERTS_FEATURE,
+    Qwen4ExpertLayoutError,
+    parse_qwen4_expert_layout,
+    validate_expert_index_counts as validate_qwen4_expert_index_counts,
+)
+from moespresso.runtime.qwen4.ple_contract import (
+    Qwen4PLEProviderError,
+    derive_qwen4_ple_provider_contract,
+    parse_qwen4_ple_component_contract,
+    qwen4_ple_contract_mismatches,
+)
 
 
 class PackageVerificationError(Exception):
@@ -44,10 +57,9 @@ class PackageVerificationError(Exception):
 
 # Per-format the suffixes a tensor's key_prefix expands to on disk. Mirrors the
 # writer (package/write.py) and the manifest's declared formats. A layer's three
-# tq entries share one key_prefix (``...switch_mlp.experts``) and all expand to
+# Routed entries share one key_prefix (``...switch_mlp.experts``) and all expand to
 # the same per-layer bundle tensor.
 _KEY_SUFFIXES = {
-    "tq": ("tq_bundle",),
     "mxfp4": ("tq_bundle",),
     "kquant": ("tq_bundle",),
     "iqk": ("tq_bundle",),
@@ -576,6 +588,164 @@ def _verify_deepseek_v4_expert_layout(
     return out
 
 
+def _verify_qwen4_expert_layout(
+    manifest: dict,
+    package_dir: Path,
+) -> list[Validation]:
+    """Authenticate a Qwen compact selection and its bundle counts."""
+
+    try:
+        layout = parse_qwen4_expert_layout(manifest)
+    except Qwen4ExpertLayoutError as exc:
+        return [
+            _validation(
+                "runtime.invalid_qwen4_expert_layout",
+                f"invalid Qwen4 compact expert layout: {exc}",
+                path="/expert_layout/per_layer_experts",
+            )
+        ]
+    if layout is None:
+        return []
+
+    out: list[Validation] = []
+    files = manifest.get("files")
+    declarations = (
+        [
+            entry
+            for entry in files
+            if isinstance(entry, dict)
+            and entry.get("path") == QWEN4_EXPERT_SELECTION_FILENAME
+        ]
+        if isinstance(files, list)
+        else []
+    )
+    if len(declarations) != 1:
+        out.append(
+            _validation(
+                "runtime.qwen4_expert_selection_identity_missing",
+                f"compact packages must declare exactly one "
+                f"{QWEN4_EXPERT_SELECTION_FILENAME} file identity",
+                path="/files",
+                expected=1,
+                actual=len(declarations),
+            )
+        )
+
+    selection_path = _declared_path(
+        package_dir,
+        QWEN4_EXPERT_SELECTION_FILENAME,
+        manifest_path=(
+            "/expert_layout/per_layer_experts/source_selection_artifact_id"
+        ),
+        out=out,
+    )
+    selection = None
+    if selection_path is not None:
+        if not selection_path.is_file():
+            out.append(
+                _validation(
+                    "runtime.missing_qwen4_expert_selection",
+                    f"compact package is missing {QWEN4_EXPERT_SELECTION_FILENAME}",
+                    path=f"/{QWEN4_EXPERT_SELECTION_FILENAME}",
+                )
+            )
+        else:
+            try:
+                selection = read_artifact(selection_path)
+            except (ArtifactError, OSError, UnicodeError, ValueError, TypeError) as exc:
+                out.append(
+                    _validation(
+                        "runtime.invalid_qwen4_expert_selection",
+                        f"could not authenticate {QWEN4_EXPERT_SELECTION_FILENAME}: {exc}",
+                        path=f"/{QWEN4_EXPERT_SELECTION_FILENAME}",
+                    )
+                )
+
+    if selection is not None:
+        if selection.get("artifact_kind") != "qwen4_expert_selection":
+            out.append(
+                _validation(
+                    "runtime.wrong_qwen4_expert_selection_kind",
+                    f"{QWEN4_EXPERT_SELECTION_FILENAME} has the wrong artifact kind",
+                    path=f"/{QWEN4_EXPERT_SELECTION_FILENAME}/artifact_kind",
+                    expected="qwen4_expert_selection",
+                    actual=selection.get("artifact_kind"),
+                )
+            )
+        if selection.get("status") != "valid":
+            out.append(
+                _validation(
+                    "runtime.qwen4_expert_selection_not_valid",
+                    f"{QWEN4_EXPERT_SELECTION_FILENAME} must have status 'valid'",
+                    path=f"/{QWEN4_EXPERT_SELECTION_FILENAME}/status",
+                    expected="valid",
+                    actual=selection.get("status"),
+                )
+            )
+        if selection.get("artifact_id") != layout.source_selection_artifact_id:
+            out.append(
+                _validation(
+                    "runtime.qwen4_expert_selection_id_mismatch",
+                    "embedded Qwen expert selection id does not match the shipped artifact",
+                    path=(
+                        "/expert_layout/per_layer_experts/"
+                        "source_selection_artifact_id"
+                    ),
+                    expected=layout.source_selection_artifact_id,
+                    actual=selection.get("artifact_id"),
+                )
+            )
+        selection_features = selection.get("required_features")
+        if (
+            not isinstance(selection_features, list)
+            or QWEN4_PER_LAYER_EXPERTS_FEATURE not in selection_features
+        ):
+            out.append(
+                _validation(
+                    "runtime.qwen4_expert_selection_feature_missing",
+                    f"{QWEN4_EXPERT_SELECTION_FILENAME} does not require "
+                    f"{QWEN4_PER_LAYER_EXPERTS_FEATURE!r}",
+                    path=f"/{QWEN4_EXPERT_SELECTION_FILENAME}/required_features",
+                )
+            )
+        expected_payload = layout.selection_payload()
+        for key, expected in expected_payload.items():
+            actual = selection.get(key)
+            if actual != expected:
+                out.append(
+                    _validation(
+                        "runtime.qwen4_expert_selection_payload_mismatch",
+                        f"embedded Qwen expert layout field {key!r} does not "
+                        f"match {QWEN4_EXPERT_SELECTION_FILENAME}",
+                        path=f"/expert_layout/per_layer_experts/{key}",
+                        expected=expected,
+                        actual=actual,
+                    )
+                )
+
+    try:
+        index = build_expert_index(package_dir)
+        validate_qwen4_expert_index_counts(layout, index)
+    except (
+        Qwen4ExpertLayoutError,
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        struct.error,
+    ) as exc:
+        out.append(
+            _validation(
+                "runtime.qwen4_expert_layout_bundle_mismatch",
+                f"Qwen compact expert layout does not match bundle headers: {exc}",
+                path="/expert_layout/per_layer_experts/layers",
+            )
+        )
+    return out
+
+
 def _verify_deepseek_v4_router_headers(
     manifest: dict,
     package_dir: Path,
@@ -720,6 +890,152 @@ def expected_keys(tensor: dict) -> list[str]:
     return [prefix if suffix is None else f"{prefix}.{suffix}" for suffix in suffixes]
 
 
+def _is_qwen4_architecture(architecture: object) -> bool:
+    if not isinstance(architecture, dict):
+        return False
+    config = architecture.get("config")
+    config_type = config.get("model_type") if isinstance(config, dict) else None
+    return any(
+        value in {"qwen4_exp", "qwen4_exp_text"}
+        for value in (architecture.get("family"), architecture.get("text_model_type"), config_type)
+    )
+
+
+def _verify_qwen4_ple_provider(
+    manifest: dict,
+    package_dir: Path,
+) -> list[Validation]:
+    """Bind repeated PLE metadata to independently derived architecture facts."""
+    architecture = manifest.get("architecture")
+    component = manifest.get("ple_provider")
+    if not _is_qwen4_architecture(architecture):
+        if component is None:
+            return []
+        return [_validation(
+            "runtime.unexpected_qwen4_ple_provider",
+            "ple_provider is declared by a package that is not Qwen4-Exp",
+            path="/ple_provider",
+        )]
+    try:
+        expected = derive_qwen4_ple_provider_contract(architecture)
+    except Qwen4PLEProviderError as exc:
+        return [_validation(
+            "runtime.invalid_qwen4_ple_architecture",
+            f"could not derive the PLE provider contract: {exc}",
+            path="/architecture/config",
+        )]
+    if expected is None:
+        if component is None:
+            return []
+        return [_validation(
+            "runtime.unexpected_qwen4_ple_provider",
+            "ple_provider is declared but the architecture has no PLE layer",
+            path="/ple_provider",
+        )]
+    if component is None:
+        return [_validation(
+            "runtime.missing_qwen4_ple_provider",
+            "the Qwen4 architecture declares PLE but the package has no PLE provider",
+            path="/ple_provider",
+        )]
+    try:
+        actual = parse_qwen4_ple_component_contract(component)
+    except Qwen4PLEProviderError as exc:
+        return [_validation(
+            "runtime.invalid_qwen4_ple_provider",
+            f"PLE provider metadata is invalid: {exc}",
+            path="/ple_provider",
+        )]
+    mismatches = qwen4_ple_contract_mismatches(actual, expected)
+    if mismatches:
+        return [_validation(
+            "runtime.qwen4_ple_contract_mismatch",
+            "PLE provider does not match the package architecture: " + ", ".join(mismatches),
+            path="/ple_provider",
+            expected={name: getattr(expected, name) for name in mismatches},
+            actual={name: getattr(actual, name) for name in mismatches},
+        )]
+
+    out: list[Validation] = []
+    files = manifest.get("files")
+    identities = {}
+    if isinstance(files, list):
+        for identity in files:
+            if isinstance(identity, dict) and isinstance(identity.get("path"), str):
+                identities[identity["path"]] = identity
+    shards = component.get("shards")
+    assert isinstance(shards, list)
+    seen_paths = set()
+    expected_bytes = actual.rows_per_shard * actual.row_bytes
+    shard_fields = {"index", "path", "row_start", "row_count"}
+    for index, shard in enumerate(shards):
+        path = f"/ple_provider/shards/{index}"
+        if not isinstance(shard, dict) or set(shard) != shard_fields:
+            out.append(_validation(
+                "runtime.invalid_qwen4_ple_shard",
+                "PLE shards must declare only index, path, row_start, and row_count",
+                path=path,
+            ))
+            continue
+        expected_start = index * actual.rows_per_shard
+        if (
+            shard.get("index") != index
+            or shard.get("row_start") != expected_start
+            or shard.get("row_count") != actual.rows_per_shard
+        ):
+            out.append(_validation(
+                "runtime.invalid_qwen4_ple_shard",
+                "PLE shards must partition padded rows uniformly and in order",
+                path=path,
+            ))
+        declared = shard.get("path")
+        if isinstance(declared, str):
+            posix = PurePosixPath(declared)
+            windows = PureWindowsPath(declared)
+            if (
+                "\\" in declared
+                or posix.is_absolute()
+                or windows.is_absolute()
+                or bool(windows.drive)
+                or any(part in {"", ".", ".."} for part in declared.split("/"))
+            ):
+                out.append(_validation(
+                    "runtime.invalid_qwen4_ple_shard",
+                    "PLE shard path must be canonical and package-relative",
+                    path=f"{path}/path",
+                ))
+        _declared_path(
+            package_dir,
+            declared,
+            manifest_path=f"{path}/path",
+            out=out,
+        )
+        if not isinstance(declared, str) or declared in seen_paths:
+            out.append(_validation(
+                "runtime.invalid_qwen4_ple_shard",
+                "PLE shard paths must be non-empty and unique",
+                path=f"{path}/path",
+            ))
+            continue
+        seen_paths.add(declared)
+        identity = identities.get(declared)
+        if not isinstance(identity, dict):
+            out.append(_validation(
+                "runtime.undeclared_qwen4_ple_shard",
+                f"PLE shard {declared!r} has no top-level file identity",
+                path=f"{path}/path",
+            ))
+        elif identity.get("size_bytes") != expected_bytes:
+            out.append(_validation(
+                "runtime.qwen4_ple_shard_size_mismatch",
+                f"PLE shard {declared!r} identity has the wrong byte size",
+                path=f"{path}/path",
+                expected=expected_bytes,
+                actual=identity.get("size_bytes"),
+            ))
+    return out
+
+
 def verify_package(manifest: dict, package_dir: Path) -> list[Validation]:
     """Check manifest, declared files, and tensor keys. Empty list means clean."""
     package_dir = Path(package_dir)
@@ -736,9 +1052,18 @@ def verify_package(manifest: dict, package_dir: Path) -> list[Validation]:
     # The bundled drafter carries its own all-or-nothing presence contract.
     out.extend(_verify_drafter_component(manifest, package_dir))
 
-    # Compact DS4 packages bind their router rows to one authenticated selection
-    # artifact and to the per-layer expert counts encoded in bundle headers.
-    out.extend(_verify_deepseek_v4_expert_layout(manifest, package_dir))
+    # Qwen4 PLE row geometry and hashing are owned by the architecture. The
+    # component only declares where those independently derived rows live.
+    out.extend(_verify_qwen4_ple_provider(manifest, package_dir))
+
+    # Compact packages bind one family-specific selection artifact to the
+    # per-layer expert counts encoded in bundle headers.
+    architecture = manifest.get("architecture")
+    family = architecture.get("family") if isinstance(architecture, dict) else None
+    if family == "deepseek_v4_flash":
+        out.extend(_verify_deepseek_v4_expert_layout(manifest, package_dir))
+    elif family == "qwen4_exp":
+        out.extend(_verify_qwen4_expert_layout(manifest, package_dir))
 
     # Every declared tensor key must be present in a manifest-declared shard.
     headers: dict[str, set[str] | None] = {}
@@ -848,44 +1173,12 @@ def _sidecar_seed(
     config: dict,
     jang_config: dict,
 ) -> tuple[int, list[Validation]]:
-    """Infer the generator seed without pretending K-quant manifests pin one.
+    """Resolve the common seed field used to reproduce generated sidecars.
 
-    TQ tensors do pin their transform seed, so that value is authoritative.
-    K-quant and affine-only manifests do not: for them the two generated views
-    must agree, and their common seed is used to reproduce the views. If only
-    one view still carries a seed, it is used so the missing/tampered field is
-    also exposed by the full semantic comparison.
+    Both views must agree. If one omits the field, semantic comparison against
+    the regenerated sidecars exposes the omission.
     """
     out: list[Validation] = []
-    tensors = manifest.get("tensors", [])
-    if not isinstance(tensors, list):
-        tensors = []
-
-    def tensor_seed(tensor: dict) -> int | None:
-        params = tensor.get("format_params")
-        if not isinstance(params, dict):
-            return None
-        return _integer_seed(params.get("seed"))
-
-    tq_values = {
-        seed
-        for tensor in tensors
-        if isinstance(tensor, dict) and tensor.get("format") == "tq"
-        for seed in [tensor_seed(tensor)]
-        if seed is not None
-    }
-    tq_entries = [
-        tensor
-        for tensor in tensors
-        if isinstance(tensor, dict) and tensor.get("format") == "tq"
-    ]
-    if len(tq_values) != (1 if tq_entries else 0):
-        out.append(_validation(
-            "runtime.inconsistent_manifest_seed",
-            "TQ tensor entries must declare one consistent integer seed",
-            path="/tensors",
-        ))
-
     config_raw = config.get("mxtq_seed")
     jang_raw = jang_config.get("mxtq_seed")
     config_seed = _integer_seed(config_raw)
@@ -901,22 +1194,6 @@ def _sidecar_seed(
                 path=f"/{name}/mxtq_seed",
             ))
 
-    manifest_seed = next(iter(tq_values), None) if len(tq_values) == 1 else None
-    if manifest_seed is not None:
-        for name, actual in (
-            ("config.json", config_seed),
-            ("jang_config.json", jang_seed),
-        ):
-            if actual is not None and actual != manifest_seed:
-                out.append(_validation(
-                    "runtime.sidecar_seed_mismatch",
-                    f"{name} mxtq_seed {actual} differs from manifest TQ seed "
-                    f"{manifest_seed}",
-                    path=f"/{name}/mxtq_seed",
-                    expected=manifest_seed,
-                    actual=actual,
-                ))
-        return manifest_seed, out
 
     if config_seed is not None and jang_seed is not None and config_seed != jang_seed:
         out.append(_validation(

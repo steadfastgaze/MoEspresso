@@ -35,6 +35,16 @@ def _parser() -> argparse.ArgumentParser:
         add_help=False,
         help="Verify package integrity and optional external drafter bytes.",
     )
+    commands.add_parser(
+        "speed",
+        add_help=False,
+        help="Print decode speed from an existing MoEspresso server.",
+    )
+    commands.add_parser(
+        "completions-api-timing",
+        add_help=False,
+        help="Independently count tokens and time an existing chat-completions API.",
+    )
     return parser
 
 
@@ -51,6 +61,14 @@ def _command(command: str) -> tuple[Callable, str]:
         from moespresso.runtime.serve import verify_main
 
         return verify_main, "moespresso verify"
+    if command == "speed":
+        from moespresso.runtime.diagnostics import main
+
+        return main, "moespresso speed"
+    if command == "completions-api-timing":
+        from moespresso.runtime.completions_api_timing import main
+
+        return main, "moespresso completions-api-timing"
     raise AssertionError(f"unknown command {command!r}")
 
 
@@ -66,10 +84,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     command = args.pop(0)
-    if command not in {"serve", "generate", "verify"}:
+    if command not in {"serve", "generate", "verify", "speed", "completions-api-timing"}:
         parser.error(
             f"argument COMMAND: invalid choice: {command!r} "
-            "(choose from 'serve', 'generate', 'verify')"
+            "(choose from 'serve', 'generate', 'verify', 'speed', 'completions-api-timing')"
         )
     command_main, prog = _command(command)
     return command_main(args, prog=prog)

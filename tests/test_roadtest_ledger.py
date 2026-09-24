@@ -61,6 +61,34 @@ def test_frontier_at_exact_prompt_length_is_not_written():
     assert check.new_frontiers == (256,)
 
 
+def test_prefill_only_cache_saves_the_full_prompt_but_not_generated_tokens():
+    ledger = SessionLedger("qwen", stride=256, prefill_only=True)
+    first = ledger.observe("t1", usage(
+        cached=0, suffix=512, completion=100, event="miss", disk_written=2))
+    assert first.findings == ()
+    assert first.new_frontiers == (256, 512)
+    assert ledger.memory_key_tokens == 512
+    second = ledger.observe("t2", usage(
+        cached=512, suffix=300, completion=40, event="hit", disk_written=1))
+    assert second.findings == ()
+    assert second.new_frontiers == (768,)
+    ledger.note_restart()
+    assert ledger.memory_key_tokens == 0
+    restored = ledger.observe("t3", usage(
+        cached=768, suffix=256, completion=20, event="disk_hit", disk_written=1))
+    assert restored.findings == ()
+    assert restored.new_frontiers == (1024,)
+
+
+def test_prefill_only_cache_does_not_credit_unsaved_decode_tokens():
+    ledger = SessionLedger("qwen", stride=256, prefill_only=True)
+    ledger.observe("t1", usage(
+        cached=0, suffix=600, completion=100, event="miss", disk_written=2))
+    check = ledger.observe("t2", usage(
+        cached=700, suffix=112, completion=10, event="hit", disk_written=1))
+    assert "cache.cached_tokens" in {finding.code for finding in check.findings}
+
+
 def test_decode_span_frontiers_stay_unwritten():
     ledger = SessionLedger("a", stride=256)
     ledger.observe("t1", usage(

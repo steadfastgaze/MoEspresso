@@ -40,28 +40,14 @@ int32 ``[offset, seq_len]`` params array and reproduces
 form takes the caller's float32 positions row. The element dtype is a
 template parameter, so each dtype compiles its own pipeline.
 
-``MOESPRESSO_DSV4_ATTN_SEAM_FUSED=0`` kills every attention seam fusion;
-``MOESPRESSO_DSV4_ATTN_SEAM_ROPE=0`` kills only the rope seam;
-``MOESPRESSO_DSV4_SEAM_ROPE_PREFILL=0`` restores the decode-only row cap
-so prefill-shaped calls stay composed. Callers fall back to the composed
-path on any precondition miss.
+Callers fall back to the composed path when Metal is unavailable or any
+shape, dtype, position, or geometry precondition misses.
 """
 
 from __future__ import annotations
 
-import os
-
-_FAMILY_ENV_FLAG = "MOESPRESSO_DSV4_ATTN_SEAM_FUSED"
-_ROPE_ENV_FLAG = "MOESPRESSO_DSV4_ATTN_SEAM_ROPE"
-_PREFILL_ENV_FLAG = "MOESPRESSO_DSV4_SEAM_ROPE_PREFILL"
-
 _ROPE_DIM = 64
 _ROPE_FREQS = _ROPE_DIM // 2
-
-# Decode row cap: 64 query heads is the widest served decode call, and
-# the cap is the eligibility contract when the prefill extension is
-# killed.
-_MAX_ROWS_DECODE = 64
 
 # Structural row ceiling for prefill-shaped calls. The kernel is
 # row-parallel (one grid row per flattened input row), reads the row
@@ -138,31 +124,6 @@ def _metal_available() -> bool:
     return _METAL_AVAILABLE
 
 
-def rope_seam_enabled() -> bool:
-    """Return True when the fused rope seam may engage."""
-    if os.environ.get(_FAMILY_ENV_FLAG, "1") == "0":
-        return False
-    if os.environ.get(_ROPE_ENV_FLAG, "1") == "0":
-        return False
-    return _metal_available()
-
-
-def prefill_rope_seam_enabled() -> bool:
-    """Return True when prefill row counts may serve the fused dispatch.
-
-    Default on: the fused form is bit-identical to the composed chain at
-    every served prefill shape and dtype (zero mismatched bits across the
-    six fenced call sites), so the extension is an eligibility widening on
-    an existing kernel rather than a math change. The served anchor A/B
-    measured the chunk wall at 14.538 s against 14.677 with the cap
-    restored (medians of three, all 192 prefill rope calls converted, the
-    token rail identical on both arms).
-    ``MOESPRESSO_DSV4_SEAM_ROPE_PREFILL=0`` restores the decode-only row
-    cap.
-    """
-    return os.environ.get(_PREFILL_ENV_FLAG, "1") != "0"
-
-
 def _element_dtypes():
     import mlx.core as mx
 
@@ -206,8 +167,7 @@ def partial_rope_eligible(x, inv_freq, *, offset, positions) -> bool:
     integer offset or a caller-supplied float32 positions row matching the
     sequence axis. Row counts up to 64 (the widest decode call) are always
     eligible; larger prefill-shaped row counts are eligible up to the
-    kernel's structural int32 ceiling unless
-    ``MOESPRESSO_DSV4_SEAM_ROPE_PREFILL=0`` restores the decode-only cap.
+    kernel's structural int32 ceiling.
     """
     import mlx.core as mx
 
@@ -220,10 +180,7 @@ def partial_rope_eligible(x, inv_freq, *, offset, positions) -> bool:
     rows = 1
     for dim in x.shape[:-1]:
         rows *= int(dim)
-    max_rows = (
-        _MAX_ROWS_PREFILL if prefill_rope_seam_enabled() else _MAX_ROWS_DECODE
-    )
-    if not 1 <= rows <= max_rows:
+    if not _metal_available() or not 1 <= rows <= _MAX_ROWS_PREFILL:
         return False
     if (
         inv_freq.ndim != 1

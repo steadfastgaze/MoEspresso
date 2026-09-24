@@ -901,10 +901,7 @@ class TestReferenceGraphContract:
         mx.eval(got, want)
         assert bool(mx.allclose(got, want.astype(got.dtype)).item())
 
-    def test_fp8_prefix_round_trip_is_the_reference_grid(self, monkeypatch):
-        # The composed arm; its bit identity with the fused kernel is pinned
-        # by the decode-attention kernel tests.
-        monkeypatch.setenv("MOESPRESSO_DSV4_FP8_KV_KERNEL", "0")
+    def test_fp8_prefix_round_trip_is_the_reference_grid(self):
         from moespresso.runtime.deepseek_v4.dspark_model import _fp8_kv_roundtrip
 
         row = mx.concatenate(

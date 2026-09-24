@@ -21,7 +21,8 @@ from moespresso.package.deepseek_v4.iqk_package import (
     dense_format_counts,
     read_iqk_allocation,
 )
-from moespresso.package.iqk_format import iqk_geometry
+from moespresso.package.iqk_format import IQK_DENSE_MEMBERS, iqk_geometry
+from moespresso.package.kquant_format import KQUANT_GEOMETRY
 
 # --------------------------------------------------------------------------
 # Candidate allocations
@@ -120,7 +121,21 @@ def test_routed_artifacts_read_experts_at_their_own_offsets(tmp_path):
 
     artifacts = IQKRoutedArtifacts(root, members, shapes, 2)
     try:
-        assert artifacts.identity()["member_counts"] == {"iq2_k": 1, "iq2_ks": 2}
+        identity = artifacts.identity()
+        assert identity["member_counts"] == {"iq2_k": 1, "iq2_ks": 2}
+        assert "root" not in identity
+        assert str(root) not in json.dumps(identity)
+        assert len(identity["cell_geometry"]) == 3
+        assert identity["cell_geometry"][0] == {
+            "layer_index": 0,
+            "projection": "down",
+            "codec": "iq2_ks",
+            "out_features": 4,
+            "in_features": 256,
+            "bytes_per_row": iqk_geometry("iq2_ks").bytes_per_row(256),
+            "bytes_per_expert": 4 * iqk_geometry("iq2_ks").bytes_per_row(256),
+            "size_bytes": 2 * 4 * iqk_geometry("iq2_ks").bytes_per_row(256),
+        }
         for (layer, projection), path in written.items():
             raw = np.frombuffer(path.read_bytes(), dtype=np.uint8)
             cell = artifacts.cells[(layer, projection)]
@@ -147,6 +162,25 @@ def test_routed_artifacts_reject_a_cell_written_at_another_member(tmp_path):
         IQKRoutedArtifacts(root, members, shapes, 2)
 
 
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+def test_routed_artifacts_require_regular_cell_files(tmp_path, replacement):
+    members = {0: {"gate": "iq2_ks", "up": "iq2_ks", "down": "iq2_ks"}}
+    root, shapes, _written = _tiny_stack(tmp_path, members)
+    path = root / "layer00_gate.iq2_ks"
+    path.unlink()
+    if replacement == "directory":
+        path.mkdir()
+    else:
+        target = root / "target.bin"
+        target.write_bytes(
+            b"\x00" * (2 * 4 * iqk_geometry("iq2_ks").bytes_per_row(256))
+        )
+        path.symlink_to(target.name)
+
+    with pytest.raises(IQKPackageError, match="not a regular file"):
+        IQKRoutedArtifacts(root, members, shapes, 2)
+
+
 def test_routed_artifacts_require_the_conversion_digests(tmp_path):
     members = {0: {"gate": "iq2_ks", "up": "iq2_ks", "down": "iq2_ks"}}
     root, shapes, written = _tiny_stack(tmp_path, members)
@@ -167,6 +201,9 @@ def test_routed_artifacts_require_the_conversion_digests(tmp_path):
     try:
         report = artifacts.verify_digests(inventory)
         assert report["files_checked"] == 3
+        assert "inventory" not in report
+        assert len(report["inventory_sha256"]) == 64
+        assert str(inventory) not in json.dumps(report)
 
         recorded["files"][0]["sha256"] = "0" * 64
         inventory.write_text(json.dumps(recorded))
@@ -225,11 +262,26 @@ def test_dense_side_rejects_an_unknown_codec():
         build_dense_allocations(_dense_inventory(), codec="q9_0")
 
 
+@pytest.mark.parametrize("codec", sorted(KQUANT_GEOMETRY))
+def test_dense_side_preserves_every_kquant_codec(codec):
+    allocation = build_dense_allocations(_dense_inventory(), codec=codec)
+    mapped = [row for row in allocation if row["format"] == "kquant"]
+
+    assert len(mapped) == 2
+    assert {row["kquant_codec"] for row in mapped} == {codec}
+
+
+@pytest.mark.parametrize("codec", IQK_DENSE_MEMBERS)
+def test_dense_side_rejects_mlx_iqk_dense_members(codec):
+    with pytest.raises(IQKPackageError, match="unknown dense codec"):
+        build_dense_allocations(_dense_inventory(), codec=codec)
+
+
 def test_dense_rows_stay_unsteered_through_the_writer_target():
     # The writer rebuilds each dense target from the allocation row
     # (`dense_target_from_allocation`), which defaults `requires_imatrix`
-    # to true. The IQ_K dense side is deliberately unsteered, so the row
-    # must carry the flag or an imatrix-steered codec such as q6_k fails
+    # to true. The converted-IQ_K package's dense K-quant side is deliberately
+    # unsteered, so the row must carry the flag or a codec such as q6_k fails
     # at encode with an empty imatrix vector set.
     from moespresso.package.deepseek_v4.recipe import dense_target_from_allocation
     from moespresso.package.kquant_recipe import validate_kquant_target_fit

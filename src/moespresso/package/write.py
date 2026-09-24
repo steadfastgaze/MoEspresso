@@ -1,37 +1,17 @@
-"""Write the MJTQ package from a package_plan, then emit its manifest.
+"""Write package-plan allocations as safetensors shards and emit a manifest.
 
-MJTQ ("MoEspresso Jang TurboQuant") is the strict package format: it reuses jang's
-TurboQuant codec + tensor conventions for compression, but the explicit manifest
-(emitted here) is the contract the runtime reads: it never guesses. The upstream
-"jangtq" package format is separate; jang is used only as the codec.
-
-The imperative shell: stream each source weight, quantize it per the plan's
-allocation (TQ for experts via jang, affine via mlx, fp16 passthrough), write the
-packed arrays into safetensors shards, collect on-disk locations + file
-identities, then hand all of that to the pure package.manifest builder.
-
-Multi-shard streaming: a new shard is started once the current one passes a byte
-cap (`--shard-size-gb`), so a 35B package doesn't have to fit one file in RAM.
-The final shard count is only known at the end, so shards are written as
-`model-NNNNN-of-?????` and renamed to `-of-COUNT` once done (mirrors the proven
-convert_moe). `shard_size_gb=0` keeps everything in one shard (the synthetic/test
-path). The manifest already takes a per-tensor `located` map + a `files` list, so
-none of this changes the manifest contract.
-
-Needs mlx + jang. The format-defining work (the manifest)
-is pure and lives in package/manifest.py; this module only moves bytes.
-
-Tensor key conventions: routed experts -> one per-layer bundle
-`...switch_mlp.experts.tq_bundle` (uint8 [n_experts, row_bytes]; the
-streaming format: row e is expert e's full gate/up/down payload, geometry in
-the shard's `__metadata__`, see package/bundle.py); affine -> `<base>.weight` /
-`.scales` / `.biases`; fp16 passthrough -> the raw array under its name.
+Source tensors are read in bounded bands or expert rows. The plan fixes each
+codec; the writer records the resulting keys, component geometry and file hashes.
+Routed experts use one per-layer bundle with a contiguous payload per expert.
+Shard files split at shard_size_gb and receive their final count after writing.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
 
@@ -41,23 +21,25 @@ from moespresso.inventory import roles
 from moespresso.package.bundle import (
     BUNDLE_KEY_SUFFIX,
     METADATA_KEY,
-    assemble_layer_bundle,
     encode_bundle_metadata,
 )
 from moespresso.package.kquant_backend import encode_kquant_weight
 from moespresso.package.kquant_bundle import assemble_kquant_encoded_layer_bundle
 from moespresso.package.kquant_cache import KQuantEncodeCache, source_identity_from_arrays
+from moespresso.package.iqk_write import (
+    annotate_expert_input_geometry,
+    iqk_bundle_row,
+)
+from moespresso.package.iqk_recipe import iqk_dense_target_from_allocation
 from moespresso.package.deepseek_v4.recipe import (
     dense_target_from_allocation as ds4_dense_target_from_allocation,
 )
 from moespresso.package.deepseek_v4.write import (
     bundle_row as deepseek_v4_bundle_row,
-    quantize_experts_streamed as quantize_deepseek_v4_experts_streamed,
 )
 from moespresso.package.qwen.write import (
     encode_kquant_experts_streamed as encode_qwen_kquant_experts_streamed,
 )
-from moespresso.package.tq import quantize_tq
 from moespresso.package.manifest import (
     PACKAGE_FORMAT,
     build_package_manifest,
@@ -87,6 +69,77 @@ _SAFETENSORS_DTYPES = {
     np.dtype("uint8"): "U8",
     np.dtype("uint32"): "U32",
 }
+
+
+def validate_additional_file_identities(
+    package_dir: str | Path,
+    records: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    """Validate package-owned non-shard files before model writing begins."""
+    root = Path(package_dir).resolve()
+    validated = []
+    seen: set[str] = set()
+    for index, raw in enumerate(records or ()):
+        if not isinstance(raw, dict):
+            raise ValueError(f"additional package file {index} is not an object")
+        relative = raw.get("path")
+        posix = PurePosixPath(relative) if isinstance(relative, str) else None
+        windows = PureWindowsPath(relative) if isinstance(relative, str) else None
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or "\\" in relative
+            or posix is None
+            or posix.is_absolute()
+            or windows is None
+            or windows.is_absolute()
+            or bool(windows.drive)
+            or any(part in {"", ".", ".."} for part in posix.parts)
+            or posix.as_posix() != relative
+        ):
+            raise ValueError(
+                f"additional package file {index} has a noncanonical relative path"
+            )
+        if relative in seen:
+            raise ValueError(f"additional package file path is duplicated: {relative}")
+        seen.add(relative)
+        size = raw.get("size_bytes")
+        digest = raw.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"additional package file {relative} has an invalid size")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"additional package file {relative} has an invalid sha256")
+        try:
+            path = (root / relative).resolve(strict=True)
+            path.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"additional package file {relative} escapes the package root"
+            ) from exc
+        if (root / relative).is_symlink() or not path.is_file():
+            raise ValueError(
+                f"additional package file {relative} must be a regular package file"
+            )
+        if path.stat().st_size != size:
+            raise ValueError(
+                f"additional package file {relative} size does not match its identity"
+            )
+        actual = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 22), b""):
+                actual.update(chunk)
+        if actual.hexdigest() != digest:
+            raise ValueError(
+                f"additional package file {relative} sha256 does not match its identity"
+            )
+        validated.append(
+            {"path": relative, "size_bytes": size, "sha256": digest}
+        )
+    return validated
 
 
 def safe_chunk_bytes(free_bytes: int, *, fraction: float = _CHUNK_FREE_FRACTION,
@@ -328,46 +381,6 @@ def _fp16_streamed(model_dir: Path, header, chunk_bytes: int) -> np.ndarray:
     return np.concatenate(parts, axis=0)
 
 
-def _quantize_experts_streamed(
-    model_dir: Path, header, projection: str, bits: int, seed: int,
-    max_experts: int | None = None,
-) -> dict[str, np.ndarray]:
-    """TQ-quantize a stacked-expert sub-projection one expert at a time -> 3D stack.
-
-    Per-expert streaming limits the peak footprint to one [rows, cols] expert.
-    For a fused gate_up source, take the gate or up
-    half of each expert before quantizing. The per-expert results are stacked
-    (packed [n_experts, out, packed_in], norms [n_experts, out]) as input for the
-    per-layer bundle assembly (package/bundle.py); the stack itself is no longer
-    written to disk. 'out' = the sub-projection's row count (moe_inter for
-    gate/up, hidden for down).
-
-    `max_experts` (smoke artifact) keeps only the first N experts; the manifest's
-    config num_experts is reduced to match so the served graph is consistent.
-    """
-    import mlx.core as mx
-
-    rows = header.shape[1]
-    mid = rows // 2
-    fused = projection in ("gate", "up")
-    packed_list, norms_list = [], []
-    for expert in weight_io.iter_experts(model_dir, header, max_experts=max_experts):
-        sub = expert
-        if fused:
-            sub = expert[:mid] if projection == "gate" else expert[mid:]
-        r = quantize_tq(sub, bits, seed)
-        packed_list.append(r["tq_packed"])   # [out, packed_in]
-        norms_list.append(r["tq_norms"])     # [out]
-        del expert, sub
-        mx.eval()
-        mx.clear_cache()
-    # Stack to 3D [n_experts, out, packed_in] / [n_experts, out]: jang's
-    # prestacked switch_mlp layout, the kernel's native form.
-    return {"tq_packed": np.stack(packed_list, axis=0),
-            "tq_norms": np.stack(norms_list, axis=0),
-            "tq_bits": np.array([bits], dtype=np.uint8)}
-
-
 def _matrix_from_row_chunks(chunks, name: str) -> np.ndarray:
     parts = [np.asarray(chunk, dtype=np.float32) for _start, chunk in chunks]
     if not parts:
@@ -380,7 +393,6 @@ def _write_deepseek_v4_layer_bundle_streamed(
     group: DecodedExpertGroup,
     layer: int,
     allocs: dict[str, dict],
-    seed: int,
     max_experts: int | None,
     *,
     kquant_imatrix_vectors: dict[str, np.ndarray] | None = None,
@@ -402,7 +414,6 @@ def _write_deepseek_v4_layer_bundle_streamed(
         layer,
         expert_indices[0],
         allocs,
-        seed,
         kquant_imatrix_vectors=kquant_imatrix_vectors,
         kquant_encoder=kquant_encoder,
         kquant_expert_loader=kquant_expert_loader,
@@ -422,7 +433,6 @@ def _write_deepseek_v4_layer_bundle_streamed(
                 layer,
                 expert_index,
                 allocs,
-                seed,
                 kquant_imatrix_vectors=kquant_imatrix_vectors,
                 kquant_encoder=kquant_encoder,
                 kquant_expert_loader=kquant_expert_loader,
@@ -433,6 +443,78 @@ def _write_deepseek_v4_layer_bundle_streamed(
             if row.shape != (row_bytes,):
                 raise ValueError(
                     f"DS4 layer {layer} expert {expert_index} bundle row "
+                    f"{row.shape} != ({row_bytes},)"
+                )
+            yield row
+
+    prefix = _expert_bundle_prefix(allocs["gate"]["source_name"])
+    shard_name = writer.add_streamed_bundle(
+        f"{prefix}.{BUNDLE_KEY_SUFFIX}",
+        layer,
+        geometry,
+        rows(),
+    )
+    return prefix, shard_name
+
+
+def _write_iqk_layer_bundle_streamed(
+    writer: _ShardWriter,
+    layer: int,
+    allocs: dict[str, dict],
+    num_experts: int,
+    *,
+    max_experts: int | None,
+    iqk_expert_loader,
+    iqk_expert_source_layout: str | None = None,
+    expert_source_ids: Sequence[int] | None = None,
+) -> tuple[str, str] | None:
+    """Write one model-independent IQ_K bundle directly as expert rows."""
+    if iqk_expert_loader is None:
+        raise ValueError(
+            f"layer {layer} declares IQ_K experts but has no converted-artifact loader"
+        )
+    if expert_source_ids is None:
+        selected = tuple(range(int(num_experts)))
+    else:
+        selected = tuple(expert_source_ids)
+        if (
+            not selected
+            or any(isinstance(expert, bool) or not isinstance(expert, int) for expert in selected)
+            or selected != tuple(sorted(set(selected)))
+            or selected[0] < 0
+            or selected[-1] >= int(num_experts)
+        ):
+            raise ValueError(
+                f"layer {layer} compact expert source ids must be sorted, unique, and in range"
+            )
+    if max_experts is not None:
+        selected = selected[: int(max_experts)]
+    if not selected:
+        return None
+    first_row, geometry = iqk_bundle_row(
+        layer,
+        selected[0],
+        allocs,
+        expert_loader=iqk_expert_loader,
+        source_layout=iqk_expert_source_layout,
+    )
+    geometry = dict(geometry)
+    geometry["num_experts"] = len(selected)
+    row_bytes = int(geometry["row_bytes"])
+
+    def rows():
+        yield first_row
+        for expert_index in selected[1:]:
+            row, _geometry = iqk_bundle_row(
+                layer,
+                expert_index,
+                allocs,
+                expert_loader=iqk_expert_loader,
+                source_layout=iqk_expert_source_layout,
+            )
+            if row.shape != (row_bytes,):
+                raise ValueError(
+                    f"IQ_K layer {layer} expert {expert_index} bundle row "
                     f"{row.shape} != ({row_bytes},)"
                 )
             yield row
@@ -460,12 +542,30 @@ _SAFETENSORS_DTYPE_TAG = {
     "float32": "F32", "float64": "F64", "int64": "I64", "uint64": "U64",
 }
 
+
+class _BF16Codes:
+    """Exact BF16 payload bits carried through NumPy's uint16 storage view."""
+
+    def __init__(self, values: np.ndarray):
+        array = np.ascontiguousarray(values)
+        if array.dtype != np.uint16:
+            raise ValueError(f"BF16 payload codes must use uint16, got {array.dtype}")
+        self.values = array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(int(value) for value in self.values.shape)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.values.nbytes)
+
 # safetensors assigns data offsets in dtype-rank-descending then name-ascending
 # order (the rank is the library's dtype enum position). This list is that
 # descending rank order restricted to the numpy-representable tags, so shards
 # written here keep the same data layout as shards written by the library.
 _SAFETENSORS_LAYOUT_ORDER = (
-    "U64", "I64", "F64", "F32", "U32", "I32", "F16", "U16", "I16",
+    "U64", "I64", "F64", "F32", "U32", "I32", "BF16", "F16", "U16", "I16",
     "I8", "U8", "BOOL",
 )
 _SAFETENSORS_LAYOUT_RANK = {
@@ -473,7 +573,9 @@ _SAFETENSORS_LAYOUT_RANK = {
 }
 
 
-def _safetensors_dtype_tag(arr: np.ndarray) -> str:
+def _safetensors_dtype_tag(arr: np.ndarray | _BF16Codes) -> str:
+    if isinstance(arr, _BF16Codes):
+        return "BF16"
     tag = _SAFETENSORS_DTYPE_TAG.get(arr.dtype.name)
     if tag is None:
         raise ValueError(f"unsupported shard tensor dtype {arr.dtype!r}")
@@ -482,7 +584,7 @@ def _safetensors_dtype_tag(arr: np.ndarray) -> str:
 
 def _write_shard_deterministic(
     path: Path,
-    tensors: dict[str, np.ndarray],
+    tensors: dict[str, np.ndarray | _BF16Codes],
     metadata: dict[str, str],
 ) -> None:
     """Write one safetensors shard whose bytes are a pure function of the inputs.
@@ -521,10 +623,11 @@ def _write_shard_deterministic(
             f.write(struct.pack("<Q", len(blob)))
             f.write(blob)
             for _name, arr in ordered:
-                if arr.flags.c_contiguous:
-                    f.write(memoryview(arr).cast("B"))
+                values = arr.values if isinstance(arr, _BF16Codes) else arr
+                if values.flags.c_contiguous:
+                    f.write(memoryview(values).cast("B"))
                 else:
-                    f.write(arr.tobytes())
+                    f.write(values.tobytes())
         tmp.rename(path)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -544,7 +647,7 @@ class _ShardWriter:
         self.out_dir = out_dir
         self.cap_bytes = cap_bytes  # 0 == unlimited (single shard)
         self.idx = 0
-        self.buf: dict[str, np.ndarray] = {}
+        self.buf: dict[str, np.ndarray | _BF16Codes] = {}
         self.buf_bytes = 0
         # Bundle geometry for the buffered layers: each shard's __metadata__
         # describes exactly the bundles it carries (package/bundle.py schema),
@@ -558,7 +661,7 @@ class _ShardWriter:
         # v2 path when no model.safetensors.index.json is present.
         return f"model-{idx:05d}-of-{_PLACEHOLDER}.safetensors"
 
-    def add_group(self, keyed: dict[str, np.ndarray],
+    def add_group(self, keyed: dict[str, np.ndarray | _BF16Codes],
                   bundle_geo: tuple[int, dict] | None = None) -> str:
         """Add one tensor group; flush first if it would overflow. Returns shard name.
 
@@ -708,7 +811,11 @@ class _ShardWriter:
         return rename
 
 
-def _passthrough_array(model_dir: Path, header, fmt: str = "fp16") -> np.ndarray:
+def _passthrough_array(
+    model_dir: Path,
+    header,
+    fmt: str = "fp16",
+) -> np.ndarray | _BF16Codes:
     """Copy a structural tensor in its declared package passthrough format.
 
     Every structural tensor is copied 1:1, no transpose, no value change. This is
@@ -723,7 +830,8 @@ def _passthrough_array(model_dir: Path, header, fmt: str = "fp16") -> np.ndarray
     Pinned by test_write.test_passthrough_structural_tensors_round_trip.
     """
     if fmt == "raw_dtype_passthrough":
-        return weight_io.load_full_raw(model_dir, header)
+        values = weight_io.load_full_raw(model_dir, header)
+        return _BF16Codes(values) if header.dtype == "BF16" else values
     if fmt == "f32_passthrough":
         return weight_io.load_full(model_dir, header).astype(np.float32)
     return weight_io.load_full(model_dir, header).astype(np.float16)
@@ -735,7 +843,6 @@ def write_package(
     arch_config: dict,
     out_dir: Path,
     *,
-    seed: int = 42,
     shard_size_gb: float = 0.0,
     chunk_bytes: int | None = None,
     passthrough: list[dict] | None = None,
@@ -749,13 +856,18 @@ def write_package(
     kquant_cache: KQuantEncodeCache | None = None,
     kquant_cache_context: dict | None = None,
     iqk_expert_loader=None,
+    iqk_expert_source_layout: str | None = None,
     iqk_dense_encoder=None,
+    expert_source_ids: Mapping[int, Sequence[int]] | None = None,
+    expert_layout: dict | None = None,
+    additional_files: list[dict] | tuple[dict, ...] | None = None,
+    ple_provider: dict | None = None,
 ) -> dict:
     """Quantize per the package plan, write shard(s), return the package_manifest.
 
     Streams within every tensor so the full model converts in a bounded footprint:
     affine/fp16 are quantized a ~`chunk_bytes` row-band at a time; stacked experts
-    are TQ-quantized one expert at a time. Peak RAM is one band / one expert plus
+    are encoded or copied one expert at a time. Peak RAM is one band / one expert plus
     the current shard buffer, never a whole tensor or the whole model.
 
     `chunk_bytes=None` (default) auto-sizes the row-band from free RAM
@@ -765,8 +877,27 @@ def write_package(
     """
     if chunk_bytes is None:
         chunk_bytes = _autosize_chunk_bytes()
+    if (expert_source_ids is None) != (expert_layout is None):
+        raise ValueError(
+            "compact expert source ids and expert layout must be declared together"
+        )
+    if expert_source_ids is None:
+        compact_ids = None
+    else:
+        if any(
+            isinstance(layer, bool) or not isinstance(layer, int)
+            for layer in expert_source_ids
+        ):
+            raise ValueError("compact expert source-id layer keys must be integers")
+        compact_ids = {
+            layer: tuple(ids) for layer, ids in expert_source_ids.items()
+        }
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    validated_additional_files = validate_additional_file_identities(
+        out_dir,
+        additional_files,
+    )
     catalog = weight_io.scan_offsets(model_dir)
 
     cap_bytes = int(shard_size_gb * (1024 ** 3))
@@ -869,9 +1000,6 @@ def write_package(
                 # checked against the member's struct arithmetic before a
                 # byte is written, so a wrong-member or truncated encode
                 # fails here rather than at serve.
-                from moespresso.package.deepseek_v4.recipe import (
-                    iqk_dense_target_from_allocation,
-                )
                 from moespresso.package.iqk_format import iqk_dense_geometry
 
                 target = iqk_dense_target_from_allocation(alloc)
@@ -925,13 +1053,45 @@ def write_package(
     # Routed experts: one bundle per layer (uint8 [n_experts, row_bytes], row e =
     # expert e's full gate/up/down payload) so a streamed miss is one pread
     # instead of six scattered ones. DS4 experts write rows directly;
-    # the Qwen K-quant/TQ fallback still assembles one layer's packed stack
+    # the Qwen K-quant path assembles one layer's packed stack
     # before writing its bundle.
+    if compact_ids is not None and set(compact_ids) != set(expert_allocs):
+        raise ValueError("compact expert source ids must cover every routed layer exactly")
     for layer in sorted(expert_allocs):
         allocs = expert_allocs[layer]
         if sorted(allocs) != ["down", "gate", "up"]:
             # Incomplete layer (missing source tensor): write nothing; the
             # manifest flags every unwritten location, fail-closed.
+            continue
+        formats = {str(alloc.get("format")) for alloc in allocs.values()}
+        if compact_ids is not None and formats != {"iqk"}:
+            raise ValueError(
+                f"compact expert source ids require an IQ_K layer, got {sorted(formats)}"
+            )
+        if formats == {"iqk"} and deepseek_v4_expert_group is None:
+            source_header = catalog.get(allocs["gate"]["source_name"])
+            if source_header is None or len(source_header.shape) != 3:
+                continue
+            streamed = _write_iqk_layer_bundle_streamed(
+                writer,
+                layer,
+                allocs,
+                int(source_header.shape[0]),
+                max_experts=max_experts,
+                iqk_expert_loader=iqk_expert_loader,
+                iqk_expert_source_layout=iqk_expert_source_layout,
+                expert_source_ids=(
+                    None if compact_ids is None else compact_ids.get(layer)
+                ),
+            )
+            if streamed is None:
+                continue
+            prefix, shard_name = streamed
+            for allocation in allocs.values():
+                located[located_key(allocation)] = {
+                    "shard": shard_name,
+                    "key_prefix": prefix,
+                }
             continue
         if deepseek_v4_expert_group is not None:
             streamed = _write_deepseek_v4_layer_bundle_streamed(
@@ -939,7 +1099,6 @@ def write_package(
                 deepseek_v4_expert_group,
                 layer,
                 allocs,
-                seed,
                 max_experts,
                 kquant_imatrix_vectors=kquant_imatrix_vectors,
                 kquant_encoder=kquant_encoder,
@@ -955,81 +1114,34 @@ def write_package(
                 located[located_key(a)] = {"shard": shard_name, "key_prefix": prefix}
             continue
 
-        comps: dict[tuple[str, str], np.ndarray] = {}
         encoded_by_projection = {}
-        bits: dict[str, int] = {}
-        codecs: dict[str, str] = {}
         for projection in ("gate", "up", "down"):
-            a = allocs[projection]
-            codec = a.get("codec", a.get("format", "tq"))
-            header = catalog.get(a["source_name"])
-            if a.get("format") == "kquant":
-                if header is None:
-                    continue
-                encoded_by_projection[projection] = encode_qwen_kquant_experts_streamed(
-                    model_dir,
-                    header,
-                    a,
-                    max_experts=max_experts,
-                    kquant_imatrix_vectors=kquant_imatrix_vectors,
-                    kquant_encoder=kquant_encoder,
-                    kquant_expert_loader=kquant_expert_loader,
-                    kquant_cache=kquant_cache,
-                    kquant_cache_context=kquant_cache_context,
-                )
-                continue
-            if codec != "tq":
+            allocation = allocs[projection]
+            if allocation.get("format") != "kquant":
                 raise ValueError(
-                    f"source mxfp4 routed codec requires DeepSeek V4 raw expert "
-                    f"storage; generic writer got codec={codec!r} for layer={layer} "
-                    f"projection={projection}")
-            if header is not None:
-                grp = _quantize_experts_streamed(
-                    model_dir,
-                    header,
-                    projection,
-                    a["bits"],
-                    seed,
-                    max_experts=max_experts,
-                )
-            elif deepseek_v4_expert_group is not None:
-                grp = quantize_deepseek_v4_experts_streamed(
-                    deepseek_v4_expert_group,
-                    layer,
-                    projection,
-                    a["bits"],
-                    seed,
-                    max_experts=max_experts,
-                )
-            else:
-                grp = None
-            if grp is None:
+                    f"unsupported routed format {allocation.get('format')!r} "
+                    f"for layer={layer} projection={projection}")
+            header = catalog.get(allocation["source_name"])
+            if header is None:
                 continue
-            comps[(f"{projection}_proj", "packed")] = grp["tq_packed"]
-            comps[(f"{projection}_proj", "norms")] = grp["tq_norms"]
-            bits[f"{projection}_proj"] = int(a["bits"])
-            codecs[f"{projection}_proj"] = "tq"
-        if encoded_by_projection:
-            if comps:
-                raise ValueError(
-                    f"generic routed layer {layer} mixes K-quant and TQ expert "
-                    "projections; use one expert codec family per layer")
-            bundle_arr, geo = assemble_kquant_encoded_layer_bundle(encoded_by_projection)
-            prefix = _expert_bundle_prefix(allocs["gate"]["source_name"])
-            shard_name = writer.add_group(
-                {f"{prefix}.{BUNDLE_KEY_SUFFIX}": bundle_arr}, bundle_geo=(layer, geo))
-            for a in allocs.values():
-                located[located_key(a)] = {"shard": shard_name, "key_prefix": prefix}
+            encoded_by_projection[projection] = encode_qwen_kquant_experts_streamed(
+                model_dir, header, allocation,
+                max_experts=max_experts,
+                kquant_imatrix_vectors=kquant_imatrix_vectors,
+                kquant_encoder=kquant_encoder,
+                kquant_expert_loader=kquant_expert_loader,
+                kquant_cache=kquant_cache,
+                kquant_cache_context=kquant_cache_context,
+            )
+        if len(encoded_by_projection) != 3:
             continue
-        if sorted(bits) != ["down_proj", "gate_proj", "up_proj"]:
-            continue
-        bundle_arr, geo = assemble_layer_bundle(comps, bits, codecs=codecs)
-        del comps
+        bundle_arr, geo = assemble_kquant_encoded_layer_bundle(encoded_by_projection)
+        annotate_expert_input_geometry(geo, allocs)
         prefix = _expert_bundle_prefix(allocs["gate"]["source_name"])
         shard_name = writer.add_group(
             {f"{prefix}.{BUNDLE_KEY_SUFFIX}": bundle_arr}, bundle_geo=(layer, geo))
-        for a in allocs.values():
-            located[located_key(a)] = {"shard": shard_name, "key_prefix": prefix}
+        for allocation in allocs.values():
+            located[located_key(allocation)] = {"shard": shard_name, "key_prefix": prefix}
 
     # Structural passthrough tensors (norms, SSM state), copied verbatim so the
     # runtime builds the graph without source files. They come from the inventory,
@@ -1050,7 +1162,22 @@ def write_package(
         loc["shard"] = rename.get(loc["shard"], loc["shard"])
 
     files = [file_identity(out_dir / new) for new in rename.values()]
-    return build_package_manifest(package_plan, arch_config, located, files, seed=seed,
-                                  passthrough=passthrough, passthrough_located=pt_located,
-                                  tokenizer=tokenizer, agentic_profile=agentic_profile,
-                                  max_experts=max_experts)
+    files.extend(validated_additional_files)
+    paths = [record.get("path") for record in files]
+    if any(not isinstance(path, str) or not path for path in paths):
+        raise ValueError("additional package files must declare non-empty paths")
+    if len(paths) != len(set(paths)):
+        raise ValueError("package file identities contain duplicate paths")
+    return build_package_manifest(
+        package_plan,
+        arch_config,
+        located,
+        files,
+        expert_layout=expert_layout,
+        passthrough=passthrough,
+        passthrough_located=pt_located,
+        tokenizer=tokenizer,
+        agentic_profile=agentic_profile,
+        ple_provider=ple_provider,
+        max_experts=max_experts,
+    )

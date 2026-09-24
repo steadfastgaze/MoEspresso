@@ -15,39 +15,28 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant.tq_kernel")
 
 import mlx.core as mx  # noqa: E402
 
 from moespresso.runtime.owned_switchglu import OwnedSwitchGLU  # noqa: E402
 
 
-def _resident_projection(n_experts, in_features, out_features, *, bits=2, seed=42):
-    from jang_tools.turboquant.tq_kernel import TurboQuantSwitchLinear
-
-    mod = TurboQuantSwitchLinear(
-        in_features, out_features, n_experts, bits=bits, seed=seed)
-    vals_per_u32 = 32 // bits
-    cols = (in_features + vals_per_u32 - 1) // vals_per_u32
-    mod.packed = mx.random.randint(
-        0, 2**31, (n_experts, out_features, cols)).astype(mx.uint32)
-    mod.norms = (mx.random.normal((n_experts, out_features)) * 0.1).astype(mx.float16)
-    mx.eval(mod.packed, mod.norms)
-    return mod
+def _resident_projection(n_experts, in_features, out_features):
+    from package_fixtures import resident_mxfp4
+    return resident_mxfp4(n_experts, in_features, out_features)
 
 
-def _owned_switchglu(*, n_experts=16, in_features=64, hidden_features=32,
-                    gate_bits=2, up_bits=4, down_bits=2):
+def _owned_switchglu(*, n_experts=16, in_features=64, hidden_features=32):
     from mlx_lm.models.switch_layers import SwitchGLU
 
     mx.random.seed(17)
     resident_shape = SwitchGLU(in_features, hidden_features, n_experts)
     gate = _resident_projection(
-        n_experts, in_features, hidden_features, bits=gate_bits)
+        n_experts, in_features, hidden_features)
     up = _resident_projection(
-        n_experts, in_features, hidden_features, bits=up_bits)
+        n_experts, in_features, hidden_features)
     down = _resident_projection(
-        n_experts, hidden_features, in_features, bits=down_bits)
+        n_experts, hidden_features, in_features)
     return OwnedSwitchGLU(
         gate_proj=gate,
         up_proj=up,

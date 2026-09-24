@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant.tq_kernel")
 
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
@@ -31,8 +30,6 @@ from moespresso.runtime.pooled_switchglu import (  # noqa: E402
     PooledKQuantSwitchLinear,
     PooledSparseMoeBlock,
     PooledSwitchGLU,
-    PooledTurboQuantSwitchLinear,
-    _lookahead_top_ids,
     _should_sort_routed_indices,
 )
 from moespresso.runtime.owned_switchglu import OwnedSwitchGLU  # noqa: E402
@@ -59,8 +56,6 @@ def _write_safetensors(path, tensors, metadata=None):
 
 
 def test_q6_down_dedicated_qmv_is_shape_and_codec_guarded(monkeypatch):
-    from moespresso.runtime import pooled_switchglu as psg
-
     calls = {"qmv": 0, "qmm": 0}
 
     def gather_qmv_kq(x, weight, codec, indices):
@@ -84,7 +79,6 @@ def test_q6_down_dedicated_qmv_is_shape_and_codec_guarded(monkeypatch):
             gather_qmm=gather_qmm,
         ),
     )
-    monkeypatch.setattr(psg, "_QWEN_DOWN_Q6_QMV", True)
     projection = SimpleNamespace(
         pool=SimpleNamespace(
             projection="down_proj",
@@ -112,32 +106,22 @@ def test_q6_down_dedicated_qmv_is_shape_and_codec_guarded(monkeypatch):
     assert calls == {"qmv": 1, "qmm": 1}
 
 
-def _resident_projection(n_experts, in_features, out_features, *, bits=2, seed=42):
-    from jang_tools.turboquant.tq_kernel import TurboQuantSwitchLinear
-
-    mod = TurboQuantSwitchLinear(
-        in_features, out_features, n_experts, bits=bits, seed=seed)
-    vals_per_u32 = 32 // bits
-    cols = (in_features + vals_per_u32 - 1) // vals_per_u32
-    mod.packed = mx.random.randint(
-        0, 2**31, (n_experts, out_features, cols)).astype(mx.uint32)
-    mod.norms = (mx.random.normal((n_experts, out_features)) * 0.1).astype(mx.float16)
-    mx.eval(mod.packed, mod.norms)
-    return mod
+def _resident_projection(n_experts, in_features, out_features):
+    from package_fixtures import resident_mxfp4
+    return resident_mxfp4(n_experts, in_features, out_features)
 
 
-def _resident_switch(*, n_experts=32, in_features=64, hidden_features=32,
-                     gate_bits=2, up_bits=4, down_bits=2):
+def _resident_switch(*, n_experts=32, in_features=64, hidden_features=32):
     from mlx_lm.models.switch_layers import SwitchGLU
 
     mx.random.seed(17)
     shape = SwitchGLU(in_features, hidden_features, n_experts)
     gate = _resident_projection(
-        n_experts, in_features, hidden_features, bits=gate_bits)
+        n_experts, in_features, hidden_features)
     up = _resident_projection(
-        n_experts, in_features, hidden_features, bits=up_bits)
+        n_experts, in_features, hidden_features)
     down = _resident_projection(
-        n_experts, hidden_features, in_features, bits=down_bits)
+        n_experts, hidden_features, in_features)
     return OwnedSwitchGLU(
         gate_proj=gate,
         up_proj=up,
@@ -160,9 +144,9 @@ def _package_from_resident(tmp_path, resident):
     for proj_name in ("gate_proj", "up_proj", "down_proj"):
         proj = getattr(resident, proj_name)
         comps[(proj_name, "packed")] = np.array(proj.packed)
-        comps[(proj_name, "norms")] = np.array(proj.norms)
+        comps[(proj_name, "scales")] = np.array(proj.scales)
         bits[proj_name] = int(proj.bits)
-    bundle, geo = assemble_layer_bundle(comps, bits)
+    bundle, geo = assemble_layer_bundle(comps, bits, codecs={p: "mxfp4" for p in bits})
     base = "language_model.model.layers.0.mlp.switch_mlp"
     _write_safetensors(pkg / "model-00001-of-00001.safetensors", {
         f"{base}.experts.tq_bundle": ("U8", bundle.shape, bundle.tobytes()),
@@ -296,18 +280,10 @@ def _mxfp4_switch_reference(x: np.ndarray, indices: np.ndarray, dense: dict):
     )
 
 
-def _pooled_projection(pkg, index, resident, projection, *, capacity,
-                       spare_slots=0):
-    proj = getattr(resident, projection)
-    return PooledTurboQuantSwitchLinear(
-        package_dir=pkg,
-        index=index,
-        layer=0,
-        projection=projection,
-        capacity=capacity,
-        codebook=proj.codebook,
-        signs=proj.signs,
-        spare_slots=spare_slots,
+def _pooled_projection(pkg, index, resident, projection, *, capacity, spare_slots=0):
+    return PooledMxfp4SwitchLinear(
+        package_dir=pkg, index=index, layer=0, projection=projection,
+        capacity=capacity, spare_slots=spare_slots,
     )
 
 
@@ -499,10 +475,8 @@ def test_prefill_chunked_paths_match_resident_reference(tmp_path, monkeypatch):
     """Sorted chunked prefill is bit-exact vs the resident reference both in
     half-capacity chunk-ahead overlap mode (capacity >= 2) and in the one-slot
     eval-per-chunk mode (capacity 1, where two chunks cannot coexist)."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", False)
 
-    resident = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)
+    resident = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
 
@@ -671,18 +645,13 @@ def test_mxfp4_slot_pool_loads_packed_and_scales(tmp_path):
     pool.ensure([0, 2, 4])
 
     assert pool.codec == "mxfp4"
-    assert pool.norms is None
     assert pool.scales is not None
     assert pool.components == ("packed", "scales")
     assert pool.resident_ids() == {0, 2, 4}
     assert pool.scales.shape == (4, 64, 8)
 
 
-def test_pooled_mxfp4_switchglu_matches_decoded_fp4_reference(tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_COMPILED_ISLAND", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
+def test_pooled_mxfp4_switchglu_matches_decoded_fp4_reference(tmp_path):
     pkg, dense = _package_from_mxfp4_source(tmp_path)
     index = build_expert_index(pkg)
     pooled = _pooled_mxfp4_switch(pkg, index, capacity=4)
@@ -705,11 +674,7 @@ def test_pooled_mxfp4_switchglu_matches_decoded_fp4_reference(tmp_path, monkeypa
 
 def test_pooled_mxfp4_switchglu_fallback_prefill_matches_fp4_reference(
     tmp_path,
-    monkeypatch,
 ):
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_COMPILED_ISLAND", False)
     pkg, dense = _package_from_mxfp4_source(tmp_path)
     index = build_expert_index(pkg)
     pooled = _pooled_mxfp4_switch(pkg, index, capacity=8)
@@ -739,10 +704,7 @@ def test_pooled_mxfp4_switchglu_fallback_prefill_matches_fp4_reference(
     assert rel < 3e-3
 
 
-def test_pooled_mxfp4_pipelined_builder_matches_direct_decode(tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
+def test_pooled_mxfp4_pipelined_builder_matches_direct_decode(tmp_path):
     pkg, _dense = _package_from_mxfp4_source(tmp_path)
     index = build_expert_index(pkg)
     direct = _pooled_mxfp4_switch(pkg, index, capacity=4)
@@ -764,112 +726,6 @@ def test_pooled_mxfp4_pipelined_builder_matches_direct_decode(tmp_path, monkeypa
     assert rel < 1e-6
     assert piped.compiled_island_calls == 1
     assert piped.fused_gate_up_calls == 1
-
-
-@pytest.mark.parametrize(
-    ("mxfp4_projection", "tq_bits", "expect_fused_gate_up"),
-    [
-        ("gate_proj", {"gate_proj": 4, "up_proj": 2, "down_proj": 1}, False),
-        ("down_proj", {"gate_proj": 1, "up_proj": 2, "down_proj": 4}, False),
-        ("down_proj", {"gate_proj": 2, "up_proj": 2, "down_proj": 4}, True),
-    ],
-)
-def test_mixed_mxfp4_tq_switchglu_uses_legal_projection_path(
-    tmp_path,
-    monkeypatch,
-    mxfp4_projection,
-    tq_bits,
-    expect_fused_gate_up,
-):
-    import moespresso.runtime.pooled_switchglu as psg
-    from moespresso.package.bundle import assemble_layer_bundle, encode_bundle_metadata
-
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_COMPILED_ISLAND", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
-    resident = _resident_switch(
-        n_experts=8,
-        in_features=256,
-        hidden_features=64,
-        gate_bits=tq_bits["gate_proj"],
-        up_bits=tq_bits["up_proj"],
-        down_bits=tq_bits["down_proj"],
-    )
-    rng = np.random.default_rng(58)
-    comps = {
-        ("gate_proj", "packed"): np.array(resident.gate_proj.packed),
-        ("gate_proj", "norms"): np.array(resident.gate_proj.norms),
-        ("up_proj", "packed"): np.array(resident.up_proj.packed),
-        ("up_proj", "norms"): np.array(resident.up_proj.norms),
-        ("down_proj", "packed"): np.array(resident.down_proj.packed),
-        ("down_proj", "norms"): np.array(resident.down_proj.norms),
-    }
-    rows, cols = (64, 256) if mxfp4_projection == "gate_proj" else (256, 64)
-    packed, scales, _dense = _mxfp4_projection(
-        rng,
-        n_experts=8,
-        rows=rows,
-        cols=cols,
-    )
-    comps.pop((mxfp4_projection, "norms"))
-    comps[(mxfp4_projection, "packed")] = packed
-    comps[(mxfp4_projection, "scales")] = scales
-    codecs = {p: "tq" for p in ("gate_proj", "up_proj", "down_proj")}
-    codecs[mxfp4_projection] = "mxfp4"
-    bundle, geo = assemble_layer_bundle(
-        comps,
-        bits=tq_bits,
-        codecs=codecs,
-    )
-    pkg = tmp_path / "pkg_mixed_mxfp4_tq"
-    pkg.mkdir()
-    base = "language_model.model.layers.0.mlp.switch_mlp"
-    _write_safetensors(
-        pkg / "model-00001-of-00001.safetensors",
-        {f"{base}.experts.tq_bundle": ("U8", bundle.shape, bundle.tobytes())},
-        metadata={"expert_bundles": encode_bundle_metadata({0: geo})},
-    )
-    index = build_expert_index(pkg)
-
-    def projection(name):
-        if name == mxfp4_projection:
-            return _pooled_mxfp4_projection(pkg, index, name, capacity=4)
-        return _pooled_projection(pkg, index, resident, name, capacity=4)
-
-    pooled = PooledSwitchGLU(
-        gate_proj=projection("gate_proj"),
-        up_proj=projection("up_proj"),
-        down_proj=projection("down_proj"),
-        activation=_SwigluActivation(),
-    )
-    pooled.eval()
-    x = mx.array((rng.standard_normal((1, 256)) * 0.03).astype(np.float32))
-    indices = mx.array(np.array([[3, 7, 1, 5]], dtype=np.uint32))
-
-    got = pooled(x, indices)
-    x4 = mx.expand_dims(x, (-2, -3))
-    gate_idx = pooled.gate_proj.pool.remap(indices)
-    up_idx = pooled.up_proj.pool.remap(indices)
-    down_idx = pooled.down_proj.pool.remap(indices)
-    expected = pooled.down_proj.matmul_slots(
-        pooled.activation(
-            pooled.up_proj.matmul_slots(x4, up_idx, sorted_indices=False),
-            pooled.gate_proj.matmul_slots(x4, gate_idx, sorted_indices=False),
-        ),
-        down_idx,
-        sorted_indices=False,
-    ).squeeze(-2)
-    mx.eval(got, expected)
-
-    assert not pooled._all_mxfp4
-    assert pooled._fused_gate_up is expect_fused_gate_up
-    if expect_fused_gate_up:
-        assert pooled._fused_gate_up
-        assert pooled.compiled_island_calls == 0
-        assert pooled.fused_gate_up_calls == 1
-    else:
-        assert pooled.fused_gate_up_calls == 0
-    np.testing.assert_allclose(np.array(got), np.array(expected), rtol=3e-2, atol=3e-3)
 
 
 def test_pooled_switchglu_matches_resident_sorted_prefill(tmp_path):
@@ -954,11 +810,9 @@ def test_slot_table_coherent_through_eviction(tmp_path):
     assert int(np.array(table)[1]) == pool.num_experts
 
 
-def test_pooled_switchglu_ondevice_matches_resident_decode(tmp_path, monkeypatch):
+def test_pooled_switchglu_ondevice_matches_resident_decode(tmp_path):
     """With the on-device remap active (default), pooled decode output is identical
     to the resident OwnedSwitchGLU reference, and the on-device path is exercised."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
     resident = _resident_switch(n_experts=16)
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
@@ -970,128 +824,12 @@ def test_pooled_switchglu_ondevice_matches_resident_decode(tmp_path, monkeypatch
     assert pooled.remap_ondevice_calls > 0
 
 
-def test_ondevice_remap_kill_switch_falls_back(tmp_path, monkeypatch):
-    """With the kill switch off the host remap_loaded path runs and the output is
-    still identical to resident (proves the fallback is exact too)."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", False)
-    resident = _resident_switch(n_experts=16)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pooled = _pooled_switch(pkg, index, resident, capacity=4)
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    indices = mx.array([[3, 7, 1, 5]], dtype=mx.uint32)
-
-    _assert_same(resident(x, indices), pooled(x, indices))
-    assert pooled.remap_ondevice_calls == 0
-
-
-def test_compiled_island_matches_eager_fused_decode(tmp_path, monkeypatch):
-    """The compiled-island decode path (mx.compile of remap x2 + rotate + fused
-    + rotate + gather) must match the eager fused path bit-exactly: same kernels,
-    same order, the only difference is compilation. All-hit and mixed-miss decode
-    shapes."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
-    resident = _resident_switch(n_experts=16, gate_bits=4, up_bits=4, down_bits=2)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    cold = mx.array([[3, 7, 1, 5]], dtype=mx.uint32)     # all-miss install
-    warm = mx.array([[5, 1, 7, 3]], dtype=mx.uint32)     # all-hit, permuted
-    mixed = mx.array([[3, 9, 1, 11]], dtype=mx.uint32)   # 2 hits + 2 misses
-
-    outs = {}
-    for flag in (False, True):
-        monkeypatch.setattr(psg, "_COMPILED_ISLAND", flag)
-        pooled = _pooled_switch(pkg, index, resident, capacity=4)
-        pooled.eval()  # production runtime calls model.eval(); island is inference-only
-        outs[flag] = [pooled(x, idx) for idx in (cold, warm, mixed)]
-        mx.eval(*outs[flag])
-        assert pooled.compiled_island_calls == (3 if flag else 0)
-
-    for eager, island in zip(outs[False], outs[True]):
-        assert np.array_equal(np.array(eager), np.array(island))
-
-
-def test_compiled_island_skipped_for_sorted_and_separate_paths(tmp_path, monkeypatch):
-    """The island only covers the unsorted single-row decode shape with fused
-    preconditions; sorted routing and non-matching codebooks stay eager."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_COMPILED_ISLAND", True)
-    # different gate/up bits -> fused (and so the island) disabled, exact path
-    resident = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pooled = _pooled_switch(pkg, index, resident, capacity=4)
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    _assert_same(resident(x, mx.array([[3, 7, 1, 5]], dtype=mx.uint32)),
-                 pooled(x, mx.array([[3, 7, 1, 5]], dtype=mx.uint32)))
-    assert pooled.compiled_island_calls == 0
-
-    # sorted/prefill shape (indices.size >= 64) -> island skipped
-    resident4 = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
-    p4 = tmp_path / "p4"
-    p4.mkdir()
-    pkg4 = _package_from_resident(p4, resident4)
-    index4 = build_expert_index(pkg4)
-    pooled4 = _pooled_switch(pkg4, index4, resident4, capacity=16)
-    pooled4.eval()
-    xs = mx.random.normal((20, 64)).astype(mx.float16)
-    idxs = mx.random.randint(0, 16, (20, 4)).astype(mx.uint32)
-    mx.eval(pooled4(xs, idxs))
-    assert pooled4.compiled_island_calls == 0
-
-
-def test_fused_gate_up_matches_resident_when_codebooks_match(tmp_path, monkeypatch):
-    """When gate/up share a codebook (the real mjtq condition: same in_features/bits/
-    seed), the fused gate+up kernel path is active and matches the resident reference
-    within fp16 tolerance (fusion reorders fp, so not bit-exact)."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    # gate_bits == up_bits -> identical codebooks/signs -> fused path enabled
-    resident = _resident_switch(n_experts=16, gate_bits=4, up_bits=4, down_bits=2)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pooled = _pooled_switch(pkg, index, resident, capacity=4)
-    assert pooled._fused_gate_up, "fused path should be active when codebooks match"
-
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    indices = mx.array([[3, 7, 1, 5]], dtype=mx.uint32)
-    ref = resident(x, indices)
-    got = pooled(x, indices)
-    mx.eval(ref, got)
-    assert pooled.fused_gate_up_calls > 0
-    a, b = np.array(ref), np.array(got)
-    # fp16 tolerance: fusion changes rounding order vs separate gate/up matmuls
-    assert np.allclose(a, b, rtol=2e-2, atol=2e-3), \
-        f"fused vs resident max diff {np.abs(a - b).max()} too large"
-
-
-def test_fused_gate_up_falls_back_when_codebooks_differ(tmp_path, monkeypatch):
-    """When gate/up have different codebooks (different bits), the fused path is
-    disabled (its single-codebook assumption would be wrong) and output is bit-exact
-    via the separate path."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    resident = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)  # differ
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pooled = _pooled_switch(pkg, index, resident, capacity=4)
-    assert not pooled._fused_gate_up, "fused must be disabled when codebooks differ"
-
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    indices = mx.array([[3, 7, 1, 5]], dtype=mx.uint32)
-    _assert_same(resident(x, indices), pooled(x, indices))  # exact via separate path
 
 
 def test_gate_up_pools_assign_identical_slots(tmp_path):
     """Invariant the fused kernel relies on: gate and up pools assign the same slot to
     the same expert (they are loaded together, so slot N holds the same expert)."""
-    resident = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
+    resident = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
     pooled = _pooled_switch(pkg, index, resident, capacity=4)
@@ -1112,10 +850,9 @@ def test_pooled_sparse_moe_overlaps_decode_load_with_shared_eval(
     """Overlap seam: routed misses start, shared expert is forced while reads are
     in flight, then the pooled switch consumes the ticket and matches resident."""
     import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", False)
-    monkeypatch.setattr(psg, "_RING_DECODE", False)  # legacy ticket path test
+    monkeypatch.setattr(psg, "_RING_DECODE", False)  # direct load-ticket fallback
 
-    resident_switch = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)
+    resident_switch = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident_switch)
     index = build_expert_index(pkg)
     pooled_switch = _pooled_switch(pkg, index, resident_switch, capacity=4)
@@ -1166,11 +903,9 @@ def test_ring_decode_matches_normal_two_layer_chain(tmp_path, monkeypatch):
     with zero MLX calls; commits stay on main. Two chained MoE blocks across
     cold/hit/eviction decode steps must match the normal path bit-exactly."""
     import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
 
-    res0 = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
-    res1 = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
+    res0 = _resident_switch(n_experts=16, )
+    res1 = _resident_switch(n_experts=16, )
     p0 = tmp_path / "r0"
     p1 = tmp_path / "r1"
     p0.mkdir()
@@ -1224,7 +959,7 @@ def _gate_available():
     if not available and os.environ.get("MOESPRESSO_REQUIRE_NATIVE_GATE") == "1":
         pytest.fail(
             "MOESPRESSO_REQUIRE_NATIVE_GATE=1 but the native gate is missing "
-            "or failed its self-test (build with native/build.sh)")
+            "or failed its self-test (build with uv sync --locked)")
     return available
 
 
@@ -1235,11 +970,9 @@ def test_gate_decode_matches_normal_two_layer_chain(tmp_path, monkeypatch):
     if not _gate_available():
         pytest.skip("native gate not built in this environment")
     import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
 
-    res0 = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
-    res1 = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
+    res0 = _resident_switch(n_experts=16, )
+    res1 = _resident_switch(n_experts=16, )
     g0 = tmp_path / "g0"
     g1 = tmp_path / "g1"
     g0.mkdir()
@@ -1287,10 +1020,9 @@ def test_gate_decode_worker_error_signals_and_raises(tmp_path, monkeypatch):
     if not _gate_available():
         pytest.skip("native gate not built in this environment")
     import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
     monkeypatch.setattr(psg, "_RING_DECODE", True)
 
-    resident = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
+    resident = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
     sw = _pooled_switch(pkg, index, resident, capacity=4)
@@ -1315,14 +1047,14 @@ def test_gate_decode_worker_error_signals_and_raises(tmp_path, monkeypatch):
     assert load_gate().signaled_value() >= 1
 
 
-def test_ring_self_test_failure_falls_back_to_legacy(tmp_path, monkeypatch):
+def test_ring_self_test_failure_falls_back_to_direct_path(tmp_path, monkeypatch):
     """If the once-per-process ring visibility self-test fails, decode
-    routes through the proven legacy path instead of per-layer timeouts."""
+    routes through the direct load-ticket path instead of per-layer timeouts."""
     import moespresso.runtime.pooled_switchglu as psg
     monkeypatch.setattr(psg, "_RING_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [False])  # simulated failure
 
-    resident = _resident_switch(n_experts=16, gate_bits=4, up_bits=4)
+    resident = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
     sw = _pooled_switch(pkg, index, resident, capacity=4)
@@ -1335,7 +1067,7 @@ def test_ring_self_test_failure_falls_back_to_legacy(tmp_path, monkeypatch):
     block.eval()
     mx.eval(block(mx.random.normal((1, 1, 64)).astype(mx.float16)))
     assert sw.pipelined_layers == 0          # ring path not taken
-    assert sw.index_resync_seconds > 0.0     # legacy path ran
+    assert sw.index_resync_seconds > 0.0     # direct path ran
 
 
 def test_ring_self_test_passes_for_current_mlx_build():
@@ -1349,10 +1081,8 @@ def test_ring_self_test_passes_for_current_mlx_build():
 def test_pooled_sparse_moe_does_not_force_prefill_shared_eval(tmp_path, monkeypatch):
     """Prefill can have a large shared-expert intermediate, so the overlap wrapper
     starts loads but does not force shared_y materialization for multi-token input."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", False)
 
-    resident_switch = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)
+    resident_switch = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident_switch)
     index = build_expert_index(pkg)
     pooled_switch = _pooled_switch(pkg, index, resident_switch, capacity=16)
@@ -1378,7 +1108,7 @@ def test_bundle_row_cache_one_pread_serves_three_pools(tmp_path):
 
     from moespresso.runtime.expert_slot_pool import BundleRowCache
 
-    resident = _resident_switch(n_experts=16, gate_bits=2, up_bits=4)
+    resident = _resident_switch(n_experts=16, )
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
 
@@ -1415,7 +1145,7 @@ def test_bundle_row_cache_one_pread_serves_three_pools(tmp_path):
             import numpy as np
             sa, sb = a.slot_of(e), b.slot_of(e)
             assert np.array_equal(np.array(a.packed[sa]), np.array(b.packed[sb]))
-            assert np.array_equal(np.array(a.norms[sa]), np.array(b.norms[sb]))
+            assert np.array_equal(np.array(a.scales[sa]), np.array(b.scales[sb]))
 
 
 def test_bundle_row_cache_failed_pread_stays_fail_closed(tmp_path):
@@ -1481,167 +1211,6 @@ def test_route_trace_captures_prefill_and_decode(tmp_path):
     assert pre[2] == [[1, 2], [3, 4], [5, 1]]  # position-intact
     dec = next(t for t in trace if t[0] == "decode_direct")
     assert dec[2] == [[7, 2]]
-
-
-def test_lookahead_top_ids_accepts_fewer_than_sixteen_experts():
-    scores = mx.array([0.3, -1.0, 4.0, 2.0, 0.0, 8.0, 7.0, 1.0])
-
-    selected = _lookahead_top_ids(scores)
-    mx.eval(selected)
-
-    assert selected.shape == (8,)
-    assert set(np.asarray(selected).tolist()) == set(range(8))
-
-
-def test_lookahead_prefetch_keeps_outputs_identical(tmp_path, monkeypatch):
-    """Cross-layer lookahead prefetch is a residency-only effect:
-    a two-layer gate-decode chain with lookahead Delta=1 wired must produce
-    bit-identical outputs to the same chain without it, and the prediction
-    machinery must actually run (exports + prefetch loads observed)."""
-    if not _gate_available():
-        pytest.skip("native gate not built in this environment")
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
-    monkeypatch.setattr(psg, "_RING_DECODE", True)
-
-    res0 = _resident_switch(n_experts=32, gate_bits=4, up_bits=4)
-    res1 = _resident_switch(n_experts=32, gate_bits=4, up_bits=4)
-    g0, g1 = tmp_path / "g0", tmp_path / "g1"
-    g0.mkdir(), g1.mkdir()
-    pkg0 = _package_from_resident(g0, res0)
-    pkg1 = _package_from_resident(g1, res1)
-
-    gates = [nn.Linear(64, 16, bias=False) for _ in range(2)]
-    shareds = [_TinySharedMLP(64, 32) for _ in range(2)]
-    sgates = [nn.Linear(64, 1, bias=False) for _ in range(2)]
-    xs = [mx.random.normal((1, 1, 64)).astype(mx.float16) for _ in range(6)]
-
-    outs = {}
-    counters = {}
-    for use_lookahead in (False, True):
-        blocks = []
-        for i, (pkg, res) in enumerate(((pkg0, res0), (pkg1, res1))):
-            index = build_expert_index(pkg)
-            block = PooledSparseMoeBlock(_TinySparseMoeBlock(
-                gate=gates[i],
-                switch_mlp=_pooled_switch(pkg, index, res, capacity=12, spare_slots=4),
-                shared_expert=shareds[i],
-                shared_expert_gate=sgates[i],
-            ))
-            block.eval()
-            blocks.append(block)
-        blocks[-1].pipeline_is_last = True
-        if use_lookahead:
-            sw0, sw1 = blocks[0].switch_mlp, blocks[1].switch_mlp
-            sw0.lookahead_w = gates[1].weight.astype(mx.float16)
-            mx.eval(sw0.lookahead_w)
-            sw0.lookahead_target = sw1
-        got = []
-        for x in xs:
-            y = blocks[1](blocks[0](x))
-            mx.eval(y)
-            got.append(np.array(y))
-        # drain the lookahead executor before reading counters
-        if use_lookahead:
-            psg._lookahead_executor().submit(lambda: None).result()
-            counters["exports"] = blocks[0].switch_mlp.lookahead_exports
-            counters["loads"] = blocks[1].switch_mlp.gate_proj.pool \
-                .total_prefetch_loads + blocks[0].switch_mlp \
-                .lookahead_prefetch_loads
-            counters["errors"] = blocks[0].switch_mlp.lookahead_errors
-            counters["ring_misses"] = blocks[0].switch_mlp.lookahead_ring_misses
-        outs[use_lookahead] = got
-
-    for a, b in zip(outs[False], outs[True], strict=True):
-        assert np.array_equal(a, b)
-    assert counters["exports"] == len(xs)
-    assert counters["errors"] == 0
-    # at least one speculative load must have happened across the steps
-    assert counters["loads"] > 0, counters
-
-
-def test_place_spare_trio_refuses_in_flight_demand_placement(tmp_path):
-    """A demand ensure's phase-1 placement reserves occupancy only; the trio
-    must refuse the expert on that occupancy alone, or the expert splits
-    across a demand and a spare slot and the loser publish strands a
-    ghost (an occupied-but-unpublished slot that permanently shrinks the
-    pool and surfaces as spurious ExpertCapacityExceeded)."""
-    import threading
-
-    from moespresso.runtime import expert_slot_pool as esp
-    from moespresso.runtime.expert_slot_pool import place_spare_trio
-
-    resident = _resident_switch(n_experts=8)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pools = tuple(
-        ExpertSlotPool(package_dir=pkg, index=index, layer=0,
-                       projection=proj, capacity=4, spare_slots=2)
-        for proj in ("gate_proj", "up_proj", "down_proj"))
-
-    gate = pools[0]
-    hold = threading.Event()
-    entered = threading.Event()
-    real_load = esp.ExpertSlotPool._load_expert
-
-    def slow_load(self, *, expert, slot):
-        entered.set()
-        hold.wait(5.0)
-        return real_load(self, expert=expert, slot=slot)
-
-    esp.ExpertSlotPool._load_expert = slow_load
-    try:
-        worker = threading.Thread(target=lambda: gate.ensure([3]))
-        worker.start()
-        entered.wait(5.0)
-        # Expert 3's demand placement is in flight (occupied, unpublished):
-        # the trio must refuse it.
-        assert place_spare_trio(pools, 3, 0) is False
-        hold.set()
-        worker.join(5.0)
-    finally:
-        esp.ExpertSlotPool._load_expert = real_load
-        hold.set()
-
-    assert gate.slot_of(3) < gate.capacity  # demand-resident, single slot
-    # No ghost occupancies anywhere: every occupied slot is published.
-    for pool in pools:
-        for sl, occ in enumerate(pool._expert_at):
-            if occ is not None:
-                assert pool._slot_of.get(occ) == sl
-    # With the load complete, the same speculative placement now lands.
-    assert place_spare_trio(pools, 5, 0) is True
-    assert gate.slot_of(5) == gate.capacity
-
-
-def test_place_spare_trio_eviction_pops_only_its_own_mapping(tmp_path):
-    """The spare-occupant eviction severs only a mapping that points at the
-    spare slot being reclaimed; a stale occupancy whose published
-    residency lives elsewhere is left resident."""
-    from moespresso.runtime.expert_slot_pool import place_spare_trio
-
-    resident = _resident_switch(n_experts=8)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    pools = tuple(
-        ExpertSlotPool(package_dir=pkg, index=index, layer=0,
-                       projection=proj, capacity=4, spare_slots=2)
-        for proj in ("gate_proj", "up_proj", "down_proj"))
-    gate = pools[0]
-    # Simulate stale spare occupancy metadata for a demand-resident expert;
-    # a later ensure moves _demand_protect off it so the occupant check is
-    # not what protects it.
-    for pool in pools:
-        pool.ensure([2])
-        pool.ensure([0])
-        pool._expert_at[pool.capacity + 0] = 2
-    demand_slot = gate.slot_of(2)
-
-    assert place_spare_trio(pools, 6, 0) is True
-    # Expert 2's demand residency survived the spare reclamation.
-    assert gate.slot_of(2) == demand_slot
-    assert gate.slot_of(6) == gate.capacity
 
 
 def test_ensure_feasibility_waits_out_reservations_not_spare_residents(
@@ -1722,21 +1291,23 @@ def test_ensure_mid_batch_capacity_raise_releases_reservations(tmp_path):
 
 def test_grow_preserves_spare_slots_and_remaps(tmp_path):
     """grow() must carry the spare region (bytes + slot map)
-    to its new offset. It used to drop spares while _slot_of still pointed
-    at them (OOB on the next trio placement under lookahead+growth)."""
-    from moespresso.runtime.expert_slot_pool import place_spare_trio
-
+    to its new offset. It must not leave _slot_of pointing at the old
+    spare region after growth."""
     resident = _resident_switch(n_experts=32)
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
-    pools = tuple(
-        ExpertSlotPool(package_dir=pkg, index=index, layer=0,
-                       projection=proj, capacity=4, spare_slots=2)
-        for proj in ("gate_proj", "up_proj", "down_proj"))
-
-    pools[0].ensure([1, 2])
-    assert place_spare_trio(pools, 9, 0)
-    gate = pools[0]
+    gate = ExpertSlotPool(
+        package_dir=pkg,
+        index=index,
+        layer=0,
+        projection="gate_proj",
+        capacity=4,
+        spare_slots=2,
+    )
+    gate.ensure([1, 2])
+    gate._load_expert(expert=9, slot=4)
+    gate._expert_at[4] = 9
+    gate._slot_of[9] = 4
     spare_bytes_before = bytes(
         gate._packed_view[4 * gate._comp_packed["nbytes"] // 1:]
     )[:64]
@@ -1750,117 +1321,12 @@ def test_grow_preserves_spare_slots_and_remaps(tmp_path):
     # spare bytes moved with the map
     pn = gate._comp_packed["nbytes"]
     assert bytes(gate._packed_view[8 * pn:8 * pn + 64]) == spare_bytes_before
-    # and the spare ring still works at the new offset
+    # and the spare storage remains mapped at the new offset
     assert gate._expert_at[8] == 9
-
-
-def test_switch_growth_waits_for_inflight_spare_trio(tmp_path, monkeypatch):
-    """A trio load completes and publishes before growth copies its spare row."""
-    import threading
-    import time as _time
-
-    from moespresso.runtime.expert_slot_pool import (
-        grow_expert_slot_pools,
-        place_spare_trio,
-    )
-
-    resident = _resident_switch(n_experts=16)
-    pkg = _package_from_resident(tmp_path, resident)
-    index = build_expert_index(pkg)
-    projections = ("gate_proj", "up_proj", "down_proj")
-    pools = tuple(
-        ExpertSlotPool(
-            package_dir=pkg,
-            index=index,
-            layer=0,
-            projection=projection,
-            capacity=4,
-            spare_slots=2,
-        )
-        for projection in projections
-    )
-    started = threading.Event()
-    release = threading.Event()
-    loaded = set()
-    errors = []
-    original_loads = [pool._load_expert for pool in pools]
-
-    for ordinal, (pool, original) in enumerate(
-        zip(pools, original_loads, strict=True)
-    ):
-        def tracked_load(*, expert, slot, _ordinal=ordinal, _original=original):
-            if _ordinal == 0:
-                started.set()
-                if not release.wait(5):
-                    raise TimeoutError("test did not release the spare load")
-            _original(expert=expert, slot=slot)
-            loaded.add(_ordinal)
-
-        monkeypatch.setattr(pool, "_load_expert", tracked_load)
-
-    def place():
-        try:
-            assert place_spare_trio(pools, 9, 0) is True
-        except BaseException as exc:  # surfaced below
-            errors.append(exc)
-
-    place_thread = threading.Thread(target=place)
-    place_thread.start()
-    assert started.wait(5)
-    assert all(pool._loads_inflight == 1 for pool in pools)
-
-    original_allocate = pools[0]._allocate_growth_candidate
-
-    def checked_allocate(capacity):
-        assert loaded == {0, 1, 2}
-        assert all(pool._slot_of.get(9) == 4 for pool in pools)
-        return original_allocate(capacity)
-
-    monkeypatch.setattr(pools[0], "_allocate_growth_candidate", checked_allocate)
-
-    def release_after_growth_closes_gate():
-        deadline = _time.monotonic() + 5
-        while _time.monotonic() < deadline:
-            states = []
-            for pool in pools:
-                with pool._bk_lock:
-                    states.append(pool._growth_pending)
-            if all(states):
-                release.set()
-                return
-            _time.sleep(0.001)
-        errors.append(TimeoutError("growth did not close every pool gate"))
-        release.set()
-
-    release_thread = threading.Thread(target=release_after_growth_closes_gate)
-    release_thread.start()
-    grow_expert_slot_pools(pools, 8)
-    place_thread.join(5)
-    release_thread.join(5)
-
-    assert not place_thread.is_alive()
-    assert not release_thread.is_alive()
-    assert errors == []
-    assert all(pool.capacity == 8 for pool in pools)
-    assert all(pool._loads_inflight == 0 for pool in pools)
-    assert all(not pool._growth_pending for pool in pools)
-    assert all(pool.slot_of(9) == 8 for pool in pools)
-    for projection, pool in zip(projections, pools, strict=True):
-        source = getattr(resident, projection)
-        assert np.array_equal(
-            np.asarray(pool.packed[8]),
-            np.asarray(source.packed[9]),
-        )
-        assert np.array_equal(
-            np.asarray(pool.norms[8]),
-            np.asarray(source.norms[9]),
-        )
 
 
 def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
     """Spare residents do not consume demand capacity after pool growth."""
-    from moespresso.runtime.expert_slot_pool import place_spare_trio
-
     resident = _resident_switch(n_experts=16)
     pkg = _package_from_resident(tmp_path, resident)
     index = build_expert_index(pkg)
@@ -1878,13 +1344,15 @@ def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
     )
 
     # Leave experts 0 and 1 in frequency history while experts 2 and 3 fill
-    # the demand region. The two speculative residents fill the spare ring.
+    # the demand region. Populate the spare storage for the growth check.
     for pool in pools:
         pool.ensure([0, 1])
         pool.ensure([2])
         pool.ensure([3])
-    assert place_spare_trio(pools, 8, 0)
-    assert place_spare_trio(pools, 9, 1)
+        for expert, slot in ((8, 2), (9, 3)):
+            pool._load_expert(expert=expert, slot=slot)
+            pool._expert_at[slot] = expert
+            pool._slot_of[expert] = slot
 
     for projection, pool in zip(projections, pools, strict=True):
         source = getattr(resident, projection)
@@ -1897,8 +1365,8 @@ def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
                 np.array(source.packed[expert]),
             )
             assert np.array_equal(
-                np.array(pool.norms[slot]),
-                np.array(source.norms[expert]),
+                np.array(pool.scales[slot]),
+                np.array(source.scales[expert]),
             )
 
         pool.grow(4)
@@ -1914,8 +1382,8 @@ def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
                 np.array(source.packed[expert]),
             )
             assert np.array_equal(
-                np.array(pool.norms[slot]),
-                np.array(source.norms[expert]),
+                np.array(pool.scales[slot]),
+                np.array(source.scales[expert]),
             )
 
     seeded = [pool.seed_hot() for pool in pools]
@@ -1935,12 +1403,12 @@ def test_grow_with_full_spare_ring_exposes_demand_slots_to_hot_seed(tmp_path):
                 np.array(source.packed[expert]),
             )
             assert np.array_equal(
-                np.array(pool.norms[slot]),
-                np.array(source.norms[expert]),
+                np.array(pool.scales[slot]),
+                np.array(source.scales[expert]),
             )
 
 
-# ---- in-session hotness decay + evict-DONTNEED page-cache hygiene ----
+# ---- in-session hotness decay ----
 
 def _gate_pool(tmp_path, *, capacity, n_experts=8, projection="gate_proj"):
     resident = _resident_switch(n_experts=n_experts)
@@ -1985,47 +1453,3 @@ def test_hotness_decay_disabled_lets_early_experts_squat(tmp_path, monkeypatch):
         pool.ensure([2])
     # the documented pre-decay behavior: the inflated early count squats
     assert 0 in pool.resident_ids()
-
-
-def test_evict_dontneed_advises_evicted_gate_rows(tmp_path, monkeypatch):
-    from moespresso.runtime import expert_slot_pool as esp
-
-    monkeypatch.setattr(esp, "_EVICT_DONTNEED", True)
-    pool = _gate_pool(tmp_path, capacity=2)
-    pool.ensure([0])
-    pool.ensure([1])
-    assert pool.total_dontneed == 0  # no eviction yet
-    pool.ensure([2])  # evicts one resident -> one advise, drained in ensure
-    assert pool.total_dontneed == 1
-    assert pool.total_dontneed_errors == 0
-    assert 2 in pool.resident_ids()  # load path unaffected
-
-
-def test_evict_dontneed_is_gate_pool_only(tmp_path, monkeypatch):
-    from moespresso.runtime import expert_slot_pool as esp
-
-    monkeypatch.setattr(esp, "_EVICT_DONTNEED", True)
-    pool = _gate_pool(tmp_path, capacity=2, projection="up_proj")
-    pool.ensure([0])
-    pool.ensure([1])
-    pool.ensure([2])  # eviction in a non-gate pool: no advise recorded
-    assert pool.total_dontneed == 0
-    assert pool._pending_advise == []
-
-
-def test_evict_dontneed_failure_is_counted_not_raised(tmp_path, monkeypatch):
-    from moespresso.runtime import expert_slot_pool as esp
-
-    monkeypatch.setattr(esp, "_EVICT_DONTNEED", True)
-    pool = _gate_pool(tmp_path, capacity=2)
-    pool.ensure([0])
-    pool.ensure([1])
-
-    def _boom(**kwargs):
-        raise RuntimeError("locate_row failed")
-
-    monkeypatch.setattr(pool.index, "locate_row", _boom)
-    pool.ensure([2])  # advise fails silently; demand flow unaffected
-    assert pool.total_dontneed == 0
-    assert pool.total_dontneed_errors == 1
-    assert 2 in pool.resident_ids()

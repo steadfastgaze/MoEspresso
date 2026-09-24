@@ -19,7 +19,7 @@ valid target.
 
 Serving enables the store by default under a per-package root in the user
 cache directory; `MOESPRESSO_DISK_KV=off` turns it off. The in-memory prefix
-cache is unchanged and is consulted first; the disk store is consulted only
+cache is consulted first; the disk store is consulted only
 on an in-memory miss.
 
 ---
@@ -48,10 +48,44 @@ full conversation history sends a prompt whose leading tokens match a stored
 checkpoint; the server restores that prefix and generates from the new suffix. No
 protocol change is needed.
 
-An exact whole-prompt hit has no suffix token from which to compute next-token
-logits, and disk payloads do not store those logits. The server therefore does
-not attempt a companion restore for that case. It performs a full prompt prefill
-and reports `exact_fallback`.
+The generic cache payload lacks next-token logits. An exact whole-prompt hit
+therefore prefills the full prompt, reports `exact_fallback`, and skips
+companion restore. Qwen4 KVarN stores the final logit row and can sample from
+an exact whole-prompt checkpoint.
+
+## Qwen4 KVarN4 checkpoints
+
+The Qwen4 generation adapter shares the disk store, root lock, byte budget,
+write-depth cap, and startup configuration. Its payload holds packed K4/V4
+records, exact sink and live tail rows, compressed and pending attention index
+state, three-axis positions, GDN recurrence and convolution state, and PLE
+token and convolution history. Restore preserves the packed bytes and rebuilds
+independent mutable storage. It does not run the KVarN quantizer or restore
+process-local rollback markers.
+
+Checkpoint identity covers the package, cache-routing configuration, rendering
+identity, packed layout, and composite-state schema. Every mixer and PLE state
+must share the selected token frontier. The shared store refuses incompatible
+or invalid payloads and falls back to cold prefill.
+
+The memory tier is consulted first. Qwen4 captures memory snapshots at the end
+of prefill. A follow-up request processes previous generated text in its
+suffix, preserving unbiased prefill even when decode uses cache-biased routing.
+Memory entry and byte limits still apply. Disk snapshots occur only at aligned
+prefill frontiers, including an aligned full prompt; decode writes none. Each
+snapshot stores the final logit row, so an exact prompt hit can sample without
+another prefill. Usage reports the uncached suffix in `prompt_tokens` and the
+restored prefix in `prompt_tokens_details.cached_tokens`.
+
+Retained snapshots consume memory outside the expert pool. Under a constrained
+memory budget, cap that tier with `--prompt-cache-bytes`; the separate disk byte
+budget does not limit it.
+
+The KV payload excludes expert-pool residency. With cache-biased routing, a
+fresh process or skipped prefill may produce a different resident expert set.
+Numerical restore comparisons must control that set or use original routing.
+The cache bias and expert loader remain unchanged. These checkpoints do not
+enable Qwen MTP or publish speculative state.
 
 ---
 
@@ -207,9 +241,9 @@ Not promised:
   package and layout that wrote it.
 - No recovery of decode-time state past the last prefill frontier. Capture is
   prefill-time in this version.
-- No next-token logits in an exact whole-prompt checkpoint. Exact hits cannot
-  start generation from an empty suffix and take the `exact_fallback` path.
-- No compression, no trim-back to an unaligned length, and no concurrent
+- The generic payload lacks next-token logits and takes `exact_fallback` on a
+  whole-prompt hit. Qwen4 KVarN includes its final logit row, as described above.
+- No additional file compression, no trim-back to an unaligned length, or concurrent
   cross-process sharing of a root.
 
 ### The cost of crossing an unwritten frontier

@@ -25,7 +25,6 @@ class ForceOverride:
     target: str
 
 
-_TQ_RE = re.compile(r"^tq(?P<bits>[124])$")
 _AFFINE_RE = re.compile(r"^affine(?P<bits>[234568])(?::(?P<group_size>32|64|128))?$")
 
 
@@ -48,9 +47,6 @@ def parse_force_overrides(specs: list[str] | tuple[str, ...] | None) -> list[For
 
 def _parse_target(target: str) -> dict:
     value = target.strip().lower()
-    match = _TQ_RE.match(value)
-    if match:
-        return {"format": "tq", "codec": "tq", "bits": int(match.group("bits"))}
     match = _AFFINE_RE.match(value)
     if match:
         return {
@@ -110,8 +106,6 @@ def _current_format(alloc: dict) -> str:
         return f"kquant:{alloc.get('kquant_codec') or alloc.get('codec')}"
     if fmt == "affine":
         return f"affine{alloc.get('bits')}:{alloc.get('group_size')}"
-    if fmt == "tq":
-        return f"tq{alloc.get('bits')}"
     return str(fmt)
 
 
@@ -229,6 +223,7 @@ def make_package_plan(
     force_overrides: list[ForceOverride] | tuple[ForceOverride, ...] | None = None,
     allow_unmatched_force: bool = False,
     dry_run: bool = False,
+    inputs: list[str] | tuple[str, ...] | None = None,
     required_features: list[str] | tuple[str, ...] | None = None,
     source_decision_id: str | None = None,
     source_probe_id: str | None = None,
@@ -246,6 +241,7 @@ def make_package_plan(
         "package_plan",
         subject,
         PRODUCER,
+        inputs=list(inputs or []),
         required_features=list(required_features or []),
         status=status,
         validation=validation or [],

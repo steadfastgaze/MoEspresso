@@ -8,20 +8,16 @@ dispatch.  It preserves the stock serial accumulation order and leaves all
 other projections, normalization, recurrence, and cache advancement on the
 pinned MLX LM path.
 
-The route is on by default after passing real-package bitwise logits and cache
-checks plus a served speed A/B. Set
-``MOESPRESSO_QWEN_GDN_CONV_STATE_FUSED=0`` to disable it. Every call that does
-not match the served Ornith decode contract delegates to the untouched inner
-module.
+The route passed real-package bitwise logits and cache checks plus a served
+speed A/B. Every call that does not match the served Ornith decode contract
+delegates to the untouched inner module.
 
-The eligible decode path also folds the fixed Q/K scale factors into the
-RMSNorm weights. Set ``MOESPRESSO_QWEN_GDN_RMS_SCALE_FUSED=0`` to restore the
-separate scalar multiplications.
+The eligible decode path folds the fixed Q/K scale factors into the RMSNorm
+weights.
 """
 
 from __future__ import annotations
 
-import os
 from functools import cache as memoize
 from importlib.metadata import PackageNotFoundError, version
 
@@ -31,12 +27,6 @@ from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.gated_delta import gated_delta_update
 
 
-_QWEN_GDN_CONV_STATE_FUSED = (
-    os.environ.get("MOESPRESSO_QWEN_GDN_CONV_STATE_FUSED", "1") == "1"
-)
-_QWEN_GDN_RMS_SCALE_FUSED = (
-    os.environ.get("MOESPRESSO_QWEN_GDN_RMS_SCALE_FUSED", "1") == "1"
-)
 _CERTIFIED_MLX_LM_VERSION = "0.31.3"
 try:
     _MLX_LM_VERSION = version("mlx-lm")
@@ -78,18 +68,6 @@ _FUSED_SOURCE = r"""
     new_state[C + channel] = state[2 * C + channel];
     new_state[2 * C + channel] = qkv_value;
 """
-
-
-def gdn_conv_state_fusion_enabled() -> bool:
-    """Return whether this process enables the guarded decode fusion."""
-
-    return _QWEN_GDN_CONV_STATE_FUSED
-
-
-def gdn_rms_scale_fusion_enabled() -> bool:
-    """Return whether RMSNorm weights absorb the Q/K decode scales."""
-
-    return _QWEN_GDN_RMS_SCALE_FUSED
 
 
 def _kernel_available() -> bool:
@@ -156,7 +134,6 @@ class FusedDecodeGatedDeltaNet(nn.Module):
         self.inner = inner
         self.fused_calls = 0
         self.rms_scale_fused_calls = 0
-        self.fallback_disabled = 0
         self.fallback_training = 0
         self.fallback_input = 0
         self.fallback_mask = 0
@@ -172,8 +149,6 @@ class FusedDecodeGatedDeltaNet(nn.Module):
 
     def _eligibility_failure(self, inputs, mask, cache) -> str | None:
         inner = self.inner
-        if not _QWEN_GDN_CONV_STATE_FUSED:
-            return "fallback_disabled"
         if inner.training:
             return "fallback_training"
         if tuple(inputs.shape) != (1, 1, _HIDDEN_SIZE):
@@ -261,15 +236,10 @@ class FusedDecodeGatedDeltaNet(nn.Module):
         ]
 
         state = cache[1]
-        inv_scale = k.shape[-1] ** -0.5
-        if _QWEN_GDN_RMS_SCALE_FUSED:
-            q_weight, k_weight = _rms_scale_weights()
-            q = mx.fast.rms_norm(q, q_weight, 1e-6)
-            k = mx.fast.rms_norm(k, k_weight, 1e-6)
-            self.rms_scale_fused_calls += 1
-        else:
-            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q_weight, k_weight = _rms_scale_weights()
+        q = mx.fast.rms_norm(q, q_weight, 1e-6)
+        k = mx.fast.rms_norm(k, k_weight, 1e-6)
+        self.rms_scale_fused_calls += 1
 
         out, state = gated_delta_update(
             q,
@@ -321,8 +291,7 @@ def install_fused_gdn_decode(model) -> int:
     """Install the guarded fusion on every gated-delta layer once."""
 
     if (
-        not _QWEN_GDN_CONV_STATE_FUSED
-        or not _mlx_lm_compatible()
+        not _mlx_lm_compatible()
         or not _kernel_available()
     ):
         return 0
@@ -343,7 +312,6 @@ def fused_gdn_decode_stats(model) -> dict[str, int]:
     keys = (
         "fused_calls",
         "rms_scale_fused_calls",
-        "fallback_disabled",
         "fallback_training",
         "fallback_input",
         "fallback_mask",

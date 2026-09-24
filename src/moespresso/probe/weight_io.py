@@ -176,16 +176,6 @@ def load_3d_rows_raw(
     return np.stack(out, axis=0) if out else np.empty(shape, dtype=_VIEW_DTYPE[h.dtype])
 
 
-def load_3d_rows(
-    model_dir: Path, h: TensorHeader, expert_indices: np.ndarray, row_indices: np.ndarray,
-) -> np.ndarray:
-    """Load selected [expert,row,:] slices of a 3D tensor as float32."""
-    raw = load_3d_rows_raw(model_dir, h, expert_indices, row_indices)
-    if h.dtype == "BF16":
-        return _bytes_to_float32(raw.tobytes(), h.dtype, raw.shape)
-    return raw.astype(np.float32)
-
-
 def load_full(model_dir: Path, h: TensorHeader) -> np.ndarray:
     """Read a whole tensor of any rank as float32. For small structural tensors
     (norms, SSM state) carried as passthrough. They're tiny, no streaming needed."""

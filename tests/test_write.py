@@ -15,10 +15,9 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant")
 
 from moespresso.inventory.build import build_inventory  # noqa: E402
-from moespresso.inventory.architecture_profile import qwen3_5_moe_profile  # noqa: E402
+from moespresso.inventory.safetensors_header import read_headers_with_offsets  # noqa: E402
 from moespresso.core.artifact import make_artifact  # noqa: E402
 from moespresso.package.bundle import (  # noqa: E402
     METADATA_KEY,
@@ -31,11 +30,8 @@ from moespresso.package.qwen.recipe import (  # noqa: E402
     build_expert_kquant_allocations as build_qwen_expert_kquant_allocations,
     build_expert_kquant_targets as build_qwen_expert_kquant_targets,
 )
-from moespresso.optimize.decide import decide  # noqa: E402
 from moespresso.package.plan import package_plan_from_decision  # noqa: E402
 from moespresso.package.write import write_package  # noqa: E402
-from moespresso.correctness.reconstruct import l1_tensor_reconstruction  # noqa: E402
-from moespresso.probe.build import build_probe_evidence  # noqa: E402
 
 
 def _plan(decision: dict) -> dict:
@@ -66,6 +62,8 @@ def _dtype_tag(arr):
         return "F16"
     if arr.dtype == np.int64:
         return "I64"
+    if arr.dtype == np.uint16:
+        return "BF16"
     raise AssertionError(f"test helper does not support dtype {arr.dtype}")
 
 
@@ -88,53 +86,6 @@ def _tiny_model(tmp_path):
             rng.standard_normal((8, 128, 128)).astype(np.float32),
     })
     (tmp_path / "config.json").write_text(json.dumps(ARCH))
-
-
-def test_write_package_end_to_end(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    _tiny_model(src)
-    out = tmp_path / "out"
-
-    inv = build_inventory(src, layer_types=["full_attention"])
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
-    man = write_package(_plan(dec), src, ARCH, out)
-
-    assert man["artifact_kind"] == "package_manifest"
-    assert man["status"] == "valid"
-    assert man["provenance"]["source_decision_id"] == dec["artifact_id"]
-
-    # the written shard exists and its sha256 matches the manifest's recorded one
-    shard = out / "model-00001-of-00001.safetensors"
-    assert shard.exists()
-    import hashlib
-    digest = hashlib.sha256(shard.read_bytes()).hexdigest()
-    assert man["files"][0]["sha256"] == digest
-
-    # every key the manifest declares for a tensor is actually present on disk
-    with open(shard, "rb") as f:
-        hlen = struct.unpack("<Q", f.read(8))[0]
-        on_disk = set(json.loads(f.read(hlen))) - {"__metadata__"}
-
-    for t in man["tensors"]:
-        if t["format"] == "tq":
-            # all three projections of a layer share one bundle tensor
-            assert f"{t['key_prefix']}.tq_bundle" in on_disk
-        elif t["format"] == "affine":
-            for suf in ("weight", "scales", "biases"):
-                assert f"{t['key_prefix']}.{suf}" in on_disk
-        else:  # fp16
-            assert t["key_prefix"] in on_disk
-
-    l1 = l1_tensor_reconstruction(
-        qwen3_5_moe_profile(), inv, man, src, out,
-        sample_policy={"affine_tensors": 1, "rows_per_tensor": 16,
-                       "tq_tensors": 2, "tq_experts": 2, "rows_per_expert": 16},
-    )
-    assert l1["status"] == "valid"
-    assert l1["summary"]["sampled_by_format"]["affine"] == 1
-    assert l1["summary"]["sampled_by_format"]["tq"] == 2
 
 
 def test_passthrough_structural_tensors_round_trip(tmp_path):
@@ -164,8 +115,9 @@ def test_passthrough_structural_tensors_round_trip(tmp_path):
     inv = build_inventory(src, layer_types=["full_attention"])
     passthrough = [e for e in inv["tensors"] if e["kind"] == "passthrough"]
     assert {e["source_name"].rsplit(".", 1)[-1] for e in passthrough} >= {"weight"}
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
+    dec = make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=[], status="valid")
     man = write_package(_plan(dec), src, ARCH, out, passthrough=passthrough)
 
     by_name = {t["source_name"]: t for t in man["tensors"]}
@@ -191,6 +143,7 @@ def test_raw_dtype_passthrough_tensors_round_trip(tmp_path):
     rng = np.random.default_rng(0)
     raw_f32 = np.array([[1.25, -2.5], [3.0, 4.5]], dtype=np.float32)
     raw_i64 = np.array([[0, 1, 2, 3, 4, 5], [250, 251, 252, 253, 254, 255]], dtype=np.int64)
+    raw_bf16 = np.array([0x3F80, 0xC020, 0x4040], dtype=np.uint16)
     _write_safetensors(src / "model-00001.safetensors", {
         "model.language_model.layers.0.self_attn.q_proj.weight":
             rng.standard_normal((128, 128)).astype(np.float32),
@@ -200,17 +153,21 @@ def test_raw_dtype_passthrough_tensors_round_trip(tmp_path):
             rng.standard_normal((8, 128, 128)).astype(np.float32),
         "layers.2.attn.compressor.ape": raw_f32,
         "layers.0.ffn.gate.tid2eid": raw_i64,
+        "layers.0.norm.weight": raw_bf16,
     })
     (src / "config.json").write_text(json.dumps(ARCH))
     out = tmp_path / "out"
 
     inv = build_inventory(src, layer_types=["full_attention"])
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
+    dec = make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=[], status="valid")
     passthrough = [
         {"source_name": "layers.2.attn.compressor.ape", "role": "attn.compressor.ape",
          "kind": "passthrough", "layer_index": 2, "format": "raw_dtype_passthrough"},
         {"source_name": "layers.0.ffn.gate.tid2eid", "role": "moe.router_tid2eid",
+         "kind": "passthrough", "layer_index": 0, "format": "raw_dtype_passthrough"},
+        {"source_name": "layers.0.norm.weight", "role": "norm",
          "kind": "passthrough", "layer_index": 0, "format": "raw_dtype_passthrough"},
     ]
     man = write_package(_plan(dec), src, ARCH, out, passthrough=passthrough)
@@ -218,14 +175,22 @@ def test_raw_dtype_passthrough_tensors_round_trip(tmp_path):
     by_name = {t["source_name"]: t for t in man["tensors"]}
     assert by_name["layers.2.attn.compressor.ape"]["format"] == "raw_dtype_passthrough"
     assert by_name["layers.0.ffn.gate.tid2eid"]["format"] == "raw_dtype_passthrough"
+    assert by_name["layers.0.norm.weight"]["format"] == "raw_dtype_passthrough"
     assert "raw_dtype_passthrough" in man["required_ops"]
 
-    from safetensors.numpy import load_file
-    arrays = load_file(str(out / man["files"][0]["path"]))
-    assert arrays["layers.2.attn.compressor.ape"].dtype == np.float32
-    assert arrays["layers.0.ffn.gate.tid2eid"].dtype == np.int64
-    np.testing.assert_array_equal(arrays["layers.2.attn.compressor.ape"], raw_f32)
-    np.testing.assert_array_equal(arrays["layers.0.ffn.gate.tid2eid"], raw_i64)
+    import mlx.core as mx
+    shard = out / man["files"][0]["path"]
+    headers = {header.name: header for header in read_headers_with_offsets(shard)}
+    assert headers["layers.0.norm.weight"].dtype == "BF16"
+    arrays = mx.load(str(shard))
+    assert arrays["layers.2.attn.compressor.ape"].dtype == mx.float32
+    assert arrays["layers.0.ffn.gate.tid2eid"].dtype == mx.int64
+    assert arrays["layers.0.norm.weight"].dtype == mx.bfloat16
+    np.testing.assert_array_equal(np.asarray(arrays["layers.2.attn.compressor.ape"]), raw_f32)
+    np.testing.assert_array_equal(np.asarray(arrays["layers.0.ffn.gate.tid2eid"]), raw_i64)
+    np.testing.assert_array_equal(
+        np.asarray(arrays["layers.0.norm.weight"].view(mx.uint16)), raw_bf16
+    )
 
 
 def test_f32_passthrough_tensors_are_promoted_to_float32(tmp_path):
@@ -246,8 +211,9 @@ def test_f32_passthrough_tensors_are_promoted_to_float32(tmp_path):
     out = tmp_path / "out"
 
     inv = build_inventory(src, layer_types=["linear_attention"])
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
+    dec = make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=[], status="valid")
     name = "model.language_model.layers.0.linear_attn.in_proj_a.weight"
     passthrough = [{
         "source_name": name,
@@ -365,23 +331,6 @@ def test_write_package_writes_qwen_kquant_expert_bundle(tmp_path):
     assert np.all(gate_wire == 11)
     assert np.all(up_wire == 22)
     assert np.all(down_wire == 33)
-
-
-def test_written_package_has_expected_tensor_kinds(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    _tiny_model(src)
-    inv = build_inventory(src, layer_types=["full_attention"])
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
-    man = write_package(_plan(dec), src, ARCH, tmp_path / "out")
-
-    kinds = {t["format"] for t in man["tensors"]}
-    assert "tq" in kinds and "affine" in kinds  # experts TQ, q_proj affine
-    # fused gate_up -> gate + up entries; down separate; one bundle key for all
-    tq_entries = [t for t in man["tensors"] if t["format"] == "tq"]
-    assert {t.get("projection") for t in tq_entries} == {"gate", "up", "down"}
-    assert len({t["key_prefix"] for t in tq_entries}) == 1
 
 
 def test_write_package_writes_dense_mxfp8_without_biases(tmp_path):

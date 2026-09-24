@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
-from pathlib import Path
 
 from moespresso.core.artifact import Validation
 from moespresso.inventory.architecture_profile import DEEPSEEK_V4_FLASH_COMPRESS_RATIOS
-from moespresso.inventory.safetensors_header import TensorHeader, scan_headers
+from moespresso.inventory.safetensors_header import TensorHeader
 
 EXPECTED_TOTAL_SIZE = 159_609_485_896
 EXPECTED_SHARD_COUNT = 46
@@ -70,19 +68,6 @@ def _check_equal(out: list[Validation], path: str, actual, expected) -> None:
         ))
 
 
-def _index_facts(model_dir: Path) -> dict:
-    idx = Path(model_dir) / "model.safetensors.index.json"
-    if not idx.exists():
-        return {}
-    data = json.loads(idx.read_text())
-    weight_map = data.get("weight_map", {})
-    return {
-        "tensor_count": len(weight_map),
-        "shard_count": len(set(weight_map.values())),
-        "total_size": data.get("metadata", {}).get("total_size"),
-    }
-
-
 def validate_deepseek_v4_static(
     config: dict,
     headers: Sequence[TensorHeader],
@@ -141,17 +126,3 @@ def validate_deepseek_v4_static(
             ))
 
     return out
-
-
-def validate_deepseek_v4_model_dir(model_dir: Path) -> list[Validation]:
-    """Run the static DS4 validator on a source directory."""
-    model_dir = Path(model_dir)
-    config = json.loads((model_dir / "config.json").read_text())
-    facts = _index_facts(model_dir)
-    return validate_deepseek_v4_static(
-        config,
-        scan_headers(model_dir),
-        shard_count=facts.get("shard_count"),
-        tensor_count=facts.get("tensor_count"),
-        total_size=facts.get("total_size"),
-    )

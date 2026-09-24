@@ -2,10 +2,10 @@
 
 These tests stay synthetic: they prove the install seam swaps the stock
 SwitchGLU for the sorted route, that the route engages on prefill shapes and
-falls closed on decode / off-contract shapes, that the kill switch restores the
-stock seam, and that the sorted kernels are called with the combined-stack
-layout and the right sorted-ids / gate-out / swiglu-limit arguments. The real
-The campaign quality ladder owns K-quant numerical acceptance.
+falls closed on decode / off-contract shapes, and that the sorted kernels are
+called with the combined-stack layout and the right sorted-ids / gate-out /
+swiglu-limit arguments. The campaign quality ladder owns K-quant numerical
+acceptance.
 """
 
 from __future__ import annotations
@@ -132,8 +132,7 @@ def test_combine_gate_up_stack_rejects_codec_mismatch():
 # ---- install seam -----------------------------------------------------------
 
 
-def test_install_swaps_switch_mlp_and_builds_combined_stack(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
+def test_install_swaps_switch_mlp_and_builds_combined_stack():
     model = _Model(n_layers=2)
     installed = install_sorted_kquant_switchglus(model)
     assert installed == 2
@@ -146,16 +145,7 @@ def test_install_swaps_switch_mlp_and_builds_combined_stack(monkeypatch):
         assert sw.down_type == "q6_k"
 
 
-def test_install_is_noop_when_kill_switch_off(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", False)
-    model = _Model()
-    installed = install_sorted_kquant_switchglus(model)
-    assert installed == 0
-    assert isinstance(_switch(model), SwitchGLU)
-
-
-def test_install_leaves_non_kquant_layers_on_stock_seam(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
+def test_install_leaves_non_kquant_layers_on_stock_seam():
     model = _Model()
     # Demote gate to a non-K-quant module: the layer must stay on the stock seam.
     _switch(model).gate_proj.mode = "affine"
@@ -164,8 +154,7 @@ def test_install_leaves_non_kquant_layers_on_stock_seam(monkeypatch):
     assert isinstance(_switch(model), SwitchGLU)
 
 
-def test_install_leaves_mismatched_gate_up_codec_on_stock_seam(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
+def test_install_leaves_mismatched_gate_up_codec_on_stock_seam():
     model = _Model(up_codec="q5_k")
     installed = install_sorted_kquant_switchglus(model)
     assert installed == 0
@@ -188,8 +177,6 @@ def _prefill_inputs(sw, *, tokens):
 
 
 def test_prefill_engages_fused_sorted_route(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED_SWIGLU", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)
@@ -220,8 +207,6 @@ def test_prefill_engages_fused_sorted_route(monkeypatch):
 
 
 def test_prefill_engages_unfused_sorted_when_no_fused_kernel(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED_SWIGLU", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)
@@ -241,26 +226,7 @@ def test_prefill_engages_unfused_sorted_when_no_fused_kernel(monkeypatch):
     assert calls[0][1][1] == 2 * sw.gate_out_features
 
 
-def test_swiglu_kill_switch_forces_unfused_route(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED_SWIGLU", False)
-    monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
-    model = _Model()
-    install_sorted_kquant_switchglus(model)
-    sw = _switch(model)
-    sw.eval()
-    calls = []
-    _fake_mlx_kquant(monkeypatch, calls, with_swiglu=True)  # fused kernel present
-
-    x, inds = _prefill_inputs(sw, tokens=700)
-    mx.eval(sw(x, inds))
-
-    assert sw.fused_swiglu_calls == 0
-    assert [c[0] for c in calls] == ["sorted", "sorted"]
-
-
 def test_decode_falls_back_to_unsorted_gather(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)
@@ -284,7 +250,6 @@ def test_decode_falls_back_to_unsorted_gather(monkeypatch):
 
 
 def test_short_prefill_below_threshold_falls_back(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)
@@ -306,7 +271,6 @@ def test_training_mode_does_not_block_sorted_route(monkeypatch):
     # backward pass, and the stock SwitchGLU sorts at this scale regardless of
     # training. The sorted route must engage in either mode so it reaches the
     # whole served path.
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)
@@ -323,7 +287,6 @@ def test_training_mode_does_not_block_sorted_route(monkeypatch):
 
 
 def test_missing_sorted_kernel_fails_closed(monkeypatch):
-    monkeypatch.setattr(ssg, "_QWEN_MOE_SORTED", True)
     monkeypatch.setattr(ssg, "_SORTED_PREFILL_MIN_ROWS", 4096)
     model = _Model()
     install_sorted_kquant_switchglus(model)

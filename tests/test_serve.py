@@ -15,8 +15,8 @@ import json
 import struct
 
 from moespresso.core.artifact import make_artifact, write_artifact
-from moespresso.optimize.allocate import AFFINE_BITS, EXPERT_BITS
-from moespresso.optimize.decide import decide
+from package_fixtures import AFFINE_BITS, EXPERT_BITS
+from package_fixtures import synthetic_decision
 from moespresso.package.manifest import build_package_manifest, file_identity, located_key
 from moespresso.package.plan import package_plan_from_decision
 from moespresso.runtime.serve import (
@@ -186,7 +186,7 @@ def _decision():
         _expert_unit("model.language_model.layers.0.mlp.experts.gate_up_proj", 0, "up"),
     ]
     ev = make_artifact("probe_evidence", SUBJECT, PRODUCER, status="valid", units=units)
-    plan, _summary = package_plan_from_decision(decide(ev, target_quality=0.5))
+    plan, _summary = package_plan_from_decision(synthetic_decision(ev))
     return plan
 
 
@@ -201,9 +201,7 @@ def _write_shard_matching(tmp_path, decision):
             tensors[f"{base}.biases"] = b"\x00" * 8
         elif a["kind"] == "expert":
             base = f"{a['source_name']}.{a['projection']}"
-            tensors[f"{base}.tq_packed"] = b"\x00" * 16
-            tensors[f"{base}.tq_norms"] = b"\x00" * 8
-            tensors[f"{base}.tq_bits"] = b"\x00" * 1
+            tensors[f"{base}.tq_bundle"] = b"\x00" * 32
     header, blob, off = {}, bytearray(), 0
     for k, b in tensors.items():
         header[k] = {"dtype": "U8", "shape": [len(b)], "data_offsets": [off, off + len(b)]}
@@ -219,7 +217,7 @@ def _write_shard_matching(tmp_path, decision):
 
 
 def _packaged(tmp_path):
-    """Write a faithful package (shard + manifest.json) and return its manifest."""
+    """Write a metadata fixture for tests with an injected model loader."""
     dec = _decision()
     located = {}
     for a in dec["allocation"]:
@@ -284,26 +282,6 @@ def test_reads_manifest_from_dir_by_default(tmp_path):
     # no manifest= passed -> it must read package_manifest.json (hash-verified)
     _, _, loaded_man = load_served_model(tmp_path, build_fn=lambda m, p: ("M", "T"))
     assert loaded_man["artifact_id"] == man["artifact_id"]
-
-
-def test_manifest_runtime_uses_ssd_streaming_for_moe_tq(tmp_path):
-    calls = []
-    manifest = {
-        "architecture": {"family": "qwen3_5_moe"},
-        "required_ops": ["affine_dequant", "tq_dequant"],
-    }
-
-    def streaming_builder(package_dir):
-        calls.append(("streaming", package_dir))
-        return "M", "T", 3
-
-    assert build_manifest_runtime(
-        manifest,
-        tmp_path,
-        resident_builder=lambda _m, _p: ("BAD", "BAD"),
-        streaming_builder=streaming_builder,
-    ) == ("M", "T")
-    assert calls == [("streaming", tmp_path)]
 
 
 def test_manifest_runtime_keeps_deepseek_on_its_owned_adapter(tmp_path):
@@ -373,7 +351,7 @@ def test_manifest_runtime_keeps_deepseek_v4_off_qwen_streaming_path(tmp_path):
         "required_ops": [
             "affine_dequant",
             "kquant_dequant",
-            "tq_dequant",
+            "mxfp4_dequant",
             "fp16_passthrough",
             "raw_dtype_passthrough",
         ],
@@ -416,7 +394,66 @@ def test_load_served_model_prints_runtime_truth_line(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "runtime=ssd-streaming" in out
     assert "capacity=85" in out and "hotlist=package" in out
-    assert "lookahead=off" in out
+    assert "decode=" in out
+
+
+def test_load_served_model_prints_resolved_automatic_budget(tmp_path, capsys):
+    from moespresso.runtime.serve import load_served_model
+
+    manifest = {"artifact_id": "pkg:abcdef1234567890aa", "subject": {}}
+
+    class _M:
+        _moespresso_ssd_streaming_capacity = 223
+        _moespresso_ssd_hotlist = {"source": "package", "seeded": 1}
+        _moespresso_ssd_streaming_capacity_budget = {
+            "planner_resolution": {
+                "resolved_bytes": 24 << 30,
+                "limiting_source": "automatic-wired-headroom",
+                "wired_budget_source": "metal-recommended-working-set",
+            },
+        }
+
+    load_served_model(
+        tmp_path,
+        manifest=manifest,
+        build_fn=lambda _manifest, _path: (_M(), object()),
+    )
+    out = capsys.readouterr().out
+    assert "auto_memory=24.00GB" in out
+    assert (
+        "planner_limit_source="
+        "automatic-wired-headroom:metal-recommended-working-set"
+        in out
+    )
+
+
+def test_load_served_model_prints_planner_budget_with_explicit_cap(
+    tmp_path, capsys, monkeypatch,
+):
+    from moespresso.runtime.serve import load_served_model
+
+    monkeypatch.setenv("MOESPRESSO_SSD_MAX_MEMORY_GB", "26")
+    manifest = {"artifact_id": "pkg:abcdef1234567890aa", "subject": {}}
+
+    class _M:
+        _moespresso_ssd_streaming_capacity = 178
+        _moespresso_ssd_hotlist = {"source": "package", "seeded": 1}
+        _moespresso_ssd_streaming_capacity_budget = {
+            "planner_resolution": {
+                "resolved_bytes": 18 << 30,
+                "limiting_source": "live-available",
+            },
+        }
+
+    load_served_model(
+        tmp_path,
+        manifest=manifest,
+        build_fn=lambda _manifest, _path: (_M(), object()),
+    )
+    out = capsys.readouterr().out
+    assert "capacity=178" in out
+    assert "max_memory=26GB" in out
+    assert "planner_memory=18.00GB planner_limit_source=live-available" in out
 
 
 def test_load_served_model_prints_mixed_resolved_capacity_range(tmp_path, capsys):

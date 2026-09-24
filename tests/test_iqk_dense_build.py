@@ -1,4 +1,4 @@
-"""Build side of dense-tensor IQ_K support.
+"""Shared build side of dense-tensor IQ_K support.
 
 Covers the format registry's dense member set, the dense allocation rows,
 the manifest's fail-closed dense IQ_K validation, and the writer's dense
@@ -16,20 +16,13 @@ import numpy as np
 import pytest
 
 from moespresso.core.artifact import make_artifact
-from moespresso.package.deepseek_v4.iqk_package import (
-    IQKPackageError,
-    build_dense_allocations,
-    dense_format_counts,
-)
-from moespresso.package.deepseek_v4.recipe import (
-    iqk_dense_target_from_allocation,
-)
 from moespresso.package.iqk_format import (
     IQK_DENSE_MEMBERS,
     IQK_GEOMETRY,
     IQKFormatError,
     iqk_dense_geometry,
 )
+from moespresso.package.iqk_recipe import iqk_dense_target_from_allocation
 from moespresso.package.manifest import build_package_manifest
 
 SUBJECT = {"source_root": "toy", "source_format": "hf_safetensors"}
@@ -74,92 +67,6 @@ def test_dense_member_allow_list_refuses_routed_members():
 
 
 # --------------------------------------------------------------------------
-# Dense allocation rows
-
-
-def _dense_inventory():
-    return {
-        "tensors": [
-            {"source_name": "embed.weight", "kind": "affine", "role": "embed_tokens",
-             "layer_index": None, "shape": [129280, 4096], "dtype": "BF16",
-             "gguf_keys": []},
-            {"source_name": "head.weight", "kind": "affine", "role": "lm_head",
-             "layer_index": None, "shape": [129280, 4096], "dtype": "BF16",
-             "gguf_keys": ["output.weight"]},
-            {"source_name": "layers.0.attn.wq_a.weight", "kind": "affine",
-             "role": "attn.wq_a", "layer_index": 0, "shape": [1024, 4096],
-             "dtype": "F8_E4M3", "gguf_keys": ["blk.0.attn_q_a.weight"]},
-            {"source_name": "layers.0.attn.indexer.wq_b.weight", "kind": "affine",
-             "role": "attn.indexer.wq_b", "layer_index": 0, "shape": [8192, 1024],
-             "dtype": "F8_E4M3", "gguf_keys": []},
-            {"source_name": "layers.0.attn.indexer.wq_b.scale", "kind": "codec_scale",
-             "role": "attn.indexer.wq_b.scale", "layer_index": 0},
-            {"source_name": "layers.0.ffn.gate.weight", "kind": "affine",
-             "role": "moe.router_gate", "layer_index": 0, "shape": [256, 4096],
-             "dtype": "BF16", "gguf_keys": []},
-        ]
-    }
-
-
-def test_dense_iqk_allocation_follows_the_gguf_key_split():
-    allocation = build_dense_allocations(_dense_inventory(), codec="iq6_k")
-
-    by_name = {a["source_name"]: a for a in allocation}
-    # Router gate stays passthrough; embedding keeps affine (no GGUF key);
-    # fp8-with-scale keeps mxfp8; only the GGUF-keyed set moves.
-    assert "layers.0.ffn.gate.weight" not in by_name
-    assert by_name["embed.weight"]["format"] == "affine"
-    assert by_name["layers.0.attn.indexer.wq_b.weight"]["format"] == "mxfp8"
-    head = by_name["head.weight"]
-    assert head["format"] == "iqk"
-    assert head["iqk_codec"] == "iq6_k"
-    assert head["layout"] == "ik_wire"
-    assert head["module_weight_key"] == "lm_head.weight"
-    assert head["imatrix_key"] == "output.weight"
-    wq_a = by_name["layers.0.attn.wq_a.weight"]
-    assert wq_a["iqk_codec"] == "iq6_k"
-    assert wq_a["module_weight_key"].endswith(".weight")
-    assert dense_format_counts(allocation) == {
-        "affine": 1, "iqk:iq6_k": 2, "mxfp8": 1}
-
-
-def test_dense_iqk_allocation_refuses_a_routed_member():
-    with pytest.raises(IQKFormatError, match="not a dense member"):
-        build_dense_allocations(_dense_inventory(), codec="iq2_ks")
-
-
-def test_dense_codec_error_names_both_families():
-    with pytest.raises(IQKPackageError, match="unknown dense codec"):
-        build_dense_allocations(_dense_inventory(), codec="q9_0")
-
-
-def test_dense_iqk_allocation_refuses_a_width_off_the_block_grid():
-    inventory = _dense_inventory()
-    for entry in inventory["tensors"]:
-        if entry["source_name"] == "layers.0.attn.wq_a.weight":
-            entry["shape"] = [1024, 4032]
-    with pytest.raises(ValueError, match="not a positive multiple of 256"):
-        build_dense_allocations(inventory, codec="iq5_k")
-
-
-def test_dense_iqk_target_rebuilds_from_the_allocation_row():
-    allocation = build_dense_allocations(_dense_inventory(), codec="iq4_ks")
-    rows = [a for a in allocation if a["format"] == "iqk"]
-    assert rows
-    for row in rows:
-        target = iqk_dense_target_from_allocation(row)
-        assert target.codec == "iq4_ks"
-        assert target.layout == "ik_wire"
-        assert target.imatrix_key == row["gguf_tensor"]
-
-    broken = dict(rows[0])
-    broken["iqk_codec"] = "iq2_k"
-    broken["codec"] = "iq2_k"
-    with pytest.raises(ValueError, match="dense member"):
-        iqk_dense_target_from_allocation(broken)
-
-
-# --------------------------------------------------------------------------
 # Manifest validation
 
 
@@ -193,6 +100,20 @@ def _dense_iqk_plan(**overrides):
     row.update(overrides)
     return make_artifact(
         "package_plan", SUBJECT, PRODUCER, status="valid", allocation=[row])
+
+
+def test_dense_iqk_target_rebuilds_from_a_shared_allocation_row():
+    row = _dense_iqk_plan()["allocation"][0]
+    target = iqk_dense_target_from_allocation(row)
+    assert target.codec == "iq6_k"
+    assert target.layout == "ik_wire"
+    assert target.imatrix_key == row["gguf_tensor"]
+
+    broken = dict(row)
+    broken["iqk_codec"] = "iq2_k"
+    broken["codec"] = "iq2_k"
+    with pytest.raises(ValueError, match="dense member"):
+        iqk_dense_target_from_allocation(broken)
 
 
 def _located():

@@ -288,8 +288,3 @@ class DeepseekV4Cache:
             DeepseekV4LayerCacheState.from_payload(layer) for layer in payload["layers"]
         )
         return cache
-
-
-def make_deepseek_v4_cache() -> DeepseekV4Cache:
-    """Factory mirroring the future runtime prompt-cache constructor."""
-    return DeepseekV4Cache()

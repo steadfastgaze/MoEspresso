@@ -51,7 +51,7 @@ def write_safetensors_raw(path, tensors, metadata=None):
         f.write(blob)
 
 
-def make_layer_components(n_exp, out=8, cols=2, *, specs=None, seed=0):
+def make_layer_components(n_exp, out=8, cols=4, *, specs=None, seed=0):
     """Random stacked components for one layer, keyed (projection, component).
 
     `specs` ({projection: (out, cols)}) overrides the uniform out/cols: real
@@ -65,8 +65,8 @@ def make_layer_components(n_exp, out=8, cols=2, *, specs=None, seed=0):
         p_out, p_cols = specs[proj]
         comps[(proj, "packed")] = rng.integers(
             0, 2**32, (n_exp, p_out, p_cols), dtype=np.uint32)
-        comps[(proj, "norms")] = (
-            rng.standard_normal((n_exp, p_out)) * 0.1).astype(np.float16)
+        comps[(proj, "scales")] = rng.integers(
+            120, 125, (n_exp, p_out, p_cols // 4), dtype=np.uint8)
     return comps
 
 
@@ -82,14 +82,14 @@ def write_bundle_package(pkg_dir, *, n_layers=1, layers=None, n_exp=4, out=8,
     """
     if specs is None:
         specs = {p: (out, cols, bits) for p in PROJECTIONS}
-    shape_specs = {p: (o, c) for p, (o, c, _b) in specs.items()}
-    bits_map = {p: b for p, (_o, _c, b) in specs.items()}
+    shape_specs = {p: (o, ((c * (4 // b) + 3) // 4) * 4) for p, (o, c, b) in specs.items()}
+    bits_map = {p: 4 for p in specs}
     if layers is None:
         layers = range(n_layers)
     tensors, layer_geo, by_layer = {}, {}, {}
     for layer in layers:
         comps = make_layer_components(n_exp, specs=shape_specs, seed=seed + layer)
-        bundle, geo = assemble_layer_bundle(comps, bits_map)
+        bundle, geo = assemble_layer_bundle(comps, bits_map, codecs={p: "mxfp4" for p in specs})
         base = f"language_model.model.layers.{layer}.mlp.switch_mlp"
         tensors[f"{base}.experts.tq_bundle"] = ("U8", bundle.shape, bundle.tobytes())
         layer_geo[layer] = geo

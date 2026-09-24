@@ -879,6 +879,65 @@ def test_generate_main_writes_json_out(tmp_path, monkeypatch, capsys):
     assert preflight_calls == [tmp_path / "pkg"]
 
 
+def test_generate_main_uses_package_sampling_defaults_with_cli_precedence(
+    tmp_path, monkeypatch
+):
+    import moespresso.runtime.http as http
+    import moespresso.runtime.serve as serve
+
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "generation_config.json").write_text(json.dumps({
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }))
+    manifest = {
+        "artifact_id": "pkg:qwen4",
+        "architecture": {"family": "qwen4_exp", "modality": "text"},
+        "tokenizer": {"files": [{"path": "generation_config.json"}]},
+        "tensors": [],
+        "files": [],
+    }
+    calls = []
+
+    monkeypatch.setattr(
+        serve, "_preflight_manifest_for_cli", lambda _package: manifest)
+    monkeypatch.setattr(
+        serve,
+        "load_served_model",
+        lambda _package, **_kwargs: ("MODEL", _Tokenizer(), manifest),
+    )
+    monkeypatch.setattr(http, "render_prompt", lambda *_args, **_kwargs: "PROMPT")
+
+    def fake_generate(*_args, **kwargs):
+        calls.append(kwargs)
+        return GenerationResult(text="ok")
+
+    monkeypatch.setattr(serve, "generate_with_metadata", fake_generate)
+
+    assert main([str(package), "--max-tokens", "1"]) == 0
+    assert calls[-1]["temperature"] == 1.0
+    assert calls[-1]["top_p"] == 0.95
+    assert calls[-1]["top_k"] == 20
+
+    assert main([
+        str(package),
+        "--max-tokens", "1",
+        "--temperature", "0.2",
+        "--top-p", "0.8",
+        "--top-k", "3",
+        "--min-p", "0.1",
+        "--presence-penalty", "0.5",
+    ]) == 0
+    assert calls[-1]["temperature"] == 0.2
+    assert calls[-1]["top_p"] == 0.8
+    assert calls[-1]["top_k"] == 3
+    assert calls[-1]["min_p"] == 0.1
+    assert calls[-1]["presence_penalty"] == 0.5
+
+
 def test_generate_main_rejects_span_beyond_explicit_context_limit(
     tmp_path, monkeypatch, capsys
 ):

@@ -26,9 +26,7 @@ def _local_source_paths(value):
 
 
 def test_package_metadata_names_all_tracked_license_files():
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ]
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
     assert project["license-files"] == [
         "LICENSE-MIT",
@@ -38,23 +36,42 @@ def test_package_metadata_names_all_tracked_license_files():
     assert all((ROOT / name).is_file() for name in project["license-files"])
 
 
-def test_hatch_build_excludes_private_and_nonrelease_trees():
+def test_build_excludes_private_and_nonrelease_trees():
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    excluded = set(config["tool"]["hatch"]["build"]["exclude"])
+    build = config["tool"]["scikit-build"]
+    excluded = set(build["sdist"]["exclude"])
 
     assert {
-        "/specs_archive",
-        "/specs_archive/**",
-        "/native/gate/build",
-        "/native/gate/build/**",
-        "/native/ds4_moe/build",
-        "/native/ds4_moe/build/**",
-        "**/private",
+        ".research/**",
+        "specs_archive/**",
+        "native/*/build/**",
         "**/private/**",
-        "**/__pycache__",
+        "**/__pycache__/**",
         "**/*.pyc",
         "**/*.pyo",
+        "**/*.so",
+        "**/*.metallib",
     } <= excluded
+    assert build["wheel"]["packages"] == ["src/moespresso"]
+    assert {"**/private/**", "**/__pycache__/**", "**/*.pyc", "**/*.pyo"} <= set(
+        build["wheel"]["exclude"]
+    )
+
+
+def test_uv_native_rebuild_inputs_exclude_generated_output():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    keys = config["tool"]["uv"]["cache-keys"]
+    inputs = {item["file"] for item in keys if "file" in item}
+    assert {
+        "pyproject.toml",
+        "CMakeLists.txt",
+        "native/*/CMakeLists.txt",
+        "native/*/*.cpp",
+        "native/*/*.h",
+    } <= inputs
+    for pattern in inputs:
+        assert "/" in pattern or not any(character in pattern for character in "*?[")
+        assert not any("build" in path.relative_to(ROOT).parts for path in ROOT.glob(pattern))
 
 
 def test_dependency_resolution_has_no_local_sources():
@@ -67,9 +84,7 @@ def test_dependency_resolution_has_no_local_sources():
 def test_public_serve_alias_uses_the_startup_supervisor():
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert config["project"]["scripts"]["moespresso-serve"] == (
-        "moespresso.serve_supervisor:main"
-    )
+    assert config["project"]["scripts"]["moespresso-serve"] == ("moespresso.serve_supervisor:main")
 
 
 def test_mlx_iqk_is_an_ordinary_published_pinned_requirement():
@@ -80,7 +95,7 @@ def test_mlx_iqk_is_an_ordinary_published_pinned_requirement():
         if item.lower().replace("_", "-").startswith("mlx-iqk")
     ]
 
-    assert requirements == ["mlx-iqk==0.1.2"]
+    assert requirements == ["mlx-iqk==0.1.3"]
 
 
 def test_mlx_lm_is_an_ordinary_published_requirement():

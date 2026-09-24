@@ -7,12 +7,11 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant")
 
 from moespresso.inventory.architecture_profile import DEEPSEEK_V4_FLASH_COMPRESS_RATIOS  # noqa: E402
 from moespresso.inventory.build import build_inventory  # noqa: E402
 from moespresso.package.bundle import component_array  # noqa: E402
-from moespresso.optimize.decide import decide  # noqa: E402
+from moespresso.core.artifact import make_artifact  # noqa: E402
 from moespresso.package.kquant_backend import KQuantEncodedWeight  # noqa: E402
 import moespresso.package.deepseek_v4.write as ds4_write_mod  # noqa: E402
 from moespresso.package.deepseek_v4.recipe import (  # noqa: E402
@@ -24,7 +23,6 @@ from moespresso.package.plan import package_plan_from_decision  # noqa: E402
 import moespresso.package.write as write_mod  # noqa: E402
 from moespresso.package.write import write_package  # noqa: E402
 from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup  # noqa: E402
-from moespresso.probe.deepseek_v4.probe import build_deepseek_v4_probe_evidence  # noqa: E402
 from moespresso.runtime.expert_index import build_expert_index  # noqa: E402
 from moespresso.runtime.verify import verify_package  # noqa: E402
 
@@ -111,24 +109,19 @@ def test_write_package_writes_synthetic_deepseek_v4_mixed_formats(tmp_path):
 
     inv = build_inventory(src, family="deepseek_v4_flash")
     group = DecodedExpertGroup.from_inventory(inv, src, fp4_block=32)
-    dense = np.random.default_rng(1).standard_normal((128, 128)).astype(np.float32)
-    ev = build_deepseek_v4_probe_evidence(
-        inv["subject"],
-        expert_group=group,
-        affine_samples=[{
-            "source_name": "layers.0.attn.wq_a.weight",
-            "role": "attn.wq_a",
-            "layer_index": 0,
-            "shape": [128, 128],
-            "sample": dense,
-        }],
-        expert_sample=2,
-        sample_rows=32,
-        seed=3,
-        source_inventory_id=inv["artifact_id"],
-    )
-    dec, _summary = package_plan_from_decision(
-        decide(ev, target_quality=0.5, allow_unhealthy=True))
+    allocation = [
+        {"source_name": "layers.0.attn.wq_a.weight", "role": "attn.wq_a",
+         "kind": "affine", "format": "affine", "bits": 4, "group_size": 32,
+         "layer_index": 0},
+        *[{"source_name": f"layers.0.ffn.experts.{p}", "projection": p,
+           "role": f"moe.expert.{p}", "kind": "expert", "format": "mxfp4",
+           "codec": "mxfp4", "bits": 4, "layer_index": 0}
+          for p in ("gate", "up", "down")],
+    ]
+    dec, _summary = package_plan_from_decision(make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=allocation, status="valid",
+    ))
     passthrough = [e for e in inv["tensors"] if e["kind"] == "passthrough"]
 
     man = write_package(
@@ -185,24 +178,19 @@ def test_write_package_streams_deepseek_v4_bundle_one_expert_row_at_a_time(
 
     inv = build_inventory(src, family="deepseek_v4_flash")
     group = DecodedExpertGroup.from_inventory(inv, src, fp4_block=32)
-    dense = np.random.default_rng(1).standard_normal((128, 128)).astype(np.float32)
-    ev = build_deepseek_v4_probe_evidence(
-        inv["subject"],
-        expert_group=group,
-        affine_samples=[{
-            "source_name": "layers.0.attn.wq_a.weight",
-            "role": "attn.wq_a",
-            "layer_index": 0,
-            "shape": [128, 128],
-            "sample": dense,
-        }],
-        expert_sample=2,
-        sample_rows=32,
-        seed=3,
-        source_inventory_id=inv["artifact_id"],
-    )
-    dec, _summary = package_plan_from_decision(
-        decide(ev, target_quality=0.5, allow_unhealthy=True))
+    allocation = [
+        {"source_name": "layers.0.attn.wq_a.weight", "role": "attn.wq_a",
+         "kind": "affine", "format": "affine", "bits": 4, "group_size": 32,
+         "layer_index": 0},
+        *[{"source_name": f"layers.0.ffn.experts.{p}", "projection": p,
+           "role": f"moe.expert.{p}", "kind": "expert", "format": "mxfp4",
+           "codec": "mxfp4", "bits": 4, "layer_index": 0}
+          for p in ("gate", "up", "down")],
+    ]
+    dec, _summary = package_plan_from_decision(make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=allocation, status="valid",
+    ))
 
     man = write_package(
         dec,
@@ -417,24 +405,19 @@ def test_write_package_streams_deepseek_v4_fp8_affine_output(tmp_path, monkeypat
 
     inv = build_inventory(src, family="deepseek_v4_flash")
     group = DecodedExpertGroup.from_inventory(inv, src, fp4_block=32)
-    dense = np.random.default_rng(1).standard_normal((128, 128)).astype(np.float32)
-    ev = build_deepseek_v4_probe_evidence(
-        inv["subject"],
-        expert_group=group,
-        affine_samples=[{
-            "source_name": "layers.0.attn.wq_a.weight",
-            "role": "attn.wq_a",
-            "layer_index": 0,
-            "shape": [128, 128],
-            "sample": dense,
-        }],
-        expert_sample=2,
-        sample_rows=32,
-        seed=3,
-        source_inventory_id=inv["artifact_id"],
-    )
-    dec, _summary = package_plan_from_decision(
-        decide(ev, target_quality=0.5, allow_unhealthy=True))
+    allocation = [
+        {"source_name": "layers.0.attn.wq_a.weight", "role": "attn.wq_a",
+         "kind": "affine", "format": "affine", "bits": 4, "group_size": 32,
+         "layer_index": 0},
+        *[{"source_name": f"layers.0.ffn.experts.{p}", "projection": p,
+           "role": f"moe.expert.{p}", "kind": "expert", "format": "mxfp4",
+           "codec": "mxfp4", "bits": 4, "layer_index": 0}
+          for p in ("gate", "up", "down")],
+    ]
+    dec, _summary = package_plan_from_decision(make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        allocation=allocation, status="valid",
+    ))
     monkeypatch.setattr(write_mod, "_STREAMED_AFFINE_OUTPUT_THRESHOLD_BYTES", 1)
 
     def _forbidden(*args, **kwargs):

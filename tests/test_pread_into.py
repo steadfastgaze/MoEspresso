@@ -78,24 +78,25 @@ def test_pread_into_safetensors_expert_range_lands_in_pool_slot(tmp_path):
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     base = "language_model.model.layers.0.mlp.switch_mlp"
-    packed = bytes(range(64))  # 4 experts * 2 rows * 2 packed cols * sizeof(U32)
+    packed = bytes(range(128))  # 4 experts * 2 rows * 4 packed cols * sizeof(U32)
     comps = {
-        ("gate_proj", "packed"): np.frombuffer(packed, np.uint32).reshape(4, 2, 2),
-        ("gate_proj", "norms"): np.zeros((4, 2), np.float16),
-        ("up_proj", "packed"): np.zeros((4, 2, 2), np.uint32),
-        ("up_proj", "norms"): np.zeros((4, 2), np.float16),
-        ("down_proj", "packed"): np.zeros((4, 2, 2), np.uint32),
-        ("down_proj", "norms"): np.zeros((4, 2), np.float16),
+        ("gate_proj", "packed"): np.frombuffer(packed, np.uint32).reshape(4, 2, 4),
+        ("gate_proj", "scales"): np.zeros((4, 2, 1), np.uint8),
+        ("up_proj", "packed"): np.zeros((4, 2, 4), np.uint32),
+        ("up_proj", "scales"): np.zeros((4, 2, 1), np.uint8),
+        ("down_proj", "packed"): np.zeros((4, 2, 4), np.uint32),
+        ("down_proj", "scales"): np.zeros((4, 2, 1), np.uint8),
     }
     bundle, geo = assemble_layer_bundle(
-        comps, {p: 2 for p in ("gate_proj", "up_proj", "down_proj")})
+        comps, {p: 4 for p in ("gate_proj", "up_proj", "down_proj")},
+        codecs={p: "mxfp4" for p in ("gate_proj", "up_proj", "down_proj")})
     _write_safetensors(pkg / "model-00001-of-00001.safetensors", {
         f"{base}.experts.tq_bundle": ("U8", bundle.shape, bundle.tobytes()),
     }, metadata={"expert_bundles": encode_bundle_metadata({0: geo})})
     index = build_expert_index(pkg)
     expert = index.locate(
         layer=0, expert=2, projection="gate_proj", component="packed")
-    pool = mx.zeros((4, 2, 2), dtype=mx.uint32)
+    pool = mx.zeros((4, 2, 4), dtype=mx.uint32)
     mx.eval(pool)
 
     pread_into(
@@ -108,7 +109,7 @@ def test_pread_into_safetensors_expert_range_lands_in_pool_slot(tmp_path):
     mx.eval(pool)
 
     pool_bytes = memoryview(pool).cast("B")
-    assert bytes(pool_bytes[expert.nbytes:2 * expert.nbytes]) == packed[32:48]
+    assert bytes(pool_bytes[expert.nbytes:2 * expert.nbytes]) == packed[64:96]
     assert bytes(pool_bytes[:expert.nbytes]) == bytes(expert.nbytes)
 
 

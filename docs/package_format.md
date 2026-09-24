@@ -10,54 +10,22 @@ is declared explicitly. Reverse engineering at load time is unnecessary.
 
 This doc documents the subsystem under `src/moespresso/package/` (`plan.py`,
 `manifest.py`, `write.py`, `bundle.py`, `hotlist.py`, `agentic_profile.py`, the
-shared K-quant modules, and the model builder subpackages `deepseek_v4/` and
-`qwen/`) plus the resulting on-disk layout.
+shared K-quant modules, and model builder subpackages `deepseek_v4/`,
+`qwen/`, and `qwen4/`) and describes the on-disk layout.
 
-## What "mjtq" means: MoEspresso Jang TurboQuant
+## Format identity and package planning
 
-`mjtq` = **MoEspresso Jang TurboQuant**. It *reuses* jang's TurboQuant codec and tensor
-conventions for compression (the `.tq_packed` / `.tq_norms` / `.tq_bits`
-arrays, Hadamard rotation with a seed, per-row norms, bit-packing), but it adds
-a strict layer on top: the explicit `package_manifest` is the contract the
-runtime reads.
+`PACKAGE_FORMAT = "mjtq"` and `PACKAGE_FORMAT_VERSION = 1` identify the
+container. Routed payload keys end in `.tq_bundle`. Tensor and bundle metadata
+specify each projection's codec.
 
-This is **distinct from the third-party `jangtq` format**.
-A `jangtq`-shaped package is consumed by *parsing* `jang_config.json` and then
-*knowing* a pile of conventions: expert shard
-naming, the TQ packing layout, which tensors are fp16 passthrough, the double
-`model.language_model.` key nesting. Every one of those "knows" is a place a new
-model can make the engine guess wrong: exactly the failure mode this project
-exists to kill. In mjtq, jang supplies the compression backend. The manifest
-defines the package format and replaces inference with declaration.
+Model-specific GGUF recipe builders consume the source, recipe and imatrix.
+IQ_K builders take validated converted expert cells and their allocation.
+Both write a `package_plan` with source, calibration and decision identity.
+Qwen4's converter also validates routed and dense teacher captures.
 
-The format identity lives in `manifest.py`:
-
-- `PACKAGE_FORMAT = "mjtq"`, `PACKAGE_FORMAT_VERSION = 1`
-- `PACKAGE_FORMAT_FEATURES = frozenset({"calibration"})`. mjtq declares its
-  strictness here. The generic convert orchestrator reads that declaration. A mjtq
-  package's probe evidence must be activation-weighted by a real imatrix; an
-  uncalibrated mjtq is a red flag the spec names. Other package formats declare
-  their own feature sets, and the convert pipeline consults only those
-  declarations when deciding whether calibration is required.
-
-## The `package_plan`: the writer-facing allocation
-
-Three build routes produce packages: the probe/optimizer route
-(`moespresso-convert`), the GGUF K-quant recipe route
-(`moespresso-ds4-kquant-package`, `moespresso-qwen-kquant-package`, with the
-per-model recipe mapping in `package/deepseek_v4/recipe.py` and
-`package/qwen/recipe.py` and the shared GGUF parsing in `kquant_recipe.py`),
-and the converted-artifact route (`moespresso-ds4-iqk-package`), which packages
-routed-expert bytes a separate conversion stage already encoded.
-All converge on one artifact before anything is written: the `package_plan`
-(`plan.py`). The plan carries the normalized per-tensor allocation, the
-producer identity (`producer_kind`, `producer_reference`), the chained
-`source_decision_id`/`source_probe_id` (null on the recipe route), the
-`optimized_kernels_expected` promotion flag, and any explicit force overrides
-(`--force-format PATTERN=FORMAT`), which fail closed on unknown formats and
-unmatched patterns unless explicitly allowed and support a dry-run preview.
-The writer and the manifest builder consume only the plan; neither branches on
-which route produced it.
+Force overrides apply at build time. Unknown formats and unmatched patterns
+fail closed; a dry-run preview is available.
 
 ## The `package_manifest`: the package's full self-description
 
@@ -111,16 +79,8 @@ linear-attn / SSM fields the graph needs and forced the loader back to
 `_passthrough_entry`): `source_name`, `role` (the typed vocabulary), `kind`
 (`expert | affine | fp16_passthrough | raw_dtype_passthrough | passthrough`),
 the on-disk location (`shard` file + `key_prefix`), and the weight format with
-its params. Nine formats exist:
+its params. Eight formats exist:
 
-- **`tq`** (routed experts): `format_params = {tq_version, bits, seed}`. The TQ
-  transform is declared by **versioned reference**: the engine knows what
-  `tq_version 1` means (Hadamard rotation with seed, per-row norms, bit-packing),
-  but versioned so it cannot silently drift. `format_params` is a sub-object
-  precisely so the transform can later be declared *structurally*
-  (`hadamard_rotate(seed)`, `pack_bits(bits)`, `scale(norms)`) without a major
-  version bump: declare enough to be unambiguous and verifiable now, leave room
-  to grow.
 - **`affine`** (dense): `format_params = {bits, group_size}`.
 - **`mxfp4`** (dense or routed experts): fixed group size 32 with uint8 UE8M0
   scales; `format_params` records `source_codec` (e.g. `fp4_e2m1_ue8m0` for
@@ -156,14 +116,14 @@ its params. Nine formats exist:
   re-encoding, writes new plan and manifest ids, and gates the move by turning
   every rewritten row back into wire bytes and by decoding sampled rows through
   both references. Only `iqk_relayout` serves. The target expert pool is
-  described in `docs/ssd_streaming.md`; resident sidecars and dense IQ_K are
-  described in `docs/runtime_resident.md`.
+  described in `docs/ssd_streaming.md`. See `docs/runtime_resident.md` for
+  resident sidecars.
   A dense tensor may also declare `iqk`, restricted to the 4- to 6-bit members
   (`iqk_format.IQK_DENSE_MEMBERS`: `iq4_ks`, `iq4_k`, `iq5_k`, `iq6_k`); a
-  routed-only member on a dense tensor is a blocking validation. No package
-  declares dense IQ_K today and the dense relayout step does not exist, so the
-  dense serving routes described in `docs/runtime_resident.md` guard an
-  unproven path.
+  routed-only member on a dense tensor triggers blocking validation. The Qwen4
+  package builder writes dense tensors directly on `iqk_relayout`; the runtime
+  installs them from manifest-owned module keys. DeepSeek-V4 uses IQ_K for
+  routed experts and K-quant for dense tensors.
 - **`fp16`** (passthrough): `format_params = {}`. The array is stored as
   float16.
 - **`f32_passthrough`**: the array is stored as float32, verbatim.
@@ -173,7 +133,7 @@ its params. Nine formats exist:
   to this format; a manifest that declares any of them at a downcast format is
   refused with a blocking `package.control_tensor_downcast` validation.
 
-Routed experts accept `tq`, `mxfp4`, `kquant`, or `iqk`; dense tensors
+Routed experts accept `mxfp4`, `kquant`, or `iqk`; dense tensors
 accept `affine`, `mxfp4`, `mxfp8`, `kquant`, or `iqk` at a dense member;
 anything else is a blocking validation.
 
@@ -196,25 +156,15 @@ serve path does not repeat a tens-of-gigabytes hash pass at every startup.
 ### Required backend ops
 
 `required_ops` is the sorted set the engine must support, derived from the
-tensor formats actually present: `tq → tq_dequant`, `affine → affine_dequant`,
+tensor formats actually present: `affine → affine_dequant`,
 `mxfp4 → mxfp4_dequant`, `mxfp8 → mxfp8_dequant`, `kquant → kquant_dequant`,
 `iqk → iqk_dequant`, `fp16 → fp16_passthrough`,
 `f32_passthrough → f32_passthrough`,
 `raw_dtype_passthrough → raw_dtype_passthrough`. The runtime adapter selection
-(`runtime/build.py`) keys off `required_ops` + `family` and resolves to one of
-four kinds: `deepseek_v4_flash` builds the `mjtq_dsv4` adapter; a dense
-`qwen3_5_dense` whose ops stay within the dense affine set builds
-`regular_jang_v2`; a `qwen3_5_moe` package carrying `kquant_dequant` without
-`tq_dequant` builds `qwen_kquant_moe`; and any other family with
-`tq_dequant` builds `jangtq_moe`. An unrecognized combination raises
-`UnsupportedRuntimeAdapter` rather than guessing. The kind also selects the
-top-level model builder. `jangtq_moe` and `qwen_kquant_moe` take the shared
-pooled builder. The `mjtq_dsv4` builder installs routed IQ_K experts into the
-same persistent pool internally: capacity equal to the expert count is fully
-resident, while smaller capacities stream missing bundle rows. Selected
-layers can grow through the runtime's post-request pool transaction.
-The dense adapter uses the resident builder in `runtime/serve.py`. Runtime
-details are in `docs/runtime_resident.md` and `docs/ssd_streaming.md`.
+(`runtime/build.py`) uses `required_ops` + `family`: DeepSeek-V4 selects its own
+adapter, Ornith the Qwen K-quant adapter, and Qwen4 its composite IQ_K adapter.
+Dense Qwen models use the affine/MX-float loader. Unknown operations fail closed.
+Optional drafters have separate model adapters and sidecar contracts.
 
 The manifest also carries a top-level `optimized_kernels_expected` flag
 (default false), copied from the plan. Setting it is an explicit
@@ -308,7 +258,7 @@ The shipped family profiles use promoted results from served studies:
 A mjtq package directory contains:
 
 - `model-NNNNN-of-COUNT.safetensors` shard(s). `write.py` streams within every
-  tensor (a row-band for affine/fp16, one expert at a time for TQ) so a 35B
+  tensor (a row-band for affine/fp16, one expert row at a time for streamed codecs) so a 35B
   model converts in bounded RAM, and starts a new shard once a byte cap
   (`--shard-size-gb`) is passed. The final count is unknown until the end, so
   shards are written `-of-?????` and renamed `-of-COUNT` once done. A "tensor
@@ -353,20 +303,14 @@ pair per projection in a fixed per-codec order (`row_order_for_codecs`). The
 components depend on each projection's declared codec:
 
 ```
-tq      -> [ packed | norms ]        (packed uint32, norms float16)
 mxfp4   -> [ packed | scales ]       (packed uint32, scales uint8 UE8M0)
 kquant  -> [ weight | scales ]       (both uint8 wire bytes)
 iqk     -> [ blocks ]                (uint8 wire bytes; scales live in the row)
 ```
 
-so an all-TQ layer's row reads
-`[ gate.packed | gate.norms | up.packed | up.norms | down.packed | down.norms ]`,
-and a mixed-codec layer substitutes each projection's own pair. The projection
-codec is declared in the bundle metadata; readers never infer it from bit
-width. A missed expert costs **one contiguous pread** because the bundle layout
-removes the six-way seek scatter. The row stride is the exact
-component sum with **no padding**: plain pread needs no alignment, and direct
-IO is explicitly out of scope.
+Bundle metadata declares each projection's codec. Readers derive component
+offsets and row strides from it. A missed expert costs one contiguous read;
+component ranges must tile the row exactly.
 
 The geometry contract (per component: within-row `offset`, `nbytes`, per-expert
 `shape`, `dtype`, plus the per-projection codec and `bits`) travels in the
@@ -382,10 +326,8 @@ inspector probe.
 
 The manifest's `expert_layout` block (`_DEFAULT_EXPERT_LAYOUT`) names this
 convention: `bundled: True`, `fused_gate_up: True` (the source `gate_up_proj`
-splits into gate + up sub-projections), `key_suffixes: ["tq_bundle"]`, and the
-same `row_order`. Older stacked packages (`tq_packed` / `tq_norms` / `tq_bits`)
-are **not readable**: the runtime fails loud with a re-convert message rather
-than guess at an old layout.
+splits into gate + up sub-projections) and `key_suffixes: ["tq_bundle"]`.
+Each shard's codec metadata determines component order and byte ranges.
 
 IQ_K target experts use this bundle directly through the pooled runtime. A
 miss reads one `blocks` row and splits its declared relayout streams into the
@@ -405,11 +347,9 @@ carries ~millions of routed calibration tokens per layer.
 `expert_hotlist.json`. Measured against real request demand: seeding capacity-70
 from these counts captures a median 0.40 of a request's expert-demand mass vs
 0.27 for arbitrary seeding, with zero run history. This artifact is the **floor
-for the first request on a host with no saved demand history**. A runtime-saved
-demand hotlist captures ~0.60 and takes precedence when present. The emitted file uses the
-**same schema** as the saved-demand hotlists, so the streaming builder
-(`ssd_streaming_build.load_expert_hotlist`) consumes either interchangeably (it
-caps installed priors so neither can dominate live traffic).
+for the first request before live demand adapts residency**. The streaming
+builder (`ssd_streaming_build.load_expert_hotlist`) installs capped prior counts
+so live demand can overtake the package ranking.
 
 **Fail-closed alignment.** imatrix counts are keyed by GGUF block index; the
 package's routed layers are keyed by model layer index. These have coincided on

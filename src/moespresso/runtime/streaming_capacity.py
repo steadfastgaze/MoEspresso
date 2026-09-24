@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
 
 from moespresso.runtime.expert_index import PROJECTIONS, ExpertIndex
 from moespresso.inventory.safetensors_header import read_headers_with_offsets
@@ -17,6 +18,36 @@ from moespresso.inventory.safetensors_header import read_headers_with_offsets
 
 class StreamingCapacityError(ValueError):
     pass
+
+
+def _sysctl_int(name: str) -> int | None:
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return None
+
+
+def usable_wired_budget_bytes() -> tuple[int | None, str]:
+    """Return the reported wired-memory budget and its source."""
+    wired_mb = _sysctl_int("iogpu.wired_limit_mb")
+    if wired_mb is not None and wired_mb > 0:
+        return wired_mb * (1 << 20), "iogpu.wired_limit_mb"
+    try:
+        import mlx.core as mx
+
+        recommended = int(mx.device_info()["max_recommended_working_set_size"])
+    except Exception:
+        return None, "unreadable"
+    if recommended <= 0:
+        return None, "unreadable"
+    return recommended, "metal-recommended-working-set"
 
 
 @dataclass(frozen=True)
@@ -70,7 +101,7 @@ def bytes_per_layer_slot(index: ExpertIndex) -> dict[int, int]:
 
 
 def full_resident_expert_bytes(index: ExpertIndex) -> int:
-    """Exact bytes for every compact expert slot in every routed layer."""
+    """Bytes for every compact expert slot in every routed layer."""
     layer_bytes = bytes_per_layer_slot(index)
     return sum(
         index.num_experts_for_layer(layer) * layer_bytes[layer]
@@ -156,7 +187,7 @@ def validate_min_resident_experts(
 
 
 def choose_capacity(budget: CapacityBudget) -> int:
-    """Return the largest safe capacity, capped at full residency."""
+    """Return the largest capacity within the supplied budget."""
     if budget.bytes_per_capacity_unit <= 0:
         raise ValueError("bytes_per_capacity_unit must be > 0")
     if budget.max_capacity < 1:
@@ -181,10 +212,8 @@ def choose_capacity(budget: CapacityBudget) -> int:
     ):
         return int(budget.max_capacity)
 
-    # Below an exact full-resident fit, retain the established conservative
-    # planner. With mixed layer counts this may leave some memory unused once
-    # shorter layers saturate, but it never overcommits and preserves the
-    # measured bounded-residency policy.
+    # Below full residency, use the uniform-capacity planner. With mixed layer
+    # counts, shorter layers can saturate before the budget is fully used.
     capacity = budget.usable_bytes // budget.bytes_per_capacity_unit
     if capacity < budget.min_capacity:
         need = budget.min_capacity * budget.bytes_per_capacity_unit
@@ -213,12 +242,11 @@ def package_capacity_budget(
 ) -> CapacityBudget:
     """Build the package-specific capacity budget from memory + headers.
 
-    `resident_base_bytes` is measured from the package (the model's
-    non-routed core). `runtime_resident_bytes` reserves generated resident
-    storage that is not present in package headers. The KV/activation allowance
-    (default 1 GiB) and safety margin (default 2 GiB) are defaults tuned for a
-    16 GB host: hosts with little free RAM tune them via
-    MOESPRESSO_SSD_KV_ALLOWANCE_GB / MOESPRESSO_SSD_SAFETY_MARGIN_GB."""
+    `resident_base_bytes` comes from the package's non-routed core.
+    `runtime_resident_bytes` reserves generated resident storage absent from
+    package headers. The KV/activation allowance and safety margin are
+    configurable with MOESPRESSO_SSD_KV_ALLOWANCE_GB and
+    MOESPRESSO_SSD_SAFETY_MARGIN_GB."""
     import os
 
     if kv_activation_allowance_bytes is None:

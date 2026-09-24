@@ -32,7 +32,7 @@ from moespresso.package.kquant_recipe import (
     validate_kquant_target_fit,
 )
 from moespresso.package.plan import force_override_preview_lines, parse_force_overrides
-from moespresso.package.convert import INVENTORY_NAME, _layer_types, _read_config
+from moespresso.package.source import INVENTORY_NAME, _layer_types, _read_config
 from moespresso.package.constants import MANIFEST_NAME
 
 KQUANT_RECIPE_REPORT_NAME = "kquant_recipe_report.json"
@@ -649,7 +649,6 @@ def build_ds4_kquant_package(
 
         kquant_expert_loader = _load_gguf_expert_bytes
     write_kwargs = {
-        "seed": seed,
         "shard_size_gb": shard_size_gb,
         "passthrough": passthrough,
         "tokenizer": tokenizer,
@@ -672,12 +671,12 @@ def build_ds4_kquant_package(
     (out_dir / "config.json").write_text(json.dumps(config_json, indent=2))
     (out_dir / "jang_config.json").write_text(json.dumps(jang_config, indent=2))
 
-    # Cold-start expert hotlist: serve seeds residency from it when no
-    # saved-demand hotlist exists. A counts-bearing (GGUF) build imatrix wins;
-    # the legacy .dat build imatrix yields no expert counts, and the vendored
-    # DS4 ranking (hotlist_vector.py) is the fallback. Alignment failures skip
-    # the artifact with a loud warning: a wrong hotlist would silently seed
-    # the wrong layers; no hotlist just means a colder start.
+    # Cold-start expert hotlist: seed package residency from a counts-bearing
+    # (GGUF) build imatrix when available. The legacy .dat build imatrix yields
+    # no expert counts, so the vendored DS4 ranking (hotlist_vector.py) is the
+    # fallback. Alignment failures skip the artifact with a loud warning: a
+    # wrong hotlist would silently seed the wrong layers; no hotlist just means
+    # a colder start.
     from moespresso.package.deepseek_v4.hotlist_vector import (
         load_vendored_expert_hotlist,
     )
@@ -805,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="PATTERN=FORMAT",
         help="Force matched package-plan rows to a format such as "
-        "tq2, tq4, mxfp4, mxfp8, affine4, or kquant:q2_k.",
+        "mxfp4, mxfp8, affine4, or kquant:q2_k.",
     )
     parser.add_argument("--allow-unmatched-force", action="store_true")
     parser.add_argument(

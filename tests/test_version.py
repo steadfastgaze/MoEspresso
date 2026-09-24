@@ -51,8 +51,20 @@ def test_imported_version_matches_project_metadata():
     assert project_metadata["project"]["readme"] == "README.md"
     assert moespresso.__version__ == project_metadata["project"]["version"]
     assert importlib_metadata.version("moespresso") == project_metadata["project"]["version"]
-    assert project_metadata["build-system"]["requires"] == ["hatchling==1.31.0"]
     assert f"MoEspresso {moespresso.__version__} requires" in readme
+
+
+def test_native_build_uses_standard_backend_and_matching_mlx_abi():
+    project_metadata = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    backend = project_metadata["build-system"]
+    assert backend["build-backend"] == "scikit_build_core.build"
+    assert "scikit-build-core==1.0.3" in backend["requires"]
+    assert "nanobind==2.12.0" in backend["requires"]
+    mlx_build = [item for item in backend["requires"] if item.startswith("mlx==")]
+    assert len(mlx_build) == 1
+    assert mlx_build[0] in project_metadata["project"]["dependencies"]
+    assert "native" not in project_metadata["dependency-groups"]
+    assert project_metadata["tool"]["scikit-build"]["editable"]["rebuild"] is False
 
 
 def test_lock_and_artifact_producers_match_release_version():

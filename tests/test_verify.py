@@ -14,8 +14,8 @@ import struct
 import pytest
 
 from moespresso.core.artifact import Validation, compute_artifact_id, make_artifact, write_artifact
-from moespresso.optimize.allocate import AFFINE_BITS, EXPERT_BITS
-from moespresso.optimize.decide import decide
+from package_fixtures import AFFINE_BITS, EXPERT_BITS
+from package_fixtures import synthetic_decision
 from moespresso.package.manifest import build_package_manifest, file_identity, located_key
 from moespresso.package.plan import package_plan_from_decision
 from moespresso.package.sidecars import build_sidecars
@@ -72,7 +72,7 @@ def _decision():
         _expert_unit("model.language_model.layers.0.mlp.experts.gate", 0, "gate"),
     ]
     ev = make_artifact("probe_evidence", SUBJECT, PRODUCER, status="valid", units=units)
-    return decide(ev, target_quality=0.5)
+    return synthetic_decision(ev)
 
 
 def _write_real_shard(tmp_path, decision):
@@ -139,7 +139,6 @@ def test_release_verifier_accepts_historical_producer_version(tmp_path):
 
 
 def test_expected_keys_per_format():
-    assert expected_keys({"key_prefix": "x", "format": "tq"}) == ["x.tq_bundle"]
     assert expected_keys({"key_prefix": "mx", "format": "mxfp4"}) == ["mx.tq_bundle"]
     assert expected_keys({"key_prefix": "dmx", "format": "mxfp4", "kind": "affine"}) == [
         "dmx.weight",
@@ -404,18 +403,11 @@ def test_generated_sidecars_match_manifest_semantics(tmp_path):
     )
 
 
-def test_tq_manifest_seed_is_authoritative_for_sidecars(tmp_path):
-    man, _ = _manifest(tmp_path)
-    _write_sidecars(tmp_path, man, seed=7)
-    issues = verify_generated_sidecars(man, tmp_path)
-    assert any(issue.code == "runtime.sidecar_seed_mismatch" for issue in issues)
-
-
 def test_kquant_sidecars_may_carry_a_consistent_nondefault_seed(tmp_path):
     man, _ = _manifest(tmp_path)
     tensors = []
     for tensor in man["tensors"]:
-        if tensor["format"] == "tq":
+        if tensor["kind"] == "expert":
             tensor = {
                 **tensor,
                 "format": "kquant",

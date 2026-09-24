@@ -335,21 +335,21 @@ wheels = [
 
 [[package]]
 name = "mlx-iqk"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mlx" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/77/7e/eae00a5b059c4de5985507acab5ed720914871ef2674c3e04579fa9ab73f/mlx_iqk-0.1.2.tar.gz", hash = "sha256:97d2a5c59fecbcc60b88a28f00b65e8907fd416b277806be7062e7a8bdf8fa62", size = 145081, upload-time = "2026-08-08T21:46:20.286Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/bc/f2b31355e9d1dab5418d7b9e9434618d1d39d92672e0353b942675b1b0d2/mlx_iqk-0.1.3.tar.gz", hash = "sha256:9f93f47d02720472aeee51e6c2243ceb63ad66ed98e07428512efc005095e956", size = 177831, upload-time = "2026-09-05T22:00:06.902Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/7b/9c8fe25e49571cc9ce58a820a547a91ad7f275ee5c8d9ddc424227de775a/mlx_iqk-0.1.2-py3-none-any.whl", hash = "sha256:97f130dcaabf0e2c913ff6b2186799996739cbfb402d29c2eaa67c64914066b3", size = 78947, upload-time = "2026-08-08T21:46:18.949Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/5c/fa68a7d1ac7737aa92eefe4b2bd83397000d29c0fb177c0c9bbb35686f6f/mlx_iqk-0.1.3-py3-none-any.whl", hash = "sha256:eb2f2dae7b44e99b46643abdc1e5fffeda84b1f4ba61df25a0aebcec400d18cf", size = 95992, upload-time = "2026-09-05T22:00:05.717Z" },
 ]
 
 [[package]]
 name = "mlx-kquant"
 version = "0.3.0"
-source = { git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089#6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089" }
+source = { git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=c4928ba74b6b119c3613e1ec68ef85d2238c636b#c4928ba74b6b119c3613e1ec68ef85d2238c636b" }
 dependencies = [
     { name = "mlx" },
 ]
@@ -384,7 +384,7 @@ wheels = [
 
 [[package]]
 name = "moespresso"
-version = "2.1.2"
+version = "3.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "jang" },
@@ -407,20 +407,17 @@ dev = [
     { name = "ruff" },
     { name = "vulture" },
 ]
-native = [
-    { name = "nanobind" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "jang", specifier = ">=2.5.29" },
-    { name = "mlx", specifier = ">=0.31.2" },
-    { name = "mlx-iqk", specifier = "==0.1.2" },
-    { name = "mlx-kquant", git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089" },
+    { name = "mlx", specifier = "==0.31.2" },
+    { name = "mlx-iqk", specifier = "==0.1.3" },
+    { name = "mlx-kquant", git = "https://github.com/steadfastgaze/mlx-kquant.git?rev=c4928ba74b6b119c3613e1ec68ef85d2238c636b" },
     { name = "mlx-lm", specifier = "==0.31.3" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "psutil", specifier = ">=7.0.0" },
-    { name = "torch", marker = "sys_platform == 'darwin' and extra == 'build'", specifier = ">=2.0.0" },
+    { name = "torch", marker = "sys_platform == 'darwin' and extra == 'build'", specifier = ">=2.5" },
 ]
 provides-extras = ["build"]
 
@@ -430,7 +427,6 @@ dev = [
     { name = "ruff", specifier = ">=0.1.0" },
     { name = "vulture", specifier = ">=2.11" },
 ]
-native = [{ name = "nanobind", specifier = "==2.12.0" }]
 
 [[package]]
 name = "mpmath"
@@ -439,15 +435,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/47/dd32fa426cc72114383ac549964eecb20ecfd886d1e5ccf5340b55b02f57/mpmath-1.3.0.tar.gz", hash = "sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f", size = 508106, upload-time = "2023-03-07T16:47:11.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl", hash = "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c", size = 536198, upload-time = "2023-03-07T16:47:09.197Z" },
-]
-
-[[package]]
-name = "nanobind"
-version = "2.12.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c6/5c/3b69bc3933ad3c3668ba029ad410ba8ecfdc8ee7262ff1009f3304f3c562/nanobind-2.12.0.tar.gz", hash = "sha256:0ae77c1a88f27153fa57045ee00f7b0a7b06b1cd3df942e95a34b38c5d0a5bee", size = 1002704, upload-time = "2026-02-25T09:41:54.691Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/bf/1a54e3573736f3ad15fc599c5dde007937234652a1a7efd62573b4ce3a7e/nanobind-2.12.0-py3-none-any.whl", hash = "sha256:a10d3d88e691dcdf22696f9acd893fda3c5a05635763aea238829d274fcad480", size = 249512, upload-time = "2026-02-25T09:41:52.908Z" },
 ]
 
 [[package]]

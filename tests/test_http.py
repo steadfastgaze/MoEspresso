@@ -18,10 +18,13 @@ import pytest
 
 from moespresso.core.artifact import make_artifact, write_artifact
 from moespresso.runtime.http import (
+    PackageRequestContract,
+    PackageRequestContractError,
     RequestError,
     build_cache_generator,
     chat_completion,
     make_handler,
+    package_request_contract,
     render_prompt,
     request_stream_options,
     run_startup_warmup,
@@ -579,6 +582,129 @@ def test_absent_sampling_parameters_leave_the_generate_call_unchanged():
     }
 
 
+def test_package_generation_defaults_apply_only_when_request_omits_fields():
+    seen = {}
+    contract = PackageRequestContract(
+        family="qwen4_exp",
+        modality="text",
+        generation_defaults={"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    )
+    chat_completion(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        _capture_generate(seen),
+        request_contract=contract,
+    )
+    assert seen["temperature"] == 1.0
+    assert seen["top_p"] == 0.95
+    assert seen["top_k"] == 20
+
+    chat_completion(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "top_k": 7,
+        },
+        _capture_generate(seen),
+        request_contract=contract,
+    )
+    assert seen["temperature"] == 0.0
+    assert seen["top_p"] == 0.8
+    assert seen["top_k"] == 7
+
+
+def test_package_request_contract_reads_only_declared_generation_config(tmp_path):
+    package = tmp_path / "package"
+    package.mkdir()
+    config = package / "generation_config.json"
+    config.write_text(json.dumps({
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "eos_token_id": [248046, 248044],
+    }))
+    manifest = {
+        "architecture": {"family": "qwen4_exp", "modality": "text"},
+        "tokenizer": {"files": [{"path": "generation_config.json"}]},
+    }
+
+    contract = package_request_contract(package, manifest)
+
+    assert contract.family == "qwen4_exp"
+    assert contract.modality == "text"
+    assert contract.generation_defaults == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+    manifest["tokenizer"]["files"] = []
+    assert package_request_contract(package, manifest).generation_defaults == {}
+
+
+def test_non_qwen4_package_ignores_declared_generation_config(tmp_path):
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "generation_config.json").write_text(json.dumps({
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "repetition_penalty": 1.2,
+    }))
+    manifest = {
+        "architecture": {"family": "qwen3_5_moe", "modality": "text"},
+        "tokenizer": {"files": [{"path": "generation_config.json"}]},
+    }
+
+    contract = package_request_contract(package, manifest)
+
+    assert contract.generation_defaults == {}
+
+
+def test_qwen4_text_family_alias_uses_declared_generation_config(tmp_path):
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "generation_config.json").write_text(json.dumps({
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }))
+    manifest = {
+        "architecture": {"family": "qwen4_exp_text", "modality": "text"},
+        "tokenizer": {"files": [{"path": "generation_config.json"}]},
+    }
+
+    contract = package_request_contract(package, manifest)
+
+    assert contract.generation_defaults == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+
+
+@pytest.mark.parametrize("payload,match", [
+    ([], "JSON object"),
+    ({"do_sample": "yes"}, "do_sample"),
+    ({"temperature": -1}, "non-negative"),
+    ({"top_p": 1.1}, "between 0 and 1"),
+    ({"top_k": True}, "non-negative integer"),
+    ({"repetition_penalty": 1.1}, "neutral value"),
+])
+def test_package_request_contract_rejects_invalid_generation_defaults(
+    tmp_path, payload, match
+):
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "generation_config.json").write_text(json.dumps(payload))
+    manifest = {
+        "architecture": {"family": "qwen4_exp", "modality": "text"},
+        "tokenizer": {"files": [{"path": "generation_config.json"}]},
+    }
+    with pytest.raises(PackageRequestContractError, match=match):
+        package_request_contract(package, manifest)
+
+
 def test_neutral_repetition_penalty_is_a_no_op():
     seen = {}
     resp = chat_completion(
@@ -608,6 +734,11 @@ def test_non_neutral_repetition_penalty_is_a_clear_400():
 
 
 @pytest.mark.parametrize("field,value,match", [
+    ("temperature", -0.1, "non-negative"),
+    ("temperature", True, "must be a number"),
+    ("temperature", "warm", "must be a number"),
+    ("top_p", 1.1, "between 0 and 1"),
+    ("top_p", True, "must be a number"),
     ("top_k", -1, "non-negative integer"),
     ("top_k", 2.5, "non-negative integer"),
     ("top_k", True, "non-negative integer"),
@@ -684,8 +815,28 @@ def test_startup_warmup_uses_isolated_deterministic_generation():
     assert seen["max_tokens"] == 4
     assert seen["temperature"] == 0.0
     assert seen["top_p"] == 1.0
-    assert seen["persist_expert_demand"] is False
     assert seen["kv_policy"].live_kv_format == "mlx_affine_q8"
+
+
+def test_qwen4_startup_warmup_uses_package_owned_live_cache_policy():
+    seen = {}
+
+    class Tok:
+        def apply_chat_template(self, messages, **_kwargs):
+            return messages[0]["content"]
+
+    def fake_generate(_model, _tokenizer, _prompt, **kwargs):
+        seen.update(kwargs)
+
+    run_startup_warmup(
+        "MODEL",
+        Tok(),
+        family="qwen4_exp",
+        generate_fn=fake_generate,
+        clock=lambda: 1.0,
+    )
+
+    assert seen["kv_policy"].live_kv_format == "raw"
 
 
 # --- handler over a real loopback socket (still no model) ---
@@ -1287,6 +1438,77 @@ def test_serve_reports_runtime_reduced_context_limit(monkeypatch, capsys):
     assert "WARNING: usability is substantially reduced" in output
 
 
+def test_serve_binds_manifest_request_contract_to_handler(
+    monkeypatch, tmp_path
+):
+    import moespresso.runtime.http as h
+
+    monkeypatch.setenv("MOESPRESSO_DISK_KV", "off")
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "generation_config.json").write_text(json.dumps({
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }))
+    manifest = make_artifact(
+        "package_manifest",
+        {"source_root": "qwen"},
+        {"tool": "test", "version": "0"},
+        status="valid",
+        architecture={"family": "qwen4_exp", "modality": "text"},
+        tokenizer={
+            "files": [{"path": "generation_config.json"}],
+            "rendering_id": "render",
+        },
+        tensors=[],
+        files=[],
+    )
+    seen = {}
+
+    class FakeCacheGenerator:
+        def __call__(self, *_args, **_kwargs):
+            return "generated"
+
+        def cache_stats(self):
+            return {}
+
+        def close(self):
+            pass
+
+    class FakeHTTPServer:
+        def __init__(self, _address, _handler):
+            pass
+
+        def serve_forever(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    def fake_make_handler(*_args, **kwargs):
+        seen["contract"] = kwargs["request_contract"]
+        return type("Handler", (), {})
+
+    monkeypatch.setattr(h, "build_cache_generator", lambda *_a, **_k: FakeCacheGenerator())
+    monkeypatch.setattr(h, "make_handler", fake_make_handler)
+    monkeypatch.setattr(h, "HTTPServer", FakeHTTPServer)
+
+    rc = h.serve(
+        package,
+        startup_warmup=False,
+        load_model_fn=lambda _package: ("MODEL", "TOKENIZER", manifest),
+    )
+
+    assert rc == 0
+    assert seen["contract"] == h.PackageRequestContract(
+        family="qwen4_exp",
+        modality="text",
+        generation_defaults={"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    )
+
+
 def test_serve_warms_before_announcing_readiness(monkeypatch, capsys):
     import moespresso.runtime.http as h
 
@@ -1468,6 +1690,53 @@ def test_resolve_thinking_via_template_sniff():
         "enable_thinking": False}
     assert resolve_thinking_kwargs(Tok(), thinking=True) == {
         "enable_thinking": True}
+
+
+def test_qwen4_thinking_toggle_adds_medium_reasoning_effort():
+    from moespresso.runtime.thinking import (
+        ThinkingToggleUnsupported,
+        resolve_thinking_kwargs,
+    )
+
+    class Tok:
+        chat_template = "{%- if enable_thinking is defined %}...{%- endif %}"
+
+    assert resolve_thinking_kwargs(
+        Tok(), thinking=True, family="qwen4_exp"
+    ) == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    assert resolve_thinking_kwargs(
+        Tok(), thinking=False, family="qwen4_exp_text"
+    ) == {"enable_thinking": False}
+
+    class MissingSwitch:
+        chat_template = "{{ messages }}"
+
+    with pytest.raises(ThinkingToggleUnsupported):
+        resolve_thinking_kwargs(
+            MissingSwitch(), thinking=True, family="qwen4_exp"
+        )
+
+
+def test_qwen4_contract_defaults_omitted_and_explicit_on_to_medium():
+    from moespresso.runtime.http import qwen4_contract_template_kwargs
+
+    class Tok:
+        chat_template = "{%- if enable_thinking is defined %}...{%- endif %}"
+
+    assert qwen4_contract_template_kwargs(Tok()) == {
+        "reasoning_effort": "medium"
+    }
+    assert qwen4_contract_template_kwargs(Tok(), "on") == {
+        "reasoning_effort": "medium",
+        "enable_thinking": True,
+    }
+    assert qwen4_contract_template_kwargs(Tok(), "off") == {
+        "reasoning_effort": "medium",
+        "enable_thinking": False,
+    }
 
 
 def test_resolve_thinking_refuses_loudly_for_unknown_family():

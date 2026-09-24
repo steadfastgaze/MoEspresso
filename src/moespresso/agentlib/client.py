@@ -71,11 +71,13 @@ class CompletionsClient:
     def __init__(self, base_url: str = DEFAULT_BASE_URL, *,
                  timeout: float = DEFAULT_TIMEOUT_SECONDS,
                  model: str | None = None,
-                 stream: bool = True):
+                 stream: bool = True,
+                 include_stream_usage: bool = True):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.model = model
         self.stream = stream
+        self.include_stream_usage = include_stream_usage
 
     def complete(
         self,
@@ -88,11 +90,15 @@ class CompletionsClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         stream: bool | None = None,
         verbatim_tool_calls: bool = False,
         on_start: Callable[[], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         on_content: Callable[[str], None] | None = None,
+        on_chunk: Callable[[dict], None] | None = None,
     ) -> ChatCompletion:
         """Send one completion request and parse the response.
 
@@ -132,12 +138,19 @@ class CompletionsClient:
             body["temperature"] = temperature
         if top_p is not None:
             body["top_p"] = top_p
+        for name, value in (
+            ("top_k", top_k),
+            ("min_p", min_p),
+            ("presence_penalty", presence_penalty),
+        ):
+            if value is not None:
+                body[name] = value
 
         use_stream = self.stream if stream is None else stream
         if not isinstance(use_stream, bool):
             raise ValueError("stream must be a boolean")
         body["stream"] = use_stream
-        if use_stream:
+        if use_stream and self.include_stream_usage:
             body["stream_options"] = {"include_usage": True}
 
         request = self._json_request("/v1/chat/completions", body)
@@ -147,6 +160,7 @@ class CompletionsClient:
                 on_start=on_start,
                 on_reasoning=on_reasoning,
                 on_content=on_content,
+                on_chunk=on_chunk,
             )
         response = self._send(request)
         choices = response.get("choices") or []
@@ -165,9 +179,6 @@ class CompletionsClient:
         return self._get_json("/health")
 
     # --- transport ---
-
-    def _post_json(self, path: str, body: dict) -> dict:
-        return self._send(self._json_request(path, body))
 
     def _json_request(self, path: str, body: dict) -> urllib.request.Request:
         return urllib.request.Request(
@@ -210,6 +221,7 @@ class CompletionsClient:
         on_start: Callable[[], None] | None,
         on_reasoning: Callable[[str], None] | None,
         on_content: Callable[[str], None] | None,
+        on_chunk: Callable[[dict], None] | None = None,
     ) -> ChatCompletion:
         try:
             with self._open(request) as resp:
@@ -223,6 +235,7 @@ class CompletionsClient:
                     resp,
                     on_reasoning=on_reasoning,
                     on_content=on_content,
+                    on_chunk=on_chunk,
                 )
         except SSEError as e:
             raise ClientError(0, str(e)) from e
@@ -235,6 +248,7 @@ class CompletionsClient:
         *,
         on_reasoning: Callable[[str], None] | None,
         on_content: Callable[[str], None] | None,
+        on_chunk: Callable[[dict], None] | None = None,
     ) -> ChatCompletion:
         identity: dict[str, object] = {}
         role = "assistant"
@@ -270,6 +284,8 @@ class CompletionsClient:
                 identity[identity_field] = value
             if isinstance(event.get("usage"), dict):
                 usage = event["usage"]
+            if on_chunk is not None:
+                on_chunk(event)
             choices = event.get("choices")
             if choices is None:
                 continue

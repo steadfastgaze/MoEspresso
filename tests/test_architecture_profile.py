@@ -1,7 +1,7 @@
 """architecture_profile: the model-family correctness contract.
 
 These tests pin the contract a package must satisfy: the qwen3_5_moe profile
-declares text-only scope, vision/mtp exclusions, TQ experts + mixed-affine
+declares text-only scope, vision/mtp exclusions, routed experts + mixed-affine
 non-experts, the fused gate_up split, and (critically) the conv1d/norm-shift
 transform contract whose violation makes the artifact incoherent. The schema
 stays generic; a minimal synthetic profile proves family-neutrality.
@@ -17,6 +17,7 @@ from moespresso.inventory.architecture_profile import (
     profile_for,
     qwen3_5_dense_profile,
     qwen3_5_moe_profile,
+    qwen4_exp_profile,
     synthetic_profile,
 )
 
@@ -42,9 +43,9 @@ def test_qwen_profile_declares_text_only_with_vision_mtp_excluded():
 def test_qwen_profile_declares_expert_and_nonexpert_quant_contract():
     p = qwen3_5_moe_profile()
     roles = p["role_quant"]
-    # routed experts -> TQ; non-expert projections (incl. SSM in_proj) -> affine;
+    # routed experts -> declared codec; non-expert projections (incl. SSM in_proj) -> affine;
     # routing gates -> fp16 passthrough.
-    assert roles["moe.expert"] == "tq"
+    assert roles["moe.expert"] == "routed_expert"
     assert roles["ssm.in_proj_a"] == "affine" and roles["ssm.in_proj_b"] == "affine"
     assert roles["attn.q_proj"] == "affine"
     assert roles["moe.router_gate"] == "fp16"
@@ -109,7 +110,7 @@ def test_deepseek_v4_flash_profile_declares_length_44_compression_contract():
 def test_deepseek_v4_flash_profile_declares_quant_ownership_and_cache_policy():
     p = deepseek_v4_flash_profile()
     roles = p["role_quant"]
-    assert roles["moe.expert"] == "tq"
+    assert roles["moe.expert"] == "routed_expert"
     assert roles["attn.wq_a"] == "affine"
     assert roles["attn.compressor.wkv"] == "affine"
     assert roles["moe.shared_expert.down_proj"] == "affine"
@@ -190,3 +191,37 @@ def test_family_resolution_distinguishes_dense_qwen35_from_moe_and_qwen3():
 
     plain_qwen3 = {"model_type": "qwen3", "num_hidden_layers": 4}
     assert family_of(plain_qwen3) is None
+
+
+def test_qwen4_exp_profile_registers_both_released_model_type_tokens() -> None:
+    wrapped = {
+        "model_type": "qwen4_exp",
+        "text_config": {"model_type": "qwen4_exp_text", "num_experts": 512},
+    }
+    text_only = {"model_type": "qwen4_exp_text", "num_experts": 512}
+
+    assert family_of(wrapped) == "qwen4_exp"
+    assert family_of(text_only) == "qwen4_exp"
+    assert profile_for(wrapped)["family"] == "qwen4_exp"
+
+
+def test_qwen4_exp_profile_pins_partition_without_qwen35_quant_guessing() -> None:
+    profile = qwen4_exp_profile()
+
+    assert validate_base(profile) == []
+    assert profile["source_partition"] == {
+        "text_graph_tensors": 1163,
+        "ple_provider_tensors": 131,
+        "excluded_vision_tensors": 333,
+        "excluded_mtp_tensors": 31,
+    }
+    assert len(profile["layer_kinds"]) == 48
+    assert profile["layer_kinds"][3::4] == ["qwen_sparse_attention"] * 12
+    assert set(profile["layer_kinds"][0::4]) == {"linear_attention"}
+    assert profile["router"]["experts_per_layer"] == 512
+    assert profile["router"]["experts_per_token"] == 10
+    assert profile["ple"]["physical_table_shards"] == 128
+    assert profile["role_quant"] == {}
+    assert profile["quantization"]["status"] == "unassigned"
+    assert "rmsnorm_shift" not in {item["name"] for item in profile["transforms"]}
+    assert "required_rungs" not in profile

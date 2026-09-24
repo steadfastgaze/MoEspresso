@@ -251,6 +251,7 @@ class RoadtestRun:
         self._keys_since_restart: list[int] = []
         self._maintenance_restarts = 0
         self._align_restarts = 0
+        self._prefill_only_cache = False
 
     # --- run record ---
 
@@ -430,7 +431,7 @@ class RoadtestRun:
         for finding in check.findings:
             self._finding(finding)
         self._keys_since_restart.append(
-            check.full_tokens + check.completion_tokens)
+            self.ledgers[session].memory_key_tokens)
         self.health.on_request(check)
         try:
             self.last_health = self.client.health()
@@ -699,7 +700,8 @@ class RoadtestRun:
         self.ledgers["sub"] = SessionLedger(
             "sub", stride=self.health.stride,
             disk_enabled=self.health.disk_enabled,
-            write_depth_tokens=self.health.write_depth_tokens)
+            write_depth_tokens=self.health.write_depth_tokens,
+            prefill_only=self._prefill_only_cache)
         self._last_sent["sub"] = None
         runner = SubagentRunner(
             parent,
@@ -781,6 +783,7 @@ class RoadtestRun:
 
         self.controller.start()
         payload = self.controller.wait_healthy()
+        self._configure_cache_accounting(payload)
         for finding in self.health.verify(
                 "startup/health", payload, expected_entries=0):
             self._finding(finding)
@@ -799,6 +802,12 @@ class RoadtestRun:
             self.controller.stop()
             self._write_summary()
         return 1 if self.findings else 0
+
+    def _configure_cache_accounting(self, health: dict) -> None:
+        cache_format = (health.get("prompt_cache") or {}).get("default_live_kv_format")
+        self._prefill_only_cache = cache_format == "qwen_kvarn_k4v4"
+        for ledger in self.ledgers.values():
+            ledger.prefill_only = self._prefill_only_cache
 
     def _drive_phases(self) -> None:
         """Phase order.
@@ -909,9 +918,11 @@ class RoadtestRun:
         }
         baseline = self.controller.wait_healthy()
         self.health.attach_baseline(baseline)
+        self._configure_cache_accounting(baseline)
         self.ledgers = {
             name: SessionLedger(name, stride=self.health.stride,
                                 disk_enabled=self.health.disk_enabled,
+                                prefill_only=self._prefill_only_cache,
                                 write_depth_tokens=(
                                     self.health.write_depth_tokens))
             for name in ("a", "b")
@@ -965,14 +976,15 @@ class RoadtestRun:
         self.log(json.dumps(summary, indent=2))
 
 
-def _package_run_settings(package_dir: Path) -> tuple[LoopSettings | None, int | None]:
+def _package_run_settings(
+    package_dir: Path, *, dialect: str | None = None, no_thinking: bool = False,
+) -> tuple[LoopSettings | None, int | None]:
     """Loop settings and default served context limit for a package.
 
-    The loop settings resolve from the package's agentic profile alone
-    (no user config layer: a certification run must not absorb host
-    configuration), and resolution fails loudly on a malformed profile or
-    an unknown dialect. A package without a profile contributes nothing
-    and the run keeps the template-native request shape.
+    The loop settings resolve from the package's agentic profile and explicit
+    run options, never the user config layer. An unknown dialect or malformed
+    profile refuses the run. With neither a profile nor explicit options, the
+    existing DSML request mode is retained.
     """
     # Imported here: the manifest reader lives with the runtime cache code
     # and is only needed when a real package is on the command line.
@@ -980,9 +992,14 @@ def _package_run_settings(package_dir: Path) -> tuple[LoopSettings | None, int |
 
     loop = None
     profile = load_agentic_profile(package_dir)
-    if profile is not None:
+    if profile is not None or dialect is not None or no_thinking:
+        overrides = {}
+        if dialect is not None:
+            overrides["dialect"] = dialect
+        if no_thinking:
+            overrides["thinking_for_tools"] = False
         loop = resolve_loop_settings(
-            package_profile=profile, use_user_config=False)
+            package_profile=profile, use_user_config=False, **overrides)
         loop.dialect_adapter()  # fail fast on an unknown dialect
     context_limit = None
     manifest_path = package_dir / "package_manifest.json"
@@ -1020,8 +1037,8 @@ def _write_depth_arg(value: str) -> int | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="moespresso-roadtest",
-        description="Run the cumulative-session engine road-test against a "
-                    "really served package (opt-in, GPU-bound).")
+        description="Run the multi-hour cumulative certification soak against "
+                    "a served package (opt-in, GPU-bound).")
     parser.add_argument(
         "--package", default=os.environ.get("MOESPRESSO_ROADTEST_PACKAGE"),
         help="Packaged model directory to serve (env "
@@ -1045,7 +1062,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Deepest disk checkpoint frontier, or 'unlimited' "
              f"(default: {DEFAULT_DISK_KV_WRITE_DEPTH}).",
     )
-    parser.add_argument("--target-tokens", type=int, default=110_000)
+    parser.add_argument(
+        "--target-tokens", type=int, default=110_000,
+        help="Stop the optional extension phase after the main session reaches "
+             "this context size. The fixed protocol always runs first and can "
+             "exceed 50k tokens; this is not a total-context or runtime bound "
+             "(default: 110000).")
     parser.add_argument("--memory-budget-tokens", type=int, default=120_000,
                         help="Live-cache budget in token-equivalents; the "
                              "driver restarts the server before a turn that "
@@ -1081,7 +1103,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Ignore the package's agentic profile and drive "
                              "the template-native request shape (request "
                              "tools, strict DSML parsing, no repair).")
+    parser.add_argument("--dialect", choices=("native", "envelope", "dsml"),
+                        help="Explicit tool dialect for the run, overriding the package profile.")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Request the template's non-thinking mode for the run.")
     args = parser.parse_args(argv)
+    if args.no_profile and (args.dialect is not None or args.no_thinking):
+        parser.error("--no-profile cannot be combined with loop overrides")
 
     if args.run_root:
         run_root = Path(args.run_root)
@@ -1094,7 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
     loop = None
     context_limit = None
     if args.package and not args.no_profile:
-        loop, context_limit = _package_run_settings(Path(args.package))
+        loop, context_limit = _package_run_settings(
+            Path(args.package), dialect=args.dialect, no_thinking=args.no_thinking)
         if loop is not None:
             print(f"[roadtest] agentic profile resolved: dialect="
                   f"{loop.dialect} repair={loop.repair} "

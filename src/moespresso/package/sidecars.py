@@ -1,36 +1,13 @@
-"""Generate jang-compatible sidecars (config.json, jang_config.json) from a manifest.
+"""Generate config.json and jang_config.json views from a package manifest.
 
-mjtq reuses jang's proven loader (load_jangtq_model + tensor_map override) to serve.
-That loader reads `config.json` (mlx_lm config + a per-module `quantization` block so
-affine non-experts build as QuantizedLinear) and `jang_config.json` (seed, per-role
-bits, per-layer routed-expert bit plan, and a per-tensor `tensor_map`). These are not
-source archaeology: they are a compatibility view generated from the package_manifest
-(the manifest stays the source of truth). Schema matched to a proven working bundle
-(Qwen3.6-35B-JANGTQ-pertensor-q95).
-
-A pure function of the manifest. No mlx, no weight bytes, no numpy compute, just
-JSON shaping. The package builders handle the file writes.
+Dense affine/MX allocations populate quantization settings and the tensor map.
+Routed projections are installed separately from their declared bundle codecs.
+Sidecar construction is pure metadata shaping; builders write the files.
 """
 
 from __future__ import annotations
 
 from moespresso.inventory.deepseek_v4.roles import module_path as deepseek_v4_module_path
-
-# Internal role -> jang's mxtq_bits role bucket. Used only to summarize per-role
-# bits in jang_config (informational for the loader's banner); the authoritative
-# per-tensor precision is the tensor_map / config.quantization entries.
-_ROLE_BUCKET = {
-    "attn.q_proj": "attention", "attn.k_proj": "attention",
-    "attn.v_proj": "attention", "attn.o_proj": "attention",
-    "ssm.in_proj_qkv": "linear_attention", "ssm.in_proj_z": "linear_attention",
-    "ssm.in_proj_a": "linear_attention", "ssm.in_proj_b": "linear_attention",
-    "ssm.out_proj": "linear_attention",
-    "moe.shared_expert.gate_proj": "shared_expert",
-    "moe.shared_expert.up_proj": "shared_expert",
-    "moe.shared_expert.down_proj": "shared_expert",
-    "embed_tokens": "embed_tokens", "lm_head": "lm_head",
-}
-
 
 def _module_path(source_name: str) -> str:
     """mjtq source name -> the model's sanitized module path (drop .weight)."""
@@ -127,12 +104,10 @@ def _build_dense_affine_sidecars(manifest: dict) -> tuple[dict, dict]:
 
 
 def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
-    """(config.json dict, jang_config.json dict) from the package_manifest.
+    """Return config.json and jang_config.json dictionaries for a manifest.
 
-    Affine tensors -> per-module {bits, group_size} in config.quantization and
-    jang tensor_map. TQ experts -> routed_expert_bit_plan.routed_layer_bits and a
-    tensor_map entry per group. fp16 passthrough (router/norms/ssm) is unquantized,
-    so it gets no quantization entry (the loader keeps it fp16).
+    Dense affine/MX tensors supply per-module quantization parameters.
+    Passthrough tensors have no quantization entry.
     """
     arch = manifest["architecture"]
     if arch.get("family") == "qwen3_5_dense":
@@ -143,15 +118,14 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
 
     # Affine/MX per-tensor allocation: module path -> {bits, group_size}. This is
     # the only thing tensor_map / config.quantization carry: JANG consumes it to
-    # pin affine QuantizedLinear precision. TQ experts and dense K-quant modules
+    # pin affine QuantizedLinear precision. Routed experts and dense K-quant modules
     # are installed by their own manifest-driven paths, so they must not leak into
     # this map and be mutated as affine quantized linears.
     affine_alloc: dict[str, dict] = {}    # sanitized module path -> quantized-linear config
-    routed_layer_bits: dict[str, dict] = {}  # str(layer) -> {gate,up,down: bits}
 
     for t in tensors:
         fmt = t["format"]
-        if fmt in {"affine", "mxfp4", "mxfp8"}:
+        if fmt in {"affine", "mxfp4", "mxfp8"} and t.get("kind") != "expert":
             path = (
                 _deepseek_v4_module_path(t["source_name"])
                 if arch["family"] == "deepseek_v4_flash"
@@ -162,10 +136,6 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
             if fmt != "affine":
                 alloc["mode"] = fmt
             affine_alloc[path] = alloc
-        elif fmt == "tq":
-            layer = str(t.get("layer_index"))
-            proj = t.get("projection")  # gate / up / down
-            routed_layer_bits.setdefault(layer, {})[proj] = int(t["format_params"]["bits"])
         # fp16 passthrough: not quantized -> no entry.
 
     # Defaults = the mode (most common) of the affine allocation, like convert_moe.
@@ -175,9 +145,6 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
     default_bits = max(set(all_bits), key=all_bits.count) if all_bits else 4
     default_gs = max(set(all_gs), key=all_gs.count) if all_gs else 128
     default_mode = max(set(all_modes), key=all_modes.count) if all_modes else "affine"
-    expert_bits = [b for lb in routed_layer_bits.values() for b in lb.values()]
-    default_expert_bits = (max(set(expert_bits), key=expert_bits.count)
-                           if expert_bits else 2)
 
     # config.quantization: top-level default + only the modules that differ from it
     # (mlx_lm's class_predicate applies these per-module overrides).
@@ -205,7 +172,7 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
             "tie_word_embeddings": text_config.get("tie_word_embeddings", False),
             "weight_format": "mxtq",
             "mxtq_seed": seed,
-            "mxtq_bits": default_expert_bits,
+            "mxtq_bits": 2,
             "quantization": config_quant,
         }
     else:
@@ -217,10 +184,8 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
             "language_model_only": True,
             "weight_format": "mxtq",
             "mxtq_seed": seed,
-            # config.json mxtq_bits is a single int (convert_moe shape). Not authoritative
-            # for compute: the loader reads per-tensor bits from on-disk tq_bits +
-            # tensor_map; this field is only a banner. Kept as the default expert bits.
-            "mxtq_bits": default_expert_bits,
+            # Sidecar schema summary; tensor precision comes from the manifest.
+            "mxtq_bits": 2,
             "quantization": config_quant,
         }
     jang_config = {
@@ -228,15 +193,12 @@ def build_sidecars(manifest: dict, *, seed: int = 42) -> tuple[dict, dict]:
         "weight_format": "mxtq",
         "profile": "MOESPRESSO_MOE",
         "mxtq_seed": seed,
-        # Per-role summary, verified to be the loader banner only: jang's _hydrate
-        # never reads it (bits come from on-disk tq_bits); the affine pin reads
-        # tensor_map. Use zero as an explicitly non-authoritative sentinel because
-        # the real per-tensor bits live in on-disk tq_bits.
+        # Sidecar schema summaries do not override per-tensor formats.
         "mxtq_bits": {
             "attention": 0, "linear_attention": 0, "shared_expert": 0,
             "embed_tokens": 0, "lm_head": 0, "routed_expert": 0,
         },
-        "routed_expert_bit_plan": {"routed_layer_bits": routed_layer_bits},
+        "routed_expert_bit_plan": {"routed_layer_bits": {}},
         "quantization": {
             "method": "affine+mxtq",
             "mode_default": default_mode,

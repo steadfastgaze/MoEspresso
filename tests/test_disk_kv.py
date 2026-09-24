@@ -112,23 +112,14 @@ def test_scope_carries_the_serve_six_tuple_and_class_list():
     assert scope["schema_version"]
 
 
-def test_scope_keys_the_banded_prefill_offset_rail(monkeypatch):
-    # The engaged route serves different attention values on chunks past
-    # the first, so its checkpoints key a separate bucket. The route is
-    # default-on, so the default scope carries the field; the kill switch
-    # keeps the recorded disabled-route scope bytes (no field, same hash),
-    # so checkpoints written under the kill switch restore there and a
-    # mixed-rail restore is impossible in either direction.
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "0")
-    base = _scope()
-    assert "dsv4_banded_prefill_offset" not in base
-
-    monkeypatch.delenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", raising=False)
+def test_scope_keeps_promoted_banded_offset_identity_distinct_from_legacy():
     engaged = _scope()
     assert engaged["dsv4_banded_prefill_offset"] is True
-    assert scope_hash(engaged) != scope_hash(base)
-
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
+    # Older composed-offset checkpoints lack this field. They cannot restore
+    # into the promoted numerical path even though its switch no longer exists.
+    legacy = dict(engaged)
+    del legacy["dsv4_banded_prefill_offset"]
+    assert scope_hash(engaged) != scope_hash(legacy)
     assert scope_hash(_scope()) == scope_hash(engaged)
 
 

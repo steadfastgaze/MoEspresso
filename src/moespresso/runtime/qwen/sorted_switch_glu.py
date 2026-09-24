@@ -28,30 +28,15 @@ intermediate rounding to the row dtype, so it is math-affecting rather than
 bit-identical. The campaign quality ladder judges this route; primitive-level
 token identity is not required.
 
-Kill switch: `MOESPRESSO_QWEN_MOE_SORTED=0` restores the stock unsorted SwitchGLU
-seam for the whole process. Default on. Eligibility fails closed to the stock
-gather on any contract mismatch (non-K-quant projections, mismatched gate/up
-codec or geometry, a kernel-less mlx_kquant).
+Eligibility fails closed to the stock gather on any contract mismatch
+(non-K-quant projections, mismatched gate/up codec or geometry, a kernel-less
+mlx_kquant).
 """
 
 from __future__ import annotations
 
-import os
-
 import mlx.core as mx
 import mlx.nn as nn
-
-# Sorted routed MoE kill switch (family style). Default on; set to 0 to restore
-# the stock unsorted SwitchGLU gather for the whole process.
-_QWEN_MOE_SORTED = os.environ.get("MOESPRESSO_QWEN_MOE_SORTED", "1") != "0"
-
-# Fused gate/up + SwiGLU: when mlx_kquant ships gather_qmm_sorted_swiglu, the
-# combined gate/up GEMM and the elementwise activation collapse into one kernel.
-# The fused epilogue skips the intermediate store in the row dtype, giving
-# numerical equivalence to the unfused sorted pair without bit identity. Default on;
-# MOESPRESSO_QWEN_MOE_SORTED_SWIGLU=0 keeps the unfused gather_qmm_sorted plus the
-# activation module.
-_QWEN_MOE_SORTED_SWIGLU = os.environ.get("MOESPRESSO_QWEN_MOE_SORTED_SWIGLU", "1") != "0"
 
 # Sorted-prefill row threshold. Below this many routed token-expert pairs the
 # per-pair gather kernel wins (decode and short prefills), so the route stays on
@@ -61,11 +46,6 @@ _SORTED_PREFILL_MIN_ROWS = 4096
 
 class SortedKQuantSwitchGLUError(RuntimeError):
     pass
-
-
-def sorted_moe_enabled() -> bool:
-    """Whether the sorted routed MoE route is enabled for this process."""
-    return _QWEN_MOE_SORTED
 
 
 class SortedKQuantSwitchGLU(nn.Module):
@@ -118,8 +98,6 @@ class SortedKQuantSwitchGLU(nn.Module):
         return ready
 
     def _sorted_eligible(self) -> bool:
-        if not _QWEN_MOE_SORTED:
-            return False
         try:
             import mlx_kquant as kq
         except ImportError:
@@ -135,8 +113,6 @@ class SortedKQuantSwitchGLU(nn.Module):
         return True
 
     def _fused_swiglu_available(self) -> bool:
-        if not _QWEN_MOE_SORTED_SWIGLU:
-            return False
         import mlx_kquant as kq
 
         return getattr(kq, "gather_qmm_sorted_swiglu", None) is not None
@@ -336,10 +312,8 @@ def install_sorted_kquant_switchglus(model) -> int:
     and replaces `switch_mlp` with a `SortedKQuantSwitchGLU`. A layer whose
     gate/up projections are not combinable K-quant stacks is left on its stock
     seam (fail-closed): the sorted route only claims layers it can serve. Returns
-    the number of layers swapped. A no-op when the kill switch is off.
+    the number of layers swapped.
     """
-    if not _QWEN_MOE_SORTED:
-        return 0
     installed = 0
     for mlp, sw in _iter_switch_mlps(model):
         gate = getattr(sw, "gate_proj", None)

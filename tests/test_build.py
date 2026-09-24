@@ -1,9 +1,4 @@
-"""Manifest-driven build helpers (pure parts, no mlx/jang needed).
-
-The jang loader prints a verbose multi-line banner to stdout (Loading JANGTQ, bits_map
-sentinel, Replaced N modules, [warmup]...). build_model wraps the call so that noise is
-dropped on a successful load but re-emitted on failure, so a broken load stays readable.
-"""
+"""Manifest-selected loaders, packed-weight installation and warning filters."""
 
 from __future__ import annotations
 
@@ -25,10 +20,11 @@ from moespresso.package.bundle import (
 from moespresso.runtime.expert_index import build_expert_index
 from moespresso.runtime.build import (
     _DropDeepSeekV4RopeWarning,
+    _DropQwen4ConfigTypeWarning,
+    _silence_known_transformers_warnings,
     UnsupportedRuntimeAdapter,
     _decoder_layers,
     _install_routed_experts_from_bundles,
-    _load_jangtq_quietly,
     _load_qwen_kquant_model,
     _runtime_adapter_kind,
     _wrap_mixed_bit_switchglus,
@@ -46,32 +42,32 @@ def test_deepseek_v4_rope_warning_filter_is_exact():
     assert warning_filter.filter(visible)
 
 
-def test_load_jangtq_quietly_drops_banner_on_success(capsys):
-    def fake_load(package_dir):
-        print("Loading JANGTQ: pkg")
-        print("  seed=42, bits_map={'lm_head': 0}")
-        print("  Replaced 6 modules")
-        return ("MODEL", "TOK")
+def test_qwen4_config_type_warning_filter_is_exact():
+    warning_filter = _DropQwen4ConfigTypeWarning()
+    hidden = logging.makeLogRecord({
+        "msg": "You are using a model of type `qwen4_exp` to instantiate a model "
+        "of type ``. This may be expected if you are loading a checkpoint that shares "
+        "a subset of the architecture (e.g., loading a `sam2_video` checkpoint into "
+        "`Sam2Model`), but is otherwise not supported and can yield errors. Please "
+        "verify that the checkpoint is compatible with the model you are instantiating.",
+    })
+    visible = logging.makeLogRecord({
+        "msg": "You are using a model of type `qwen4_exp_text` to instantiate a model "
+        "of type ``. This is not supported for all configurations of models and can yield errors.",
+    })
 
-    result = _load_jangtq_quietly(fake_load, "pkg-dir")
-
-    assert result == ("MODEL", "TOK")
-    assert capsys.readouterr().out == "", "jang's banner must be dropped on success"
+    assert not warning_filter.filter(hidden)
+    assert warning_filter.filter(visible)
 
 
-def test_load_jangtq_quietly_reemits_captured_output_on_failure(capsys):
-    def fake_load(package_dir):
-        print("Loading JANGTQ: pkg")
-        print("  Replaced 3 modules")
-        raise RuntimeError("kernel compile failed")
-
-    import pytest
-    with pytest.raises(RuntimeError, match="kernel compile failed"):
-        _load_jangtq_quietly(fake_load, "pkg-dir")
-
-    out = capsys.readouterr().out
-    assert "Loading JANGTQ: pkg" in out, "captured progress must be surfaced on failure"
-    assert "Replaced 3 modules" in out
+def test_qwen4_config_type_warning_filter_is_registered_on_its_source_logger():
+    logger = logging.getLogger("transformers.configuration_utils")
+    original = list(logger.filters)
+    try:
+        _silence_known_transformers_warnings()
+        assert sum(isinstance(item, _DropQwen4ConfigTypeWarning) for item in logger.filters) == 1
+    finally:
+        logger.filters[:] = original
 
 
 def test_decoder_layers_finds_qwen_style_path():
@@ -131,19 +127,6 @@ def test_runtime_adapter_accepts_dense_f32_passthrough():
     assert _runtime_adapter_kind(man) == "regular_jang_v2"
 
 
-def test_runtime_adapter_keeps_jangtq_for_tq_packages():
-    man = _manifest("qwen3_5_moe", ["affine_dequant", "tq_dequant", "fp16_passthrough"])
-    assert _runtime_adapter_kind(man) == "jangtq_moe"
-
-
-def test_runtime_adapter_keeps_jangtq_for_tq_kquant_hybrid_packages():
-    man = _manifest(
-        "qwen3_5_moe",
-        ["tq_dequant", "kquant_dequant", "f32_passthrough"],
-    )
-    assert _runtime_adapter_kind(man) == "jangtq_moe"
-
-
 def test_runtime_adapter_selects_qwen_kquant_for_gguf_recipe_packages():
     man = _manifest("qwen3_5_moe", ["kquant_dequant", "f32_passthrough"])
     assert _runtime_adapter_kind(man) == "qwen_kquant_moe"
@@ -152,9 +135,26 @@ def test_runtime_adapter_selects_qwen_kquant_for_gguf_recipe_packages():
 def test_runtime_adapter_selects_dsv4_for_deepseek_manifest():
     man = _manifest(
         "deepseek_v4_flash",
-        ["affine_dequant", "tq_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
+        ["affine_dequant", "iqk_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
     )
     assert _runtime_adapter_kind(man) == "mjtq_dsv4"
+
+
+def test_runtime_adapter_selects_qwen4_composite_runtime():
+    man = _manifest(
+        "qwen4_exp",
+        ["iqk_dequant", "kquant_dequant", "raw_dtype_passthrough"],
+    )
+    assert _runtime_adapter_kind(man) == "qwen4_iqk_moe"
+
+
+def test_runtime_adapter_rejects_unknown_qwen4_ops():
+    man = _manifest(
+        "qwen4_exp",
+        ["iqk_dequant", "kquant_dequant", "future_dequant"],
+    )
+    with pytest.raises(UnsupportedRuntimeAdapter, match="Qwen4 runtime ops"):
+        _runtime_adapter_kind(man)
 
 
 def test_runtime_adapter_never_sweeps_deepseek_unknown_ops_into_qwen_moe():
@@ -162,7 +162,7 @@ def test_runtime_adapter_never_sweeps_deepseek_unknown_ops_into_qwen_moe():
         "deepseek_v4_flash",
         [
             "affine_dequant",
-            "tq_dequant",
+            "iqk_dequant",
             "fp16_passthrough",
             "raw_dtype_passthrough",
             "deepseek_v4_composite_cache",
@@ -177,7 +177,7 @@ def test_runtime_adapter_accepts_deepseek_mxfp4():
         "deepseek_v4_flash",
         [
             "affine_dequant",
-            "tq_dequant",
+            "iqk_dequant",
             "mxfp4_dequant",
             "fp16_passthrough",
             "raw_dtype_passthrough",
@@ -224,7 +224,7 @@ def test_runtime_adapter_accepts_deepseek_f32_passthrough():
 
 
 def test_runtime_adapter_fails_closed_for_unknown_dense_ops():
-    man = _manifest("qwen3_5_dense", ["affine_dequant", "tq_dequant"])
+    man = _manifest("qwen3_5_dense", ["affine_dequant", "iqk_dequant"])
     with pytest.raises(UnsupportedRuntimeAdapter, match="unsupported runtime adapter"):
         _runtime_adapter_kind(man)
 
@@ -238,7 +238,7 @@ def test_runtime_adapter_fails_closed_for_unknown_family_affine_only():
 def test_runtime_adapter_fails_closed_for_unknown_tq_companion_op():
     man = _manifest(
         "qwen3_5_moe",
-        ["affine_dequant", "tq_dequant", "future_dequant"],
+        ["affine_dequant", "iqk_dequant", "future_dequant"],
     )
     with pytest.raises(UnsupportedRuntimeAdapter, match="unsupported runtime adapter"):
         _runtime_adapter_kind(man)
@@ -251,29 +251,9 @@ def test_build_model_uses_regular_jang_loader_for_dense_affine(tmp_path):
         calls.append(("regular", package_dir))
         return ("DENSE", "TOK")
 
-    def fake_jangtq(_package_dir):
-        raise AssertionError("dense must not use the JANGTQ loader")
-
     man = _manifest("qwen3_5_dense", ["affine_dequant", "fp16_passthrough"])
-    assert build_model(man, tmp_path, load_jang_fn=fake_regular,
-                       load_jangtq_fn=fake_jangtq) == ("DENSE", "TOK")
+    assert build_model(man, tmp_path, load_jang_fn=fake_regular) == ("DENSE", "TOK")
     assert calls == [("regular", tmp_path)]
-
-
-def test_build_model_uses_jangtq_loader_for_moe(tmp_path):
-    calls = []
-
-    def fake_jangtq(package_dir):
-        calls.append(("jangtq", package_dir))
-        return ("MOE", "TOK")
-
-    def fake_regular(_package_dir):
-        raise AssertionError("MoE must not use the regular JANG loader")
-
-    man = _manifest("qwen3_5_moe", ["affine_dequant", "tq_dequant", "fp16_passthrough"])
-    assert build_model(man, tmp_path, load_jang_fn=fake_regular,
-                       load_jangtq_fn=fake_jangtq) == ("MOE", "TOK")
-    assert calls == [("jangtq", tmp_path)]
 
 
 def test_build_model_uses_qwen_kquant_loader_for_kquant_moe(tmp_path):
@@ -287,14 +267,10 @@ def test_build_model_uses_qwen_kquant_loader_for_kquant_moe(tmp_path):
         calls.append((manifest["architecture"]["family"], package_dir))
         return fake_model, "TOK"
 
-    def fake_jangtq(_package_dir):
-        raise AssertionError("Qwen K-quant packages need the K-quant loader")
-
     man = _manifest("qwen3_5_moe", ["kquant_dequant", "f32_passthrough"])
     built_model, built_tok = build_model(
         man,
         tmp_path,
-        load_jangtq_fn=fake_jangtq,
         load_qwen_kquant_fn=fake_qwen_kquant,
     )
     assert built_model is fake_model
@@ -335,8 +311,8 @@ def test_qwen_kquant_loader_swaps_modules_before_loading_weights(tmp_path):
     def fake_load_non_routed(model_arg, package_dir):
         events.append(("load_non_routed", model_arg is model, package_dir))
 
-    def fake_load_tokenizer(package_dir):
-        events.append(("load_tokenizer", package_dir))
+    def fake_load_tokenizer(package_dir, *, eos_token_ids):
+        events.append(("load_tokenizer", package_dir, eos_token_ids))
         return "TOK"
 
     assert _load_qwen_kquant_model(
@@ -354,8 +330,38 @@ def test_qwen_kquant_loader_swaps_modules_before_loading_weights(tmp_path):
         ("load_model", tmp_path, True, False, None, None),
         ("install_kquant", True, True),
         ("load_non_routed", True, tmp_path),
-        ("load_tokenizer", tmp_path),
+        ("load_tokenizer", tmp_path, None),
     ]
+
+
+def test_qwen_kquant_loader_retains_all_declared_stop_ids(tmp_path):
+    model = SimpleNamespace()
+    seen = {}
+
+    def fake_load_tokenizer(package_dir, *, eos_token_ids):
+        seen["package_dir"] = package_dir
+        seen["eos_token_ids"] = eos_token_ids
+        return "TOK"
+
+    built_model, tokenizer = _load_qwen_kquant_model(
+        _manifest("qwen3_5_moe", ["kquant_dequant", "f32_passthrough"]),
+        tmp_path,
+        load_config_fn=lambda _path: {
+            "model_type": "qwen3_5_moe",
+            "text_config": {"eos_token_id": 17},
+            "eos_token_id": [23],
+        },
+        load_model_fn=lambda _path, **kwargs: (model, kwargs["model_config"]),
+        load_tokenizer_fn=fake_load_tokenizer,
+        install_kquant_modules_fn=lambda _model, _manifest: None,
+        load_non_routed_fn=lambda _model, _path: None,
+    )
+
+    assert built_model is model
+    assert tokenizer == "TOK"
+    assert seen["package_dir"] == tmp_path
+    assert seen["eos_token_ids"] == {17, 23}
+    assert 29 not in seen["eos_token_ids"]
 
 
 def test_build_model_uses_dsv4_loader_for_deepseek_manifest(tmp_path):
@@ -367,7 +373,7 @@ def test_build_model_uses_dsv4_loader_for_deepseek_manifest(tmp_path):
 
     man = _manifest(
         "deepseek_v4_flash",
-        ["affine_dequant", "tq_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
+        ["affine_dequant", "iqk_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
     )
     assert build_model(man, tmp_path, load_dsv4_fn=fake_dsv4) == ("DS4", "TOK")
     assert calls == [(
@@ -375,6 +381,55 @@ def test_build_model_uses_dsv4_loader_for_deepseek_manifest(tmp_path):
         tmp_path,
         {},
     )]
+
+
+def test_build_model_uses_qwen4_loader_with_served_context(tmp_path):
+    calls = []
+
+    def fake_qwen4(manifest, package_dir, **kwargs):
+        calls.append((manifest["architecture"]["family"], package_dir, kwargs))
+        return "QWEN4", "TOK"
+
+    man = _manifest(
+        "qwen4_exp",
+        ["iqk_dequant", "kquant_dequant", "raw_dtype_passthrough"],
+    )
+    assert build_model(
+        man,
+        tmp_path,
+        load_qwen4_fn=fake_qwen4,
+        context_limit=65536,
+        context_limit_explicit=True,
+    ) == ("QWEN4", "TOK")
+    assert calls == [(
+        "qwen4_exp",
+        tmp_path,
+        {"max_context_tokens": 65536, "cache_routing": "auto"},
+    )]
+    build_model(
+        man, tmp_path, load_qwen4_fn=fake_qwen4, cache_routing="prefer-resident",
+        cache_routing_factor=3, cache_routing_protected_routes=0,
+    )
+    assert calls[-1][2] == {
+        "cache_routing": "prefer-resident", "cache_routing_factor": 3,
+        "cache_routing_protected_routes": 0,
+    }
+
+
+@pytest.mark.parametrize("options", [
+    {"cache_routing_factor": 2},
+    {"cache_routing": "prefer-resident", "cache_routing_factor": 4},
+    {"cache_routing": "prefer-resident", "cache_routing_protected_routes": 0},
+])
+def test_other_adapters_reject_routing_controls_before_loading(tmp_path, options):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unsupported routing options reached the loader")
+
+    manifest = _manifest(
+        "deepseek_v4_flash", ["affine_dequant", "iqk_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
+    )
+    with pytest.raises((ValueError, UnsupportedRuntimeAdapter), match="routing"):
+        build_model(manifest, tmp_path, load_dsv4_fn=forbidden, **options)
 
 
 def test_build_model_uses_default_dsv4_loader_for_deepseek(tmp_path, monkeypatch):
@@ -390,7 +445,7 @@ def test_build_model_uses_default_dsv4_loader_for_deepseek(tmp_path, monkeypatch
 
     man = _manifest(
         "deepseek_v4_flash",
-        ["affine_dequant", "tq_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
+        ["affine_dequant", "iqk_dequant", "fp16_passthrough", "raw_dtype_passthrough"],
     )
     assert build_model(
         man,
@@ -480,7 +535,7 @@ def test_install_routed_experts_from_bundles_installs_resident_kquant_modules(
     model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
     index = build_expert_index(pkg)
 
-    assert _install_routed_experts_from_bundles(model, pkg, index, seed=42) == 1
+    assert _install_routed_experts_from_bundles(model, pkg, index) == 1
 
     gate = switch.gate_proj
     assert isinstance(gate, FakeKQuantSwitchLinear)

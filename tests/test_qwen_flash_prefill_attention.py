@@ -1,14 +1,11 @@
 """Flash D=256 prefill attention dispatch for the qwen full-attention layers.
 
-The route ships default on; MOESPRESSO_QWEN_PREFILL_FLASH_D256=0 is the kill
-switch. These
-tests prove the kill switch installs nothing, the enabled route wraps exactly
-the full-attention layers, an eligible prefill chunk engages the flash kernel
-with a numeric bound against the stock composed path, every fallback branch
-falls back to the stock path with its counter incremented, the decode fallback
-is bit-identical to the stock module, and the stats aggregator sums the
-counters. The served speed effect and the token rail are the campaign's job,
-not this unit's.
+These tests prove that the route wraps exactly the full-attention layers, an
+eligible prefill chunk engages the flash kernel with a numeric bound against
+the stock composed path, every fallback branch falls back to the stock path
+with its counter incremented, the decode fallback is bit-identical to the stock
+module, and the stats aggregator sums the counters. The served speed effect and
+the token rail are the campaign's job, not this unit's.
 """
 
 from __future__ import annotations
@@ -82,25 +79,14 @@ def _rel(a, b):
     return float(mx.linalg.norm(af - bf) / (mx.linalg.norm(bf) + 1e-9))
 
 
-def test_kill_switch_installs_nothing(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", False)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", False)
-    model = _model_with_layers([_attention()])
-    assert install_flash_prefill_attention(model) == 0
-    assert isinstance(model.layers[0].self_attn, Qwen3NextAttention)
-
-
 def test_install_requires_kernel(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", False)
     monkeypatch.setattr(fa, "_kernel_available", lambda: False)
+    monkeypatch.setattr(fa, "_decode_kernel_available", lambda: False)
     model = _model_with_layers([_attention()])
     assert install_flash_prefill_attention(model) == 0
 
 
 def test_install_wraps_full_attention_layers_idempotently(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", False)
     model = _model_with_layers([_attention(), _attention(seed=2)])
     assert install_flash_prefill_attention(model) == 2
     assert isinstance(model.layers[0].self_attn, FlashPrefillD256Attention)
@@ -163,8 +149,7 @@ def test_engagement_on_converted_cache():
     assert bool(mx.all(mx.isfinite(out1)).item())
 
 
-def test_decode_fallback_is_bit_identical_to_stock(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", False)
+def test_decode_below_depth_fallback_is_bit_identical_to_stock():
     stock = _attention(seed=4)
     wrapped = FlashPrefillD256Attention(stock)
     cache_w = QuantizedKVCache(group_size=64, bits=8)
@@ -181,7 +166,6 @@ def test_decode_fallback_is_bit_identical_to_stock(monkeypatch):
 
 
 def test_decode_tile16_engages_with_numeric_bound(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", True)
     monkeypatch.setattr(fa, "_DECODE_Q8_TILE16_MIN_KEYS", 1)
     stock = _attention(seed=42)
     wrapped = FlashPrefillD256Attention(stock)
@@ -202,14 +186,12 @@ def test_decode_tile16_engages_with_numeric_bound(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("enabled", "capability", "expected_option"),
-    [(True, True, True), (False, True, None), (True, False, None)],
+    ("capability", "expected_option"),
+    [(True, True), (False, None)],
 )
-def test_decode_dimension_merge_is_capability_and_kill_switch_gated(
-    monkeypatch, enabled, capability, expected_option
+def test_decode_dimension_merge_is_capability_gated(
+    monkeypatch, capability, expected_option
 ):
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", True)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_DIMENSION_MERGE", enabled)
     monkeypatch.setattr(fa, "_decode_dimension_merge_available", lambda: capability)
     monkeypatch.setattr(fa, "_DECODE_Q8_TILE16_MIN_KEYS", 1)
 
@@ -233,7 +215,6 @@ def test_decode_dimension_merge_is_capability_and_kill_switch_gated(
 
 
 def test_decode_tile16_falls_back_below_depth(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", True)
     monkeypatch.setattr(fa, "_DECODE_Q8_TILE16_MIN_KEYS", 64)
     stock = _attention(seed=43)
     wrapped = FlashPrefillD256Attention(stock)
@@ -304,8 +285,6 @@ def test_fallback_no_cache_branch():
 
 
 def test_stats_aggregation(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", True)
     monkeypatch.setattr(fa, "_DECODE_Q8_TILE16_MIN_KEYS", 1)
     model = _model_with_layers([_attention(seed=12), _attention(seed=13)])
     install_flash_prefill_attention(model)
@@ -324,90 +303,5 @@ def test_stats_aggregation(monkeypatch):
     assert stats["fallback_cache"] == 2
 
 
-# ---- BQ=64 float32-staging width -------------------------------------------
-
-
-def test_f32_default_is_bq64_and_f32w32_is_bq32():
-    # The float32 default runs the wide BQ=64 query tile; f32w32 keeps the
-    # BQ=32 width selectable for re-pricing. Both hold the same staging id and
-    # key tile; only the query tile differs.
-    assert fa._STAGE_CONFIGS["f32"] == (2, 64, 16)
-    assert fa._STAGE_CONFIGS["f32w32"] == (2, 32, 16)
-    assert fa._STAGE_CONFIGS["f32"][0] == fa._STAGE_CONFIGS["f32w32"][0]
-    assert fa._STAGE_CONFIGS["f32"][2] == fa._STAGE_CONFIGS["f32w32"][2]
-
-
-def test_bq64_width_engages_and_matches_stock(monkeypatch):
-    # The wrapper reads the width from the module globals; select the BQ=64
-    # float32 width and confirm it engages and stays within the same
-    # accumulation-order bound against the composed path as the BQ=32 width.
-    monkeypatch.setattr(fa, "_FLASH_STAGE", 2)
-    monkeypatch.setattr(fa, "_FLASH_BQ", 64)
-    monkeypatch.setattr(fa, "_FLASH_BK", 16)
-    stock = _attention(seed=33)
-    wrapped = FlashPrefillD256Attention(stock)
-    cache_w = QuantizedKVCache(group_size=64, bits=8)
-    cache_s = QuantizedKVCache(group_size=64, bits=8)
-    wrapped(_x(64, seed=40), mask="causal", cache=cache_w)
-    stock(_x(64, seed=40), mask="causal", cache=cache_s)
-    out1_w = wrapped(_x(48, seed=41), mask="causal", cache=cache_w)
-    out1_s = stock(_x(48, seed=41), mask="causal", cache=cache_s)
-    mx.eval(out1_w, out1_s)
-    assert wrapped.flash_calls == 1
-    rel = _rel(out1_w, out1_s)
-    assert rel < 1e-4, f"f32w64 flash vs composed rel {rel:.3e}"
-
-
-def _prefill_q8(q, past_k, past_v, self_k, self_v, scale, bq, bk):
-    gs, bits = 64, 8
-    pk = mx.quantize(past_k, group_size=gs, bits=bits)
-    pv = mx.quantize(past_v, group_size=gs, bits=bits)
-    sk = mx.dequantize(
-        *mx.quantize(self_k, group_size=gs, bits=bits), group_size=gs, bits=bits
-    )
-    sv = mx.dequantize(
-        *mx.quantize(self_v, group_size=gs, bits=bits), group_size=gs, bits=bits
-    )
-    out = kq.sdpa_fa_prefill_q8(
-        q, *pk, *pv, sk, sv, scale, bq=bq, bk=bk, stage=2
-    )
-    mx.eval(out)
-    return out
-
-
-def _prefill_inputs(past_len, q_len, seed):
-    n_q, n_kv, D = 16, 2, 256
-    mx.random.seed(seed)
-    q = 0.1 * mx.random.normal((1, n_q, q_len, D)).astype(mx.float32)
-    past_k = 0.1 * mx.random.normal((1, n_kv, past_len, D)).astype(mx.float32)
-    past_v = 0.1 * mx.random.normal((1, n_kv, past_len, D)).astype(mx.float32)
-    self_k = 0.1 * mx.random.normal((1, n_kv, q_len, D)).astype(mx.float32)
-    self_v = 0.1 * mx.random.normal((1, n_kv, q_len, D)).astype(mx.float32)
-    mx.eval(q, past_k, past_v, self_k, self_v)
-    return q, past_k, past_v, self_k, self_v, 1.0 / (D ** 0.5)
-
-
-def test_bq64_vs_bq32_bit_identical_on_full_chunk():
-    # At depth both widths pin at 16 splits (by_depth dominates) and the
-    # key-axis walk is BK-tile sequential with BK unchanged, so the per-row
-    # accumulation order is identical: a full chunk is bit-identical.
-    q, pk, pv, sk, sv, scale = _prefill_inputs(past_len=32768, q_len=256, seed=7)
-    out32 = _prefill_q8(q, pk, pv, sk, sv, scale, bq=32, bk=16)
-    out64 = _prefill_q8(q, pk, pv, sk, sv, scale, bq=64, bk=16)
-    assert bool(mx.array_equal(out32, out64)), (
-        "full-chunk BQ=64 not bit-identical to BQ=32"
-    )
-
-
-def test_bq64_vs_bq32_forks_only_on_short_tail():
-    # A short tail near N=2200 shifts the occupancy split floor (BQ=64 gives 8
-    # splits, BQ=32 gives 4), which changes the pass-2 merge count, so the
-    # outputs fork. The fork is a scheduling reorder only: the values stay
-    # numerically close because the staging precision is unchanged.
-    q, pk, pv, sk, sv, scale = _prefill_inputs(past_len=2065, q_len=135, seed=8)
-    out32 = _prefill_q8(q, pk, pv, sk, sv, scale, bq=32, bk=16)
-    out64 = _prefill_q8(q, pk, pv, sk, sv, scale, bq=64, bk=16)
-    assert not bool(mx.array_equal(out32, out64)), (
-        "short-tail split counts should differ, so the outputs fork"
-    )
-    assert _rel(out64, out32) < 1e-5, "short-tail fork should be a tiny reorder"
+def test_f32_staging_constants_are_promoted_values():
+    assert (fa._FLASH_STAGE, fa._FLASH_BQ, fa._FLASH_BK) == (2, 64, 16)

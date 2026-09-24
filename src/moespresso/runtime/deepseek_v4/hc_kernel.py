@@ -58,20 +58,11 @@ is transcribable (256 strided partial sums, binary tree combine, then
 half-precision rows match no composed candidate order, and the norm
 dispatches measure at the fence floor, so the fold stays unimplemented.
 
-``MOESPRESSO_DSV4_HC_PREFILL_FUSED=0`` is the kill switch for multi-row
-(prefill) shapes, ``MOESPRESSO_DSV4_HC_DECODE_FUSED=0`` for the
-single-row decode shape, and ``MOESPRESSO_DSV4_HC_DECODE_TAIL=0`` for
-the decode tail absorption alone; callers fall back to the composed
-path on any precondition miss.
+Callers fall back to the composed path when Metal is unavailable or any
+shape, dtype, or geometry precondition misses.
 """
 
 from __future__ import annotations
-
-import os
-
-_PREFILL_ENV_FLAG = "MOESPRESSO_DSV4_HC_PREFILL_FUSED"
-_DECODE_ENV_FLAG = "MOESPRESSO_DSV4_HC_DECODE_FUSED"
-_DECODE_TAIL_ENV_FLAG = "MOESPRESSO_DSV4_HC_DECODE_TAIL"
 
 _HC = 4
 _MIX = (2 + _HC) * _HC
@@ -456,44 +447,9 @@ def _metal_available() -> bool:
     return _METAL_AVAILABLE
 
 
-def hc_prefill_fused_enabled() -> bool:
-    """Return True when the fused mHC path may engage on multi-row shapes."""
-    if os.environ.get(_PREFILL_ENV_FLAG, "1") == "0":
-        return False
-    return _metal_available()
-
-
-def hc_decode_fused_enabled() -> bool:
-    """Return True when the fused mHC path may engage on single-row shapes."""
-    if os.environ.get(_DECODE_ENV_FLAG, "1") == "0":
-        return False
-    return _metal_available()
-
-
-def hc_decode_tail_enabled() -> bool:
-    """Return True when the decode tail absorption may engage.
-
-    The tail rides the fused decode split kernel, so it delegates to the
-    decode gate: with ``MOESPRESSO_DSV4_HC_DECODE_FUSED=0`` the tail is
-    off regardless of its own flag.
-    """
-    if os.environ.get(_DECODE_TAIL_ENV_FLAG, "1") == "0":
-        return False
-    return hc_decode_fused_enabled()
-
-
-def hc_fused_enabled() -> bool:
-    """Return True when either the prefill or the decode gate is open."""
-    return hc_prefill_fused_enabled() or hc_decode_fused_enabled()
-
-
 def _rows_enabled(rows: int) -> bool:
-    """Route the row count to its phase gate; zero rows fail closed."""
-    if rows < 1:
-        return False
-    if rows == 1:
-        return hc_decode_fused_enabled()
-    return hc_prefill_fused_enabled()
+    """Require a non-empty row set and Metal execution support."""
+    return rows >= 1 and _metal_available()
 
 
 def _f32_hex(value: float) -> str:
@@ -680,7 +636,7 @@ def hc_split_weighted_sum_tail_eligible(
     """Return True when the decode tail absorption can run.
 
     On top of the split eligibility this requires the single-row decode
-    shape, the tail gate, and a flattened width of at least 4096 so the
+    shape and a flattened width of at least 4096 so the
     composed reduce's 1,024-logical-lane shape holds. Anything else falls back
     to the fused split with the composed rsqrt tail.
     """
@@ -691,7 +647,7 @@ def hc_split_weighted_sum_tail_eligible(
         return False
     if _HC * int(x.shape[3]) < _TAIL_MIN_WIDTH:
         return False
-    return hc_decode_tail_enabled()
+    return True
 
 
 def hc_split_weighted_sum_tail(mixes_raw, x_flat, scale, base, *,

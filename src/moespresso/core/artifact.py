@@ -31,6 +31,7 @@ ARTIFACT_KINDS = frozenset({
     "package_plan",
     "package_manifest",
     "deepseek_v4_expert_selection",
+    "qwen4_expert_selection",
     # correctness ladder (standalone evidence; not wired into convert/serve/verify).
     "architecture_profile",   # the model-family contract consumed by L0-L4
     "correctness_evidence",   # what a ladder rung (L0/L1/...) actually found
@@ -44,6 +45,7 @@ _KIND_TAG = {
     "package_plan": "plan",
     "package_manifest": "pkg",
     "deepseek_v4_expert_selection": "select",
+    "qwen4_expert_selection": "select",
     "architecture_profile": "arch",
     "correctness_evidence": "correct",
 }
@@ -71,6 +73,10 @@ KNOWN_FEATURES = frozenset({
     # A DeepSeek-V4 package may store a different compact expert-id space in
     # each routed layer while retaining the checkpoint's global source count.
     "deepseek_v4_per_layer_experts",
+    # A Qwen4 package may store compact expert rows behind a source-width router.
+    "qwen4_per_layer_experts",
+    # Qwen4 inventories distinguish PLE provider tensors from graph tensors.
+    "qwen4_ple_provider_inventory",
 })
 
 

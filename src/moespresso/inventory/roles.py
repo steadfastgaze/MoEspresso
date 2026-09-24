@@ -181,15 +181,10 @@ def expert_role(projection: str) -> str:
 
 
 def switch_mlp_key(source_name: str, projection: str) -> str:
-    """On-disk key for a stacked-expert sub-projection in jang's switch_mlp layout.
+    """Return the runtime module key for a routed-expert projection.
 
-    The TQ kernel (TurboQuantSwitchLinear) consumes pre-stacked tensors keyed by the
-    sanitized module path `{layer_prefix}switch_mlp.{gate,up,down}_proj`. jang's
-    loader installs the module at exactly this path (no rename), so it must match the
-    model's param path. `source_name` is the fused source
-    (`model.language_model.layers.N.mlp.experts.gate_up_proj`); we rewrite
-    `...mlp.experts.<x>` -> `...mlp.switch_mlp.<proj>_proj` and apply mlx_lm's
-    sanitize rename (`model.language_model.` -> `language_model.model.`).
+    Fused source experts split into gate/up/down modules. Qwen source prefixes
+    use the mlx_lm sanitize rename to language_model.model.
     """
     marker = ".experts."
     head = source_name[: source_name.index(marker)] if marker in source_name else source_name

@@ -220,10 +220,8 @@ def test_router_kernel_rejects_bad_inputs():
             good_orig, good_sel, scaling=float("nan"))
 
 
-def test_eligibility_predicates(monkeypatch):
+def test_eligibility_predicates():
     mx = _require_metal()
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV, raising=False)
-    monkeypatch.delenv(router_kernel._ROUTER_SELECT_ENV, raising=False)
 
     gates = mx.zeros((1, 1, 64), dtype=mx.float32)
     bias = mx.zeros((64,), dtype=mx.float32)
@@ -247,20 +245,6 @@ def test_eligibility_predicates(monkeypatch):
         orig, mx.zeros((1, 1, 65), dtype=mx.uint32))
     assert not router_kernel.topk_weights_eligible(
         orig, sel.astype(mx.float32))
-
-    # The family and per-piece kill switches are read per call.
-    monkeypatch.setenv(router_kernel._ROUTER_TRIMS_ENV, "0")
-    assert not router_kernel.score_head_eligible(gates, bias)
-    assert not router_kernel.router_precast_enabled()
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV)
-    monkeypatch.setenv(router_kernel._ROUTER_SELECT_ENV, "0")
-    assert not router_kernel.score_head_eligible(gates, bias)
-    assert router_kernel.router_precast_enabled()
-    monkeypatch.delenv(router_kernel._ROUTER_SELECT_ENV)
-    monkeypatch.setenv(router_kernel._ROUTER_PRECAST_ENV, "0")
-    assert not router_kernel.router_precast_enabled()
-    assert router_kernel.router_select_enabled()
-
 
 def _model_args(dsv4, *, hidden=128, experts=64, k=6, hash_layers=1):
     return dsv4.ModelArgs(
@@ -318,12 +302,11 @@ def _assert_gate_parity(mx, expected, got, label):
 
 
 @pytest.mark.parametrize("x_dtype_name", ["float32", "bfloat16"])
-def test_gate_contract_decode_parity_nonhash(monkeypatch, x_dtype_name):
+def test_gate_contract_decode_parity_nonhash(x_dtype_name):
     mx = _require_metal()
     dsv4 = _jang_model()
     from moespresso.runtime.deepseek_v4 import model as ds4m
 
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV, raising=False)
     gate, args = _make_gate(mx, dsv4, layer_id=2)
     contract = _gate_contract(gate)
     rng = np.random.default_rng(3)
@@ -340,12 +323,11 @@ def test_gate_contract_decode_parity_nonhash(monkeypatch, x_dtype_name):
     _assert_gate_parity(mx, gate(x), got, f"decode {x_dtype_name}")
 
 
-def test_gate_contract_prefill_parity_nonhash(monkeypatch):
+def test_gate_contract_prefill_parity_nonhash():
     mx = _require_metal()
     dsv4 = _jang_model()
     from moespresso.runtime.deepseek_v4 import model as ds4m
 
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV, raising=False)
     gate, args = _make_gate(mx, dsv4, layer_id=2)
     contract = _gate_contract(gate)
     rng = np.random.default_rng(4)
@@ -362,11 +344,10 @@ def test_gate_contract_prefill_parity_nonhash(monkeypatch):
     _assert_gate_parity(mx, gate(x), got, "prefill")
 
 
-def test_gate_contract_hash_parity(monkeypatch):
+def test_gate_contract_hash_parity():
     mx = _require_metal()
     dsv4 = _jang_model()
 
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV, raising=False)
     gate, args = _make_gate(mx, dsv4, layer_id=0)
     assert gate.hash
     contract = _gate_contract(gate)
@@ -380,55 +361,10 @@ def test_gate_contract_hash_parity(monkeypatch):
         mx, gate(x, input_ids=input_ids), got, "hash decode")
 
 
-def test_gate_contract_kill_switches(monkeypatch):
-    mx = _require_metal()
-    dsv4 = _jang_model()
-    from moespresso.runtime.deepseek_v4 import model as ds4m
-
-    gate, args = _make_gate(mx, dsv4, layer_id=2)
-    contract = _gate_contract(gate)
-    rng = np.random.default_rng(9)
-    x = mx.array(
-        rng.normal(0.0, 1.0, (1, 1, args.hidden_size)).astype(np.float32))
-
-    # Family kill: full delegation to the stock gate.
-    monkeypatch.setenv(router_kernel._ROUTER_TRIMS_ENV, "0")
-    before = ds4m.router_gate_trim_call_counts()
-    got = contract(x)
-    after = ds4m.router_gate_trim_call_counts()
-    assert after["composed"] == before["composed"] + 1
-    assert after["precast"] == before["precast"]
-    assert after["select_kernel"] == before["select_kernel"]
-    _assert_gate_parity(mx, gate(x), got, "family kill")
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV)
-
-    # Precast kill: per-call weight cast with the fused select.
-    monkeypatch.setenv(router_kernel._ROUTER_PRECAST_ENV, "0")
-    before = ds4m.router_gate_trim_call_counts()
-    got = contract(x)
-    after = ds4m.router_gate_trim_call_counts()
-    assert after["precast"] == before["precast"]
-    assert after["select_kernel"] == before["select_kernel"] + 1
-    _assert_gate_parity(mx, gate(x), got, "precast kill")
-    monkeypatch.delenv(router_kernel._ROUTER_PRECAST_ENV)
-
-    # Select kill: hoisted operand with the composed select.
-    monkeypatch.setenv(router_kernel._ROUTER_SELECT_ENV, "0")
-    before = ds4m.router_gate_trim_call_counts()
-    got = contract(x)
-    after = ds4m.router_gate_trim_call_counts()
-    assert after["precast"] == before["precast"] + 1
-    assert after["select_kernel"] == before["select_kernel"]
-    assert after["select_composed"] == before["select_composed"] + 1
-    _assert_gate_parity(mx, gate(x), got, "select kill")
-    monkeypatch.delenv(router_kernel._ROUTER_SELECT_ENV)
-
-
-def test_gate_contract_fails_closed_on_static_contract(monkeypatch):
+def test_gate_contract_fails_closed_on_static_contract():
     mx = _require_metal()
     dsv4 = _jang_model()
 
-    monkeypatch.delenv(router_kernel._ROUTER_TRIMS_ENV, raising=False)
     args = _model_args(dsv4, k=1)
     gate, args = _make_gate(mx, dsv4, layer_id=2, args=args)
     contract = _gate_contract(gate)

@@ -59,19 +59,42 @@ def _mixed_package(tmp_path):
     return pkg
 
 
+def test_wired_budget_uses_the_current_mlx_device_info_api(monkeypatch):
+    import mlx.core as mx
+
+    from moespresso.runtime import streaming_capacity as sc
+
+    monkeypatch.setattr(sc, "_sysctl_int", lambda _name: None)
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {"max_recommended_working_set_size": 24 << 30},
+    )
+    monkeypatch.setattr(
+        mx.metal,
+        "device_info",
+        lambda: pytest.fail("deprecated mx.metal.device_info was called"),
+    )
+
+    assert sc.usable_wired_budget_bytes() == (
+        24 << 30,
+        "metal-recommended-working-set",
+    )
+
+
 def test_bytes_per_capacity_unit_comes_from_index_geometry(tmp_path):
     index = build_expert_index(_package(tmp_path, n_layers=2, out=8, cols=2))
 
-    # Per layer/projection: packed row = 8*2*4, norms row = 8*2.
-    assert bytes_per_capacity_unit(index) == 2 * 3 * ((8 * 2 * 4) + (8 * 2))
+    # MXFP4 projection rows include packed words and per-32 input scales.
+    assert bytes_per_capacity_unit(index) == 2 * 3 * ((8 * 4 * 4) + 8)
 
 
 def test_bytes_per_layer_slot_comes_from_index_geometry(tmp_path):
     index = build_expert_index(_package(tmp_path, n_layers=2, out=8, cols=2))
 
     assert bytes_per_layer_slot(index) == {
-        0: 3 * ((8 * 2 * 4) + (8 * 2)),
-        1: 3 * ((8 * 2 * 4) + (8 * 2)),
+        0: 3 * ((8 * 4 * 4) + 8),
+        1: 3 * ((8 * 4 * 4) + 8),
     }
 
 
@@ -227,10 +250,6 @@ def test_routed_payload_filter_matches_routed_bundle_keys():
         "layers.0.ffn.experts.tq_bundle")
     assert not is_routed_expert_payload_key(
         "language_model.model.layers.0.mlp.shared_expert.up_proj.weight")
-    # legacy stacked keys are not routed payload anymore (such packages are
-    # refused by the index before capacity math ever runs)
-    assert not is_routed_expert_payload_key(
-        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.tq_packed")
 
 
 def test_non_routed_payload_bytes_are_header_only_and_exclude_expert_stacks(tmp_path):

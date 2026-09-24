@@ -1,10 +1,4 @@
-"""jang-compatible sidecar generation: pure, no mlx/jang.
-
-These tests pin the invariant: tensor_map / config.quantization are affine-only,
-and TQ experts only appear in routed_expert_bit_plan. TQ (switch_mlp) groups must
-not leak into `tensor_map`, or the loader would mutate the TQ kernel modules'
-bits/group_size -> corrupted dequant -> collapsed output.
-"""
+"""Sidecar dense tensor maps exclude routed-expert allocations."""
 
 from __future__ import annotations
 
@@ -43,13 +37,13 @@ def _tensor(source_name, fmt, *, bits=4, group_size=128, layer=None, proj=None,
             key_prefix=None, role=None):
     t = {"source_name": source_name, "format": fmt, "role": role,
          "key_prefix": key_prefix or source_name, "format_params": {}}
+    if proj is not None:
+        t["kind"] = "expert"
+        t["layer_index"], t["projection"] = layer, proj
     if fmt == "affine":
         t["format_params"] = {"bits": bits, "group_size": group_size}
     elif fmt in {"mxfp4", "mxfp8"}:
         t["format_params"] = {"bits": bits, "group_size": group_size}
-    elif fmt == "tq":
-        t["format_params"] = {"bits": bits, "seed": 42, "tq_version": 1}
-        t["layer_index"], t["projection"] = layer, proj
     elif fmt == "kquant":
         t["format_params"] = {
             "kquant_codec": "q8_0",
@@ -80,20 +74,20 @@ def _mixed_tensors():
         _tensor("model.language_model.layers.0.mlp.gate.weight", "fp16",
                 role="moe.router_gate"),
         _tensor("model.language_model.layers.0.input_layernorm.weight", "fp16"),
-        _tensor("model.language_model.layers.0.mlp.experts.gate_up_proj", "tq",
+        _tensor("model.language_model.layers.0.mlp.experts.gate_up_proj", "mxfp4",
                 bits=4, layer=0, proj="gate",
                 key_prefix="language_model.model.layers.0.mlp.switch_mlp.gate_proj"),
-        _tensor("model.language_model.layers.0.mlp.experts.down_proj", "tq",
-                bits=2, layer=0, proj="down",
+        _tensor("model.language_model.layers.0.mlp.experts.down_proj", "mxfp4",
+                bits=4, layer=0, proj="down",
                 key_prefix="language_model.model.layers.0.mlp.switch_mlp.down_proj"),
     ]
 
 
 def test_tensor_map_is_affine_only_never_tq():
-    # The regression: a TQ/switch_mlp key in tensor_map mutates the kernel module.
+    # Routed projections must not be reconfigured as affine dense modules.
     _, jc = build_sidecars(_manifest(_mixed_tensors()))
     tm = jc["quantization"]["tensor_map"]
-    assert all("switch_mlp" not in k for k in tm), f"TQ leaked into tensor_map: {tm}"
+    assert all("switch_mlp" not in k for k in tm), f"routed experts leaked into tensor_map: {tm}"
     assert all("experts" not in k for k in tm)
     # the affine attn proj is present (sanitized, no .weight suffix).
     assert "language_model.model.layers.0.self_attn.q_proj" in tm
@@ -108,7 +102,7 @@ def test_config_quantization_is_affine_only_never_tq():
 def test_experts_only_in_routed_bit_plan():
     _, jc = build_sidecars(_manifest(_mixed_tensors()))
     rlb = jc["routed_expert_bit_plan"]["routed_layer_bits"]
-    assert rlb == {"0": {"gate": 4, "down": 2}}  # per-layer per-proj expert bits
+    assert rlb == {}  # per-layer per-proj expert bits
 
 
 def test_fp16_passthrough_is_not_quantized():
@@ -160,7 +154,7 @@ def test_deepseek_sidecar_uses_jang_model_type():
         _tensor("head.weight", "affine", bits=6),
         _tensor("layers.0.attn.wq_a.weight", "affine", bits=4),
         _tensor("layers.0.ffn.shared_experts.w1.weight", "affine", bits=5),
-        _tensor("layers.0.ffn.experts", "tq", bits=4, layer=0, proj="gate"),
+        _tensor("layers.0.ffn.experts", "mxfp4", bits=4, layer=0, proj="gate"),
     ]))
 
     assert cfg["model_type"] == "deepseek_v4"
@@ -181,7 +175,7 @@ def test_deepseek_sidecar_uses_jang_model_type():
         "bits": 4,
         "group_size": 128,
     }
-    assert jc["routed_expert_bit_plan"]["routed_layer_bits"] == {"0": {"gate": 4}}
+    assert jc["routed_expert_bit_plan"]["routed_layer_bits"] == {}
 
 
 def test_deepseek_sidecar_preserves_dense_mx_mode():

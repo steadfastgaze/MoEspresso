@@ -151,23 +151,13 @@ def build_deepseek_v4_graph_from_manifest(
     return model_cls(args)
 
 
-def load_deepseek_v4_package_graph(manifest: dict, package_dir: Path) -> Any:
-    """Build only the DS4 graph.
-
-    This helper deliberately does not bind package weights yet. The full DS4 runtime
-    loader must map MJTQ affine/TQ/raw tensors into the graph before generation.
-    """
-    _ = Path(package_dir)
-    return build_deepseek_v4_graph_from_manifest(manifest)
-
-
 def _is_deepseek_v4_bundle_key(key: str) -> bool:
     return key.endswith(".tq_bundle") and ".ffn.experts" in key
 
 
 def _manifest_requires_routed_bundles(manifest: dict) -> bool:
     return any(
-        t.get("format") in {"tq", "mxfp4", "kquant", "iqk"}
+        t.get("format") in {"mxfp4", "kquant", "iqk"}
         and t.get("kind") == "expert"
         for t in manifest.get("tensors", [])
     )
@@ -236,7 +226,6 @@ def _install_deepseek_v4_pooled_bundles(
     package_dir: Path,
     index,
     *,
-    seed: int,
     capacity_per_layer: int | None = None,
     capacity_overrides: Mapping[int, int] | None = None,
     eviction_policy: str = "lfu",
@@ -253,7 +242,7 @@ def _install_deepseek_v4_pooled_bundles(
     """
     from moespresso.runtime.ssd_streaming_build import (
         _budget_payload,
-        _deterministic_available_bytes,
+        _resolved_available_bytes,
         install_pooled_switchglus,
     )
     from moespresso.runtime.streaming_capacity import (
@@ -282,13 +271,14 @@ def _install_deepseek_v4_pooled_bundles(
                     architecture, requested_context)
             except (KeyError, TypeError, ValueError):
                 exact_context_allowance = False
+        available_bytes, budget_resolution = _resolved_available_bytes(
+            already_resident_bytes=resident_base,
+        )
         budget = package_capacity_budget(
             index=index,
             package_dir=package_dir,
             max_router_fanout=max_router_fanout,
-            available_bytes=_deterministic_available_bytes(
-                already_resident_bytes=resident_base,
-            ),
+            available_bytes=available_bytes,
             kv_activation_allowance_bytes=kv_allowance,
             runtime_resident_bytes=compact_router_reserve,
         )
@@ -334,7 +324,7 @@ def _install_deepseek_v4_pooled_bundles(
                         budget,
                         context_tokens=requested_context,
                     ) from exc
-        budget_payload = _budget_payload(budget)
+        budget_payload = _budget_payload(budget, resolution=budget_resolution)
         if exact_context_allowance:
             budget_payload["context_limit"] = int(
                 getattr(model, "_moespresso_auto_context_limit", None)
@@ -343,38 +333,6 @@ def _install_deepseek_v4_pooled_bundles(
             budget_payload["context_limit_auto_reduced_from"] = getattr(
                 model, "_moespresso_auto_context_limit_from", None)
     capacity_per_layer = int(capacity_per_layer)
-    # Cross-layer decode lookahead (opt-in, MOESPRESSO_SSD_LOOKAHEAD=<delta>).
-    # The prediction export exists only on the native-gate decode path, and
-    # at full residency there are no misses to hide while carving spares
-    # would break the full-residency certificate, so both cases refuse with
-    # a printed reason and zero engagement. Spares come out of the same
-    # capacity budget (the honest A/B against the LFU slots they replace).
-    lookahead_env = int(
-        os.environ.get("MOESPRESSO_SSD_LOOKAHEAD", "0") or "0")
-    spare_slots = 0
-    if lookahead_env > 0:
-        from moespresso.runtime.pooled_switchglu import (
-            _RING_DECODE,
-            _gate_module,
-            _ring_visibility_ok,
-        )
-        gate_live = (_RING_DECODE and _ring_visibility_ok()
-                     and _gate_module() is not None)
-        if not gate_live:
-            print("[ds4-streaming] lookahead requested but the native-gate "
-                  "decode path is not live - DISABLED (no capacity carved)",
-                  flush=True)
-            lookahead_env = 0
-        elif capacity_per_layer >= index.max_num_experts:
-            print("[ds4-streaming] lookahead requested at full residency - "
-                  "DISABLED (no misses to hide; spares would break the "
-                  "full-residency certificate)", flush=True)
-            lookahead_env = 0
-    if lookahead_env > 0:
-        spare_slots = min(16, max(0, capacity_per_layer - 24))
-        capacity_per_layer -= spare_slots
-        if spare_slots <= 0:
-            lookahead_env = 0
     installed = install_pooled_switchglus(
         model,
         package_dir=package_dir,
@@ -382,8 +340,6 @@ def _install_deepseek_v4_pooled_bundles(
         capacity_per_layer=capacity_per_layer,
         capacity_overrides=capacity_overrides,
         eviction_policy=eviction_policy,
-        seed=seed,
-        spare_slots=spare_slots,
         wrap_deepseek_v4_moe=True,
     )
     from moespresso.runtime.deepseek_v4.iqk_experts import iqk_switch_modules
@@ -426,13 +382,6 @@ def _install_deepseek_v4_pooled_bundles(
             ),
             "pooled": True,
         })
-    if lookahead_env > 0:
-        from moespresso.runtime.ssd_streaming_build import install_lookahead
-
-        wired = install_lookahead(model, lookahead_env)
-        object.__setattr__(model, "_moespresso_ssd_lookahead",
-                           {"delta": lookahead_env, "wired": wired,
-                            "spare_slots": spare_slots})
     object.__setattr__(model, "_moespresso_ssd_streaming_capacity",
                        int(capacity_per_layer))
     object.__setattr__(
@@ -555,12 +504,8 @@ def _patch_deepseek_v4_hc_fused(model) -> int:
     (see ``hc_kernel``); the fused post stage implements the served
     float32 recombine contract, so it only installs after
     ``_patch_deepseek_v4_hc_post_float32`` has marked the model.
-    Multi-row prefill chunks engage under
-    ``MOESPRESSO_DSV4_HC_PREFILL_FUSED`` and single-row decode steps
-    under ``MOESPRESSO_DSV4_HC_DECODE_FUSED``; with both gates at ``0``
-    the wrap does not install. Eligible single-row decode steps also
-    absorb the pre stage's rsqrt chain and mixer scale into the split
-    kernel unless ``MOESPRESSO_DSV4_HC_DECODE_TAIL=0``.
+    Eligible single-row decode steps also absorb the pre stage's rsqrt chain
+    and mixer scale into the split kernel.
     """
     try:
         import mlx.core as mx
@@ -569,7 +514,7 @@ def _patch_deepseek_v4_hc_fused(model) -> int:
     from moespresso.runtime.deepseek_v4 import hc_kernel
 
     if (
-        not hc_kernel.hc_fused_enabled()
+        not hc_kernel._metal_available()
         or getattr(model, "_moespresso_dsv4_hc_post_dtype", None) != "float32"
     ):
         object.__setattr__(model, "_moespresso_dsv4_hc_fused_layers", 0)
@@ -933,8 +878,7 @@ def _patch_deepseek_v4_required_attention_cache(
             )
             if compress_ratio:
                 # Fixed-shape decode state (capacity buffers plus row
-                # counts) for the compressed-layer pool state. No-op when
-                # MOESPRESSO_DSV4_DECODE_FIXED_STATE=0.
+                # counts) for the compressed-layer pool state.
                 wrapped = _fixed_decode_state.install_fixed_decode_state(wrapped)
             caches.append(wrapped)
         return caches
@@ -976,6 +920,40 @@ def _deepseek_v4_e4m3fn_mx():
     return _DEEPSEEK_V4_E4M3FN_MX
 
 
+def _deepseek_v4_fp8_kv_roundtrip_composed(x, *, head_dim: int, rot_dim: int):
+    """Apply the composed E4M3FN reference form after geometry validation."""
+    import mlx.core as mx
+
+    n_nope = int(head_dim) - int(rot_dim)
+    original_dtype = x.dtype
+    prefix = x[..., :n_nope].astype(mx.float32)
+    tail = x[..., n_nope:]
+    blocks = prefix.reshape((-1, n_nope // 64, 64))
+    amax = mx.max(mx.abs(blocks), axis=-1, keepdims=True)
+    amax = mx.maximum(amax, mx.array(1.0e-4, dtype=mx.float32))
+    log2 = mx.log(amax / 448.0) / math.log(2.0)
+    scale = mx.exp(mx.ceil(log2) * math.log(2.0))
+    scaled = mx.clip(blocks / scale, -448.0, 448.0)
+
+    table = _deepseek_v4_e4m3fn_mx()
+    abs_scaled = mx.abs(scaled)
+    diff = mx.abs(abs_scaled[..., None] - table)
+    nearest = mx.argmin(diff, axis=-1)
+    quantized = mx.take(table, nearest)
+    sign = mx.where(
+        scaled < 0,
+        mx.array(-1.0, dtype=mx.float32),
+        mx.where(
+            scaled > 0,
+            mx.array(1.0, dtype=mx.float32),
+            mx.array(0.0, dtype=mx.float32),
+        ),
+    )
+    rounded = (sign * quantized * scale).reshape(prefix.shape)
+    out = mx.concatenate([rounded, tail.astype(mx.float32)], axis=-1)
+    return out.astype(original_dtype)
+
+
 def _deepseek_v4_fp8_kv_roundtrip(x, *, head_dim: int = 512, rot_dim: int = 64):
     """Apply DS4's E4M3FN round trip to the non-RoPE compressed-KV prefix."""
     import mlx.core as mx
@@ -996,37 +974,17 @@ def _deepseek_v4_fp8_kv_roundtrip(x, *, head_dim: int = 512, rot_dim: int = 64):
         int(head_dim) == 512
         and int(rot_dim) == 64
         and x.dtype == mx.float32
-        and os.environ.get("MOESPRESSO_DSV4_FP8_KV_KERNEL", "1") != "0"
     ):
         # Single-dispatch bit-exact transcription; the composed path below
         # materializes a [rows, 448, 127] float32 argmin diff per call.
-        from moespresso.runtime.deepseek_v4 import decode_attention_kernel
+        from moespresso.runtime.deepseek_v4.fp8_kv_kernel import (
+            fp8_kv_prefix_rows,
+        )
 
-        return decode_attention_kernel.fp8_kv_prefix_rows(x)
+        return fp8_kv_prefix_rows(x)
 
-    original_dtype = x.dtype
-    prefix = x[..., :n_nope].astype(mx.float32)
-    tail = x[..., n_nope:]
-    blocks = prefix.reshape((-1, n_nope // 64, 64))
-    amax = mx.max(mx.abs(blocks), axis=-1, keepdims=True)
-    amax = mx.maximum(amax, mx.array(1.0e-4, dtype=mx.float32))
-    log2 = mx.log(amax / 448.0) / math.log(2.0)
-    scale = mx.exp(mx.ceil(log2) * math.log(2.0))
-    scaled = mx.clip(blocks / scale, -448.0, 448.0)
-
-    table = _deepseek_v4_e4m3fn_mx()
-    abs_scaled = mx.abs(scaled)
-    diff = mx.abs(abs_scaled[..., None] - table)
-    nearest = mx.argmin(diff, axis=-1)
-    quantized = mx.take(table, nearest)
-    sign = mx.where(
-        scaled < 0,
-        mx.array(-1.0, dtype=mx.float32),
-        mx.where(scaled > 0, mx.array(1.0, dtype=mx.float32), mx.array(0.0, dtype=mx.float32)),
-    )
-    rounded = (sign * quantized * scale).reshape(prefix.shape)
-    out = mx.concatenate([rounded, tail.astype(mx.float32)], axis=-1)
-    return out.astype(original_dtype)
+    return _deepseek_v4_fp8_kv_roundtrip_composed(
+        x, head_dim=head_dim, rot_dim=rot_dim)
 
 
 class _AttentionCompressorFp8KV:
@@ -1175,18 +1133,13 @@ def _dsv4_prefill_pooled_qat(mx, x):
     Routes to ``indexer_qat_rows``, the single-dispatch Metal transcription
     whose parity tests prove bit identity with ``_dsv4_indexer_qat``; the
     composed op chain costs a dozen dispatches and an argmin materialization
-    per prefill chunk. ``MOESPRESSO_DSV4_R4_PREFILL_POOLED_QAT_KERNEL=0``
-    falls back to the composed chain.
+    per prefill chunk. Unsupported rows fall back to the composed chain.
     """
-    if os.environ.get("MOESPRESSO_DSV4_R4_PREFILL_POOLED_QAT_KERNEL", "1") != "0":
-        from moespresso.runtime.deepseek_v4 import indexer_score_kernel
+    from moespresso.runtime.deepseek_v4 import indexer_score_kernel
 
-        if x.dtype in (mx.float32, mx.float16, mx.bfloat16) and x.size > 0:
-            return indexer_score_kernel.indexer_qat_rows(x)
+    if x.dtype in (mx.float32, mx.float16, mx.bfloat16) and x.size > 0:
+        return indexer_score_kernel.indexer_qat_rows(x)
     return _dsv4_indexer_qat(mx, x)
-
-
-_DSV4_DECODE_QAT_KERNEL_ENV = "MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL"
 
 
 def _dsv4_decode_indexer_qat(mx, x):
@@ -1199,21 +1152,19 @@ def _dsv4_decode_indexer_qat(mx, x):
     spine that composed chain is the fattest line of the indexer segment
     (0.443 ms fenced against a 0.186 ms kernel segment at the served
     steady state), so the kernel routing is a measured whole-token win at
-    identical bits. ``MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL=0`` is the
-    kill switch and restores the composed chain.
+    identical bits.
 
     Returns ``(rows, used_kernel)`` so the caller can count engagement.
     """
-    if os.environ.get(_DSV4_DECODE_QAT_KERNEL_ENV, "1") != "0":
-        from moespresso.runtime.deepseek_v4 import indexer_score_kernel
+    from moespresso.runtime.deepseek_v4 import indexer_score_kernel
 
-        if (
-            indexer_score_kernel._metal_available()
-            and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
-            and x.size > 0
-            and int(x.shape[-1]) == 128
-        ):
-            return indexer_score_kernel.indexer_qat_rows(x), True
+    if (
+        indexer_score_kernel._metal_available()
+        and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+        and x.size > 0
+        and int(x.shape[-1]) == 128
+    ):
+        return indexer_score_kernel.indexer_qat_rows(x), True
     return _dsv4_indexer_qat(mx, x), False
 
 
@@ -1637,14 +1588,13 @@ class _DeepseekV4RouterGateContract:
 
         mx = self._mx
         original = self._original
-        precast = router_kernel.router_precast_enabled() and self._precast_ok()
+        precast = self._precast_ok()
         rows = 1
         for dim in x.shape[:-1]:
             rows *= int(dim)
         select = (
             rows == 1
             and x.ndim == 3
-            and router_kernel.router_select_enabled()
             and self._select_static_ok()
         )
         if not (precast or select):
@@ -1936,322 +1886,6 @@ def _patch_deepseek_v4_ratio4_prefill_fast_path(model) -> int:
     return patched
 
 
-class _Ratio4DecodeFusedAttention:
-    """DS4 ratio-4 decode attention as two fused Metal dispatches.
-
-    The composed decode step issues roughly sixty small dispatches per
-    ratio-4 layer and is launch-bound; this wrapper routes the single-token
-    shape to ``decode_attention_kernel`` (indexer QAT + scoring + top-k +
-    KV-row prep in one dispatch, rope + selected-row SDPA + inverse rope in
-    a second). Projections, norms, and compressor calls stay as MLX ops.
-    The prepared KV row is bit-identical to the composed rope + FP8 round
-    trip, so the local cache append bypasses the FP8 wrapper and replicates
-    ``RotatingKVCache._update_in_place`` bookkeeping directly.
-
-    Any shape, dtype, or cache-state condition outside the proven decode
-    contract delegates to the composed path before any cache mutation; the
-    checks that can only run after the compressor has advanced fall back to
-    ``_composed_decode_tail``, which finishes the token with exactly the
-    composed op sequence.
-    """
-
-    def __init__(self, original, *, mx, dsv4_model, cache_cls):
-        self._original = original
-        self._mx = mx
-        self._dsv4_model = dsv4_model
-        self._cache_cls = cache_cls
-        self._moespresso_dsv4_fused_decode_attention = True
-        self.fused_decode_calls = 0
-        self.fused_decode_composed_tail_calls = 0
-        self._fused_sinks_f16 = None
-
-    def __getattr__(self, name: str):
-        return getattr(self._original, name)
-
-    def _decode_eligible(self, x, cache) -> bool:
-        from moespresso.runtime.deepseek_v4 import decode_attention_kernel
-
-        if not decode_attention_kernel.fused_decode_enabled():
-            return False
-        if os.environ.get("MOESPRESSO_DSV4_INDEXER_DUMP_PREFIX"):
-            return False
-        mx = self._mx
-        attn = self._original
-        if x.ndim != 3 or int(x.shape[0]) != 1 or int(x.shape[1]) != 1:
-            return False
-        if x.dtype != mx.float16:
-            return False
-        if int(getattr(attn, "compress_ratio", 0) or 0) != 4:
-            return False
-        if not hasattr(attn, "indexer"):
-            return False
-        if int(attn.head_dim) != 512 or int(getattr(attn.rope, "dims", 0)) != 64:
-            return False
-        indexer = attn.indexer
-        if int(indexer.head_dim) != 128 or not 0 < int(indexer.n_heads) <= 64:
-            return False
-        if int(indexer.index_topk) <= 0:
-            return False
-        if not isinstance(cache, self._cache_cls):
-            return False
-        # The prepared KV row bakes in the FP8 round trip, so the cache must
-        # carry the served FP8 update contract for the direct append to be
-        # equivalent to update_and_fetch.
-        if not getattr(cache, "_moespresso_dsv4_fp8_kv_cache", False):
-            return False
-        local = getattr(cache, "local", None)
-        window = getattr(attn.args, "sliding_window", None)
-        max_size = getattr(local, "max_size", None)
-        if window is None or max_size is None or int(max_size) != int(window):
-            return False
-        if int(getattr(local, "keep", -1)) != 0:
-            return False
-        keys = getattr(local, "keys", None)
-        values = getattr(local, "values", None)
-        if keys is None or values is None:
-            return False
-        if int(local.offset) < int(max_size):
-            return False
-        expected = (1, 1, int(max_size), int(attn.head_dim))
-        if tuple(int(v) for v in keys.shape) != expected:
-            return False
-        if tuple(int(v) for v in values.shape) != expected:
-            return False
-        if keys.dtype != mx.float16 or values.dtype != mx.float16:
-            return False
-        return True
-
-    def _composed_decode_tail(self, *, x, q_residual, q, kv, pooled, cache,
-                              offset, run_indexer, topk):
-        """Finish the token with the composed op sequence.
-
-        ``q`` and ``kv`` arrive pre-rope in the ``[1, 1, heads, dim]``
-        layout; the compressor has already advanced. ``run_indexer`` re-uses
-        the wrapped indexer (which advances its own compressor state);
-        ``topk`` carries an already-computed selection when the fused path
-        bailed after the indexer state advance.
-        """
-        mx = self._mx
-        attn = self._original
-        dsv4 = self._dsv4_model
-        self.fused_decode_composed_tail_calls += 1
-        q = q.transpose(0, 2, 1, 3)
-        kv = kv.transpose(0, 2, 1, 3)
-        q = dsv4._apply_partial_rope(q, attn.rope, offset)
-        kv = dsv4._apply_partial_rope(kv, attn.rope, offset)
-        kv, _ = cache.update_and_fetch(kv, kv)
-        if run_indexer and pooled.shape[1] > attn.indexer.index_topk:
-            topk = attn.indexer(
-                x, q_residual, attn.compress_rope, attn.rope, cache, offset,
-            )
-        if topk is not None:
-            idx = topk[:, None, :, :, None]
-            expanded = mx.broadcast_to(
-                pooled[:, None, None, :, :],
-                (1, 1, 1, pooled.shape[1], attn.head_dim),
-            )
-            pooled_kv = mx.take_along_axis(
-                expanded,
-                mx.broadcast_to(idx, idx.shape[:-1] + (attn.head_dim,)),
-                axis=3,
-            ).reshape(1, 1, -1, attn.head_dim)
-        else:
-            pooled_kv = pooled[:, None]
-        full_kv = mx.concatenate([kv, pooled_kv], axis=2)
-        out = dsv4.scaled_dot_product_attention(
-            q, full_kv, full_kv,
-            cache=cache, scale=attn.softmax_scale, mask=None,
-            sinks=attn.attn_sink.astype(q.dtype),
-        )
-        out = dsv4._apply_partial_rope(out, attn.rope, offset, inverse=True)
-        out = out.transpose(0, 2, 1, 3).reshape(
-            1, 1, attn.n_heads * attn.head_dim)
-        out = attn._grouped_output_projection(out)
-        return attn.wo_b(out)
-
-    def __call__(self, x, mask=None, cache=None):
-        if cache is None or not self._decode_eligible(x, cache):
-            return self._original(x, mask=mask, cache=cache)
-
-        from moespresso.runtime.deepseek_v4 import decode_attention_kernel
-
-        mx = self._mx
-        attn = self._original
-        dsv4 = self._dsv4_model
-        indexer = attn.indexer
-        local = cache.local
-        offset = int(cache.offset)
-        write_idx = int(local._idx)
-        if write_idx == int(local.max_size):
-            write_idx = int(local.keep)
-
-        q_residual = attn.q_norm(attn.wq_a(x))
-        q = attn.wq_b(q_residual).reshape(1, 1, attn.n_heads, attn.head_dim)
-        q = mx.fast.rms_norm(
-            q,
-            weight=dsv4._get_q_norm_ones(attn.head_dim, q.dtype),
-            eps=attn.args.rms_norm_eps,
-        )
-        kv = attn.kv_norm(attn.wkv(x)).reshape(1, 1, 1, attn.head_dim)
-
-        pooled = attn.compressor(x, attn.compress_rope, cache, offset)
-        n_rows = int(pooled.shape[1])
-        topk_width = int(indexer.index_topk)
-        if (
-            n_rows <= topk_width
-            or n_rows >= (1 << 16)
-            or pooled.dtype != mx.float16
-            or q.dtype != mx.float16
-            or kv.dtype != mx.float16
-        ):
-            # The composed tail re-runs the wrapped indexer, which advances
-            # the indexer compressor state exactly as the composed path.
-            return self._composed_decode_tail(
-                x=x, q_residual=q_residual, q=q, kv=kv, pooled=pooled,
-                cache=cache, offset=offset, run_indexer=True, topk=None,
-            )
-
-        # Indexer-side prep, mirroring _IndexerDS4ScoreContract: advance the
-        # indexer compressor, maintain the pooled QAT cache, and project the
-        # indexer queries and head weights.
-        index_pooled = indexer.compressor(
-            x, attn.compress_rope, cache, offset, state_key="indexer_state")
-        state = getattr(cache, "indexer_state", None)
-        cached = state.get("pooled_qat") if isinstance(state, dict) else None
-        cached_rows = (
-            int(state.get("pooled_qat_rows", 0) or 0)
-            if isinstance(state, dict) else 0
-        )
-        index_rows = int(index_pooled.shape[1])
-        if cached is not None and 0 < cached_rows <= index_rows:
-            if cached_rows == index_rows:
-                index_pooled_qat = cached
-            else:
-                tail_rows = _dsv4_indexer_qat(mx, index_pooled[:, cached_rows:, :])
-                index_pooled_qat = mx.concatenate([cached, tail_rows], axis=1)
-                if isinstance(state, dict):
-                    state["pooled_qat"] = index_pooled_qat
-                    state["pooled_qat_rows"] = index_rows
-        else:
-            index_pooled_qat = _dsv4_indexer_qat(mx, index_pooled)
-            if isinstance(state, dict):
-                state["pooled_qat"] = index_pooled_qat
-                state["pooled_qat_rows"] = index_rows
-
-        q_idx = indexer.wq_b(q_residual).reshape(
-            1, 1, indexer.n_heads, indexer.head_dim).transpose(0, 2, 1, 3)
-        q_idx = dsv4._apply_partial_rope(q_idx, attn.rope, offset)
-        weights = indexer.weights_proj(x).astype(mx.float32) * (
-            indexer.n_heads ** -0.5
-        )
-
-        if index_rows != n_rows or q_idx.dtype not in (
-            mx.float32, mx.float16, mx.bfloat16,
-        ):
-            # The indexer state already advanced; score with the composed
-            # ops instead of re-entering the wrapped indexer.
-            q_idx_qat = _dsv4_indexer_qat(mx, q_idx)
-            scores = (
-                q_idx_qat.astype(mx.float32)
-                @ index_pooled_qat[:, None].swapaxes(-1, -2).astype(mx.float32)
-            )
-            scores = mx.maximum(scores, 0) * indexer.scale
-            scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
-            k = min(topk_width, index_rows)
-            topk = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-            return self._composed_decode_tail(
-                x=x, q_residual=q_residual, q=q, kv=kv, pooled=pooled,
-                cache=cache, offset=offset, run_indexer=False, topk=topk,
-            )
-
-        params = mx.array([offset, write_idx], dtype=mx.int32)
-        inv_freq = attn.rope.inv_freq
-        sinks = self._fused_sinks_f16
-        if sinks is None:
-            sinks = attn.attn_sink.astype(mx.float16)
-            mx.eval(sinks)
-            self._fused_sinks_f16 = sinks
-
-        sel, row, _scores = decode_attention_kernel.fused_decode_prep(
-            q_idx.reshape(int(indexer.n_heads), int(indexer.head_dim)),
-            index_pooled_qat.reshape(n_rows, int(indexer.head_dim)),
-            weights.reshape(int(indexer.n_heads)),
-            kv.reshape(int(attn.head_dim)),
-            inv_freq,
-            params,
-            scale=float(indexer.scale),
-            topk=topk_width,
-        )
-        heads = decode_attention_kernel.fused_decode_sdpa(
-            q.reshape(int(attn.n_heads), int(attn.head_dim)),
-            local.keys.reshape(int(local.max_size), int(attn.head_dim)),
-            row,
-            pooled.reshape(n_rows, int(attn.head_dim)),
-            sel,
-            sinks,
-            inv_freq,
-            params,
-            scale=float(attn.softmax_scale),
-        )
-
-        # The prepared row is bit-identical to the composed rope + FP8 round
-        # trip, so append it directly, replicating the steady-state
-        # RotatingKVCache._update_in_place bookkeeping (no growth, no trim).
-        row4 = row.reshape(1, 1, 1, int(attn.head_dim))
-        local.keys[..., write_idx:write_idx + 1, :] = row4
-        local.values[..., write_idx:write_idx + 1, :] = row4
-        local.offset += 1
-        local._idx = write_idx + 1
-
-        self.fused_decode_calls += 1
-        out = heads.reshape(1, 1, attn.n_heads * attn.head_dim)
-        out = attn._grouped_output_projection(out)
-        return attn.wo_b(out)
-
-
-def _patch_deepseek_v4_ratio4_decode_fused_attention(model) -> int:
-    """Install the fused ratio-4 decode attention island on DS4 layers."""
-    try:
-        import mlx.core as mx
-        import jang_tools.dsv4.mlx_model as dsv4_model
-        from jang_tools.dsv4.mlx_model import DeepseekV4Cache
-    except ImportError:  # pragma: no cover - DS4 runtime already checks this
-        return 0
-    from moespresso.runtime.deepseek_v4 import decode_attention_kernel
-
-    if not decode_attention_kernel.fused_decode_enabled():
-        object.__setattr__(
-            model, "_moespresso_dsv4_fused_decode_attention_layers", 0)
-        return 0
-
-    patched = 0
-    layers = getattr(getattr(model, "model", model), "layers", ())
-    for layer in layers:
-        attn = getattr(layer, "self_attn", None)
-        if attn is None:
-            continue
-        if getattr(attn, "_moespresso_dsv4_fused_decode_attention", False):
-            continue
-        if int(getattr(attn, "compress_ratio", 0) or 0) != 4:
-            continue
-        if not hasattr(attn, "indexer"):
-            continue
-        object.__setattr__(
-            layer,
-            "self_attn",
-            _Ratio4DecodeFusedAttention(
-                attn,
-                mx=mx,
-                dsv4_model=dsv4_model,
-                cache_cls=DeepseekV4Cache,
-            ),
-        )
-        patched += 1
-    object.__setattr__(
-        model, "_moespresso_dsv4_fused_decode_attention_layers", patched)
-    return patched
-
-
 _DEEPSEEK_V4_BANDED_PREFILL_BLOCK = 512
 _DEEPSEEK_V4_BANDED_PREFILL_PLAN_CACHE: dict = {}
 _DEEPSEEK_V4_BANDED_PREFILL_PLAN_CACHE_MAX = 8
@@ -2271,44 +1905,6 @@ def banded_prefill_call_counts() -> dict[str, int]:
     return dict(_BANDED_PREFILL_CALL_COUNTS)
 
 
-def _banded_prefill_mma_enabled() -> bool:
-    """Gate for routing banded prefill layers through the mma consumer.
-
-    The mma route computes the same band-plus-pool visibility with half
-    operand staging and float32 accumulation (the operand contract the
-    ratio-4 layers already serve), replacing the composed SDPA fallback
-    that materializes the [blocks, heads, block, band] score tensor at head
-    dim 512. This numerically valid variant changes accumulation order and
-    therefore lacks bit identity. The default rides the math-change gate campaign
-    recorded in the speed log.
-    Kill switch ``MOESPRESSO_DSV4_BANDED_PREFILL_MMA=0`` restores the
-    batched banded SDPA form.
-    """
-    import os
-
-    return os.environ.get("MOESPRESSO_DSV4_BANDED_PREFILL_MMA", "1") != "0"
-
-
-def _banded_prefill_offset_enabled() -> bool:
-    """Gate for serving banded prefill chunks at cache offsets past zero.
-
-    Default on. The route passes the true cache offset through the banded
-    mma consumer, which computes every visibility predicate from ``pos0``;
-    the ratio-4 path serves the same kernel family at offset on every
-    chunk. It engages only past the 4096 single-chunk gate and measured
-    1.10x faster prefill at depth 7698 and 1.14x at 15406 with transient
-    peaks of 10.7 to 11.1 GiB against 12.2 to 16.5 GiB for the composed
-    fallback, with engaged teacher-forced NLL reading better at both
-    depths. Kill switch ``MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET=0``
-    restores the offset-zero-only behavior byte-identically: every chunk
-    after the first drops the banded layers to the composed SDPA fallback
-    that materializes the score tensor at head dim 512.
-    """
-    import os
-
-    return os.environ.get("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1") != "0"
-
-
 def _deepseek_v4_banded_mma_offset_ready(
     mx, *, q, kv, ratio, scale, cache, cache_cls,
 ) -> bool:
@@ -2321,12 +1917,6 @@ def _deepseek_v4_banded_mma_offset_ready(
     ``update_and_fetch`` or the compressor advance state, so an ineligible
     call fails closed to the composed form with the cache untouched.
     """
-    from moespresso.runtime.deepseek_v4.indexed_attention_kernel import (
-        _prefill_live_mma_enabled,
-    )
-
-    if not _banded_prefill_mma_enabled() or not _prefill_live_mma_enabled():
-        return False
     n_heads = int(q.shape[1])
     head_dim = int(q.shape[3])
     if head_dim != 512 or n_heads % 16 != 0:
@@ -2361,7 +1951,6 @@ def _deepseek_v4_banded_mma_attention(
     single-chunk call would.
     """
     from moespresso.runtime.deepseek_v4.indexed_attention_kernel import (
-        _prefill_live_mma_enabled,
         banded_prefill_attention_live,
     )
 
@@ -2373,8 +1962,6 @@ def _deepseek_v4_banded_mma_attention(
     # The consumer kernel applies rsqrt(head_dim); any other served scale
     # keeps the SDPA form.
     if float(scale) != float(head_dim) ** -0.5:
-        return None
-    if not _prefill_live_mma_enabled():
         return None
     floats = (mx.float16, mx.bfloat16, mx.float32)
     if q.dtype not in floats or kv.dtype not in floats:
@@ -2537,9 +2124,8 @@ class _BandedPrefillAttention:
     ``pos0``, and the rotating cache hands exactly the band lead-in rows.
     The batched SDPA plan assumes local key positions starting at zero, so
     at offset the only fallback is the composed original and every
-    eligibility predicate is decided before any cache mutation. The kill
-    switch ``MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET=0`` serves the composed
-    original unchanged on every offset chunk.
+    eligibility predicate is decided before any cache mutation. Calls that
+    miss a precondition serve the composed original with the cache untouched.
     """
 
     def __init__(self, original, *, mx, dsv4_model, cache_cls):
@@ -2571,8 +2157,6 @@ class _BandedPrefillAttention:
         ):
             return attn(x, mask=mask, cache=cache)
         offset = int(offset)
-        if offset != 0 and not _banded_prefill_offset_enabled():
-            return attn(x, mask=mask, cache=cache)
         if (
             # The band must be narrower than the dense key length or the
             # banded call is dense work plus padding overhead. The gate is
@@ -2638,19 +2222,17 @@ class _BandedPrefillAttention:
                     pooled = candidate
 
         pooled_rows = 0 if pooled is None else int(pooled.shape[1])
-        heads = None
-        if offset != 0 or _banded_prefill_mma_enabled():
-            heads = _deepseek_v4_banded_mma_attention(
-                mx,
-                q=q,
-                kv=kv,
-                pooled=pooled,
-                sinks=attn.attn_sink,
-                window=window,
-                ratio=ratio,
-                scale=attn.softmax_scale,
-                pos0=offset,
-            )
+        heads = _deepseek_v4_banded_mma_attention(
+            mx,
+            q=q,
+            kv=kv,
+            pooled=pooled,
+            sinks=attn.attn_sink,
+            window=window,
+            ratio=ratio,
+            scale=attn.softmax_scale,
+            pos0=offset,
+        )
         if offset != 0:
             if heads is None:
                 # The hoisted eligibility check decides every engine
@@ -2902,14 +2484,6 @@ def deepseek_v4_attention_layer_stats(model) -> list[dict[str, int]]:
             "attention_sdpa_max_key_rows": int(
                 attn._moespresso_dsv4_attention_sdpa_max_key_rows
             ),
-            # Proxied down the wrapper chain to the fused decode wrapper;
-            # zero when the fused island is absent or never engaged.
-            "fused_decode_attention_calls": int(
-                getattr(attn, "fused_decode_calls", 0) or 0
-            ),
-            "fused_decode_composed_tail_calls": int(
-                getattr(attn, "fused_decode_composed_tail_calls", 0) or 0
-            ),
             # Decode steps this layer ran under the fixed-shape decode
             # cache contract; zero for sliding-window layers, which keep
             # no compressed pool state.
@@ -3048,8 +2622,7 @@ def _patch_deepseek_v4_attention_seam_rope(model) -> bool:
     four times (query, KV, inverse output, indexer query) at near-zero
     traffic; the decode ledger prices the three attention rope stages at
     about 0.29 ms/layer fenced marginal. Prefill row counts serve the
-    same fused dispatch by default (`MOESPRESSO_DSV4_SEAM_ROPE_PREFILL=0`
-    restores the decode-only row cap); the composed prefill assemblies
+    same fused dispatch by default; the composed prefill assemblies
     fence at 222.8 ms of removable data movement per anchor chunk and the
     extension served 0.14 s off the anchor chunk wall (14.538 against
     14.677 s, medians of three). The fused kernel is a bit-exact per-op
@@ -3059,9 +2632,7 @@ def _patch_deepseek_v4_attention_seam_rope(model) -> bool:
     The patch replaces the jang module-global (the fp16 SDPA precedent):
     every caller routes through the module attribute, including the
     indexer score contract and the compressor's pooled-row rope.
-    Eligibility fails closed to the composed path per call; the kill
-    switches are read per call so serving and tests can toggle them
-    without reinstalling.
+    Eligibility fails closed to the composed path per call.
     """
     try:
         import jang_tools.dsv4.mlx_model as dsv4_model
@@ -3090,8 +2661,7 @@ def _patch_deepseek_v4_attention_seam_rope(model) -> bool:
             x, rope, offset=0, inverse=False, positions=None,
         ):
             if (
-                attention_seam_kernel.rope_seam_enabled()
-                and type(rope) is rope_cls
+                type(rope) is rope_cls
                 and int(rope.dims) == 64
                 and attention_seam_kernel.partial_rope_eligible(
                     x, rope.inv_freq, offset=offset, positions=positions,
@@ -3122,9 +2692,6 @@ def _patch_deepseek_v4_attention_seam_rope(model) -> bool:
     return patched
 
 
-# Kill switch for the decode-shaped q8_0 affine-QMV fast path below.
-_DSV4_Q8_DECODE_QMV = os.environ.get("MOESPRESSO_DSV4_Q8_DECODE_QMV", "1") != "0"
-
 # The wire-QMV decode route on wo_b and lm_head below is unconditional at
 # eligible decode shapes. At the served decode shapes the mlx-kquant QMV
 # on the resident q8_0 wire bytes beats the affine QMV at lm_head (1.718
@@ -3138,8 +2705,7 @@ _DSV4_Q8_DECODE_QMV = os.environ.get("MOESPRESSO_DSV4_Q8_DECODE_QMV", "1") != "0
 # gate campaign without moving served tokens off the banded rail. wo_a
 # keeps the batched affine decode form, which beats every wire
 # alternative (the wire QMV has no batched-weight form), and multi-row
-# prefill calls keep their current paths. MOESPRESSO_DSV4_Q8_DECODE_QMV=0
-# closes the whole decode QMV family, wire route included.
+# prefill calls keep their current paths.
 
 _DEEPSEEK_V4_Q8_BLOCK_BYTES = 34
 _DEEPSEEK_V4_Q8_GROUP = 32
@@ -3164,9 +2730,8 @@ _WO_A_PROJECTION_CALL_COUNTS = {
 # contract and is math-affecting at the fp32-protected q8 seam (0.0076
 # max-abs against the affine form at the served decode shape); it
 # certified ahead of the reference engine with the full quality ladder
-# on the woagather rail. MOESPRESSO_DSV4_Q8_DECODE_QMV=0 closes the
-# whole decode QMV family, this route included, and per-call
-# eligibility fails closed to the batched affine form.
+# on the woagather rail. Per-call eligibility fails closed to the batched
+# affine form.
 
 
 def wo_a_projection_call_counts() -> dict[str, int]:
@@ -3205,39 +2770,10 @@ def kquant_bulk_route_call_counts() -> dict[str, int]:
     return dict(_KQUANT_BULK_ROUTE_CALL_COUNTS)
 
 
-_DSV4_KQUANT_BULK_ROUTE_ENV = "MOESPRESSO_DSV4_KQUANT_BULK_ROUTE"
-
 # Cached verdict of the strided-bulk kernel probe below. None until the
 # first bulk call asks; then True (kernel verified on the defect pair) or
 # False (bridge stays engaged).
 _DSV4_KQUANT_STRIDED_BULK_FIXED = None
-
-
-def _dsv4_kquant_bulk_route() -> str:
-    """Route selector for non-q8_0 dense bulk multi-row matmul calls.
-
-    ``auto`` (default) serves the direct kernel route only for
-    verify-shaped tiny multi-row calls (rows within the declared tiny-M
-    width, the speculative verify class) and only when the strided-bulk
-    probe verifies the installed mlx-kquant on the recorded defect pair;
-    prefill- and scorer-width calls keep the dequant bridge. The kernel
-    op emits on the bfloat16 lattice where the bridge computes in
-    float32, and routing every bulk width through the kernel measured
-    Q2 avg NLL 0.40094 on the ship artifact against 0.39634 through the
-    bridge (above the 0.3990 dense-gate band bar), so the width gate
-    confines the math change to the verify forwards that own the round
-    wall. ``kernel`` forces the kernel route at every bulk width (the
-    instrument arm behind the bounding Q2 reading; still probe-gated,
-    refusing on an unverified build). ``bridge`` forces the dequant
-    bridge regardless of the probe (the A/B and kill lever). Unknown
-    values refuse rather than guess.
-    """
-    value = os.environ.get(_DSV4_KQUANT_BULK_ROUTE_ENV, "auto")
-    if value not in ("auto", "kernel", "bridge"):
-        raise DeepseekV4RuntimeLoadError(
-            f"{_DSV4_KQUANT_BULK_ROUTE_ENV} must be 'auto', 'kernel', or "
-            f"'bridge', got {value!r}")
-    return value
 
 
 def _dsv4_kquant_strided_bulk_fixed(*, mx, kq) -> bool:
@@ -3304,47 +2840,14 @@ def q8_ffn_hc_post_call_counts() -> dict[str, int]:
     return dict(_Q8_FFN_HC_POST_CALL_COUNTS)
 
 
-# Kill switch for the fp32 seam contract on affine dense wo modules below.
-# Setting MOESPRESSO_DSV4_AFFINE_WO_FP32=0 restores the stock float16 wo
-# seams for A/B arms; default serving keeps the fp32 contract.
-_DSV4_AFFINE_WO_FP32 = (
-    os.environ.get("MOESPRESSO_DSV4_AFFINE_WO_FP32", "1") != "0"
-)
-
 # Affine dense wo fp32-seam engagement counts by module, exported through
-# `ssd_streaming_stats` and the speed-stats count keys so served A/B arms
-# can prove which seam contract ran. "delegated" counts kill-switch
-# delegations to the stock float16 path.
-_AFFINE_WO_FP32_CALL_COUNTS = {"wo_a": 0, "wo_b": 0, "delegated": 0}
+# `ssd_streaming_stats` and the speed-stats count keys.
+_AFFINE_WO_FP32_CALL_COUNTS = {"wo_a": 0, "wo_b": 0}
 
 
 def affine_wo_fp32_call_counts() -> dict[str, int]:
     """Return affine dense wo fp32-seam engagement counts by module."""
     return dict(_AFFINE_WO_FP32_CALL_COUNTS)
-
-
-def _dsv4_wo_a_batched_decode_enabled() -> bool:
-    """Kill switch for the single-dispatch decode form of the grouped wo_a.
-
-    Decode-shaped (single activation row) grouped projections run one
-    batched `mx.quantized_matmul` over the stacked affine group views
-    instead of eight per-group QMV dispatches plus a concatenate. Each
-    output element reduces the same group_feat products through the same
-    per-batch QMV kernel, so the batched form is bit-identical to the
-    slice loop (0 mismatched output bits per group across all 43 layers'
-    served steady-state activations on real q8_0 wire at the served
-    [8, 1024, 4096] geometry). Unlike the batched prefill form, the decode
-    shape is dispatch-bound rather than GEMM-floor-bound: the fenced
-    same-stage A/B at the seeded steady state reads loop 0.516-0.543
-    versus batched 0.329-0.337 ms medians across the layer classes, and
-    the whole-token alternating A/B reads 57.4 versus 52.8 ms/token.
-
-    Default on. ``MOESPRESSO_DSV4_WO_A_BATCHED_DECODE=0`` restores the
-    per-group slice loop. Ineligible calls (non-q8_0 wire, missing affine
-    views, geometry mismatches, or the affine decode QMV kill switch)
-    always fall back to the loop.
-    """
-    return os.environ.get("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", "1") != "0"
 
 
 def _dsv4_q8_tiny_m_rows_max() -> int:
@@ -3368,8 +2871,6 @@ def _dsv4_q8_tiny_m_rows_max() -> int:
 
     Default 8 covers a draft block of five plus the bonus row; 0 disables
     the route. Read per call, so the env is a live switch.
-    ``MOESPRESSO_DSV4_Q8_DECODE_QMV=0`` also closes the route with the
-    rest of the q8_0 QMV/QMM family.
     """
     return int(os.environ.get("MOESPRESSO_DSV4_Q8_TINY_M_MAX", "8"))
 
@@ -3520,7 +3021,6 @@ def _deepseek_v4_q8_hc_post_eligible(module, x, call, *, mx) -> bool:
         call is None
         or call.used
         or not getattr(module, "_moespresso_dsv4_q8_hc_post_eligible", False)
-        or not _DSV4_Q8_DECODE_QMV
     ):
         return False
     original = module.original
@@ -3566,7 +3066,6 @@ def _deepseek_v4_q8_ffn_hc_post_eligible(module, x, call, *, mx) -> bool:
         or call.routed is None
         or not getattr(
             module, "_moespresso_dsv4_q8_ffn_hc_post_eligible", False)
-        or not _DSV4_Q8_DECODE_QMV
     ):
         return False
     original = module.original
@@ -3618,7 +3117,6 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
         if (
             rows == 1
             and wire_decode_site is not None
-            and _DSV4_Q8_DECODE_QMV
             and _deepseek_v4_q8_wire_decode_eligible(
                 x, weight, wire_decode_site, mx=mx)
         ):
@@ -3637,7 +3135,7 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
                 kquant_type,
                 transpose=True,
             ).astype(mx.float32)
-        elif (rows == 1 and _DSV4_Q8_DECODE_QMV) and (
+        elif rows == 1 and (
             # `affine` may be a zero-arg callable so the repack (a full
             # extra copy of the wire tensor) only materializes when this
             # branch actually consumes it; the wire and dequant branches
@@ -3668,7 +3166,6 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
             )
         elif (
             1 < rows <= _dsv4_q8_tiny_m_rows_max()
-            and _DSV4_Q8_DECODE_QMV
             and ("tiny_m_qmm_" + str(tiny_m_site))
             in _Q8_DENSE_MATMUL_CALL_COUNTS
             and x.dtype in (mx.float32, mx.bfloat16, mx.float16)
@@ -3721,25 +3218,14 @@ def _kquant_matmul_ds4_fp32(x, weight, scales, kquant_type: str, bias=None, *,
             # only when the strided-bulk probe verifies the installed
             # mlx-kquant bit-exact on the recorded defect pair; wider
             # calls and unverified builds keep the bridge, and the route
-            # selector documents the Q2 reading behind the width gate.
-            # A forced `kernel` route on an unverified build refuses
-            # rather than serve the defect. Single-row decode calls never
+            # width gate preserves the quality-qualified route. Single-row
+            # decode calls never
             # carried a multi-row strided activation and measure clean
             # in-situ, so they stay on the kernel unconditionally.
-            route = _dsv4_kquant_bulk_route()
-            use_kernel = False
-            if route == "kernel":
-                if not _dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq):
-                    raise DeepseekV4RuntimeLoadError(
-                        f"{_DSV4_KQUANT_BULK_ROUTE_ENV}=kernel requires an "
-                        "mlx-kquant build that passes the strided-bulk "
-                        "probe; the installed build does not")
-                use_kernel = True
-            elif route == "auto":
-                use_kernel = (
-                    rows <= _dsv4_q8_tiny_m_rows_max()
-                    and _dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq)
-                )
+            use_kernel = (
+                rows <= _dsv4_q8_tiny_m_rows_max()
+                and _dsv4_kquant_strided_bulk_fixed(mx=mx, kq=kq)
+            )
             if use_kernel:
                 _KQUANT_BULK_ROUTE_CALL_COUNTS["kernel"] += 1
                 y = kq.quantized_matmul(
@@ -3858,7 +3344,6 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
         if (
             rows == 1
             and wo_a.kquant_type == "q8_0"
-            and _DSV4_Q8_DECODE_QMV
             and hasattr(kq, "gather_qmv_kq")
             and grouped.dtype in (mx.float32, mx.bfloat16, mx.float16)
         ):
@@ -3889,8 +3374,6 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
         if (
             rows == 1
             and wo_a.kquant_type == "q8_0"
-            and _DSV4_Q8_DECODE_QMV
-            and _dsv4_wo_a_batched_decode_enabled()
         ):
             group_views = _deepseek_v4_q8_affine_group_views(
                 wo_a, groups=groups, rank=rank, group_feat=group_feat, mx=mx)
@@ -3919,7 +3402,6 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
         if (
             1 < rows <= _dsv4_q8_tiny_m_rows_max()
             and wo_a.kquant_type == "q8_0"
-            and _DSV4_Q8_DECODE_QMV
             and grouped.dtype in (mx.float32, mx.bfloat16, mx.float16)
         ):
             group_views = _deepseek_v4_q8_affine_group_views(
@@ -3933,8 +3415,7 @@ def _patch_deepseek_v4_kquant_grouped_output_projection(model) -> int:
                 # differs from the loop only in float32 accumulation
                 # order (see ``_dsv4_q8_tiny_m_rows_max``). The swapaxes
                 # pair keeps the loop's row order and last-axis group
-                # concatenation. Missing views or the kill switches fall
-                # through to the loop.
+                # concatenation. Missing views fall through to the loop.
                 _WO_A_PROJECTION_CALL_COUNTS["batched_tiny_m"] += 1
                 w_qg, group_scales, group_biases = group_views
                 y = mx.quantized_matmul(
@@ -4448,10 +3929,7 @@ def _patch_deepseek_v4_affine_wo_fp32(model) -> int:
     and wo_b in affine mode are patched, and wo_a additionally must match
     the grouped projection geometry. K-quant wo modules are not
     QuantizedLinear and keep their existing bridge; plain and mx-mode
-    modules keep the stock path. `MOESPRESSO_DSV4_AFFINE_WO_FP32=0` is the
-    kill switch: patched modules then delegate per call to the stock
-    float16 path (counted as "delegated") so A/B arms can prove which seam
-    contract ran.
+    modules keep the stock path.
     """
     try:
         import mlx.core as mx
@@ -4477,9 +3955,6 @@ def _patch_deepseek_v4_affine_wo_fp32(model) -> int:
 
         def __call__(self, x):
             original = self.original
-            if not _DSV4_AFFINE_WO_FP32:
-                _AFFINE_WO_FP32_CALL_COUNTS["delegated"] += 1
-                return original(x)
             _AFFINE_WO_FP32_CALL_COUNTS["wo_b"] += 1
             y = mx.quantized_matmul(
                 x.astype(mx.float32),
@@ -4495,40 +3970,35 @@ def _patch_deepseek_v4_affine_wo_fp32(model) -> int:
                 y = y + original["bias"].astype(mx.float32)
             return y
 
-    def _make_projection(stock):
-        def _affine_fp32_grouped_output_projection(self, out):
-            if not _DSV4_AFFINE_WO_FP32:
-                _AFFINE_WO_FP32_CALL_COUNTS["delegated"] += 1
-                return stock(out)
-            wo_a = self.wo_a
-            bsz, length = out.shape[:2]
-            groups = int(self.o_groups)
-            rank = int(self.o_lora_rank)
-            group_feat = (self.n_heads * self.head_dim) // groups
-            _AFFINE_WO_FP32_CALL_COUNTS["wo_a"] += 1
-            # The stock grouped QMM at the float32 activation dtype: same
-            # batched dispatch over the packed group views, float32
-            # accumulation and output at the seam.
-            x = out.reshape(bsz, length, groups, group_feat)
-            x = x.astype(mx.float32).transpose(2, 0, 1, 3)
-            weight = wo_a["weight"].reshape(groups, rank, -1)[:, None]
-            scales = wo_a["scales"].reshape(groups, rank, -1)[:, None]
-            biases = wo_a["biases"].reshape(groups, rank, -1)[:, None]
-            y = mx.quantized_matmul(
-                x,
-                weight,
-                scales=scales,
-                biases=biases,
-                transpose=True,
-                group_size=wo_a.group_size,
-                bits=wo_a.bits,
-                mode="affine",
-            )
-            y = y.transpose(1, 2, 0, 3).reshape(bsz, length, groups * rank)
-            if "bias" in wo_a:
-                y = y + wo_a["bias"].astype(mx.float32)
-            return y
-        return _affine_fp32_grouped_output_projection
+    def _affine_fp32_grouped_output_projection(self, out):
+        wo_a = self.wo_a
+        bsz, length = out.shape[:2]
+        groups = int(self.o_groups)
+        rank = int(self.o_lora_rank)
+        group_feat = (self.n_heads * self.head_dim) // groups
+        _AFFINE_WO_FP32_CALL_COUNTS["wo_a"] += 1
+        # The stock grouped QMM at the float32 activation dtype: same
+        # batched dispatch over the packed group views, float32
+        # accumulation and output at the seam.
+        x = out.reshape(bsz, length, groups, group_feat)
+        x = x.astype(mx.float32).transpose(2, 0, 1, 3)
+        weight = wo_a["weight"].reshape(groups, rank, -1)[:, None]
+        scales = wo_a["scales"].reshape(groups, rank, -1)[:, None]
+        biases = wo_a["biases"].reshape(groups, rank, -1)[:, None]
+        y = mx.quantized_matmul(
+            x,
+            weight,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=wo_a.group_size,
+            bits=wo_a.bits,
+            mode="affine",
+        )
+        y = y.transpose(1, 2, 0, 3).reshape(bsz, length, groups * rank)
+        if "bias" in wo_a:
+            y = y + wo_a["bias"].astype(mx.float32)
+        return y
 
     patched = 0
     layers = getattr(getattr(model, "model", None), "layers", ())
@@ -4540,10 +4010,9 @@ def _patch_deepseek_v4_affine_wo_fp32(model) -> int:
         wo_a = getattr(attn, "wo_a", None)
         groups = getattr(attn, "o_groups", None)
         rank = getattr(attn, "o_lora_rank", None)
-        stock = getattr(attn, "_grouped_output_projection", None)
         if (
             _eligible(wo_a)
-            and callable(stock)
+            and callable(getattr(attn, "_grouped_output_projection", None))
             and groups is not None
             and rank is not None
             and int(wo_a["weight"].shape[0]) == int(groups) * int(rank)
@@ -4551,7 +4020,7 @@ def _patch_deepseek_v4_affine_wo_fp32(model) -> int:
             object.__setattr__(
                 attn,
                 "_grouped_output_projection",
-                MethodType(_make_projection(stock), attn),
+                MethodType(_affine_fp32_grouped_output_projection, attn),
             )
             layer_patched = True
         wo_b = getattr(attn, "wo_b", None)
@@ -5212,9 +4681,6 @@ def _dsv4_prefill_single_chunk_max_tokens() -> int:
     ))
 
 
-_DSV4_WIRED_PREWARM_ENV = "MOESPRESSO_DSV4_WIRED_PREWARM"
-
-
 def _prewarm_wired_limit(model, *, wired_limit_fn=None, streams=None) -> float | None:
     """Enter and exit the generation wired-limit context once at load.
 
@@ -5233,11 +4699,8 @@ def _prewarm_wired_limit(model, *, wired_limit_fn=None, streams=None) -> float |
     no-op and the cost stays in the first request. The warm therefore
     evaluates a one-element sentinel first (scheduling-only, no model
     math) and then enters the context. Returns the elapsed entry
-    seconds, or None when disabled or when mlx_lm is absent.
-    ``MOESPRESSO_DSV4_WIRED_PREWARM=0`` is the kill switch.
+    seconds, or None when mlx_lm is absent.
     """
-    if os.environ.get(_DSV4_WIRED_PREWARM_ENV, "1") == "0":
-        return None
     if wired_limit_fn is None:
         try:
             import mlx.core as mx
@@ -5282,6 +4745,14 @@ def load_deepseek_v4_package_model(
     architecture = manifest.get("architecture") or {}
     if architecture.get("family") != "deepseek_v4_flash":
         raise DeepseekV4RuntimeLoadError("manifest is not a DeepSeek V4 package")
+    if any(
+        tensor.get("format") == "iqk" and tensor.get("kind") != "expert"
+        for tensor in manifest.get("tensors", [])
+        if isinstance(tensor, dict)
+    ):
+        raise DeepseekV4RuntimeLoadError(
+            "DeepSeek V4 packages do not support dense IQ_K tensors"
+        )
 
     package_dir = Path(package_dir)
     if load_config_fn is None or load_skeleton_fn is None or load_tokenizer_fn is None:
@@ -5308,12 +4779,11 @@ def load_deepseek_v4_package_model(
         from moespresso.runtime.build import _mixed_gate_up_layers
 
     if install_bundles_fn is None:
-        def install_bundles_fn(model_arg, package_dir_arg, index_arg, *, seed):
+        def install_bundles_fn(model_arg, package_dir_arg, index_arg):
             return _install_deepseek_v4_pooled_bundles(
                 model_arg,
                 package_dir_arg,
                 index_arg,
-                seed=seed,
                 capacity_per_layer=capacity_per_layer,
                 capacity_overrides=capacity_overrides,
                 eviction_policy=eviction_policy,
@@ -5389,24 +4859,6 @@ def load_deepseek_v4_package_model(
         )
         _patch_deepseek_v4_kquant_grouped_output_projection(model)
         _patch_deepseek_v4_kquant_lm_head(model)
-    from moespresso.runtime.deepseek_v4.iqk_dense import (
-        manifest_requires_iqk_dense as _manifest_requires_iqk_dense,
-    )
-
-    if _manifest_requires_iqk_dense(manifest):
-        # Dense IQ_K modules swap before the regular-weight load so their
-        # packed wire binds by module weight key; the DS4 seam routes and
-        # the lm_head patch key on the installed modules' mode and leave
-        # every non-IQ_K module on its stock route.
-        from moespresso.runtime.deepseek_v4.iqk_dense import (
-            install_deepseek_v4_iqk_dense_modules,
-            install_deepseek_v4_iqk_dense_seams,
-            patch_deepseek_v4_iqk_dense_lm_head,
-        )
-
-        install_deepseek_v4_iqk_dense_modules(model, manifest)
-        install_deepseek_v4_iqk_dense_seams(model)
-        patch_deepseek_v4_iqk_dense_lm_head(model)
     _patch_deepseek_v4_affine_wo_fp32(model)
     _patch_deepseek_v4_hc_post_float32(model)
     _patch_deepseek_v4_hc_fused(model)
@@ -5435,7 +4887,6 @@ def load_deepseek_v4_package_model(
     _patch_deepseek_v4_attention_compressor_fp8_kv(model)
     _patch_deepseek_v4_indexer_score_contract(model)
     _patch_deepseek_v4_router_gate_trims(model)
-    _patch_deepseek_v4_ratio4_decode_fused_attention(model)
     _patch_deepseek_v4_ratio4_prefill_fast_path(model)
     _patch_deepseek_v4_banded_prefill_attention(model)
     _patch_deepseek_v4_attention_shape_stats(model)
@@ -5454,8 +4905,7 @@ def load_deepseek_v4_package_model(
         raise DeepseekV4RuntimeLoadError(
             "DeepSeek V4 manifest declares routed experts but no expert index was found")
     if index is not None:
-        seed = int(jang_cfg.get("mxtq_seed", 42))
-        install_bundles_fn(model, package_dir, index, seed=seed)
+        install_bundles_fn(model, package_dir, index)
         if default_pooled_install:
             from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 

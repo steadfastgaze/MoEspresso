@@ -8,8 +8,8 @@ help:
 	@echo "make lock           - re-resolve uv.lock after a deliberate dep change"
 	@echo "make lock-check     - fail if uv.lock is stale vs pyproject.toml"
 	@echo "make dist-check     - build and audit the public wheel and sdist"
-	@echo "make roadtest       - cumulative-session engine road-test against a"
-	@echo "                      really served package (opt-in, GPU-bound; set"
+	@echo "make roadtest       - multi-hour 110k-token cumulative certification"
+	@echo "                      soak against a served package (opt-in, GPU-bound; set"
 	@echo "                      MOESPRESSO_ROADTEST_PACKAGE or ROADTEST_ARGS)"
 	@echo "make clean          - remove caches"
 
@@ -26,10 +26,12 @@ lint:
 fmt:
 	uv run ruff format src tests
 
-# Engine road-test: a scripted cumulative agentic session against a really
+# Engine road-test: a multi-hour scripted cumulative agentic session against a
 # served model, asserting cache events, disk checkpoints, and restart resume
-# turn over turn. Opt-in and GPU-bound; never part of `make test`. The runner
-# itself is a pure HTTP client that launches the served process.
+# turn over turn. Its default growth target is 110k tokens. `--target-tokens`
+# controls only the optional extension phase and does not skip the fixed
+# protocol. Opt-in and GPU-bound; never part of `make test`. The runner itself
+# is a pure HTTP client that launches the served process.
 roadtest:
 	uv run --locked python -m moespresso.agentlib.roadtest $(ROADTEST_ARGS)
 

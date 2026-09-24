@@ -242,8 +242,8 @@ class _ExpertIndex:
 def _manifest():
     return {
         "architecture": {"family": "deepseek_v4_flash"},
-        "required_ops": ["affine_dequant", "tq_dequant"],
-        "tensors": [{"format": "affine"}, {"format": "tq"}],
+        "required_ops": ["affine_dequant", "mxfp4_dequant"],
+        "tensors": [{"format": "affine"}, {"format": "mxfp4"}],
     }
 
 
@@ -304,7 +304,7 @@ def _routed_tq_manifest():
         {
             "source_name": "layers.0.ffn.experts.gate",
             "kind": "expert",
-            "format": "tq",
+            "format": "mxfp4",
             "format_params": {"bits": 2},
         },
     ]
@@ -562,7 +562,6 @@ def _configure_q8_ffn_hc_post(
     attn_input=256,
     ffn_input=32,
 ):
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", True)
     monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_HIDDEN", hidden)
     monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_HC_POST_INPUT", attn_input)
     monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_FFN_HC_POST_HIDDEN", hidden)
@@ -1502,7 +1501,7 @@ def test_deepseek_v4_q8_decode_row_uses_affine_qmv(monkeypatch, x_dtype_name):
         np.asarray(out), np.asarray(reference), rtol=1.0e-5, atol=1.0e-5)
 
 
-def test_deepseek_v4_q8_multi_row_and_kill_switch_stay_on_dequant(monkeypatch):
+def test_deepseek_v4_q8_multi_row_stays_on_dequant():
     mx = pytest.importorskip("mlx.core")
     kq = pytest.importorskip("mlx_kquant")
     from moespresso.runtime.deepseek_v4.model import (
@@ -1531,18 +1530,6 @@ def test_deepseek_v4_q8_multi_row_and_kill_switch_stay_on_dequant(monkeypatch):
     mx.eval(out)
     assert out.dtype == mx.float32
     assert calls["dequantize"] == 1
-
-    # The kill switch forces the dequant bridge for single rows too.
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
-    out = _kquant_matmul_ds4_fp32(
-        mx.zeros((1, 1, 64), dtype=mx.float16),
-        module["weight"], module["scales"], "q8_0",
-        mx=mx, kq=spy_kq, affine=affine,
-    )
-    mx.eval(out)
-    assert out.dtype == mx.float32
-    assert calls["dequantize"] == 2
-
 
 def test_deepseek_v4_non_q8_multi_row_takes_the_dequant_bridge(monkeypatch):
     # The defective kq.quantized_matmul returned wrong values when an
@@ -1681,66 +1668,6 @@ def test_deepseek_v4_non_q8_multi_row_kernel_route_when_probe_verified(
     assert counts_after["bridge"] == counts_before["bridge"] + 1
 
 
-def test_deepseek_v4_kquant_bulk_route_env_overrides(monkeypatch):
-    # `bridge` forces the dequant bridge even on a verified build; unknown
-    # values refuse rather than guess.
-    mx = pytest.importorskip("mlx.core")
-    kq = pytest.importorskip("mlx_kquant")
-    import moespresso.runtime.deepseek_v4.model as ds4_model
-    from moespresso.runtime.deepseek_v4.model import (
-        DeepseekV4RuntimeLoadError,
-        _kquant_matmul_ds4_fp32,
-    )
-
-    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
-
-    rng = np.random.default_rng(11)
-    dense = mx.array(rng.standard_normal((16, 256), dtype=np.float32))
-    wire, scales = kq.quantize(dense, "q6_k")
-    mx.eval(wire, scales)
-    calls = {"dequantize": 0, "quantized_matmul": 0}
-
-    def spy_dequantize(*args, **kwargs):
-        calls["dequantize"] += 1
-        return kq.dequantize(*args, **kwargs)
-
-    def spy_qmm(*args, **kwargs):
-        calls["quantized_matmul"] += 1
-        return kq.quantized_matmul(*args, **kwargs)
-
-    spy_kq = SimpleNamespace(dequantize=spy_dequantize, quantized_matmul=spy_qmm)
-    x = mx.array(rng.standard_normal((1, 3, 256), dtype=np.float32)).astype(
-        mx.bfloat16)
-    mx.eval(x)
-
-    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "bridge")
-    out = _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
-    mx.eval(out)
-    assert calls["dequantize"] == 1
-    assert calls["quantized_matmul"] == 0
-
-    # `kernel` forces the kernel route at any bulk width on a verified
-    # build (the instrument arm behind the bounding Q2 reading).
-    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "kernel")
-    wide = mx.array(rng.standard_normal((1, 16, 256), dtype=np.float32)).astype(
-        mx.bfloat16)
-    mx.eval(wide)
-    out = _kquant_matmul_ds4_fp32(wide, wire, scales, "q6_k", mx=mx, kq=spy_kq)
-    mx.eval(out)
-    assert calls["quantized_matmul"] == 1
-    assert calls["dequantize"] == 1
-
-    # A forced kernel route on an unverified build refuses.
-    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", False)
-    with pytest.raises(DeepseekV4RuntimeLoadError):
-        _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
-    monkeypatch.setattr(ds4_model, "_DSV4_KQUANT_STRIDED_BULK_FIXED", True)
-
-    monkeypatch.setenv("MOESPRESSO_DSV4_KQUANT_BULK_ROUTE", "kernel-please")
-    with pytest.raises(DeepseekV4RuntimeLoadError):
-        _kquant_matmul_ds4_fp32(x, wire, scales, "q6_k", mx=mx, kq=spy_kq)
-
-
 def test_kquant_bulk_route_counters_reach_all_three_census_surfaces(monkeypatch):
     """A counter on one surface defeats a census-gated instrument.
 
@@ -1842,19 +1769,16 @@ def test_deepseek_v4_q8_tiny_m_qmm_engages_at_declared_site(monkeypatch):
     np.testing.assert_allclose(
         np.asarray(tiny_out), np.asarray(reference), rtol=1.0e-5, atol=1.0e-5)
 
-    # Undeclared sites, rows past the cap, the cap kill switch, and the
-    # family switch all keep the dequant bridge.
-    for kwargs, env_max, family in (
-        (dict(), None, True),
-        (dict(tiny_m_site="wq_b"), None, True),
-        (dict(tiny_m_site="wo_b"), "0", True),
-        (dict(tiny_m_site="wo_b"), None, False),
+    # Undeclared sites and the operator-controlled cap keep the dequant bridge.
+    for kwargs, env_max in (
+        (dict(), None),
+        (dict(tiny_m_site="wq_b"), None),
+        (dict(tiny_m_site="wo_b"), "0"),
     ):
         if env_max is not None:
             monkeypatch.setenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", env_max)
         else:
             monkeypatch.delenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", raising=False)
-        monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", family)
         before = q8_dense_matmul_call_counts()
         out = _kquant_matmul_ds4_fp32(
             x, module["weight"], module["scales"], "q8_0",
@@ -1864,8 +1788,6 @@ def test_deepseek_v4_q8_tiny_m_qmm_engages_at_declared_site(monkeypatch):
         after = q8_dense_matmul_call_counts()
         assert after["prefill_dequant"] == before["prefill_dequant"] + 1
         assert after["tiny_m_qmm_wo_b"] == before["tiny_m_qmm_wo_b"]
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", True)
-
     wide = mx.array(np.random.default_rng(53).standard_normal(
         (1, 9, 128), dtype=np.float32))
     before = q8_dense_matmul_call_counts()
@@ -1929,45 +1851,6 @@ def test_deepseek_v4_q8_wire_decode_qmv_engages_and_bounds_drift(
     scale = float(mx.max(mx.abs(affine_out)).item())
     assert diff > 0.0
     assert diff <= 0.01 * scale
-
-
-def test_deepseek_v4_q8_wire_decode_family_switch_closes_wire(monkeypatch):
-    mx = pytest.importorskip("mlx.core")
-    kq = pytest.importorskip("mlx_kquant")
-    from moespresso.runtime.deepseek_v4.model import (
-        _deepseek_v4_q8_affine_views,
-        _kquant_matmul_ds4_fp32,
-        q8_dense_matmul_call_counts,
-    )
-
-    module = _real_q8_module(kq, mx, out_dims=32, in_dims=128, seed=13)
-    affine = _deepseek_v4_q8_affine_views(module, mx=mx)
-    x = mx.array(np.random.default_rng(14).standard_normal(
-        (1, 1, 128), dtype=np.float32))
-
-    # The family switch closes the wire route too: both sites land on the
-    # dequant bridge.
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
-    calls = {"dequantize": 0}
-    real_dequantize = kq.dequantize
-
-    def spy_dequantize(*args, **kwargs):
-        calls["dequantize"] += 1
-        return real_dequantize(*args, **kwargs)
-
-    spy_kq = SimpleNamespace(
-        dequantize=spy_dequantize, quantized_matmul=kq.quantized_matmul)
-    before = q8_dense_matmul_call_counts()
-    out = _kquant_matmul_ds4_fp32(
-        x, module["weight"], module["scales"], "q8_0",
-        mx=mx, kq=spy_kq, affine=affine, wire_decode_site="lm_head",
-    )
-    mx.eval(out)
-    after = q8_dense_matmul_call_counts()
-    assert calls["dequantize"] == 1
-    assert after["decode_wire_qmv_lm_head"] == (
-        before["decode_wire_qmv_lm_head"])
-    assert after["decode_qmv"] == before["decode_qmv"]
 
 
 def test_deepseek_v4_q8_wire_decode_eligibility_fails_closed():
@@ -2138,7 +2021,7 @@ def test_deepseek_v4_wo_a_multi_row_routes_by_tiny_m_cap(monkeypatch):
     assert after["loop"] == before["loop"] + 1
     assert after["batched_tiny_m"] == before["batched_tiny_m"]
 
-    # The tiny-M cap env is a live kill switch.
+    # The tiny-M cap remains a live operator control.
     monkeypatch.setenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", "0")
     before = after
     out = attn._grouped_output_projection(
@@ -2147,18 +2030,6 @@ def test_deepseek_v4_wo_a_multi_row_routes_by_tiny_m_cap(monkeypatch):
     after = wo_a_projection_call_counts()
     assert after["loop"] == before["loop"] + 1
     assert after["batched_tiny_m"] == before["batched_tiny_m"]
-
-    # The family switch closes the tiny-M form with the QMV family.
-    monkeypatch.delenv("MOESPRESSO_DSV4_Q8_TINY_M_MAX", raising=False)
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
-    before = after
-    out = attn._grouped_output_projection(
-        mx.zeros((1, 3, 128), dtype=mx.bfloat16))
-    mx.eval(out)
-    after = wo_a_projection_call_counts()
-    assert after["loop"] == before["loop"] + 1
-    assert after["batched_tiny_m"] == before["batched_tiny_m"]
-
 
 def test_deepseek_v4_wo_a_tiny_m_matches_loop_bridge(monkeypatch):
     mx = pytest.importorskip("mlx.core")
@@ -2244,8 +2115,7 @@ def test_deepseek_v4_wo_a_gather_decode_engages_and_bounds_drift(monkeypatch):
     assert diff <= 0.01 * scale
 
 
-def test_deepseek_v4_wo_a_gather_decode_family_switch_and_fail_closed(
-        monkeypatch):
+def test_deepseek_v4_wo_a_gather_decode_fails_closed():
     mx = pytest.importorskip("mlx.core")
     kq = pytest.importorskip("mlx_kquant")
     if not hasattr(kq, "gather_qmv_kq"):
@@ -2255,21 +2125,8 @@ def test_deepseek_v4_wo_a_gather_decode_family_switch_and_fail_closed(
         wo_a_projection_call_counts,
     )
 
-    # The family switch closes the gather route with the rest of the
-    # decode QMV family; the call lands on the per-group loop.
     attn = _real_wo_a_attention_fixture(
         kq, mx, group_feat=256, rank=8, seed=43)
-    model = _WrappedModel([_AttentionLayer(attn)])
-    assert _patch_deepseek_v4_kquant_grouped_output_projection(model) == 1
-    hidden = mx.zeros((1, 1, 512), dtype=mx.float32)
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
-    before = wo_a_projection_call_counts()
-    out = attn._grouped_output_projection(hidden)
-    mx.eval(out)
-    after = wo_a_projection_call_counts()
-    assert after["loop"] == before["loop"] + 1
-    assert after["gather_decode"] == before["gather_decode"]
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", True)
 
     # Geometry outside the gather contract fails closed to the batched
     # affine form: a 64-wide group_feat is not tileable by 256.
@@ -2327,10 +2184,12 @@ def test_deepseek_v4_q8_affine_views_defer_until_fallback(monkeypatch):
     assert diff <= 0.01 * scale
 
 
-def test_deepseek_v4_wo_a_batched_decode_bit_identical_per_group(monkeypatch):
+def test_deepseek_v4_wo_a_batched_decode_bit_identical_per_group():
     mx = pytest.importorskip("mlx.core")
     kq = pytest.importorskip("mlx_kquant")
     from moespresso.runtime.deepseek_v4.model import (
+        _deepseek_v4_q8_affine_views,
+        _kquant_matmul_ds4_fp32,
         wo_a_projection_call_counts,
     )
 
@@ -2343,25 +2202,36 @@ def test_deepseek_v4_wo_a_batched_decode_bit_identical_per_group(monkeypatch):
         rng.standard_normal((1, 1, 128), dtype=np.float32)
     ).astype(mx.bfloat16)
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", "0")
-    before = wo_a_projection_call_counts()
-    loop_out = attn._grouped_output_projection(hidden)
+    groups = int(attn.o_groups)
+    rank = int(attn.o_lora_rank)
+    group_feat = (attn.n_heads * attn.head_dim) // groups
+    grouped = hidden.reshape(1, 1, groups, group_feat)
+    affine = _deepseek_v4_q8_affine_views(attn.wo_a, mx=mx)
+    assert affine is not None
+    pieces = []
+    for group in range(groups):
+        row_start = group * rank
+        row_end = row_start + rank
+        pieces.append(_kquant_matmul_ds4_fp32(
+            grouped[:, :, group, :],
+            attn.wo_a["weight"][row_start:row_end],
+            attn.wo_a["scales"],
+            attn.wo_a.kquant_type,
+            mx=mx,
+            kq=kq,
+            affine=tuple(
+                tensor[row_start:row_end] for tensor in affine),
+        ))
+    loop_out = mx.concatenate(pieces, axis=-1)
     mx.eval(loop_out)
-    after_loop = wo_a_projection_call_counts()
-    assert after_loop["loop"] == before["loop"] + 1
-    assert after_loop["batched_decode"] == before["batched_decode"]
 
-    # Default (no env): decode-shaped calls take the single-dispatch form.
-    monkeypatch.delenv("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", raising=False)
+    before = wo_a_projection_call_counts()
     batched_out = attn._grouped_output_projection(hidden)
     mx.eval(batched_out)
     after_batched = wo_a_projection_call_counts()
-    assert after_batched["batched_decode"] == after_loop["batched_decode"] + 1
-    assert after_batched["loop"] == after_loop["loop"]
+    assert after_batched["batched_decode"] == before["batched_decode"] + 1
 
     assert batched_out.dtype == mx.float32
-    groups = int(attn.o_groups)
-    rank = int(attn.o_lora_rank)
     loop_bits = np.asarray(loop_out).reshape(groups, rank).view(np.uint32)
     batched_bits = np.asarray(batched_out).reshape(
         groups, rank).view(np.uint32)
@@ -2377,7 +2247,6 @@ def test_deepseek_v4_wo_a_batched_decode_single_dispatch_and_fail_closed(
     kq = pytest.importorskip("mlx_kquant")
     from moespresso.runtime.deepseek_v4.model import (
         _deepseek_v4_q8_affine_group_views,
-        wo_a_projection_call_counts,
     )
 
     attn = _real_wo_a_attention_fixture(kq, mx)
@@ -2394,28 +2263,10 @@ def test_deepseek_v4_wo_a_batched_decode_single_dispatch_and_fail_closed(
     monkeypatch.setattr(mx, "quantized_matmul", spy_quantized_matmul)
     hidden = mx.zeros((1, 1, 128), dtype=mx.bfloat16)
 
-    # Engaged decode form: one QMV dispatch for the whole projection.
-    monkeypatch.delenv("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", raising=False)
+    # The eligible decode form issues one QMV dispatch for the whole projection.
     out = attn._grouped_output_projection(hidden)
     mx.eval(out)
     assert calls["quantized_matmul"] == 1
-
-    # Killed: one QMV dispatch per group through the slice loop.
-    monkeypatch.setenv("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", "0")
-    calls["quantized_matmul"] = 0
-    out = attn._grouped_output_projection(hidden)
-    mx.eval(out)
-    assert calls["quantized_matmul"] == int(attn.o_groups)
-
-    # The affine decode QMV kill switch also disables the batched form.
-    monkeypatch.delenv("MOESPRESSO_DSV4_WO_A_BATCHED_DECODE", raising=False)
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_Q8_DECODE_QMV", False)
-    before = wo_a_projection_call_counts()
-    out = attn._grouped_output_projection(hidden)
-    mx.eval(out)
-    after = wo_a_projection_call_counts()
-    assert after["loop"] == before["loop"] + 1
-    assert after["batched_decode"] == before["batched_decode"]
 
     # Geometry mismatches fail closed to None instead of a bogus stack.
     wo_a = attn.wo_a
@@ -2586,59 +2437,6 @@ def test_deepseek_v4_affine_wo_fp32_contract_parity_vs_f64_reference():
         assert fp32_b_err < stock_b_err
 
 
-def test_deepseek_v4_affine_wo_fp32_kill_switch_delegates_to_stock(
-        monkeypatch):
-    mx = pytest.importorskip("mlx.core")
-    nn = pytest.importorskip("mlx.nn")
-    from moespresso.runtime.deepseek_v4.model import (
-        affine_wo_fp32_call_counts,
-    )
-
-    attn = _affine_wo_attention_fixture(mx, nn)
-    model = _WrappedModel([_AttentionLayer(attn)])
-    assert _patch_deepseek_v4_affine_wo_fp32(model) == 1
-    wo_b_original = attn.wo_b.original
-
-    rng = np.random.default_rng(59)
-    groups = attn.o_groups
-    group_feat = (attn.n_heads * attn.head_dim) // groups
-    x = mx.array(rng.standard_normal(
-        (1, 3, groups * group_feat), dtype=np.float32)).astype(mx.float16)
-    y = mx.array(rng.standard_normal(
-        (1, 3, groups * attn.o_lora_rank), dtype=np.float32)
-    ).astype(mx.float16)
-
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_AFFINE_WO_FP32", False)
-    before = affine_wo_fp32_call_counts()
-    off_a = attn._grouped_output_projection(x)
-    off_b = attn.wo_b(y)
-    mx.eval(off_a, off_b)
-    after = affine_wo_fp32_call_counts()
-    assert after["delegated"] == before["delegated"] + 2
-    assert after["wo_a"] == before["wo_a"]
-    assert after["wo_b"] == before["wo_b"]
-
-    stock_a = _AffineAttention._grouped_output_projection(attn, x)
-    stock_b = wo_b_original(y)
-    mx.eval(stock_a, stock_b)
-    assert off_a.dtype == mx.float16
-    assert off_b.dtype == mx.float16
-    np.testing.assert_array_equal(
-        np.asarray(off_a).view(np.uint16), np.asarray(stock_a).view(np.uint16))
-    np.testing.assert_array_equal(
-        np.asarray(off_b).view(np.uint16), np.asarray(stock_b).view(np.uint16))
-
-    monkeypatch.setattr(dsv4_runtime, "_DSV4_AFFINE_WO_FP32", True)
-    on_a = attn._grouped_output_projection(x)
-    on_b = attn.wo_b(y)
-    mx.eval(on_a, on_b)
-    final = affine_wo_fp32_call_counts()
-    assert final["wo_a"] == after["wo_a"] + 1
-    assert final["wo_b"] == after["wo_b"] + 1
-    assert on_a.dtype == mx.float32
-    assert on_b.dtype == mx.float32
-
-
 def test_deepseek_v4_affine_wo_fp32_fail_closed_eligibility():
     mx = pytest.importorskip("mlx.core")
     nn = pytest.importorskip("mlx.nn")
@@ -2748,8 +2546,6 @@ def test_deepseek_v4_prefill_candidate_counters_export_via_streaming_stats():
         q8_ffn_hc_post_counts["delegated"])
     assert stats["affine_wo_fp32_wo_a_calls"] == affine_wo_counts["wo_a"]
     assert stats["affine_wo_fp32_wo_b_calls"] == affine_wo_counts["wo_b"]
-    assert stats["affine_wo_fp32_delegated_calls"] == (
-        affine_wo_counts["delegated"])
 
 
 def _lm_head_model_fixture(mx, hidden):
@@ -3050,8 +2846,8 @@ def test_deepseek_v4_package_loader_binds_regular_and_bundle_weights(tmp_path):
         calls.append(("skeleton", package_dir, kwargs))
         return model, kwargs["model_config"]
 
-    def install_bundles(model_arg, package_dir, index, *, seed):
-        calls.append(("install", model_arg, package_dir, index, seed))
+    def install_bundles(model_arg, package_dir, index):
+        calls.append(("install", model_arg, package_dir, index))
         return 1
 
     def wrap_switchglus(model_arg, *, required_mixed_layers):
@@ -3102,8 +2898,19 @@ def test_deepseek_v4_package_loader_binds_regular_and_bundle_weights(tmp_path):
     install_call = calls[2]
     assert install_call[:3] == ("install", model, tmp_path)
     assert isinstance(install_call[3], _ExpertIndex)
-    assert install_call[4] == 123
+    assert len(install_call) == 4
     assert calls[3] == ("wrap", model, {0})
+
+
+def test_deepseek_v4_package_loader_refuses_dense_iqk(tmp_path):
+    manifest = _manifest()
+    manifest["tensors"].append({"kind": "affine", "format": "iqk"})
+
+    with pytest.raises(
+        DeepseekV4RuntimeLoadError,
+        match="do not support dense IQ_K tensors",
+    ):
+        load_deepseek_v4_package_model(manifest, tmp_path)
 
 
 def _load_package_with_fakes(model, tmp_path):
@@ -3178,20 +2985,6 @@ def test_prewarm_wired_limit_enters_context_and_records_elapsed():
     assert elapsed is not None
     assert elapsed >= 0.0
     assert model._moespresso_dsv4_wired_prewarm_seconds == elapsed
-
-
-def test_prewarm_wired_limit_kill_switch(monkeypatch):
-    monkeypatch.setenv("MOESPRESSO_DSV4_WIRED_PREWARM", "0")
-    model = SimpleNamespace()
-    calls = []
-
-    def fake_wired_limit(model_arg, streams):
-        calls.append((model_arg, streams))
-
-    assert dsv4_runtime._prewarm_wired_limit(
-        model, wired_limit_fn=fake_wired_limit, streams=None) is None
-    assert calls == []
-    assert not hasattr(model, "_moespresso_dsv4_wired_prewarm_seconds")
 
 
 def test_deepseek_v4_package_loader_prewarms_wired_limit_at_load(
@@ -3373,7 +3166,7 @@ def test_deepseek_v4_pooled_bundle_installer_wraps_moe_by_default(
         model,
         tmp_path,
         object(),
-        seed=42,
+
         capacity_per_layer=4,
     )
 
@@ -3517,7 +3310,6 @@ def test_deepseek_v4_package_loader_requires_deepseek_model_type(tmp_path):
 def test_deepseek_v4_tiny_package_loads_renders_prefills_and_decodes(tmp_path):
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("jang_tools.dsv4")
-    pytest.importorskip("jang_tools.turboquant")
     import json
     import numpy as np
     from safetensors.numpy import save_file
@@ -3553,26 +3345,29 @@ def test_deepseek_v4_tiny_package_loads_renders_prefills_and_decodes(tmp_path):
     }
     manifest = {
         "architecture": {"family": "deepseek_v4_flash", "config": config},
-        "required_ops": ["raw_dtype_passthrough", "tq_dequant"],
+        "required_ops": ["raw_dtype_passthrough", "mxfp4_dequant"],
         "tensors": [
             {"source_name": "layers.0.attn.attn_sink", "format": "raw_dtype_passthrough"},
             {
                 "source_name": "layers.0.ffn.experts",
-                "format": "tq",
+                "kind": "expert",
+                "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "gate",
                 "format_params": {"bits": 4},
             },
             {
                 "source_name": "layers.0.ffn.experts",
-                "format": "tq",
+                "kind": "expert",
+                "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "up",
                 "format_params": {"bits": 4},
             },
             {
                 "source_name": "layers.0.ffn.experts",
-                "format": "tq",
+                "kind": "expert",
+                "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "down",
                 "format_params": {"bits": 4},
@@ -3588,17 +3383,18 @@ def test_deepseek_v4_tiny_package_loads_renders_prefills_and_decodes(tmp_path):
     components = {
         ("gate_proj", "packed"): np.zeros(
             (n_exp, inter, hidden // vals_per_word), dtype=np.uint32),
-        ("gate_proj", "norms"): np.ones((n_exp, inter), dtype=np.float16),
+        ("gate_proj", "scales"): np.full((n_exp, inter, hidden // 32), 127, dtype=np.uint8),
         ("up_proj", "packed"): np.zeros(
             (n_exp, inter, hidden // vals_per_word), dtype=np.uint32),
-        ("up_proj", "norms"): np.ones((n_exp, inter), dtype=np.float16),
+        ("up_proj", "scales"): np.full((n_exp, inter, hidden // 32), 127, dtype=np.uint8),
         ("down_proj", "packed"): np.zeros(
             (n_exp, hidden, inter // vals_per_word), dtype=np.uint32),
-        ("down_proj", "norms"): np.ones((n_exp, hidden), dtype=np.float16),
+        ("down_proj", "scales"): np.full((n_exp, hidden, inter // 32), 127, dtype=np.uint8),
     }
     bundle, geometry = assemble_layer_bundle(
         components,
         {"gate_proj": bits, "up_proj": bits, "down_proj": bits},
+        codecs={p: "mxfp4" for p in ("gate_proj", "up_proj", "down_proj")},
     )
     save_file(
         {
@@ -3684,6 +3480,7 @@ def test_deepseek_v4_tiny_mxfp4_package_loads_prefills_and_decodes(tmp_path):
             {"source_name": "layers.0.attn.attn_sink", "format": "raw_dtype_passthrough"},
             {
                 "source_name": "layers.0.ffn.experts",
+                "kind": "expert",
                 "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "gate",
@@ -3691,6 +3488,7 @@ def test_deepseek_v4_tiny_mxfp4_package_loads_prefills_and_decodes(tmp_path):
             },
             {
                 "source_name": "layers.0.ffn.experts",
+                "kind": "expert",
                 "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "up",
@@ -3698,6 +3496,7 @@ def test_deepseek_v4_tiny_mxfp4_package_loads_prefills_and_decodes(tmp_path):
             },
             {
                 "source_name": "layers.0.ffn.experts",
+                "kind": "expert",
                 "format": "mxfp4",
                 "layer_index": 0,
                 "projection": "down",

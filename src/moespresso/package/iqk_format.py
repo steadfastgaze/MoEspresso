@@ -7,11 +7,13 @@ and the effective rate depends on the row width. The block struct sizes below
 are the library's own `static_assert`ed sizes and the row meta sizes are its
 `row_meta_size` type traits; nothing here re-derives them from bit counts.
 
-Two wire layouts exist. `ik_wire` is the byte layout the CPU quantizer emits,
-row-major within an expert, which is what the conversion artifacts hold.
-`iqk_relayout` is reserved for the decode kernels' own layout: a package
-records which one its bundles carry, so a package can be rebuilt into the
-relayout from the same encoded bytes without re-running the encoder.
+Three wire layouts exist. `ik_wire` is the byte layout the CPU quantizer emits,
+row-major within an expert. `iqk_relayout` is the decode kernels' own layout.
+`qwen4_iqk_stream_major_v1` groups each native stream across one routed
+projection while retaining the component's declared shape and byte count.
+Every converted artifact and package records which layout its bytes carry.
+Some builders consume the quantizer wire and relayout a package later; others
+publish package-ready relayout rows directly after encoding.
 """
 
 from __future__ import annotations
@@ -25,7 +27,15 @@ IQK_LAYOUT_IK_WIRE = "ik_wire"
 # The decode kernels' layout. Reserved: a package declares it only after a
 # build step has actually rearranged the bytes.
 IQK_LAYOUT_IQK_RELAYOUT = "iqk_relayout"
-IQK_LAYOUTS = (IQK_LAYOUT_IK_WIRE, IQK_LAYOUT_IQK_RELAYOUT)
+# A routed-Qwen candidate layout. It is intentionally distinct from the
+# existing row-wise relayout: each native stream occupies one contiguous
+# projection span. Builders and runtime consumers must opt in explicitly.
+IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1 = "qwen4_iqk_stream_major_v1"
+IQK_LAYOUTS = (
+    IQK_LAYOUT_IK_WIRE,
+    IQK_LAYOUT_IQK_RELAYOUT,
+    IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
+)
 # The spelling packages carried before the name was corrected to `iqk`. It is
 # a value inside shard metadata and manifests, so packages already written
 # hold it and rewriting them would mean shipping their bytes again. Readers
@@ -78,12 +88,12 @@ class IQKCodecGeometry:
 # decode consumes a whole group per call, so any consumer that slices wire
 # expands a row to its whole group first.
 #
-# Registration here is a build-side fact and does not imply a serving path.
-# Which members serve is the kernel repository's own declaration, which the
-# relayout and installer read; the relayout and serving paths fail closed on
-# members it does not carry. `iq2_ks`, `iq2_k`, and `iq1_s_r4` serve today;
-# `iq3_k`, `iq4_ks`, `iq4_k`, `iq5_k`, and `iq6_k` are registered for
-# conversion artifacts and comparators only.
+# Registration here is a build-side fact and does not by itself imply a
+# serving path. Which members serve is the installed kernel repository's own
+# declaration, which the relayout and installer read; those paths fail closed
+# on members they do not carry. The current routed surface carries `iq2_ks`,
+# `iq2_k`, `iq3_k`, and `iq1_s_r4`; `iq4_ks`, `iq4_k`, `iq5_k`, and `iq6_k`
+# remain registered for conversion artifacts and comparators only.
 IQK_GEOMETRY = {
     "iq1_s_r4": IQKCodecGeometry(219, 1, 32, 6, 2),
     "iq2_ks": IQKCodecGeometry(145, 2, 256, 70, 2),

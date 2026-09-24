@@ -7,7 +7,7 @@ source checkpoint. Model-specific execution code is allowed; model detection
 and conversion at load are not.
 
 > Scope note. `build_manifest_runtime` (`serve.py`) dispatches on the resolved
-> runtime adapter kind. `jangtq_moe` and `qwen_kquant_moe` enter the top-level
+> runtime adapter kind. `qwen_kquant_moe` enters the top-level
 > pooled builder. Other kinds enter `runtime/build.py`. The DeepSeek-V4 loader
 > then installs supported routed bundles into pooled slots, including IQ_K. The
 > outer builder branch therefore does not determine routed-expert residency.
@@ -32,43 +32,17 @@ produces it:
    drafter engaged. Runtime statistics carry any later per-layer capacity
    overrides.
 
-### The build (`runtime/build.py`): the proven jang loader, no dequant at load
+### Model-specific loading (`runtime/build.py`)
 
-`build_model` reuses the serve path already proven on Qwen3.5/3.6 mixed
-affine+TQ, driven entirely by the manifest:
+The adapter is selected from `architecture.family` and `required_ops`.
+DeepSeek-V4 and Qwen4 use their own model loaders. Ornith uses the Qwen
+K-quant adapter with pooled routed experts; dense Qwen uses Jang's affine and
+MX-float loader. Unknown combinations raise `UnsupportedRuntimeAdapter`.
 
-- `_runtime_adapter_kind(manifest)` chooses the loader from the **declared**
-  `architecture.family` + `required_ops`, never from guesswork:
-  - `mjtq_dsv4`: `deepseek_v4_flash`, whose ops must stay within the declared
-    DS4 set.
-  - `regular_jang_v2`: `qwen3_5_dense` whose ops are a subset of the dense
-    affine set (`affine_dequant`, MX-float dequants, passthroughs) → jang's
-    `load_jang_model`.
-  - `qwen_kquant_moe`: `qwen3_5_moe` with `kquant_dequant` experts (and no
-    `tq_dequant`).
-  - `jangtq_moe`: any other non-dense family with `tq_dequant` → jang's
-    `load_jangtq_model`. (Unknown combinations raise
-    `UnsupportedRuntimeAdapter`.)
-- The package carries jang-compatible **sidecars** (`config.json`,
-  `jang_config.json`) that convert *generated from the manifest*: a compat view
-  for the loader, with the manifest staying the source of truth. The loader
-  builds the graph from `config.json` (affine
-  non-experts as MLX `QuantizedLinear`; TQ experts as TurboQuant metal-kernel
-  modules), and a per-tensor `tensor_map` override (`_apply_tensor_map`) pins
-  each affine module's exact `bits`/`group_size` so shape-guessing can never
-  pick the wrong precision.
-- **No dequant at load.** TQ weights stay packed and the GPU kernel runs them;
-  affine modules dequant in-layer at inference. No numpy on this path.
-- **Bundle packages.** When the package carries per-layer routed-expert
-  *bundles* (no pre-stacked keys), jang's loader leaves a random-init `SwitchGLU`
-  in place, *silently*. `_install_routed_experts_from_bundles` owns that
-  payload: it reads each layer's bundle once, splits components per the index
-  geometry, and replaces each projection with a `TurboQuantSwitchLinear`
-  carrying the exact packed/norms bytes (filled by byte-copy into persistent MLX
-  buffers, no numpy on the engine path). Anything missing raises
-  `RoutedExpertInstallError` rather than serving a quietly-wrong model. The
-  byte-copy installer knows the TQ and K-quant codecs. DeepSeek-V4 installs
-  supported target bundles through its pooled adapter.
+The runtime loads declared packed formats at their specified precision. The
+K-quant bundle installer and pooled loaders read component geometry from the
+package. Compatibility sidecars come from the manifest.
+
 - **IQ_K target experts.** DeepSeek-V4 installs routed IQ_K bundles through
   `install_pooled_switchglus`. Each projection is a
   `PooledIqkSwitchLinear` backed by an `ExpertSlotPool`. A miss reads the
@@ -100,25 +74,16 @@ affine+TQ, driven entirely by the manifest:
   failure is recorded and latched instead of turning the completed response
   into an HTTP or SSE error. `docs/ssd_streaming.md` defines the transaction and
   replacement-headroom contract.
-- **`MOESPRESSO_DSV4_KQUANT_BULK_ROUTE`** selects the route for non-q8_0
-  dense bulk multi-row matmul calls: `auto` (default) serves the direct
-  kernel only for verify-shaped tiny multi-row calls, and only when the
+- **Non-q8_0 dense bulk routing.** The direct kernel serves only
+  verify-shaped tiny multi-row calls, and only when the
   strided-bulk probe verifies the installed mlx-kquant against the recorded
   defect pair; prefill- and scorer-width calls keep the dequant bridge. The
   kernel op emits on the bfloat16 lattice where the bridge computes in
   float32, and routing every bulk width through the kernel measured Q2 avg
   NLL 0.40094 on the ship artifact against 0.39634 through the bridge, above
   the 0.3990 dense-gate band, so the width gate confines the math change to
-  the verify forwards that own the round wall. `kernel` forces the kernel at
-  every bulk width (the instrument arm, still probe-gated); `bridge` forces
-  the bridge regardless of the probe (the A/B and the kill lever). Unknown
-  values refuse rather than guess.
-- **`MOESPRESSO_DSV4_IQK_DENSE_QMV`** is the kill switch for the dense IQ_K
-  serving routes, default on; `0` sends every dense call to the counted
-  dequant bridge. The dense members reach no serving default today (no
-  package declares them and the dense relayout step does not exist), so the
-  switch guards an unproven path rather than a measured one. Counters
-  `iqk_dense_*` export through all three census surfaces.
+  the verify forwards that own the round wall. Unsupported widths and an
+  unverified mlx-kquant build fall back to the bridge.
 - **Mixed gate/up bits** (`_wrap_mixed_bit_switchglus` + `owned_switchglu.py`):
   jang monkeypatches `SwitchGLU.__call__` at the class level with a fused
   gate+up kernel that has *one* bit-width parameter. For layers whose routed
@@ -128,10 +93,6 @@ affine+TQ, driven entirely by the manifest:
   attributes but owns its own forward (gather-sort → per-projection apply →
   scatter-unsort), immune to the class patch. Layers the metadata declares as
   mixed but that don't wrap raise `MixedBitSwitchGLUError`, fail-loud both ways.
-- jang's loader prints a verbose multi-line banner to stdout;
-  `_load_jangtq_quietly` captures it and drops it on success, but re-emits it on
-  failure so a broken load stays diagnosable.
-
 `build_model` returns `(model, tokenizer)`. The tokenizer is the one jang's
 loader produced (mlx_lm `load_tokenizer` + eos/chat handling). The runtime does
 **not** re-load it separately; that would diverge from the proven path. (One
@@ -185,16 +146,8 @@ them to the user PATH. They are listed in `DEVGUIDE.md`.
 
 ### Conversion tooling
 
-`package.convert` is the imperative shell that streams the whole pipeline
-(`inventory → probe → optimize → package`) on a few-GB machine and writes a
-package (quantized shards + `package_manifest.json`) to disk, e.g. an SSD. Every
-phase streams (the probe samples by byte-range; the writer quantizes a row-band /
-one expert at a time), so a 35B converts in a bounded footprint. It is
-**format-neutral**: it consults the *target format's declared* requirements
-rather than hardcoding policy: `mjtq` declares it requires `calibration`, so the
-CLI always produces a calibrated package; producing an uncalibrated `mjtq` is a
-deliberate in-process library call (`allow_uniform=True`), never a CLI accident.
-This is the producer of the packages the rest of this document consumes.
+Use the model-specific GGUF recipe and IQ_K builders described in
+[package format](package_format.md).
 
 ### `moespresso generate`: one-shot
 
@@ -215,10 +168,10 @@ mechanism.
 The server loads the package **once** at startup (no verify), primes one
 isolated deterministic four-token generation, then serves. The prime
 moves first-use model wiring and MLX graph setup before readiness. It bypasses
-the prompt-cache manager, publishes no memory or disk KV entry, and does not
-persist its synthetic expert demand; in-memory expert residency and runtime
-counters may still reflect it. `--startup-warmup off` restores lazy
-first-request setup for cold-start measurements. The server prints an explicit
+the prompt-cache manager and publishes no memory or disk KV entry. It may
+still affect in-memory expert residency and runtime counters.
+`--startup-warmup off` restores lazy first-request setup for cold-start
+measurements. The server prints an explicit
 not-ready warmup line and announces readiness only after the prime, cache
 generator, handler, and socket bind finish. It then exposes an OpenAI
 chat-completions endpoint over the same load+generate seam (§3).
@@ -260,7 +213,7 @@ fail-closed:
 2. **Files**: every declared shard, tokenizer file, and agentic profile is
    present, package-relative, and matches `size_bytes` and `sha256`.
 3. **Tensors**: every declared tensor's expanded on-disk keys (per format:
-   `tq` → `tq_bundle`; `affine` → `weight`/`scales`/`biases`; `fp16` → the
+   routed formats → `tq_bundle`; `affine` → `weight`/`scales`/`biases`; `fp16` → the
    prefix itself) present in its shard's safetensors header.
 4. **Generated sidecars**: `config.json` and `jang_config.json` match the
    manifest-derived runtime views semantically.
@@ -348,12 +301,16 @@ and refuses loudly elsewhere), in order:
 
 Crucially, the server resolves this **at startup, before binding the socket**
 (`http.serve`): an unsupported toggle refuses immediately rather than serving the
-wrong default on every request. The default (no `--thinking` flag) is the
-template's own default. MoEspresso's baseline render kwargs
+wrong default on every request. The default (no `--thinking` flag) follows the
+family request contract and then the template's own default. MoEspresso's
+baseline render kwargs
 (`DEFAULT_TEMPLATE_KWARGS = {"enable_thinking": True, "preserve_thinking": True}`)
 keep the model thinking-on and history append-only. Generic templates use
 `chat_template_kwargs` with precedence
-**module defaults < server launch flags < per-request kwargs**. DeepSeek-V4 is
+**module defaults < family contract < server launch flags < per-request
+kwargs**. Qwen3.8 uses `medium` reasoning effort when thinking is enabled and
+the request omits an effort; an explicit `xhigh`, `medium`, or `low` value
+wins. DeepSeek-V4 is
 stricter: callers may select `enable_thinking`/`reasoning_effort`, but
 `preserve_thinking` and `drop_thinking` are runtime-owned contract fields.
 Requests that try to set them fail closed instead of producing a cache-invalid
@@ -363,9 +320,9 @@ attention mode.
 
 ## 5. KV policy (in-memory live KV)
 
-`kv_policy.py` is pure and import-light: it only parses and validates the live-KV
-policy MoEspresso owns; actual cache objects and MLX calls live at the runtime
-edge. The `KVPolicy` dataclass:
+For adapters using the generic mlx_lm KV cache, the pure, import-light
+`kv_policy.py` parses and validates MoEspresso's live-KV policy. Cache objects and MLX calls stay at the
+runtime edge. The `KVPolicy` dataclass contains:
 
 - **`live_kv_format`**: `mlx_affine_q8` (default, symmetric q8) or `raw`
   (explicit fallback). q6 and TurboQuant/vMLX KV are **refused**
@@ -385,25 +342,28 @@ This is a **live, in-memory KV quantization policy** for the running cache. The
 policy object is not a stored artifact; it is resolved per request and never
 serialized.
 
+Qwen4 owns a fixed KVarN K4/V4 composite state and rejects the generic q8/raw
+choices and other live-KV formats. See
+[`qwen4.md`](qwen4.md) and [`disk_kv.md`](disk_kv.md) for its memory and disk
+snapshot contract.
+
 ---
 
 ## 6. In-memory prefix reuse
 
-`prefix_cache.py` owns MoEspresso's prompt-cache glue. The store is
-**`PromptCacheStore`**: an in-memory, bounded (`max_size` entries /
+`prefix_cache.py` provides generic prompt-cache handling. Its
+**`PromptCacheStore`** is an in-memory, bounded (`max_size` entries /
 `max_bytes`) store of prompt-cache objects keyed by token prefix, holding one
-live timeline per session chain. A fetch moves the matched entry out of the
-store and returns the stored object itself (no deep copy); the generated-
-through cache is published back by the insert, after generation completes,
-under the serve lock. An insert pops strict-prefix entries of its key
-regardless of the caches' trimmability, so an append-only session retains
-exactly one entry instead of one snapshot per request (rotating-window caches
-report untrimmable, which otherwise measured 3.30 GB retained at 89.8k tokens
-under the ten-entry cap). The cost is that a branch from an earlier prefix
-loses its in-memory hit and is served by the disk frontier restore, which is
-exact. This prefix reuse is **in-memory first**. The disk KV cache adds a
-second tier that restores an exact token prefix from disk on an in-memory
-miss; serving enables it by default under a per-package root
+live timeline per session chain. On the generic
+`PrefixCacheGenerator` path, a fetch removes the matching entry and returns its
+stored object without copying. After generation, an insert publishes the
+generated-through cache under the serve lock. It removes strict-prefix entries
+even for untrimmable caches, leaving one entry in an append-only session.
+Rotating-window caches otherwise retained 3.30 GB at 89.8k tokens under a
+ten-entry cap. Branches from earlier prefixes lose their in-memory hit but can
+use an exact disk-frontier restore. Memory is checked first. The
+disk KV cache adds a second tier that restores an exact token prefix from disk
+on an in-memory miss; serving enables it by default under a per-package root
 (`MOESPRESSO_DISK_KV=off` disables it) and it is documented separately in
 `docs/disk_kv.md`.
 
@@ -414,7 +374,7 @@ limits. Other speculative drafter paths remain non-resumable and bypass both
 cache tiers for that request. `docs/speculative_decoding.md` states which
 drafter families are resumable and the provenance a rail identity covers.
 
-`PrefixCacheGenerator.__call__` per request:
+`PrefixCacheGenerator.__call__` handles a generic-adapter request as follows:
 
 1. **Encode** the rendered prompt to token ids with the same BOS/special-token
    rule MLX uses (`encode_rendered_prompt`), so cache keys match the generation
@@ -455,6 +415,17 @@ drafter families are resumable and the provenance a rail identity covers.
    companion with matching provenance. Empty-suffix exact hits fall back to a
    fresh prompt prefill (`exact_fallback`), since the cache does not persist the
    next-token logits needed to start generation.
+
+Ordinary Qwen4 requests use
+`runtime/qwen4/generation.py:Qwen4RequestGenerator`. Its `Qwen4PromptCache`
+captures composite state and last prompt logits at a completed prefill frontier.
+Memory is checked before disk. Because the snapshot includes logits, an exact
+whole-prompt hit resumes directly without the generic `exact_fallback` path.
+After generation, the snapshot is published under the prompt tokens; the
+generated-through decode state is excluded. On the next turn, previous generated
+text becomes an unbiased prompt suffix. The Qwen4 scope binds package,
+rendering, routing and KVarN payload contracts. Speculative producer rails and
+DSpark companions do not apply.
 
 A client may send `metadata.moespresso_cache_key` on a request to group its
 requests as one session chain for disk-cache eviction preference. It is an
@@ -584,8 +555,9 @@ and expert-I/O counters.
 | `disk_kv.py` | The disk KV target-checkpoint tier and optional companion store, on by default when serving (`docs/disk_kv.md`). |
 | `kquant_install.py` | Manifest-driven swap of constructed MLX modules to mlx-kquant module classes before K-quant wire bytes load. |
 | `owned_switchglu.py` | `OwnedSwitchGLU` forward immune to jang's class-level fused patch (mixed gate/up bits). |
-| `deepseek_v4/` | DeepSeek-V4 runtime graph adapter, cache contract, DSpark continuation and disk-companion bridge, native/helper probes, and speed replay tools. |
-| `qwen/` | Qwen-family runtime kernels: flash-style q8 full attention, prefill chunk planning, sorted SwitchGLU. |
+| `deepseek_v4/` | DeepSeek-V4 runtime graph adapter, cache contract, DSpark continuation and disk-companion bridge, kernel helpers, and served-path probes. |
+| `qwen/` | Qwen-family runtime kernels used by Ornith: flash-style q8 full attention, prefill chunk planning, sorted SwitchGLU. |
+| `qwen4/` | Qwen4 graph, composite state, KVarN memory and disk snapshots, cache-conditioned routing, generation, and experimental MTP command. |
 
 Packages that carry an `agentic_profile.json` sidecar expose recorded
 agent-loop defaults (tool dialect, repair, sampling) to agent clients;

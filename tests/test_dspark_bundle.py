@@ -21,8 +21,8 @@ from moespresso.core.artifact import (
     read_artifact,
     write_artifact,
 )
-from moespresso.optimize.allocate import AFFINE_BITS
-from moespresso.optimize.decide import decide
+from package_fixtures import AFFINE_BITS
+from package_fixtures import synthetic_decision
 from moespresso.package.deepseek_v4.dspark_bundle import (
     BUNDLE_REPORT_NAME,
     DSparkBundleError,
@@ -76,7 +76,7 @@ def _tiny_ds4_package(tmp_path):
         "probe_evidence", SUBJECT, PRODUCER, status="valid",
         units=[_affine_unit(
             "model.layers.0.self_attn.q_proj.weight", "attn.q_proj")])
-    plan, _ = package_plan_from_decision(decide(ev, target_quality=0.5))
+    plan, _ = package_plan_from_decision(synthetic_decision(ev))
     located = {
         located_key(a): {"shard": SHARD, "key_prefix": a["source_name"]}
         for a in plan["allocation"]

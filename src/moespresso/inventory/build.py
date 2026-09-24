@@ -15,6 +15,8 @@ from pathlib import Path
 from moespresso.core.artifact import Validation, artifact_producer, make_artifact
 from moespresso.inventory import roles
 from moespresso.inventory.deepseek_v4 import roles as deepseek_v4_roles
+from moespresso.inventory.qwen4 import roles as qwen4_roles
+from moespresso.inventory.qwen4.static import validate_qwen38_flash_next_headers
 from moespresso.inventory.safetensors_header import TensorHeader, scan_headers
 
 # Substrings marking a tensor we never quantize/probe (norms, biases, rope,
@@ -25,6 +27,12 @@ _SKIP_SUBSTR = (
 )
 
 PRODUCER = artifact_producer("moespresso.inventory")
+
+
+def _canonical_family(family: str | None) -> str | None:
+    if family in {"qwen4_exp", "qwen4_exp_text"}:
+        return "qwen4_exp"
+    return family
 
 
 def _classify_deepseek_v4(h: TensorHeader) -> dict | None:
@@ -57,15 +65,47 @@ def _classify_deepseek_v4(h: TensorHeader) -> dict | None:
     return entry
 
 
+def _classify_qwen4(h: TensorHeader) -> dict | None:
+    """One released Qwen4 tensor -> typed entry, or an explicit exclusion."""
+    resolved = qwen4_roles.tensor_role(h.name)
+    if resolved is None:
+        return None
+    entry = {
+        "source_name": h.name,
+        "role": resolved["role"],
+        "kind": resolved["kind"],
+        "layer_index": resolved.get("layer_index", qwen4_roles.tensor_layer(h.name)),
+        "shape": list(h.shape),
+        "dtype": h.dtype,
+        "shard": h.shard,
+        "gguf_keys": [],
+        "status": "unknown" if resolved["kind"] == "unknown" else "required",
+    }
+    module_path = qwen4_roles.module_path(h.name)
+    module_weight_key = qwen4_roles.module_weight_key(h.name)
+    if module_path is not None:
+        entry["module_path"] = module_path
+    if module_weight_key is not None:
+        entry["module_weight_key"] = module_weight_key
+    for key in ("projection", "format", "component", "provider_tensor_kind",
+                "provider_shard_index"):
+        if key in resolved:
+            entry[key] = resolved[key]
+    return entry
+
+
 def _classify(
     h: TensorHeader,
     layer_types: list[str] | None,
     family: str | None = None,
 ) -> dict | None:
     """One tensor -> inventory entry, or None to skip."""
+    family = _canonical_family(family)
     name = h.name
     if family == "deepseek_v4_flash":
         return _classify_deepseek_v4(h)
+    if family == "qwen4_exp":
+        return _classify_qwen4(h)
 
     # Structural text tensors (norms, SSM state) are not quantized but the graph
     # needs them. Carry them as passthrough. Checked before _SKIP_SUBSTR, which
@@ -134,6 +174,7 @@ def build_inventory_from_headers(
     any resolved key unexpectedly absent: the guard against a silent mapping
     regression.
     """
+    family = _canonical_family(family)
     entries = []
     for h in sorted(headers, key=lambda x: x.name):
         e = _classify(h, layer_types, family)
@@ -145,9 +186,12 @@ def build_inventory_from_headers(
     n_affine = sum(1 for e in entries if e["kind"] == "affine")
     n_codec_scale = sum(1 for e in entries if e["kind"] == "codec_scale")
     n_passthrough = sum(1 for e in entries if e["kind"] == "passthrough")
+    n_provider = sum(1 for e in entries if e["kind"] == "provider")
     n_unknown = sum(1 for e in entries if e["status"] == "unknown")
 
     validation: list[Validation] = []
+    if family == "qwen4_exp":
+        validation.extend(validate_qwen38_flash_next_headers(headers, require_complete=True))
     coverage = None
     if imatrix_keys is not None:
         resolved = mapped = absent = 0
@@ -170,20 +214,31 @@ def build_inventory_from_headers(
             "error", "inventory.unknown_tensors",
             f"{n_unknown} DeepSeek V4 tensors had no role",
             phase="inventory", blocking=True))
+    elif n_unknown and family == "qwen4_exp":
+        validation.append(Validation(
+            "error", "inventory.unknown_tensors",
+            f"{n_unknown} Qwen4 tensors had no role",
+            phase="inventory", blocking=True))
     elif n_unknown:
         validation.append(Validation(
             "warning", "inventory.unknown_tensors",
             f"{n_unknown} 2D weight tensors had no role", phase="inventory"))
 
     status = "valid" if not any(v.blocking for v in validation) else "invalid"
+    counts = {"expert": n_expert, "affine": n_affine,
+              "expert_source": n_expert_source, "codec_scale": n_codec_scale,
+              "passthrough": n_passthrough, "unknown": n_unknown,
+              "total": len(entries)}
+    if family == "qwen4_exp" or n_provider:
+        counts["provider"] = n_provider
+    required_features = (
+        ["qwen4_ple_provider_inventory"] if family == "qwen4_exp" else [])
     return make_artifact(
         "source_inventory", subject, PRODUCER,
         status=status, validation=validation,
+        required_features=required_features,
         tensors=entries,
-        counts={"expert": n_expert, "affine": n_affine,
-                "expert_source": n_expert_source, "codec_scale": n_codec_scale,
-                "passthrough": n_passthrough, "unknown": n_unknown,
-                "total": len(entries)},
+        counts=counts,
         imatrix_coverage=coverage,
         layer_types=layer_types,
         family=family,

@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 from moespresso.core.artifact import Validation
 from moespresso.package.iqk_format import (
-    IQK_GEOMETRY,
     IQK_LAYOUT_IK_WIRE,
-    IQK_LAYOUTS,
-    validate_iqk_layout,
+)
+from moespresso.package.iqk_recipe import (
+    IQKRecipeError,
+    build_iqk_expert_allocations,
+    build_iqk_package_plan,
 )
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
 from moespresso.package.kquant_recipe import KQuantRecipeError
@@ -163,41 +165,22 @@ def build_ds4_iqk_expert_allocations(
     wire layout the stored bytes are on, and the writer, the bundle metadata
     and the manifest all read that row rather than a package-wide setting.
     """
-    if layout not in IQK_LAYOUTS:
-        raise KQuantRecipeError(
-            f"unknown IQ_K wire layout {layout!r}; known: {list(IQK_LAYOUTS)}")
-    if not member_by_layer_proj:
-        raise KQuantRecipeError("no layers for IQ_K expert allocation")
-    out: list[dict] = []
-    for layer in sorted(member_by_layer_proj):
-        members = member_by_layer_proj[layer]
-        if sorted(members) != ["down", "gate", "up"]:
-            raise KQuantRecipeError(
-                f"layer {layer}: IQ_K allocation must cover gate, up and down, "
-                f"got {sorted(members)}")
-        for projection in ("gate", "up", "down"):
-            codec = str(members[projection])
-            geometry = IQK_GEOMETRY.get(codec)
-            if geometry is None:
-                raise KQuantRecipeError(
-                    f"layer {layer} {projection}: unknown IQ_K member {codec!r}")
-            module_path = f"model.layers.{layer}.mlp.switch_mlp.{projection}_proj"
-            alloc = {
-                "source_name": f"layers.{layer}.ffn.experts.{projection}",
-                "kind": "expert",
-                "role": f"moe.expert.{projection}",
-                "layer_index": int(layer),
-                "projection": projection,
-                "bits": int(geometry.bits),
-                "codec": codec,
-                "format": "iqk",
-                "iqk_codec": codec,
-                "layout": layout,
-                "module_path": module_path,
-                "module_weight_key": f"{module_path}.weight",
-            }
-            out.append(alloc)
-    return out
+    def target_fields(layer: int, projection: str) -> dict:
+        module_path = f"model.layers.{layer}.mlp.switch_mlp.{projection}_proj"
+        return {
+            "source_name": f"layers.{layer}.ffn.experts.{projection}",
+            "module_path": module_path,
+            "module_weight_key": f"{module_path}.weight",
+        }
+
+    try:
+        return build_iqk_expert_allocations(
+            member_by_layer_proj,
+            target_fields=target_fields,
+            layout=layout,
+        )
+    except IQKRecipeError as exc:
+        raise KQuantRecipeError(str(exc)) from exc
 
 
 def build_ds4_iqk_plan(
@@ -208,66 +191,35 @@ def build_ds4_iqk_plan(
     allocation_source: str | None = None,
     imatrix_identity: dict | None = None,
     extra_allocation: list[dict] | tuple[dict, ...] | None = None,
+    source_decision_id: str | None = None,
+    source_probe_id: str | None = None,
+    additional_source_constraints: dict | None = None,
+    additional_achieved: dict | None = None,
     optimized_kernels_expected: bool = False,
     force_overrides=None,
     allow_unmatched_force: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """Package plan for IQ_K routed experts plus the dense side."""
-    allocation = [dict(a) for a in iqk_expert_allocation]
-    allocation.extend(dict(a) for a in (extra_allocation or ()))
-    for alloc in allocation:
-        if alloc.get("format") == "iqk" or (
-            alloc.get("kind") == "expert" and alloc.get("codec") == "iqk"
-        ):
-            validate_iqk_layout(
-                alloc.get("layout", IQK_LAYOUT_IK_WIRE))
-    dense_counts: dict[str, int] = {}
-    format_counts: dict[str, int] = {}
-    expert_members: dict[str, int] = {}
-    dense_iqk_members: dict[str, int] = {}
-    for alloc in allocation:
-        fmt = alloc.get("format") or alloc.get("codec") or alloc.get("kind")
-        format_counts[fmt] = format_counts.get(fmt, 0) + 1
-        if alloc.get("format") == "kquant":
-            dense_counts[alloc["kquant_codec"]] = dense_counts.get(
-                alloc["kquant_codec"], 0) + 1
-        if alloc.get("format") == "iqk" and alloc.get("kind") == "expert":
-            member = alloc["iqk_codec"]
-            expert_members[member] = expert_members.get(member, 0) + 1
-        if alloc.get("format") == "iqk" and alloc.get("kind") == "affine":
-            member = alloc["iqk_codec"]
-            dense_iqk_members[member] = dense_iqk_members.get(member, 0) + 1
-    constraints = {
-        "objective": "iqk_expert_allocation",
-        "allocation_source": allocation_source,
-        "imatrix": imatrix_identity,
-    }
-    if artifacts_identity is not None:
-        constraints["iqk_artifacts"] = artifacts_identity
-    plan, _summary = make_package_plan(
-        subject,
-        allocation,
-        producer_kind="iqk_converted_artifacts",
-        producer_reference=(artifacts_identity or {}).get("inventory_sha256"),
-        optimized_kernels_expected=optimized_kernels_expected,
-        force_overrides=force_overrides,
-        allow_unmatched_force=allow_unmatched_force,
-        dry_run=dry_run,
-        required_features=["calibration"],
-        status="valid",
-        validation=[],
-        source_constraints=constraints,
-        achieved={
-            "expert_codec_counts": dict(sorted(expert_members.items())),
-            "dense_kquant_codec_counts": dict(sorted(dense_counts.items())),
-            "dense_iqk_member_counts": dict(sorted(dense_iqk_members.items())),
-            "format_counts": dict(sorted(format_counts.items())),
-            "expert_format_counts": {
-                "iqk": sum(expert_members.values())} if expert_members else {},
-        },
-    )
-    return plan
+    try:
+        return build_iqk_package_plan(
+            subject,
+            iqk_expert_allocation,
+            artifacts_identity=artifacts_identity,
+            allocation_source=allocation_source,
+            imatrix_identity=imatrix_identity,
+            extra_allocation=extra_allocation,
+            source_decision_id=source_decision_id,
+            source_probe_id=source_probe_id,
+            additional_source_constraints=additional_source_constraints,
+            additional_achieved=additional_achieved,
+            optimized_kernels_expected=optimized_kernels_expected,
+            force_overrides=force_overrides,
+            allow_unmatched_force=allow_unmatched_force,
+            dry_run=dry_run,
+        )
+    except IQKRecipeError as exc:
+        raise KQuantRecipeError(str(exc)) from exc
 
 
 def expert_target_from_allocation(alloc: dict) -> DS4KQuantExpertTarget:
@@ -298,60 +250,6 @@ def expert_target_from_allocation(alloc: dict) -> DS4KQuantExpertTarget:
         imatrix_key=str(alloc["imatrix_key"]),
         source_weight_template=str(alloc["source_weight_template"]),
         source_scale_template=str(alloc["source_scale_template"]),
-        module_path=str(alloc["module_path"]),
-        module_weight_key=str(alloc["module_weight_key"]),
-    )
-
-
-@dataclass(frozen=True)
-class DS4IqkDenseTarget:
-    """One dense tensor's IQ_K encode target.
-
-    Dense tensors have no per-expert slicing: the encode consumes one
-    steering vector for the whole tensor, keyed by the GGUF tensor name.
-    The IQ_K members are all imatrix-required in this project, so the
-    target carries no unsteered mode.
-    """
-
-    source_name: str
-    role: str
-    layer_index: int | None
-    codec: str
-    layout: str
-    gguf_tensor: str
-    imatrix_key: str
-    module_path: str
-    module_weight_key: str
-
-
-def iqk_dense_target_from_allocation(alloc: dict) -> DS4IqkDenseTarget:
-    """Rebuild a DS4 dense IQ_K target from one package-plan allocation row."""
-    from moespresso.package.iqk_format import IQK_DENSE_MEMBERS
-
-    icodec = alloc.get("iqk_codec") or alloc.get("codec")
-    layout = alloc.get("layout", IQK_LAYOUT_IK_WIRE)
-    missing = [
-        key for key in ("gguf_tensor", "imatrix_key", "module_path", "module_weight_key")
-        if alloc.get(key) is None
-    ]
-    if icodec not in IQK_DENSE_MEMBERS:
-        missing.append("iqk_codec (dense member)")
-    if layout not in IQK_LAYOUTS:
-        missing.append("layout")
-    if missing:
-        raise ValueError(
-            f"IQ_K dense allocation for {alloc.get('source_name')} is missing "
-            f"or misdeclares required field(s): {', '.join(missing)}")
-    return DS4IqkDenseTarget(
-        source_name=str(alloc["source_name"]),
-        role=str(alloc["role"]),
-        layer_index=(
-            None if alloc.get("layer_index") is None else int(alloc["layer_index"])
-        ),
-        codec=str(icodec),
-        layout=str(layout),
-        gguf_tensor=str(alloc["gguf_tensor"]),
-        imatrix_key=str(alloc["imatrix_key"]),
         module_path=str(alloc["module_path"]),
         module_weight_key=str(alloc["module_weight_key"]),
     )

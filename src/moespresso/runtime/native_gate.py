@@ -2,7 +2,7 @@
 
 The gate is a compiled MLX extension (native/gate). It is optional: when the
 .so is missing, fails to import, or fails the runtime self-test, decode falls
-back to the ring path transparently. Build with `native/build.sh`.
+back to the ring path transparently. Package installation builds the extension.
 
 The self-test mirrors the ring visibility self-test discipline: once per
 process, prove hold + foreign-thread release + value integrity before the
@@ -11,17 +11,22 @@ gate is allowed anywhere near the product path.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import threading
 import time
 from pathlib import Path
 
-_NATIVE_DIR = Path(__file__).resolve().parents[3] / "native" / "gate" / "build"
 _ENV_DIR = os.environ.get("MOESPRESSO_NATIVE_DIR")
 
 # None = undecided, module = usable, False = unavailable/failed
 _GATE: list = [None]
+
+
+def gate_is_loaded() -> bool:
+    """Return whether a usable gate module is already cached."""
+    return _GATE[0] is not None and _GATE[0] is not False
 
 
 def _self_test(mod) -> bool:
@@ -59,7 +64,6 @@ def load_gate():
     candidates = []
     if _ENV_DIR:
         candidates.append(Path(_ENV_DIR))
-    candidates.append(_NATIVE_DIR)
     mod = None
     for cand in candidates:
         if not cand.is_dir():
@@ -72,6 +76,11 @@ def load_gate():
             mod = None
         finally:
             sys.path.remove(str(cand))
+    if mod is None:
+        try:
+            mod = importlib.import_module("moespresso._native._moespresso_gate")
+        except Exception:
+            mod = None
     if mod is None or not _self_test(mod):
         if mod is not None:
             import warnings

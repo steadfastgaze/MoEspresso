@@ -501,13 +501,6 @@ def _layer_geometry(index: ExpertIndex, layer: int) -> dict:
 # The install
 
 
-def manifest_requires_iqk_experts(manifest: dict) -> bool:
-    return any(
-        tensor.get("format") == IQK_CODEC and tensor.get("kind") == "expert"
-        for tensor in manifest.get("tensors", [])
-    )
-
-
 def _layer_switch_seam(model, layer: int):
     layers = getattr(model, "layers", None)
     if layers is None:

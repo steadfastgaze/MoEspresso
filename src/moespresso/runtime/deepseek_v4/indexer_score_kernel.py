@@ -44,9 +44,6 @@ the section comment above the kernel for the transcription facts.
 from __future__ import annotations
 
 import math
-import os
-
-
 # Gate for the fused decode pre-top-k path (query QAT + score chain in one
 # dispatch). Default off: the fenced served-layer A/B (layer 2, 961 pooled
 # rows, alternating 20-repeat blocks) measured the indexer segment at
@@ -443,12 +440,6 @@ def fused_qat_indexer_scores(q, pooled_qat, weights, scale):
 #   composed `-scores` bit for bit and the selected set and order match
 #   the stock path exactly.
 #
-# `MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS=0` kills every indexer chain trim;
-# `MOESPRESSO_DSV4_INDEXER_SCORE_TAIL=0` kills only this seam. Both are
-# read per call.
-_CHAIN_TRIMS_ENV = "MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS"
-_SCORE_TAIL_ENV = "MOESPRESSO_DSV4_INDEXER_SCORE_TAIL"
-
 # col_reduce_looped BM=32/BN=32 is selected for head-axis sums with at
 # least 32 and at most 256 head rows; the DS4 index head count is 64 and
 # the parity tests pin 32 through 64.
@@ -496,15 +487,6 @@ _TAIL_SOURCE_TEMPLATE = """
 _TAIL_KERNELS: dict = {}
 
 
-def score_tail_enabled() -> bool:
-    """Return True when the fused score tail may engage."""
-    if os.environ.get(_CHAIN_TRIMS_ENV, "1") == "0":
-        return False
-    if os.environ.get(_SCORE_TAIL_ENV, "1") == "0":
-        return False
-    return _metal_available()
-
-
 def _get_tail_kernel(scale: float, n_heads: int):
     key = (float(scale), int(n_heads))
     kernel = _TAIL_KERNELS.get(key)
@@ -537,7 +519,7 @@ def score_tail_eligible(scores, weights_raw, params) -> bool:
     per-token params array carrying the valid-row count. Everything else
     fails closed to the composed chain.
     """
-    if not score_tail_enabled():
+    if not _metal_available():
         return False
     import mlx.core as mx
 

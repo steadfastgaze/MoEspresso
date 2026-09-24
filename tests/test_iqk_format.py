@@ -26,6 +26,7 @@ from moespresso.package.iqk_format import (
     IQK_GEOMETRY,
     IQK_LAYOUT_IK_WIRE,
     IQK_LAYOUT_IQK_RELAYOUT,
+    IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
     IQK_LAYOUT_LEGACY_RELAYOUT,
     IQKFormatError,
     iqk_geometry,
@@ -94,6 +95,7 @@ def test_iqk_format_rejects_unknown_members_and_layouts():
     with pytest.raises(IQKFormatError):
         validate_iqk_layout("mlx_wire")
     assert validate_iqk_layout(IQK_LAYOUT_IQK_RELAYOUT) == IQK_LAYOUT_IQK_RELAYOUT
+    assert validate_iqk_layout(IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1) == IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1
 
 
 def test_the_pre_rename_layout_reads_but_never_writes():

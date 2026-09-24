@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_SEGMENTS = {
+    ".research",
     "specs_archive",
     "private",
     "build",
@@ -30,6 +31,20 @@ FORBIDDEN_SEGMENTS = {
 }
 FORBIDDEN_SUFFIXES = (".pyc", ".pyo")
 FORBIDDEN_NATIVE_SUFFIXES = (".a", ".dylib", ".metallib", ".o", ".so")
+WHEEL_NATIVE_EXTENSION = re.compile(
+    r"^moespresso/_native/(_moespresso_gate)\.cpython-(\d+)-darwin\.so$"
+)
+WHEEL_PLATFORM_TAG = re.compile(r"^cp(\d+)-cp\1-macosx_26_0_arm64$")
+WHEEL_NATIVE_EXTENSION_STEMS = {"_moespresso_gate"}
+SDIST_NATIVE_SOURCES = {
+    "CMakeLists.txt",
+    "native/gate/CMakeLists.txt",
+    "native/gate/all_hit.cpp",
+    "native/gate/all_hit.h",
+    "native/gate/bindings.cpp",
+    "native/gate/gate.cpp",
+    "native/gate/gate.h",
+}
 HOST_PATH_MARKERS = (
     ("/" + "Users/", "macOS user path"),
     ("/" + "Volumes/", "macOS volume path"),
@@ -48,11 +63,20 @@ EXPECTED_RUNTIME_REQUIREMENTS = {
     "numpy",
     "psutil",
 }
-EXPECTED_MLX_IQK_REQUIREMENT = "mlx-iqk==0.1.2"
+EXPECTED_MLX_REQUIREMENT = "mlx==0.31.2"
+EXPECTED_MLX_IQK_REQUIREMENT = "mlx-iqk==0.1.3"
 README_BYTES = (REPO_ROOT / "README.md").read_bytes()
+SDIST_BINARY_ASSET = "docs/assets/hero.webp"
+SDIST_BINARY_ASSET_BYTES = (REPO_ROOT / SDIST_BINARY_ASSET).read_bytes()
 PROJECT_METADATA = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 EXPECTED_VERSION = PROJECT_METADATA["project"]["version"]
 EXPECTED_SURFACE_SUFFIXES = (
+    "moespresso/package/deepseek_v4/mtp_sidecar.py",
+    "moespresso/package/deepseek_v4/dflash_sidecar.py",
+    "moespresso/package/deepseek_v4/dspark_sidecar.py",
+    "moespresso/runtime/deepseek_v4/mtp_model.py",
+    "moespresso/runtime/deepseek_v4/dflash_model.py",
+    "moespresso/runtime/deepseek_v4/dspark_model.py",
     "moespresso/package/deepseek_v4/kquant_package.py",
     "moespresso/correctness/deepseek_v4/quality.py",
     "moespresso/correctness/fixtures/deepseek_v4/test_vectors/official.vec",
@@ -64,6 +88,17 @@ EXPECTED_SURFACE_SUFFIXES = (
     "moespresso/correctness/ornith/scoring.py",
     "moespresso/package/qwen/kquant_package.py",
     "moespresso/runtime/qwen/full_attention.py",
+    "moespresso/runtime/qwen4/native_publication.py",
+    "moespresso/runtime/qwen4/cache_routing.py",
+    "moespresso/runtime/qwen4/cache_routing_config.py",
+    "moespresso/runtime/qwen4/cache_routing_kernel.py",
+    "moespresso/runtime/diagnostics.py",
+    "moespresso/runtime/decode_trace.py",
+    "moespresso/runtime/diagnostic_environment.py",
+    "moespresso/runtime/decode_trace_detail.py",
+    "moespresso/runtime/completions_api_timing.py",
+    "moespresso/runtime/timing_tokens.py",
+    "moespresso/runtime/process_resources.py",
     "moespresso/package/templates/qwen3_5_moe.chat_template.jinja",
 )
 PUBLIC_ENTRY_POINTS = tuple(sorted(PROJECT_METADATA["project"]["scripts"]))
@@ -109,6 +144,87 @@ def _line_with_marker(text: str, marker: str) -> int:
     )
 
 
+def _has_binary_content(data: bytes) -> bool:
+    if b"\x00" in data[:1024]:
+        return True
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _audit_native_payload(kind: str, members: dict[str, bytes]) -> list[str]:
+    """Validate the platform wheel payload or source-only sdist inputs."""
+    failures: list[str] = []
+    names = set(members)
+    binary_payloads = {
+        name
+        for name, data in members.items()
+        if name.endswith(FORBIDDEN_NATIVE_SUFFIXES) or _has_binary_content(data)
+    }
+
+    if kind == "sdist":
+        for name in sorted(binary_payloads - {SDIST_BINARY_ASSET}):
+            failures.append(f"sdist: generated binary artifact {name}")
+        if SDIST_BINARY_ASSET not in members:
+            failures.append(f"sdist: missing public asset {SDIST_BINARY_ASSET}")
+        elif members[SDIST_BINARY_ASSET] != SDIST_BINARY_ASSET_BYTES:
+            failures.append(
+                f"sdist: {SDIST_BINARY_ASSET} does not match the repository copy"
+            )
+        for name in sorted(SDIST_NATIVE_SOURCES - names):
+            failures.append(f"sdist: missing native build source {name}")
+        return failures
+
+    extensions: list[tuple[str, str, str]] = []
+    allowed_binaries: set[str] = set()
+    for name in sorted(names):
+        match = WHEEL_NATIVE_EXTENSION.fullmatch(name)
+        if match is None:
+            continue
+        stem, interpreter = match.groups()
+        extensions.append((name, stem, interpreter))
+        allowed_binaries.add(name)
+
+    for name in sorted(binary_payloads - allowed_binaries):
+        failures.append(f"wheel: unexpected binary artifact {name}")
+    for stem in sorted(WHEEL_NATIVE_EXTENSION_STEMS):
+        count = sum(extension_stem == stem for _, extension_stem, _ in extensions)
+        if count == 0:
+            failures.append(f"wheel: missing native extension {stem}")
+        elif count != 1:
+            failures.append(
+                f"wheel: expected exactly one native extension {stem}, found {count}"
+            )
+
+    interpreters = {interpreter for _, _, interpreter in extensions}
+    if len(interpreters) > 1:
+        failures.append("wheel: native extensions do not share one interpreter ABI")
+
+    wheel_metadata = [
+        data for name, data in members.items() if name.endswith(".dist-info/WHEEL")
+    ]
+    if len(wheel_metadata) != 1:
+        failures.append("wheel: expected exactly one WHEEL metadata file")
+        return failures
+    headers = wheel_metadata[0].decode("utf-8", errors="replace").splitlines()
+
+    def values(field: str) -> list[str]:
+        prefix = f"{field}: "
+        return [line[len(prefix) :] for line in headers if line.startswith(prefix)]
+
+    if values("Root-Is-Purelib") != ["false"]:
+        failures.append("wheel: Root-Is-Purelib must be false")
+    tags = values("Tag")
+    tag_match = WHEEL_PLATFORM_TAG.fullmatch(tags[0]) if len(tags) == 1 else None
+    if tag_match is None:
+        failures.append("wheel: WHEEL must declare one cp*-cp*-macosx_26_0_arm64 tag")
+    elif interpreters and interpreters != {tag_match.group(1)}:
+        failures.append("wheel: WHEEL tag interpreter does not match native extensions")
+    return failures
+
+
 def audit_members(kind: str, members: dict[str, bytes]) -> list[str]:
     """Return release-boundary failures for normalized archive members."""
     failures: list[str] = []
@@ -121,8 +237,6 @@ def audit_members(kind: str, members: dict[str, bytes]) -> list[str]:
             failures.append(f"{kind}: forbidden path {name}")
         if name.endswith(FORBIDDEN_SUFFIXES):
             failures.append(f"{kind}: bytecode path {name}")
-        if name.endswith(FORBIDDEN_NATIVE_SUFFIXES):
-            failures.append(f"{kind}: generated native artifact {name}")
         if any(part == ".env" or part.startswith(".env.") for part in parts):
             failures.append(f"{kind}: environment file {name}")
 
@@ -141,9 +255,9 @@ def audit_members(kind: str, members: dict[str, bytes]) -> list[str]:
             for marker in PRIVATE_PACKAGE_PAYLOAD_MARKERS:
                 if marker in text:
                     line_no = _line_with_marker(text, marker)
-                    failures.append(
-                        f"{kind}: {name}:{line_no} contains private package reference"
-                    )
+                    failures.append(f"{kind}: {name}:{line_no} contains private package reference")
+
+    failures.extend(_audit_native_payload(kind, members))
 
     for license_name in sorted(LICENSE_NAMES):
         matches = [name for name in names if PurePosixPath(name).name == license_name]
@@ -235,18 +349,21 @@ def _audit_core_metadata(kind: str, label: str, data: bytes) -> list[str]:
     missing_requirements = sorted(EXPECTED_RUNTIME_REQUIREMENTS - requirement_names)
     if missing_requirements:
         failures.append(
-            f"{kind}: {label} is missing runtime requirements "
-            + ", ".join(missing_requirements)
+            f"{kind}: {label} is missing runtime requirements " + ", ".join(missing_requirements)
         )
-    iqk_requirements = [
-        requirement
-        for requirement in requirements
-        if re.split(r"[\s<>=!~@;\[]", requirement, maxsplit=1)[0].lower() == "mlx-iqk"
-    ]
-    if iqk_requirements != [EXPECTED_MLX_IQK_REQUIREMENT]:
-        failures.append(
-            f"{kind}: {label} must require exactly {EXPECTED_MLX_IQK_REQUIREMENT}"
-        )
+    exact_requirements = {
+        "mlx": EXPECTED_MLX_REQUIREMENT,
+        "mlx-iqk": EXPECTED_MLX_IQK_REQUIREMENT,
+    }
+    for requirement_name, expected in exact_requirements.items():
+        matches = [
+            requirement
+            for requirement in requirements
+            if re.split(r"[\s<>=!~@;\[]", requirement, maxsplit=1)[0].lower()
+            == requirement_name
+        ]
+        if matches != [expected]:
+            failures.append(f"{kind}: {label} must require exactly {expected}")
     if "compute" in values("Provides-Extra") or any(
         "extra == 'compute'" in requirement or 'extra == "compute"' in requirement
         for requirement in requirements
@@ -323,7 +440,7 @@ def _minimal_metadata() -> bytes:
         "License-File: LICENSE-MIT\n"
         "License-File: THIRD-PARTY-NOTICES\n"
         "Requires-Dist: jang>=2.5.29\n"
-        "Requires-Dist: mlx>=0.31.2\n"
+        f"Requires-Dist: {EXPECTED_MLX_REQUIREMENT}\n"
         f"Requires-Dist: {EXPECTED_MLX_IQK_REQUIREMENT}\n"
         "Requires-Dist: mlx-kquant@ git+https://example.invalid/mlx-kquant.git\n"
         "Requires-Dist: mlx-lm>=0.31.3\n"
@@ -335,20 +452,32 @@ def _minimal_metadata() -> bytes:
     return headers + README_BYTES
 
 
+def _minimal_wheel_metadata(interpreter: str = "313") -> bytes:
+    return (
+        "Wheel-Version: 1.0\n"
+        "Generator: distribution-audit-test\n"
+        "Root-Is-Purelib: false\n"
+        f"Tag: cp{interpreter}-cp{interpreter}-macosx_26_0_arm64\n"
+    ).encode()
+
+
 def _minimal_members(kind: str) -> dict[str, bytes]:
     members = {suffix: b"public\n" for suffix in EXPECTED_SURFACE_SUFFIXES}
     for license_name in LICENSE_NAMES:
         members[license_name] = LICENSE_BYTES[license_name]
     if kind == "wheel":
         entry_points = "\n".join(f"{name} = package:main" for name in PUBLIC_ENTRY_POINTS)
-        members[f"moespresso-{EXPECTED_VERSION}.dist-info/entry_points.txt"] = (
-            entry_points.encode()
-        )
+        members[f"moespresso-{EXPECTED_VERSION}.dist-info/entry_points.txt"] = entry_points.encode()
         members[f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"] = _minimal_metadata()
+        members[f"moespresso-{EXPECTED_VERSION}.dist-info/WHEEL"] = _minimal_wheel_metadata()
+        members["moespresso/_native/_moespresso_gate.cpython-313-darwin.so"] = b"gate"
     else:
         members["tests/test_ornith_gate.py"] = b"synthetic_fixture = True\n"
         members["PKG-INFO"] = _minimal_metadata()
         members["README.md"] = README_BYTES
+        members[SDIST_BINARY_ASSET] = SDIST_BINARY_ASSET_BYTES
+        for name in SDIST_NATIVE_SOURCES:
+            members[name] = b"source\n"
     return members
 
 
@@ -373,8 +502,7 @@ def test_audit_rejects_modified_third_party_notice():
     failures = audit_members("wheel", members)
 
     assert any(
-        "THIRD-PARTY-NOTICES does not match the repository copy" in failure
-        for failure in failures
+        "THIRD-PARTY-NOTICES does not match the repository copy" in failure for failure in failures
     )
 
 
@@ -390,6 +518,12 @@ def test_audit_rejects_private_material_and_host_paths():
     assert any("specs_archive/notes.md" in failure for failure in failures)
     assert any("ornith/private/key.json" in failure for failure in failures)
     assert any("macOS user path" in failure for failure in failures)
+
+
+def test_audit_rejects_research_checkouts_without_other_forbidden_content():
+    members = _minimal_members("sdist")
+    members[".research/example/module.py"] = b"value = 1\n"
+    assert audit_members("sdist", members) == ["sdist: forbidden path .research/example/module.py"]
 
 
 def test_audit_rejects_private_references_in_package_payloads():
@@ -425,8 +559,11 @@ def test_audit_rejects_removed_compute_extra_metadata():
     members = _minimal_members("wheel")
     metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
     members[metadata_name] = members[metadata_name].replace(
-        b"Requires-Dist: mlx>=0.31.2\n",
-        b"Requires-Dist: mlx>=0.31.2; extra == 'compute'\nProvides-Extra: compute\n",
+        f"Requires-Dist: {EXPECTED_MLX_REQUIREMENT}\n".encode(),
+        (
+            f"Requires-Dist: {EXPECTED_MLX_REQUIREMENT}; extra == 'compute'\n"
+            "Provides-Extra: compute\n"
+        ).encode(),
     )
 
     failures = audit_members("wheel", members)
@@ -439,12 +576,92 @@ def test_audit_rejects_an_inexact_mlx_iqk_requirement():
     metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
     members[metadata_name] = members[metadata_name].replace(
         f"Requires-Dist: {EXPECTED_MLX_IQK_REQUIREMENT}\n".encode(),
-        b"Requires-Dist: mlx-iqk>=0.1.2\n",
+        b"Requires-Dist: mlx-iqk>=0.1.3\n",
     )
 
     failures = audit_members("wheel", members)
 
-    assert any("must require exactly mlx-iqk==0.1.2" in failure for failure in failures)
+    assert any("must require exactly mlx-iqk==0.1.3" in failure for failure in failures)
+
+
+def test_audit_rejects_a_broadened_mlx_requirement():
+    members = _minimal_members("wheel")
+    metadata_name = f"moespresso-{EXPECTED_VERSION}.dist-info/METADATA"
+    members[metadata_name] = members[metadata_name].replace(
+        f"Requires-Dist: {EXPECTED_MLX_REQUIREMENT}\n".encode(),
+        b"Requires-Dist: mlx>=0.31.2\n",
+    )
+
+    failures = audit_members("wheel", members)
+
+    assert any("must require exactly mlx==0.31.2" in failure for failure in failures)
+
+
+def test_wheel_audit_rejects_missing_and_extra_native_payloads():
+    members = _minimal_members("wheel")
+    del members["moespresso/_native/_moespresso_gate.cpython-313-darwin.so"]
+    members["moespresso/_native/unexpected.cpython-313-darwin.so"] = b"extra"
+    members["moespresso/_native/unexpected.metallib"] = b"extra"
+    members["moespresso/elsewhere.dylib"] = b"extra"
+    members["moespresso/data/opaque.bin"] = b"\x00opaque"
+
+    failures = audit_members("wheel", members)
+
+    assert "wheel: missing native extension _moespresso_gate" in failures
+    assert any("unexpected.cpython-313-darwin.so" in failure for failure in failures)
+    assert any("unexpected.metallib" in failure for failure in failures)
+    assert any("moespresso/elsewhere.dylib" in failure for failure in failures)
+    assert any("moespresso/data/opaque.bin" in failure for failure in failures)
+
+
+def test_wheel_audit_rejects_duplicate_gate_extension_and_mixed_abi():
+    members = _minimal_members("wheel")
+    members["moespresso/_native/_moespresso_gate.cpython-312-darwin.so"] = b"duplicate"
+
+    failures = audit_members("wheel", members)
+
+    assert "wheel: expected exactly one native extension _moespresso_gate, found 2" in failures
+    assert "wheel: native extensions do not share one interpreter ABI" in failures
+    assert "wheel: WHEEL tag interpreter does not match native extensions" in failures
+
+
+def test_wheel_audit_rejects_inconsistent_platform_metadata():
+    members = _minimal_members("wheel")
+    wheel_name = f"moespresso-{EXPECTED_VERSION}.dist-info/WHEEL"
+    members[wheel_name] = _minimal_wheel_metadata().replace(
+        b"Root-Is-Purelib: false\nTag: cp313-cp313-macosx_26_0_arm64",
+        b"Root-Is-Purelib: true\nTag: py3-none-any",
+    )
+
+    failures = audit_members("wheel", members)
+
+    assert "wheel: Root-Is-Purelib must be false" in failures
+    assert "wheel: WHEEL must declare one cp*-cp*-macosx_26_0_arm64 tag" in failures
+
+
+def test_sdist_audit_requires_native_sources_and_rejects_binaries():
+    members = _minimal_members("sdist")
+    del members["native/gate/gate.cpp"]
+    members["native/gate/build/_moespresso_gate.so"] = b"binary"
+
+    failures = audit_members("sdist", members)
+
+    assert "sdist: missing native build source native/gate/gate.cpp" in failures
+    assert any("generated binary artifact" in failure for failure in failures)
+
+
+def test_sdist_audit_requires_the_exact_public_hero_asset():
+    members = _minimal_members("sdist")
+    assert not any("hero.webp" in failure for failure in audit_members("sdist", members))
+
+    members[SDIST_BINARY_ASSET] = bytes([SDIST_BINARY_ASSET_BYTES[0] ^ 1]) + (
+        SDIST_BINARY_ASSET_BYTES[1:]
+    )
+    failures = audit_members("sdist", members)
+
+    assert failures.count(
+        f"sdist: {SDIST_BINARY_ASSET} does not match the repository copy"
+    ) == 1
 
 
 def main(argv: list[str] | None = None) -> int:

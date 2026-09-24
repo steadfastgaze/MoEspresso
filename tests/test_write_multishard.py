@@ -15,13 +15,11 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant")
 
 from moespresso.inventory.build import build_inventory  # noqa: E402
-from moespresso.optimize.decide import decide  # noqa: E402
+from moespresso.core.artifact import make_artifact  # noqa: E402
 from moespresso.package.plan import package_plan_from_decision  # noqa: E402
 from moespresso.package.write import write_package  # noqa: E402
-from moespresso.probe.build import build_probe_evidence  # noqa: E402
 from moespresso.runtime.verify import verify_package  # noqa: E402
 
 ARCH = {"model_type": "qwen3_moe",
@@ -52,6 +50,8 @@ def _tiny_model(d):
     _write_safetensors(d / "model-00001.safetensors", {
         "model.language_model.layers.0.self_attn.q_proj.weight":
             rng.standard_normal((128, 128)).astype(np.float32),
+        "model.language_model.layers.0.self_attn.k_proj.weight":
+            rng.standard_normal((128, 128)).astype(np.float32),
         "model.language_model.layers.0.mlp.experts.gate_up_proj":
             rng.standard_normal((8, 256, 128)).astype(np.float32),
         "model.language_model.layers.0.mlp.experts.down_proj":
@@ -65,8 +65,14 @@ def _build(tmp_path, shard_size_gb):
     _tiny_model(src)
     out = tmp_path / "out"
     inv = build_inventory(src, layer_types=["full_attention"])
-    ev = build_probe_evidence(inv, src, expert_sample=2, sample_rows=64)
-    dec = decide(ev, target_quality=0.5)
+    dec = make_artifact(
+        "optimizer_decision", inv["subject"], {"name": "test", "version": "1"},
+        status="valid", allocation=[
+            {"source_name": f"model.language_model.layers.0.self_attn.{p}_proj.weight",
+             "kind": "affine", "format": "affine", "bits": 4, "group_size": 32,
+             "role": f"attn.{p}_proj", "layer_index": 0}
+            for p in ("q", "k")
+        ])
     plan, _summary = package_plan_from_decision(dec)
     man = write_package(plan, src, ARCH, out, shard_size_gb=shard_size_gb)
     return src, out, man

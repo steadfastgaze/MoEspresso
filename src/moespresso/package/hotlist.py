@@ -5,14 +5,13 @@ provenance) carries per-layer routed-expert usage counters (~millions of
 routed calibration tokens per layer). Measured against real request demand:
 seeding capacity-70 from these counts captures a median 0.40
 of a request's expert-demand mass vs 0.27 for arbitrary seeding, with zero
-run history. A runtime-saved demand hotlist captures ~0.60 and takes
-precedence when present (the layered seeding design); this artifact is the
-cold-start floor before any request history exists.
+run history. This artifact supplies the package's cold-start seed before live
+request demand adapts residency.
 
-The emitted `expert_hotlist.json` uses the same schema as the saved-demand
-hotlists, so `ssd_streaming_build.load_expert_hotlist` consumes either
-interchangeably (it caps installed priors so neither can dominate live
-traffic; see prior_cap there).
+The emitted `expert_hotlist.json` is consumed by
+`ssd_streaming_build.load_expert_hotlist` to seed initial residency. Installed
+priors are capped so the package ranking cannot dominate live traffic (see
+`prior_cap` there).
 
 Fail-closed alignment: imatrix counts are keyed by GGUF block index; the
 package's routed layers are keyed by model layer index. These coincide on
@@ -23,6 +22,7 @@ package's expert index and emits nothing (with a loud reason) otherwise.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from pathlib import Path
 
@@ -42,29 +42,50 @@ def build_package_expert_hotlist(
     counts: dict[int, np.ndarray],
     *,
     layers_indexed: tuple[int, ...],
-    num_experts: int,
+    num_experts: int | Mapping[int, int],
     source: dict | None = None,
 ) -> dict:
     """Pure: ranked per-layer expert counts -> the expert_hotlist payload.
 
     Raises HotlistAlignmentError unless the count layers exactly equal the
-    package's routed layers and every layer has at least `num_experts`
-    counters (a smoke package keeps the first N experts, so counts[:N] are
-    the right counters for it).
+    package's routed layers and every layer has enough counters for its
+    physical expert count. A scalar count describes a uniform package; a
+    mapping describes a compact package with per-layer counts.
     """
     if set(counts) != set(layers_indexed):
         raise HotlistAlignmentError(
             f"imatrix count layers {_span(set(counts))} != package routed "
             f"layers {_span(set(layers_indexed))}: refusing to emit a "
             f"possibly misaligned hotlist")
+    if isinstance(num_experts, Mapping):
+        if set(num_experts) != set(layers_indexed):
+            raise HotlistAlignmentError(
+                "per-layer expert counts do not match package routed layers"
+            )
+        if any(
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            for layer, value in num_experts.items()
+        ):
+            raise HotlistAlignmentError(
+                "per-layer expert counts must map integer layers to integer counts"
+            )
+        layer_counts = dict(num_experts)
+    else:
+        layer_counts = {int(layer): int(num_experts) for layer in layers_indexed}
+    if any(value <= 0 for value in layer_counts.values()):
+        raise HotlistAlignmentError("package expert counts must be positive")
     layers: dict[str, dict[str, int]] = {}
     for layer in sorted(layers_indexed):
         c = counts[layer]
-        if len(c) < num_experts:
+        layer_experts = layer_counts[layer]
+        if len(c) < layer_experts:
             raise HotlistAlignmentError(
                 f"layer {layer}: {len(c)} expert counters < package "
-                f"num_experts {num_experts}")
-        c = c[:num_experts]
+                f"num_experts {layer_experts}")
+        c = c[:layer_experts]
         layers[str(layer)] = {
             str(expert): int(c[expert])
             for expert in np.argsort(c)[::-1].tolist()

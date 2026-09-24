@@ -134,6 +134,18 @@ def test_deepseek_v4_expert_selection_kind_and_feature_are_registered():
     assert validate_base(selection) == []
 
 
+def test_qwen4_expert_selection_kind_and_feature_are_registered():
+    selection = make_artifact(
+        "qwen4_expert_selection",
+        SUBJECT,
+        PRODUCER,
+        required_features=["qwen4_per_layer_experts"],
+    )
+
+    assert selection["artifact_id"].startswith("select:")
+    assert validate_base(selection) == []
+
+
 def test_unknown_required_feature_fails_closed():
     # fail-closed at construction: make_artifact raises on an unknown feature.
     with pytest.raises(ArtifactError):

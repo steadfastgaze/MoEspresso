@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant.gather_tq_kernel")
 
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
@@ -29,6 +28,7 @@ from moespresso.runtime.ssd_streaming_build import (  # noqa: E402
     SSDStreamingBuildError,
     _budget_payload,
     _is_routed_expert_key,
+    _load_qwen_streaming_tokenizer,
     grow_ssd_streaming_capacity,
     install_pooled_switchglus,
     maybe_adapt_ssd_streaming_capacity,
@@ -36,7 +36,33 @@ from moespresso.runtime.ssd_streaming_build import (  # noqa: E402
     ssd_streaming_stats,
     suggest_capacity_overrides_from_layer_stats,
 )
+from moespresso.runtime.qwen4.expert_provider import (  # noqa: E402
+    build_qwen4_pooled_expert_executor,
+)
 from moespresso.runtime.streaming_capacity import CapacityBudget  # noqa: E402
+
+
+def test_qwen_streaming_loader_retains_all_declared_stop_ids(tmp_path):
+    seen = {}
+
+    def fake_load_tokenizer(package_dir, *, eos_token_ids):
+        seen["package_dir"] = package_dir
+        seen["eos_token_ids"] = eos_token_ids
+        return "TOK"
+
+    tokenizer = _load_qwen_streaming_tokenizer(
+        tmp_path,
+        {
+            "text_config": {"eos_token_id": 17},
+            "eos_token_id": [23],
+        },
+        load_tokenizer_fn=fake_load_tokenizer,
+    )
+
+    assert tokenizer == "TOK"
+    assert seen["package_dir"] == tmp_path
+    assert seen["eos_token_ids"] == {17, 23}
+    assert 29 not in seen["eos_token_ids"]
 
 
 def _package(tmp_path, *, n_experts=8, hidden=64, intermediate=32, layers=(0,)):
@@ -136,28 +162,9 @@ def _kquant_package(tmp_path, *, n_experts=4, hidden=256, intermediate=256):
     return pkg, expected
 
 
-def _resident_projection(n_experts, in_features, out_features, *, bits, seed=42):
-    from jang_tools.turboquant.tq_kernel import TurboQuantSwitchLinear
-
-    mod = TurboQuantSwitchLinear(
-        in_features,
-        out_features,
-        n_experts,
-        bits=bits,
-        seed=seed,
-    )
-    vals_per_u32 = 32 // bits
-    cols = (in_features + vals_per_u32 - 1) // vals_per_u32
-    mod.packed = mx.random.randint(
-        0,
-        2**31,
-        (n_experts, out_features, cols),
-    ).astype(mx.uint32)
-    mod.norms = (mx.random.normal((n_experts, out_features)) * 0.1).astype(
-        mx.float16
-    )
-    mx.eval(mod.packed, mod.norms)
-    return mod
+def _resident_projection(n_experts, in_features, out_features):
+    from package_fixtures import resident_mxfp4
+    return resident_mxfp4(n_experts, in_features, out_features)
 
 
 def _resident_switch(
@@ -165,9 +172,6 @@ def _resident_switch(
     n_experts=8,
     hidden=64,
     intermediate=32,
-    gate_bits=2,
-    up_bits=4,
-    down_bits=2,
 ):
     from mlx_lm.models.switch_layers import SwitchGLU
     from moespresso.runtime.owned_switchglu import OwnedSwitchGLU
@@ -176,11 +180,11 @@ def _resident_switch(
     shape = SwitchGLU(hidden, intermediate, n_experts)
     return OwnedSwitchGLU(
         gate_proj=_resident_projection(
-            n_experts, hidden, intermediate, bits=gate_bits),
+            n_experts, hidden, intermediate),
         up_proj=_resident_projection(
-            n_experts, hidden, intermediate, bits=up_bits),
+            n_experts, hidden, intermediate),
         down_proj=_resident_projection(
-            n_experts, intermediate, hidden, bits=down_bits),
+            n_experts, intermediate, hidden),
         activation=shape.activation,
     )
 
@@ -195,9 +199,9 @@ def _package_from_resident(tmp_path, resident):
     for projection in ("gate_proj", "up_proj", "down_proj"):
         proj = getattr(resident, projection)
         components[(projection, "packed")] = np.array(proj.packed)
-        components[(projection, "norms")] = np.array(proj.norms)
+        components[(projection, "scales")] = np.array(proj.scales)
         bits[projection] = int(proj.bits)
-    bundle, geo = assemble_layer_bundle(components, bits)
+    bundle, geo = assemble_layer_bundle(components, bits, codecs={p: "mxfp4" for p in bits})
     base = "language_model.model.layers.0.mlp.switch_mlp"
     write_safetensors_raw(
         pkg / "model-00001-of-00001.safetensors",
@@ -301,7 +305,7 @@ class _DeepseekV4SparseModel(nn.Module):
         self.language_model.model.layers = [layer]
 
 
-def test_routed_key_filter_is_exact_to_switch_tq_payloads():
+def test_routed_key_filter_is_exact_to_bundle_payloads():
     assert _is_routed_expert_key(
         "language_model.model.layers.0.mlp.switch_mlp.experts.tq_bundle")
 
@@ -309,10 +313,6 @@ def test_routed_key_filter_is_exact_to_switch_tq_payloads():
         "language_model.model.layers.0.mlp.gate_proj.weight")
     assert not _is_routed_expert_key(
         "language_model.model.layers.0.mlp.shared_expert.up_proj.weight")
-    # legacy stacked keys never reach the resident-load filter: the expert
-    # index refuses stacked packages before any weights are loaded
-    assert not _is_routed_expert_key(
-        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.tq_packed")
 
 
 def test_install_pooled_switchglus_replaces_indexed_layers(tmp_path):
@@ -325,7 +325,7 @@ def test_install_pooled_switchglus_replaces_indexed_layers(tmp_path):
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
     )
 
     assert installed == 1
@@ -333,9 +333,53 @@ def test_install_pooled_switchglus_replaces_indexed_layers(tmp_path):
     layer1 = model.language_model.model.layers[1]
     assert isinstance(layer0.mlp.switch_mlp, PooledSwitchGLU)
     assert not isinstance(layer1.mlp.switch_mlp, PooledSwitchGLU)
-    assert layer0.mlp.switch_mlp.gate_proj.bits == 2
+    assert layer0.mlp.switch_mlp.gate_proj.bits == 4
     assert layer0.mlp.switch_mlp.up_proj.bits == 4
     assert layer0.mlp.switch_mlp.gate_proj.pool.capacity == 4
+
+
+def test_qwen4_pooled_executor_reuses_package_bundle_without_replacing_moe(
+    tmp_path,
+):
+    resident = _resident_switch(n_experts=8, hidden=64, intermediate=32)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    executor = build_qwen4_pooled_expert_executor(
+        package_dir=pkg,
+        index=index,
+        layer=0,
+        hidden_size=64,
+        intermediate_size=32,
+        num_experts=8,
+        capacity=8,
+    )
+    hidden = mx.random.normal((1, 3, 64)).astype(mx.float32)
+    indices = mx.array([[[0, 2, 5], [7, 1, 3], [4, 6, 0]]], dtype=mx.uint32)
+
+    expected = resident(hidden, indices)
+    got = executor(hidden, indices)
+    mx.eval(expected, got)
+
+    assert (executor.hidden_size, executor.intermediate_size) == (64, 32)
+    assert executor.num_experts == 8
+    assert executor.gate_proj.pool.capacity == 8
+    assert np.array_equal(np.asarray(got), np.asarray(expected))
+
+
+def test_qwen4_pooled_executor_rejects_expert_count_mismatch(tmp_path):
+    pkg = _package(tmp_path, n_experts=8)
+    index = build_expert_index(pkg)
+
+    with pytest.raises(SSDStreamingBuildError, match="expert count"):
+        build_qwen4_pooled_expert_executor(
+            package_dir=pkg,
+            index=index,
+            layer=0,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=512,
+            capacity=8,
+        )
 
 
 def test_install_pooled_switchglus_caps_mixed_layers_locally(tmp_path):
@@ -385,7 +429,7 @@ def test_install_pooled_switchglus_kquant_combines_gate_up_by_default(tmp_path):
         package_dir=pkg,
         index=index,
         capacity_per_layer=2,
-        seed=42,
+
     )
 
     assert installed == 1
@@ -419,7 +463,7 @@ def test_install_pooled_switchglus_can_share_kquant_gate_up_pool(
         package_dir=pkg,
         index=index,
         capacity_per_layer=2,
-        seed=42,
+
     )
 
     assert installed == 1
@@ -456,7 +500,7 @@ def test_pooled_kquant_projection_dispatches_to_mlx_kquant(tmp_path, monkeypatch
         package_dir=pkg,
         index=index,
         capacity_per_layer=2,
-        seed=42,
+
     )
     calls = []
 
@@ -497,7 +541,7 @@ def test_combined_kquant_gate_up_dispatches_two_routed_gathers(
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
     )
     switch = model.language_model.model.layers[0].mlp.switch_mlp
     calls = []
@@ -528,6 +572,7 @@ def test_combined_kquant_gate_up_dispatches_two_routed_gathers(
     assert stats["expert_misses"] == 8
     assert stats["expert_loads"] == 8
     assert stats["bundle_row_preads"] == 4
+    assert stats["bundle_row_read_bytes"] == 4 * switch.gate_proj.pool.row_cache.index.row_bytes(layer=0)
     assert stats["bundle_cached_takes"] == 4
     assert stats["routed_matmul_calls"] == 2
     assert stats["routed_gate_matmul_calls"] == 1
@@ -551,7 +596,7 @@ def test_combined_kquant_gate_up_pipelined_builder_uses_combined_gather(
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
     )
     switch = model.language_model.model.layers[0].mlp.switch_mlp
     calls = []
@@ -592,7 +637,7 @@ def test_install_pooled_switchglus_wraps_real_sparse_moe_shape(tmp_path):
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
     )
 
     assert installed == 1
@@ -618,7 +663,7 @@ def test_install_pooled_switchglus_leaves_deepseek_v4_moe_unwrapped_by_default(
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
     )
 
     mlp = model.language_model.model.layers[0].mlp
@@ -629,10 +674,9 @@ def test_install_pooled_switchglus_leaves_deepseek_v4_moe_unwrapped_by_default(
 def test_pooled_deepseek_v4_moe_block_matches_direct_hash_route(tmp_path, monkeypatch):
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", False)
     monkeypatch.setattr(psg, "_RING_DECODE", False)
 
-    resident_switch = _resident_switch(n_experts=8, gate_bits=2, up_bits=4)
+    resident_switch = _resident_switch(n_experts=8, )
     pkg = _package_from_resident(tmp_path, resident_switch)
     gate = _DeepseekV4HashGate(n_experts=8, top_k=4)
     shared = _TinySharedMLP()
@@ -652,7 +696,7 @@ def test_pooled_deepseek_v4_moe_block_matches_direct_hash_route(tmp_path, monkey
         package_dir=pkg,
         index=index,
         capacity_per_layer=4,
-        seed=42,
+
         wrap_deepseek_v4_moe=True,
     )
     pooled = model.language_model.model.layers[0].mlp
@@ -683,21 +727,16 @@ def test_pooled_deepseek_v4_moe_block_matches_direct_hash_route(tmp_path, monkey
     assert gate.calls
 
 
-def test_pooled_deepseek_v4_ring_decode_matches_legacy(tmp_path, monkeypatch):
+def test_pooled_deepseek_v4_ring_decode_matches_direct(tmp_path, monkeypatch):
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_FUSED_GATE_UP", True)
-    monkeypatch.setattr(psg, "_ONDEVICE_REMAP", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     resident_switch = _resident_switch(
         n_experts=8,
-        gate_bits=4,
-        up_bits=4,
-        down_bits=2,
+
+
     )
     shared = _TinySharedMLP()
     xs = [mx.random.normal((1, 1, 64)).astype(mx.float16) for _ in range(4)]
@@ -712,7 +751,7 @@ def test_pooled_deepseek_v4_ring_decode_matches_legacy(tmp_path, monkeypatch):
 
     for use_ring in (False, True):
         monkeypatch.setattr(psg, "_RING_DECODE", use_ring)
-        root = tmp_path / ("ring" if use_ring else "legacy")
+        root = tmp_path / ("ring" if use_ring else "direct")
         root.mkdir()
         pkg = _package_from_resident(root, resident_switch)
         model = _DeepseekV4SparseModel(
@@ -725,21 +764,24 @@ def test_pooled_deepseek_v4_ring_decode_matches_legacy(tmp_path, monkeypatch):
             package_dir=pkg,
             index=build_expert_index(pkg),
             capacity_per_layer=4,
-            seed=42,
+
             wrap_deepseek_v4_moe=True,
         )
         block = model.language_model.model.layers[0].mlp
+        assert type(block) is PooledDeepseekV4MoEBlock
+        assert model._moespresso_pooled_decode_session is not None
         block.eval()
         got = []
         for x, input_ids in zip(xs, ids):
             y = block(x, input_ids=input_ids)
             mx.eval(y)
             got.append(np.array(y))
+        assert block.switch_mlp.shared_pooled_decode_calls == len(xs)
         outs[use_ring] = got
         stats[use_ring] = ssd_streaming_stats(model)
 
-    for legacy, ringed in zip(outs[False], outs[True]):
-        np.testing.assert_array_equal(legacy, ringed)
+    for direct, ringed in zip(outs[False], outs[True]):
+        np.testing.assert_array_equal(direct, ringed)
     assert stats[True]["pipelined_layers"] == len(xs)
     assert stats[True]["decode_moe_block_calls"] == len(xs)
     assert stats[True]["index_sync_calls"] == 0
@@ -762,7 +804,15 @@ def test_install_pooled_switchglus_fails_on_geometry_mismatch(tmp_path):
         )
 
 
-def test_ssd_streaming_stats_reports_pool_activity(tmp_path):
+def test_ssd_streaming_stats_reports_pool_activity(tmp_path, monkeypatch):
+    from moespresso.runtime import native_gate
+
+    monkeypatch.setattr(native_gate, "_GATE", [False])
+    monkeypatch.setattr(
+        native_gate,
+        "load_gate",
+        lambda: pytest.fail("stats must not attempt to load the native gate"),
+    )
     pkg = _package(tmp_path, layers=(0,))
     model = _Model(n_layers=1)
     index = build_expert_index(pkg)
@@ -780,6 +830,23 @@ def test_ssd_streaming_stats_reports_pool_activity(tmp_path):
 
     stats = ssd_streaming_stats(model)
     assert stats["enabled"] is True
+    assert stats["shared_pooled_decode"] is True
+    assert stats["native_gate_bound"] is False
+    assert stats["native_gate_loaded"] is False
+    assert stats["qwen_native_publication_modules"] == 0
+    for name in (
+        "native_calls",
+        "published",
+        "miss",
+        "pending",
+        "suppressed",
+        "map_builds",
+        "ineligible",
+        "poll_slices",
+        "poll_yields",
+        "timed_out",
+    ):
+        assert stats["qwen_native_publication_" + name] == 0
     assert stats["switch_modules"] == 1
     assert stats["resident_slots"] == 12  # 4 experts in each of gate/up/down pools
     assert switch.gate_proj.pool.eviction_policy == "lfu"
@@ -800,6 +867,7 @@ def test_ssd_streaming_stats_reports_pool_activity(tmp_path):
     assert stats["decode_seen_experts"] == 4
     assert stats["prefill_seen_experts"] == 0
     assert stats["max_unique_active_experts"] == 4
+
     # phase counters: __call__'s host read is timed (index_resync) and the
     # routed graph build is timed once misses are resident. index_sync and
     # decode_moe_block accrue only through PooledSparseMoeBlock.
@@ -822,7 +890,7 @@ def test_ssd_streaming_stats_reports_pool_activity(tmp_path):
     assert per_layer[0]["capacity"] == 4
     assert per_layer[0]["num_experts"] == 8
     assert per_layer[0]["projection_pool_count"] == 3
-    assert per_layer[0]["slot_bytes"] == 2304
+    assert per_layer[0]["slot_bytes"] == 3264
     assert per_layer[0]["expert_misses"] == 12
     assert per_layer[0]["projection_load_wait_calls"] == 1
     assert per_layer[0]["projection_no_miss_calls"] == 0
@@ -833,41 +901,56 @@ def test_ssd_streaming_stats_reports_pool_activity(tmp_path):
     assert per_layer[0]["decode_seen_experts"] == 4
 
 
-def test_expert_hotlist_round_trip_warm_starts_residency(tmp_path):
-    """Demand saved from one session warm-starts the next session's pools
-    (the hottest experts become resident at load time, before any request)."""
-    from moespresso.runtime.ssd_streaming_build import (
-        load_expert_hotlist,
-        save_expert_hotlist,
+def test_ssd_streaming_stats_aggregates_existing_native_publication_helpers(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from moespresso.runtime import native_gate
+
+    pkg = _package(tmp_path, layers=(0, 1))
+    model = _Model(n_layers=2)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
     )
+    names = (
+        "native_calls",
+        "published",
+        "miss",
+        "pending",
+        "suppressed",
+        "map_builds",
+        "ineligible",
+        "poll_slices",
+        "poll_yields",
+        "timed_out",
+    )
+    for factor, layer in enumerate(model.language_model.model.layers, 1):
+        values = {name: factor * (index + 1) for index, name in enumerate(names)}
+        helper = SimpleNamespace(snapshot=lambda values=values: dict(values))
+        object.__setattr__(layer.mlp.switch_mlp, "_qwen4_native_publication", helper)
 
-    pkg = _package(tmp_path, layers=(0,))
-    index = build_expert_index(pkg)
+    session = model._moespresso_pooled_decode_session
+    loaded_gate = object()
+    object.__setattr__(session, "_gate_mod", loaded_gate)
+    monkeypatch.setattr(native_gate, "_GATE", [loaded_gate])
+    stats = ssd_streaming_stats(model)
 
-    model_a = _Model(n_layers=1)
-    install_pooled_switchglus(
-        model_a, package_dir=pkg, index=index, capacity_per_layer=3)
-    switch_a = model_a.language_model.model.layers[0].mlp.switch_mlp
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    # expert 5 is demanded twice, 1 and 2 once -> 5 must rank hottest
-    mx.eval(switch_a(x, mx.array([[5, 1]], dtype=mx.uint32)))
-    mx.eval(switch_a(x, mx.array([[5, 2]], dtype=mx.uint32)))
-    hot_path = tmp_path / "hotlist.json"
-    assert save_expert_hotlist(model_a, hot_path) == 1
+    assert stats["shared_pooled_decode"] is True
+    assert stats["native_gate_bound"] is True
+    assert stats["native_gate_loaded"] is True
+    assert stats["qwen_native_publication_modules"] == 2
+    for index, name in enumerate(names):
+        assert stats["qwen_native_publication_" + name] == 3 * (index + 1)
 
-    model_b = _Model(n_layers=1)
-    install_pooled_switchglus(
-        model_b, package_dir=pkg, index=index, capacity_per_layer=2)
-    seeded = load_expert_hotlist(model_b, hot_path)
-    switch_b = model_b.language_model.model.layers[0].mlp.switch_mlp
-    assert seeded == 6  # 2 free slots x 3 pools
-    # capacity 2: the two hottest experts of the saved demand are resident
-    assert switch_b.gate_proj.pool.resident_ids() == {5, 1} or \
-        switch_b.gate_proj.pool.resident_ids() == {5, 2}
-    assert 5 in switch_b.down_proj.pool.resident_ids()
-
-    # A missing optional hotlist is a no-op.
-    assert load_expert_hotlist(model_b, tmp_path / "absent.json") == 0
+    object.__setattr__(session, "_gate_mod", None)
+    idle_stats = ssd_streaming_stats(model)
+    assert idle_stats["native_gate_bound"] is False
+    assert idle_stats["native_gate_loaded"] is True
 
 
 def test_suggest_capacity_overrides_spends_budget_on_churniest_layers():
@@ -1029,7 +1112,7 @@ def test_byte_budget_charges_prior_deltas_to_later_replacement_headroom():
     ) == {1: 5}
 
 
-def test_suggest_capacity_overrides_reserves_lookahead_spare_slots():
+def test_suggest_capacity_overrides_can_use_spare_slot_headroom():
     rows = [{
         "layer": 0,
         "capacity": 200,
@@ -1134,12 +1217,12 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
         model,
         available_bytes=100_000,
         min_available_bytes=0,
-        max_extra_bytes=2 * 2304,
+        max_extra_bytes=2 * 3264,
         seed_hot=False,
     )
 
     assert result["applied"] == {0: 6}
-    assert result["used_extra_bytes"] == 2 * 2304
+    assert result["used_extra_bytes"] == 2 * 3264
     assert result["replacement_headroom_bytes"] == 100_000
     assert result["seed_hot"] is False
     assert result["seeded_slots"] == 0
@@ -1152,7 +1235,7 @@ def test_maybe_adapt_ssd_streaming_capacity_uses_byte_budget(tmp_path):
         model,
         available_bytes=100_000,
         min_available_bytes=0,
-        max_extra_bytes=2 * 2304,
+        max_extra_bytes=2 * 3264,
         seed_hot=False,
     )
     assert second["applied"] == {}
@@ -1201,7 +1284,7 @@ def test_maybe_adapt_growth_failure_keeps_response_path_and_committed_prefix(
         model,
         available_bytes=100_000,
         min_available_bytes=0,
-        max_extra_bytes=4 * 2304,
+        max_extra_bytes=4 * 3264,
         seed_hot=False,
     )
 
@@ -1233,7 +1316,7 @@ def test_maybe_adapt_growth_failure_keeps_response_path_and_committed_prefix(
         model,
         available_bytes=100_000,
         min_available_bytes=0,
-        max_extra_bytes=4 * 2304,
+        max_extra_bytes=4 * 3264,
         seed_hot=False,
     )
     assert second is result
@@ -1273,7 +1356,7 @@ def test_maybe_adapt_seed_failure_records_the_committed_capacity(
         model,
         available_bytes=100_000,
         min_available_bytes=0,
-        max_extra_bytes=2 * 2304,
+        max_extra_bytes=2 * 3264,
         seed_hot=True,
     )
 
@@ -1314,7 +1397,7 @@ def test_maybe_adapt_ssd_streaming_capacity_respects_memory_floor(tmp_path):
         model,
         available_bytes=4_000,
         min_available_bytes=4_000,
-        max_extra_bytes=2304,
+        max_extra_bytes=3264,
     )
 
     assert result["applied"] == {}
@@ -1469,17 +1552,11 @@ def _hotlist_payload(layers):
     return _json.dumps({"version": 1, "kind": "expert_hotlist", "layers": layers})
 
 
-def test_seed_expert_residency_precedence_and_kill_switch(tmp_path, monkeypatch):
-    """Layered seeding: saved demand (0.60 tier) > package imatrix
-    hotlist (0.40 tier) > nothing; MOESPRESSO_SSD_HOTLIST=0 disables."""
+def test_seed_expert_residency_loads_package_hotlist(tmp_path):
+    """The package hotlist seeds the cold expert pool."""
     from moespresso.package.hotlist import HOTLIST_NAME
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
     pkg = _package(tmp_path, layers=(0,))
     index = build_expert_index(pkg)
 
@@ -1489,7 +1566,6 @@ def test_seed_expert_residency_precedence_and_kill_switch(tmp_path, monkeypatch)
             m, package_dir=pkg, index=index, capacity_per_layer=2)
         return m
 
-    # package hotlist alone -> package tier, top experts resident
     (pkg / HOTLIST_NAME).write_text(_hotlist_payload({"0": {"4": 100, "6": 50}}))
     m = fresh_model()
     info = seed_expert_residency(m, pkg)
@@ -1497,23 +1573,24 @@ def test_seed_expert_residency_precedence_and_kill_switch(tmp_path, monkeypatch)
     assert m.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
         .resident_ids() == {4, 6}
 
-    # saved demand wins over the package hotlist
-    saved = default_saved_hotlist_path(pkg)
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    saved.write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
-    m2 = fresh_model()
-    info2 = seed_expert_residency(m2, pkg)
-    assert info2["source"] == "saved"
-    assert m2.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
-        .resident_ids() == {1, 2}
 
-    # kill switch: nothing seeded
-    monkeypatch.setenv("MOESPRESSO_SSD_HOTLIST", "0")
-    m3 = fresh_model()
-    info3 = seed_expert_residency(m3, pkg)
-    assert info3["source"] == "disabled" and info3["seeded"] == 0
-    assert m3.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
-        .resident_ids() == set()
+def test_seed_expert_residency_without_package_hotlist_stays_empty(tmp_path):
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
+
+    pkg = _package(tmp_path, layers=(0,))
+    model = _Model(n_layers=1)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=2,
+    )
+
+    info = seed_expert_residency(model, pkg)
+
+    assert info == {"source": "none", "path": None, "seeded": 0}
+    switch = model.language_model.model.layers[0].mlp.switch_mlp
+    assert switch.gate_proj.pool.resident_ids() == set()
 
 
 def test_seed_expert_residency_can_prewarm_all_full_capacity(
@@ -1527,7 +1604,6 @@ def test_seed_expert_residency_can_prewarm_all_full_capacity(
     from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 
     monkeypatch.setenv("MOESPRESSO_SSD_PREWARM_EXPERTS", "all")
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
     pkg = _package(tmp_path, n_experts=4, layers=(0,))
     index = build_expert_index(pkg)
     model = _Model(n_layers=1, n_experts=4)
@@ -1553,24 +1629,12 @@ def test_seed_expert_residency_default_prewarms_all_at_full_capacity(
         tmp_path, monkeypatch):
     """With no explicit prewarm request and every pool at full capacity, the
     default prewarms every expert (pool residency selects the routed prefill
-    kernel, so serving must start on the fully resident numerics). The
-    saved-demand tier does not preempt it: hotlist seeding covers only the
-    recorded demand and would leave the cold segmented path live."""
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
+    kernel, so serving must start on the fully resident numerics)."""
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_EXPERTS", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_DEFAULT", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
     pkg = _package(tmp_path, n_experts=4, layers=(0,))
     index = build_expert_index(pkg)
-
-    saved = default_saved_hotlist_path(pkg)
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    saved.write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
 
     model = _Model(n_layers=1, n_experts=4)
     install_pooled_switchglus(
@@ -1582,6 +1646,38 @@ def test_seed_expert_residency_default_prewarms_all_at_full_capacity(
     assert info["seeded"] == 12
     assert switch.gate_proj.pool.resident_ids() == {0, 1, 2, 3}
     assert switch.down_proj.pool.resident_ids() == {0, 1, 2, 3}
+
+
+def test_seed_expert_residency_supports_qwen_experts_layout(
+        tmp_path, monkeypatch):
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
+
+    monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_EXPERTS", raising=False)
+    pkg = _package(tmp_path, n_experts=4, layers=(0,))
+    model = _Model(n_layers=1, n_experts=4)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        capacity_per_layer=4,
+    )
+    mlp = model.language_model.model.layers[0].mlp
+    switch = mlp.switch_mlp
+    mlp.experts = switch
+    del mlp.switch_mlp
+
+    info = seed_expert_residency(model, pkg)
+    rows = ssd_streaming_layer_stats(model)
+    aggregate = ssd_streaming_stats(model)
+
+    assert info["source"] == "all-default"
+    assert info["seeded"] == 12
+    assert switch.gate_proj.pool.resident_ids() == {0, 1, 2, 3}
+    assert len(rows) == 1
+    assert rows[0]["resident_slots"] == 12
+    assert aggregate["enabled"] is True
+    assert aggregate["switch_modules"] == 1
+    assert aggregate["resident_slots"] == 12
 
 
 def test_full_pool_residency_requires_rows_not_only_capacity(tmp_path):
@@ -1612,77 +1708,23 @@ def test_seed_expert_residency_default_prewarm_needs_full_capacity(
         tmp_path, monkeypatch):
     """Below full capacity the default prewarm cannot engage (a partial "all"
     preload would silently leave the first request on the demand-miss path);
-    the hotlist tiers keep their behavior."""
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
+    the package hotlist remains available."""
+    from moespresso.package.hotlist import HOTLIST_NAME
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_EXPERTS", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_DEFAULT", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
     pkg = _package(tmp_path, n_experts=4, layers=(0,))
     index = build_expert_index(pkg)
-
-    saved = default_saved_hotlist_path(pkg)
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    saved.write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
+    (pkg / HOTLIST_NAME).write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
 
     model = _Model(n_layers=1, n_experts=4)
     install_pooled_switchglus(
         model, package_dir=pkg, index=index, capacity_per_layer=3)
     info = seed_expert_residency(model, pkg)
 
-    assert info["source"] == "saved"
+    assert info["source"] == "package"
     assert model.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
         .resident_ids() == {1, 2}
-
-
-def test_seed_expert_residency_default_prewarm_kill_switch(
-        tmp_path, monkeypatch):
-    """MOESPRESSO_SSD_PREWARM_DEFAULT=0 restores lazy hotlist seeding at full
-    capacity; an explicit MOESPRESSO_SSD_PREWARM_EXPERTS=all still wins over
-    the kill switch because the switch only controls the default."""
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
-
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("MOESPRESSO_SSD_PREWARM_DEFAULT", "0")
-    monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_EXPERTS", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
-    pkg = _package(tmp_path, n_experts=4, layers=(0,))
-    index = build_expert_index(pkg)
-
-    saved = default_saved_hotlist_path(pkg)
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    saved.write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
-
-    def fresh_model():
-        m = _Model(n_layers=1, n_experts=4)
-        install_pooled_switchglus(
-            m, package_dir=pkg, index=index, capacity_per_layer=4)
-        return m
-
-    m = fresh_model()
-    info = seed_expert_residency(m, pkg)
-    assert info["source"] == "saved"
-    assert m.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
-        .resident_ids() == {1, 2}
-
-    # with the hotlist tiers also disabled the pool state is fully cold
-    monkeypatch.setenv("MOESPRESSO_SSD_HOTLIST", "0")
-    m2 = fresh_model()
-    info2 = seed_expert_residency(m2, pkg)
-    assert info2["source"] == "disabled" and info2["seeded"] == 0
-
-    # explicit env request overrides the kill switch
-    monkeypatch.setenv("MOESPRESSO_SSD_PREWARM_EXPERTS", "all")
-    m3 = fresh_model()
-    info3 = seed_expert_residency(m3, pkg)
-    assert info3["source"] == "all" and info3["seeded"] == 12
 
 
 def test_seed_expert_residency_prewarm_all_fails_without_full_capacity(
@@ -1719,32 +1761,24 @@ def test_seed_expert_residency_prewarm_none_skips_prewarm_and_default(
         tmp_path, monkeypatch):
     """MOESPRESSO_SSD_PREWARM_EXPERTS=none is the explicit no-prewarm
     override: it skips both the explicit prewarm and the full-capacity
-    default and falls through to the hotlist tiers, so callers that pin
+    default and falls through to the package hotlist, so callers that pin
     the prewarm (the quality gates) can run a bounded capacity budget."""
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
+    from moespresso.package.hotlist import HOTLIST_NAME
+    from moespresso.runtime.ssd_streaming_build import seed_expert_residency
 
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("MOESPRESSO_SSD_PREWARM_EXPERTS", "none")
-    monkeypatch.delenv("MOESPRESSO_SSD_PREWARM_DEFAULT", raising=False)
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
     pkg = _package(tmp_path, n_experts=4, layers=(0,))
     index = build_expert_index(pkg)
-
-    saved = default_saved_hotlist_path(pkg)
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    saved.write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
+    (pkg / HOTLIST_NAME).write_text(_hotlist_payload({"0": {"1": 3, "2": 2}}))
 
     # Full-capacity pools: the all-default prewarm would normally engage,
-    # so 'none' skipping it (and seeding from the hotlist tier instead) is
+    # so 'none' skipping it (and seeding from the package hotlist instead) is
     # the override evidence.
     model = _Model(n_layers=1, n_experts=4)
     install_pooled_switchglus(
         model, package_dir=pkg, index=index, capacity_per_layer=4)
     info = seed_expert_residency(model, pkg)
-    assert info["source"] == "saved"
+    assert info["source"] == "package"
     assert model.language_model.model.layers[0].mlp.switch_mlp.gate_proj.pool \
         .resident_ids() == {1, 2}
 
@@ -1753,75 +1787,18 @@ def test_seed_expert_residency_prewarm_none_skips_prewarm_and_default(
     install_pooled_switchglus(
         bounded, package_dir=pkg, index=index, capacity_per_layer=3)
     info2 = seed_expert_residency(bounded, pkg)
-    assert info2["source"] == "saved"
-
-
-def test_serve_persists_demand_after_generation(tmp_path, monkeypatch):
-    """A served request saves its expert demand (default-ON) so the
-    next session warm-starts from the saved-demand tier; the kill switch
-    suppresses the save."""
-    import json as _json
-
-    from moespresso.runtime.serve import generate_with_metadata
-    from moespresso.runtime.ssd_streaming_build import (
-        default_saved_hotlist_path,
-        seed_expert_residency,
-    )
-
-    monkeypatch.setenv("MOESPRESSO_HOTLIST_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("MOESPRESSO_SSD_HOTLIST", raising=False)
-    pkg = _package(tmp_path, layers=(0,))
-    index = build_expert_index(pkg)
-    model = _Model(n_layers=1)
-    install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=3)
-    object.__setattr__(model, "_moespresso_ssd_hotlist",
-                       seed_expert_residency(model, pkg))
-
-    switch = model.language_model.model.layers[0].mlp.switch_mlp
-    x = mx.random.normal((1, 64)).astype(mx.float16)
-    mx.eval(switch(x, mx.array([[5, 1]], dtype=mx.uint32)))
-
-    def fake_stream(model, tokenizer, prompt, **kwargs):
-        return iter(())
-
-    generate_with_metadata(model, tokenizer=None, prompt=[1],
-                           stream_generate_fn=fake_stream,
-                           sampler_factory=lambda **kw: None)
-    saved = default_saved_hotlist_path(pkg)
-    assert saved.exists()
-    assert "5" in _json.loads(saved.read_text())["layers"]["0"]
-
-    # Startup warmup exercises the live model but must not make its synthetic
-    # routing demand durable across sessions.
-    saved.unlink()
-    generate_with_metadata(
-        model,
-        tokenizer=None,
-        prompt=[1],
-        persist_expert_demand=False,
-        stream_generate_fn=fake_stream,
-        sampler_factory=lambda **kw: None,
-    )
-    assert not saved.exists()
-
-    # kill switch suppresses persistence
-    monkeypatch.setenv("MOESPRESSO_SSD_HOTLIST", "0")
-    generate_with_metadata(model, tokenizer=None, prompt=[1],
-                           stream_generate_fn=fake_stream,
-                           sampler_factory=lambda **kw: None)
-    assert not saved.exists()
+    assert info2["source"] == "package"
 
 
 def test_growth_budget_default_is_env_tunable(monkeypatch):
-    """The growth cap default is 2 GiB (the live memory floor is the
-    safety contract; the old 512 MiB cap bound first on the shippable) and
-    MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB overrides it."""
+    """Growth is default-off and remains explicitly configurable."""
     from moespresso.runtime.ssd_streaming_build import (
         _growth_max_extra_bytes_default,
     )
 
     monkeypatch.delenv("MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB", raising=False)
+    assert _growth_max_extra_bytes_default() == 0
+    monkeypatch.setenv("MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB", "2")
     assert _growth_max_extra_bytes_default() == 2 << 30
     monkeypatch.setenv("MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB", "0.5")
     assert _growth_max_extra_bytes_default() == 512 << 20
@@ -1829,27 +1806,68 @@ def test_growth_budget_default_is_env_tunable(monkeypatch):
     assert _growth_max_extra_bytes_default() == 0
 
 
+def test_default_adaptation_preserves_startup_capacity_with_headroom(
+    tmp_path, monkeypatch,
+):
+    pkg = _package(tmp_path, layers=(0,))
+    model = _Model(n_layers=1)
+    index = build_expert_index(pkg)
+    install_pooled_switchglus(
+        model,
+        package_dir=pkg,
+        index=index,
+        capacity_per_layer=4,
+    )
+    object.__setattr__(model, "_moespresso_ssd_streaming_capacity", 4)
+    switch = model.language_model.model.layers[0].mlp.switch_mlp
+    switch.seen_experts.update({0, 1, 2, 3, 4, 5, 6})
+    switch.decode_seen_experts.update({0, 1, 2, 3, 4, 5, 6})
+    switch.max_unique_active_experts = 7
+    monkeypatch.delenv("MOESPRESSO_SSD_GROWTH_MAX_EXTRA_GB", raising=False)
+
+    result = maybe_adapt_ssd_streaming_capacity(
+        model,
+        available_bytes=100 << 30,
+        min_available_bytes=0,
+        seed_hot=False,
+    )
+
+    assert result["max_extra_bytes"] == 0
+    assert result["plan"] == {}
+    assert result["applied"] == {}
+    assert switch.gate_proj.pool.capacity == 4
+
+
 def test_deterministic_available_bytes_quiet_vs_busy(monkeypatch):
-    """Capacity budgets from min(total - OS reserve, available now):
-    deterministic when memory is idle, clamped by live availability under
-    pressure (never budget memory someone else is using)."""
+    """The shared planner retains its threshold; Qwen4 opts into a live cap."""
     from moespresso.runtime import ssd_streaming_build as ssb
+    from moespresso.runtime import streaming_capacity as sc
 
     class _VM:
         def __init__(self, total, available):
             self.total, self.available = total, available
 
     monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.setattr(
+        sc, "usable_wired_budget_bytes",
+        lambda: (12 << 30, "synthetic-wired-budget"),
+    )
     import psutil as _psutil
-    # idle memory: available within 25% of the deterministic budget -> the
-    # gap is reclaimable cache, the deterministic number wins (reproducible)
+    # Idle availability above the automatic ceiling leaves its pool geometry
+    # unchanged.
     monkeypatch.setattr(_psutil, "virtual_memory",
                         lambda: _VM(16 << 30, 12 << 30))
     assert ssb._deterministic_available_bytes() == 11 << 30
     monkeypatch.setattr(_psutil, "virtual_memory",
-                        lambda: _VM(16 << 30, int(9 << 30)))  # 9 >= 0.75*11
+                        lambda: _VM(16 << 30, 9 << 30))
     assert ssb._deterministic_available_bytes() == 11 << 30
-    # genuinely under memory pressure: live availability clamps
+    strict, strict_details = ssb._resolved_available_bytes(
+        strict_live_available=True,
+        wired_budget_fn=lambda: (12 << 30, "synthetic-wired-budget"),
+    )
+    assert strict == 9 << 30
+    assert strict_details["strict_live_available"] is True
+    assert strict_details["limiting_source"] == "live-available"
     monkeypatch.setattr(_psutil, "virtual_memory",
                         lambda: _VM(16 << 30, 6 << 30))
     assert ssb._deterministic_available_bytes() == 6 << 30
@@ -1861,39 +1879,16 @@ def test_deterministic_available_bytes_quiet_vs_busy(monkeypatch):
         ssb._deterministic_available_bytes(already_resident_bytes=5 << 30)
         == 11 << 30
     )
+    resolved, details = ssb._resolved_available_bytes(
+        already_resident_bytes=5 << 30,
+        wired_budget_fn=lambda: (12 << 30, "synthetic-wired-budget"),
+    )
+    assert resolved == 11 << 30
+    assert details["live_available_bytes"] == 6 << 30
+    assert details["already_resident_bytes"] == 5 << 30
+    assert details["live_budget_bytes"] == 11 << 30
     with pytest.raises(ValueError, match="already_resident_bytes"):
         ssb._deterministic_available_bytes(already_resident_bytes=-1)
-
-
-def test_lookahead_decision_is_single_sourced(tmp_path, monkeypatch):
-    """When the gate path is not live, a requested lookahead
-    must be fully disabled: no spares carved and no predictors wired (the
-    env must not be re-read after the gating decision)."""
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setenv("MOESPRESSO_SSD_LOOKAHEAD", "4")
-    monkeypatch.setattr(psg, "_RING_DECODE", False)  # gate path not live
-
-    pkg = _package(tmp_path, layers=(0, 1))
-
-    # mimic the build's gating + wiring decision flow without a real model
-    lookahead_env = 4
-    gate_live = psg._RING_DECODE
-    if not gate_live:
-        lookahead_env = 0
-    spare_slots = 16 if lookahead_env > 0 else 0
-    assert lookahead_env == 0 and spare_slots == 0
-
-    # and a directly-wired model only happens through install_lookahead,
-    # which the single-sourced decision never calls when gated off
-    model = _Model(n_layers=2)
-    index = build_expert_index(pkg)
-    install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=4,
-        spare_slots=spare_slots)
-    sw = model.language_model.model.layers[0].mlp.switch_mlp
-    assert sw.lookahead_w is None and sw.lookahead_target is None
-    assert sw.gate_proj.pool.spare_slots == 0
 
 
 def test_max_memory_cap_bounds_the_budget(monkeypatch):
@@ -1903,18 +1898,140 @@ def test_max_memory_cap_bounds_the_budget(monkeypatch):
     import psutil as _psutil
 
     from moespresso.runtime import ssd_streaming_build as ssb
+    from moespresso.runtime import streaming_capacity as sc
 
     class _VM:
         def __init__(self, total, available):
             self.total, self.available = total, available
 
     monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.setattr(
+        sc, "usable_wired_budget_bytes",
+        lambda: (12 << 30, "synthetic-wired-budget"),
+    )
     monkeypatch.setattr(_psutil, "virtual_memory",
                         lambda: _VM(16 << 30, 12 << 30))
     monkeypatch.setenv("MOESPRESSO_SSD_MAX_MEMORY_GB", "3.5")
     assert ssb._deterministic_available_bytes() == int(3.5 * (1 << 30))
     monkeypatch.delenv("MOESPRESSO_SSD_MAX_MEMORY_GB")
     assert ssb._deterministic_available_bytes() == 11 << 30
+
+
+@pytest.mark.parametrize(
+    ("total_gib", "wired_gib", "expected_gib"),
+    [(16, 12, 11), (32, 25, 24), (64, 48, 47), (128, 96, 95)],
+)
+def test_automatic_budget_uses_reported_wired_limit_with_headroom(
+    monkeypatch, total_gib, wired_gib, expected_gib,
+):
+    import psutil as _psutil
+
+    from moespresso.runtime import ssd_streaming_build as ssb
+
+    class _VM:
+        total = total_gib << 30
+        available = total
+
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.delenv("MOESPRESSO_SSD_MAX_MEMORY_GB", raising=False)
+    monkeypatch.setattr(_psutil, "virtual_memory", lambda: _VM())
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (wired_gib << 30, "synthetic-wired-budget"),
+    )
+    assert resolved == expected_gib << 30
+    assert details["resolved_bytes"] == resolved
+    assert details["wired_budget_source"] == "synthetic-wired-budget"
+    assert details["automatic_wired_headroom_bytes"] == 1 << 30
+
+
+def test_explicit_budget_bypasses_automatic_wired_headroom(monkeypatch):
+    import psutil as _psutil
+
+    from moespresso.runtime import ssd_streaming_build as ssb
+
+    class _VM:
+        total = 32 << 30
+        available = 30 << 30
+
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.setenv("MOESPRESSO_SSD_MAX_MEMORY_GB", "26")
+    monkeypatch.setattr(_psutil, "virtual_memory", lambda: _VM())
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (25 << 30, "must-not-be-called"),
+    )
+    assert resolved == 26 << 30
+    assert details["limiting_source"] == "explicit-max-memory"
+    assert details["wired_budget_source"] == "not-consulted"
+
+    class _BusyVM:
+        total = 32 << 30
+        available = 18 << 30
+
+    monkeypatch.setattr(_psutil, "virtual_memory", lambda: _BusyVM())
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (25 << 30, "must-not-be-called"),
+    )
+    assert resolved == 18 << 30
+    assert details["limiting_source"] == "live-available"
+    assert details["live_available_bytes"] == 18 << 30
+    assert details["already_resident_bytes"] == 0
+
+
+def test_m1_max_reported_wired_budget_resolves_to_23_96_gib(monkeypatch):
+    import psutil as _psutil
+
+    from moespresso.runtime import ssd_streaming_build as ssb
+
+    class _VM:
+        total = 32 << 30
+        available = 30 << 30
+
+    reported_bytes = 26_800_603_136
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.delenv("MOESPRESSO_SSD_MAX_MEMORY_GB", raising=False)
+    monkeypatch.setattr(_psutil, "virtual_memory", lambda: _VM())
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (
+            reported_bytes,
+            "metal-recommended-working-set",
+        ),
+    )
+    assert resolved == reported_bytes - (1 << 30)
+    assert resolved / (1 << 30) == pytest.approx(23.96, abs=0.001)
+    assert details["limiting_source"] == "automatic-wired-headroom"
+
+
+def test_automatic_budget_falls_back_and_validates_inputs(monkeypatch):
+    import psutil as _psutil
+
+    from moespresso.runtime import ssd_streaming_build as ssb
+
+    class _VM:
+        total = 32 << 30
+        available = 30 << 30
+
+    monkeypatch.delenv("MOESPRESSO_SSD_MAX_MEMORY_GB", raising=False)
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.setattr(_psutil, "virtual_memory", lambda: _VM())
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (None, "unreadable"),
+    )
+    assert resolved == 27 << 30
+    assert details["limiting_source"] == "physical-reserve"
+
+    resolved, details = ssb._resolved_available_bytes(
+        wired_budget_fn=lambda: (512 << 20, "synthetic-small"),
+    )
+    assert resolved == 0
+    assert details["automatic_ceiling_bytes"] == 0
+
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "nan")
+    with pytest.raises(ValueError, match="OS_RESERVE_GB"):
+        ssb._resolved_available_bytes(wired_budget_fn=lambda: (None, "unreadable"))
+    monkeypatch.setenv("MOESPRESSO_SSD_OS_RESERVE_GB", "5")
+    monkeypatch.setenv("MOESPRESSO_SSD_MAX_MEMORY_GB", "-1")
+    with pytest.raises(ValueError, match="MAX_MEMORY_GB"):
+        ssb._resolved_available_bytes(wired_budget_fn=lambda: (None, "unreadable"))
 
 
 def _fake_kquant_module(
@@ -1972,7 +2089,7 @@ def test_bulk_sorted_prefill_uses_segmented_kquant_matmul(tmp_path, monkeypatch)
     model = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=4, seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=4)
     switch = model.language_model.model.layers[0].mlp.switch_mlp
 
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
@@ -2014,7 +2131,7 @@ def test_small_sorted_prefill_keeps_gather_path(tmp_path, monkeypatch):
     model = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=4, seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=4)
     switch = model.language_model.model.layers[0].mlp.switch_mlp
 
     gather_calls = []
@@ -2051,8 +2168,7 @@ def _full_resident_kquant_switch(tmp_path, *, capacity=4):
     model = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=capacity,
-        seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=capacity)
     if capacity >= 4:
         seed_all_expert_residency(model)
     return model.language_model.model.layers[0].mlp.switch_mlp
@@ -2069,9 +2185,6 @@ def test_bulk_prefill_barrier_free_when_full_resident(tmp_path, monkeypatch):
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=4)
 
-    # The route ships gated off (measured served-neutral); force it on so the
-    # test exercises the eligibility predicates and the device-only path.
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
     gather_calls, qmm_calls, sorted_calls = [], [], []
     monkeypatch.setitem(
@@ -2140,7 +2253,6 @@ def test_barrier_free_prefill_requires_full_capacity(tmp_path, monkeypatch):
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=3)
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
     gather_calls, qmm_calls, sorted_calls = [], [], []
     monkeypatch.setitem(
@@ -2168,10 +2280,8 @@ def test_barrier_free_prefill_rechecks_a_cold_full_capacity_pool(
 ):
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=4)
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setitem(sys.modules, "mlx_kquant", _fake_kquant_module([], [], []))
 
     evicted_by_pool = []
@@ -2211,7 +2321,6 @@ def test_barrier_free_non_identity_slots_keep_per_pool_remap(
     pool._slot_of[0], pool._slot_of[1] = pool._slot_of[1], pool._slot_of[0]
     pool._slot_table_dirty = True
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
     gather_calls, qmm_calls, sorted_calls = [], [], []
     monkeypatch.setitem(
@@ -2251,9 +2360,7 @@ def test_barrier_free_fused_swiglu_engages_at_identity_slots(
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=4)
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
-    monkeypatch.setattr(psg, "_FUSED_SORTED_SWIGLU", True)
     gather_calls, qmm_calls, sorted_calls, fused_calls = [], [], [], []
     monkeypatch.setitem(
         sys.modules, "mlx_kquant",
@@ -2288,40 +2395,6 @@ def test_barrier_free_fused_swiglu_engages_at_identity_slots(
     assert switch.down_proj.matmul_slot_calls == 1
 
 
-def test_barrier_free_fused_swiglu_kill_switch_falls_back(
-        tmp_path, monkeypatch):
-    """MOESPRESSO_SSD_FUSED_SORTED_SWIGLU=0 (the module constant) keeps the
-    unfused gather_qmm_sorted + activation pair even when the fused kernel
-    is available."""
-    import sys
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    switch = _full_resident_kquant_switch(tmp_path, capacity=4)
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
-    monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
-    monkeypatch.setattr(psg, "_FUSED_SORTED_SWIGLU", False)
-    gather_calls, qmm_calls, sorted_calls, fused_calls = [], [], [], []
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant",
-        _fake_kquant_module(gather_calls, qmm_calls, sorted_calls, fused_calls))
-
-    tokens, top_k = 32, 4
-    x = mx.zeros((tokens, 256), dtype=mx.float16)
-    indices = mx.array(
-        np.random.default_rng(0).integers(0, 4, (tokens, top_k)).astype(np.uint32))
-    y = switch(x, indices)
-    mx.eval(y)
-
-    assert y.shape == (tokens, top_k, 256)
-    assert switch.barrier_free_prefill_calls == 1
-    assert switch.barrier_free_identity_calls == 1
-    assert switch.barrier_free_fused_swiglu_calls == 0
-    assert not fused_calls
-    assert [codec for codec, _ids in sorted_calls] == ["iq2_xxs", "q2_k"]
-
-
 def test_barrier_free_fused_swiglu_stays_off_non_identity(
         tmp_path, monkeypatch):
     """Non-identity slot tables keep the unfused pair even with the fused
@@ -2337,9 +2410,7 @@ def test_barrier_free_fused_swiglu_stays_off_non_identity(
     pool._slot_of[0], pool._slot_of[1] = pool._slot_of[1], pool._slot_of[0]
     pool._slot_table_dirty = True
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
-    monkeypatch.setattr(psg, "_FUSED_SORTED_SWIGLU", True)
     gather_calls, qmm_calls, sorted_calls, fused_calls = [], [], [], []
     monkeypatch.setitem(
         sys.modules, "mlx_kquant",
@@ -2366,11 +2437,9 @@ def test_sub_threshold_bulk_prefill_keeps_gather_when_full_resident(
     gather path, where the per-pair vector kernel wins."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=4)
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
     gather_calls, qmm_calls, sorted_calls = [], [], []
     monkeypatch.setitem(
         sys.modules, "mlx_kquant",
@@ -2408,7 +2477,7 @@ def _full_resident_kquant_ds4_block(
     index = build_expert_index(pkg)
     install_pooled_switchglus(
         model, package_dir=pkg, index=index, capacity_per_layer=capacity,
-        seed=42, wrap_deepseek_v4_moe=True)
+         wrap_deepseek_v4_moe=True)
     if capacity >= 4:
         seed_all_expert_residency(model)
     block = model.language_model.model.layers[0].mlp
@@ -2461,12 +2530,9 @@ def test_deepseek_v4_decode_barrier_free_when_full_resident(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
     monkeypatch.setattr(psg, "_DECODE_FLUSH_LAYERS", 1)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2534,12 +2600,8 @@ def test_deepseek_v4_decode_barrier_free_when_full_resident(
     assert layer_stats[0]["barrier_free_decode_flush_calls"] == 1
 
 
-def test_deepseek_v4_decode_barrier_free_matches_ring_and_kill_switch(
-        tmp_path, monkeypatch):
-    """The barrier-free decode route selects exactly the slots the ring path
-    publishes (value-bearing fake kernel), and the kill switch
-    (MOESPRESSO_SSD_BARRIER_FREE_DECODE=0, the module constant) keeps the
-    ring path with its counters."""
+def test_deepseek_v4_resident_decode_matches_bounded_ring(tmp_path, monkeypatch):
+    """Full and bounded pools select identical expert bytes across evictions."""
     import sys
 
     import moespresso.runtime.pooled_switchglu as psg
@@ -2547,42 +2609,31 @@ def test_deepseek_v4_decode_barrier_free_matches_ring_and_kill_switch(
     monkeypatch.setattr(psg, "_RING_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant", _value_kquant_decode_module())
-
+    monkeypatch.setitem(sys.modules, "mlx_kquant", _value_kquant_decode_module())
     mx.random.seed(11)
     xs = [mx.random.normal((1, 1, 256)).astype(mx.float16) for _ in range(4)]
     mx.eval(*xs)
     ids = [mx.array([[step]], dtype=mx.int32) for step in (0, 1, 3, 0)]
     shared = _TinySharedMLP(hidden=256, intermediate=32)
-    outs = {}
-    switches = {}
-
-    for barrier_free in (False, True):
-        monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", barrier_free)
-        root = tmp_path / ("bf" if barrier_free else "ring")
+    outputs, switches = {}, {}
+    for capacity in (2, 4):
+        root = tmp_path / str(capacity)
         root.mkdir()
         _model, block = _full_resident_kquant_ds4_block(
-            root, capacity=4, shared_experts=shared)
-        got = []
-        for x, input_ids in zip(xs, ids):
-            y = block(x, input_ids=input_ids)
-            mx.eval(y)
-            got.append(np.array(y))
-        outs[barrier_free] = got
-        switches[barrier_free] = block.switch_mlp
-
-    for ring_y, bf_y in zip(outs[False], outs[True]):
-        np.testing.assert_array_equal(ring_y, bf_y)
-    assert switches[True].barrier_free_decode_calls == len(xs)
-    assert switches[True].pipelined_layers == 0
-    assert switches[True].block_exit_kick_calls == 0
-    assert switches[False].barrier_free_decode_calls == 0
-    assert switches[False]._barrier_free_decode_ready_cached is False
-    assert switches[False].pipelined_layers == len(xs)
-    assert switches[False].block_exit_kick_calls == len(xs)
+            root, capacity=capacity, top_k=2, shared_experts=shared)
+        outputs[capacity] = []
+        switches[capacity] = block.switch_mlp
+        for x, token_ids in zip(xs, ids, strict=True):
+            result = block(x, input_ids=token_ids)
+            mx.eval(result)
+            outputs[capacity].append(np.array(result))
+    for bounded, resident in zip(outputs[2], outputs[4], strict=True):
+        np.testing.assert_array_equal(bounded, resident)
+    assert switches[2].pipelined_layers == len(xs)
+    assert switches[2].barrier_free_decode_calls == 0
+    assert switches[2].gate_proj.pool.total_evictions > 0
+    assert switches[4].barrier_free_decode_calls == len(xs)
+    assert switches[4].pipelined_layers == 0
 
 
 def test_deepseek_v4_decode_barrier_free_fails_closed_on_partial_residency(
@@ -2593,12 +2644,9 @@ def test_deepseek_v4_decode_barrier_free_fails_closed_on_partial_residency(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
     monkeypatch.setattr(psg, "_RING_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
     monkeypatch.setitem(
         sys.modules, "mlx_kquant", _value_kquant_decode_module())
 
@@ -2613,7 +2661,7 @@ def test_deepseek_v4_decode_barrier_free_fails_closed_on_partial_residency(
     assert switch.barrier_free_decode_calls == 0
     assert switch._barrier_free_decode_ready_cached is False
     assert switch.pipelined_layers == 1
-    assert switch.block_exit_kick_calls == 1
+    assert switch.block_exit_kick_calls == 2
 
 
 def test_deepseek_v4_decode_barrier_free_non_identity_uses_ondevice_remap(
@@ -2622,11 +2670,6 @@ def test_deepseek_v4_decode_barrier_free_non_identity_uses_ondevice_remap(
     engages, through one on-device slot-table gather per pool."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2662,28 +2705,32 @@ def test_deepseek_v4_decode_barrier_free_drains_pending_ring_futures(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
-
-    _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
+    model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
+    session = model._moespresso_pooled_decode_session
     gather_calls = []
     monkeypatch.setitem(
         sys.modules, "mlx_kquant", _fake_kquant_decode_module(gather_calls))
 
     assert block.pipeline_is_last
-    psg._PIPE_PREV.append(psg._PIPELINE_EXECUTOR.submit(lambda: None))
-    psg._GATE_PENDING.append(psg._PIPELINE_EXECUTOR.submit(lambda: None))
-
     x = mx.random.normal((1, 1, 256)).astype(mx.float16)
-    y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
-    mx.eval(y)
+    owner = object()
+    with session.request(owner, synchronize=lambda root: mx.eval(root)):
+        session.next_sequence()
+        for _ in range(2):
+            session.submit(
+                psg._PIPELINE_EXECUTOR,
+                lambda cancelled: None,
+                publication_required=True,
+            )
+        assert session.publication_pending
+        y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
+        mx.eval(y)
+        assert not session.pending
 
     assert switch.barrier_free_decode_calls == 1
-    assert psg._PIPE_PREV == []
-    assert psg._GATE_PENDING == []
     assert switch.pipeline_join_seconds > 0.0
+    assert not session.active
 
 
 def _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls):
@@ -2717,7 +2764,7 @@ def _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls):
 
 def test_deepseek_v4_decode_routed_fused_engages_and_kills_weighted_sum(
         tmp_path, monkeypatch):
-    """With the flag on, identity slots, and matching codecs, the decode
+    """With identity slots and matching codecs, the decode
     routed block runs as the fused matvec pair: baked route weights, the
     expert sum inside the down kernel, no route-weighted-sum reduction, and
     no unfused decode gathers."""
@@ -2725,11 +2772,7 @@ def test_deepseek_v4_decode_routed_fused_engages_and_kills_weighted_sum(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
     monkeypatch.setattr(psg, "_DECODE_FLUSH_LAYERS", 1)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2770,40 +2813,6 @@ def test_deepseek_v4_decode_routed_fused_engages_and_kills_weighted_sum(
     assert layer_stats[0]["decode_routed_fused_calls"] == 1
 
 
-def test_deepseek_v4_decode_routed_fused_kill_switch(tmp_path, monkeypatch):
-    """With the kill switch set (MOESPRESSO_DSV4_DECODE_ROUTED_FUSED=0, the
-    module constant), the barrier-free decode route keeps the unfused
-    gathers and the route-weighted sum even when the fused kernels are
-    available."""
-    import sys
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", False)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
-
-    _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
-    switch = block.switch_mlp
-    gather_calls, pair_calls, sum_calls = [], [], []
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant",
-        _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls))
-
-    x = mx.random.normal((1, 1, 256)).astype(mx.float16)
-    y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
-    mx.eval(y)
-
-    assert switch.decode_routed_fused_calls == 0
-    assert switch._decode_routed_fused_ready_cached is False
-    assert switch.barrier_free_decode_calls == 1
-    assert switch.routed_weighted_sum_calls == 1
-    assert pair_calls == []
-    assert sum_calls == []
-    assert [codec for codec, _rhs, _s in gather_calls] == ["iq2_xxs", "q2_k"]
-
-
 def test_deepseek_v4_decode_routed_fused_stays_off_non_identity(
         tmp_path, monkeypatch):
     """Non-identity slot tables keep the unfused barrier-free route (with
@@ -2811,12 +2820,6 @@ def test_deepseek_v4_decode_routed_fused_stays_off_non_identity(
     scoped to the identity slot layout, per call."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2850,12 +2853,6 @@ def test_deepseek_v4_decode_routed_fused_fails_closed_on_codec_mismatch(
     eligibility closed; the unfused barrier-free route keeps serving."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2883,12 +2880,6 @@ def test_deepseek_v4_decode_routed_fused_requires_kernel_surface(
     one-shot eligibility closed."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     _model, block = _full_resident_kquant_ds4_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -2919,8 +2910,6 @@ def _ring_v3_partial_ds4_block(tmp_path, monkeypatch):
     monkeypatch.setattr(psg, "_RING_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])  # no native gate: v3
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
     monkeypatch.setattr(psg, "_RING_SEQ", [0])
 
     model, block = _full_resident_kquant_ds4_block(
@@ -2931,7 +2920,8 @@ def _ring_v3_partial_ds4_block(tmp_path, monkeypatch):
         switch, "export_inds",
         lambda inds, seq: mx.zeros((1,), dtype=mx.uint32))
 
-    def _fake_ring_install(seq, K, gate_mod=None):
+    def _fake_ring_install(seq, K, gate_mod=None, *, cancelled=None):
+        assert callable(cancelled)
         switch.publish_slots(mx.array([1, 2], dtype=mx.uint32))
 
     monkeypatch.setattr(switch, "ring_install", _fake_ring_install)
@@ -2946,10 +2936,6 @@ def test_deepseek_v4_pipelined_decode_fused_engages_at_partial_residency(
     gathers, and slot values (not expert ids) reaching the kernels."""
     import sys
 
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_DECODE_RING_FUSED", True)
 
     model, block = _ring_v3_partial_ds4_block(tmp_path, monkeypatch)
     switch = block.switch_mlp
@@ -3002,467 +2988,6 @@ def test_deepseek_v4_pipelined_decode_fused_engages_at_partial_residency(
     assert layer_stats[0]["pipelined_decode_fused_calls"] == 1
 
 
-def test_deepseek_v4_pipelined_decode_fused_ring_kill_switch(
-        tmp_path, monkeypatch):
-    """MOESPRESSO_DSV4_DECODE_RING_FUSED=0 (the module constant) restores the
-    unfused ring composition at partial residency: separate gathers plus the
-    route-weighted sum, with the fused kernels untouched even though they
-    are available."""
-    import sys
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_DECODE_RING_FUSED", False)
-
-    _model, block = _ring_v3_partial_ds4_block(tmp_path, monkeypatch)
-    switch = block.switch_mlp
-    gather_calls, pair_calls, sum_calls = [], [], []
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant",
-        _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls))
-
-    x = mx.random.normal((1, 1, 256)).astype(mx.float16)
-    y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
-    mx.eval(y)
-
-    assert y.shape == (1, 1, 256)
-    assert switch.pipelined_decode_fused_calls == 0
-    assert switch.pipelined_layers == 1
-    assert switch.routed_weighted_sum_calls == 1
-    assert pair_calls == []
-    assert sum_calls == []
-    assert [codec for codec, _rhs, _s in gather_calls] == ["iq2_xxs", "q2_k"]
-
-
-def test_deepseek_v4_pipelined_decode_fused_family_kill_switch(
-        tmp_path, monkeypatch):
-    """The family switch (MOESPRESSO_DSV4_DECODE_ROUTED_FUSED=0) keeps the
-    fused kernels off the ring path too: the ring-scoped flag alone cannot
-    engage them."""
-    import sys
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", False)
-    monkeypatch.setattr(psg, "_DECODE_RING_FUSED", True)
-
-    _model, block = _ring_v3_partial_ds4_block(tmp_path, monkeypatch)
-    switch = block.switch_mlp
-    gather_calls, pair_calls, sum_calls = [], [], []
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant",
-        _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls))
-
-    x = mx.random.normal((1, 1, 256)).astype(mx.float16)
-    y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
-    mx.eval(y)
-
-    assert switch.pipelined_decode_fused_calls == 0
-    assert switch._decode_routed_fused_ready_cached is False
-    assert switch.routed_weighted_sum_calls == 1
-    assert pair_calls == []
-    assert [codec for codec, _rhs, _s in gather_calls] == ["iq2_xxs", "q2_k"]
-
-
-# --- DS4 decode lookahead port ------------------------------------------------
-
-
-class _FakeDs4ScoreGateModule(nn.Module):
-    """DS4 score-gate shape for lookahead wiring tests: fp16 router weight
-    plus a per-expert selection bias, hash off."""
-
-    def __init__(self, *, n_experts, hidden):
-        super().__init__()
-        self.hash = False
-        self.weight = mx.random.normal((n_experts, hidden)).astype(mx.float16)
-        self.bias = mx.array(
-            np.linspace(-2.0, 2.0, n_experts).astype(np.float32))
-
-
-class _FakeDs4HashGateModule(nn.Module):
-    """DS4 hash-gate shape: routing comes from a token-id table, so the
-    lookahead installer must skip it as a target."""
-
-    def __init__(self, *, n_experts, hidden):
-        super().__init__()
-        self.hash = True
-        self.weight = mx.random.normal((n_experts, hidden)).astype(mx.float16)
-
-
-def _lookahead_chain_model(tmp_path, gates):
-    """A model whose layers carry pooled switches and the given gates."""
-    layers = []
-    for i, gate in enumerate(gates):
-        sub = tmp_path / f"la{i}"
-        sub.mkdir()
-        switch = _kquant_switch(sub, capacity=3, n_experts=4)
-        layer = nn.Module()
-        layer.mlp = nn.Module()
-        layer.mlp.switch_mlp = switch
-        layer.mlp.gate = gate
-        layers.append(layer)
-    model = nn.Module()
-    model.model = nn.Module()
-    model.model.layers = layers
-    return model
-
-
-def test_install_lookahead_skips_hash_targets_and_wires_bias(tmp_path):
-    from moespresso.runtime.ssd_streaming_build import install_lookahead
-
-    gates = [
-        _FakeDs4HashGateModule(n_experts=4, hidden=256),
-        _FakeDs4HashGateModule(n_experts=4, hidden=256),
-        _FakeDs4ScoreGateModule(n_experts=4, hidden=256),
-    ]
-    model = _lookahead_chain_model(tmp_path, gates)
-    wired = install_lookahead(model, 1)
-    layers = model.model.layers
-    sw0 = layers[0].mlp.switch_mlp
-    sw1 = layers[1].mlp.switch_mlp
-    sw2 = layers[2].mlp.switch_mlp
-    # layer 0 targets layer 1, a hash gate: skipped, nothing stored.
-    assert wired == 1
-    assert sw0.lookahead_w is None and sw0.lookahead_b is None
-    # layer 1 targets layer 2, score-routed: weight and bias stored.
-    assert sw1.lookahead_w is not None
-    assert sw1.lookahead_w.dtype == mx.float16
-    assert sw1.lookahead_b is not None
-    assert sw1.lookahead_b.dtype == mx.float32
-    np.testing.assert_array_equal(
-        np.array(sw1.lookahead_b), np.array(gates[2].bias))
-    assert sw1.lookahead_target is sw2
-    # the last layer has no target.
-    assert sw2.lookahead_w is None
-
-
-def test_install_lookahead_reads_wrapped_router_weight(tmp_path):
-    from moespresso.runtime.qwen.router_gemv import BF16F32RouterLinear
-    from moespresso.runtime.ssd_streaming_build import install_lookahead
-
-    source = _FakeDs4ScoreGateModule(n_experts=4, hidden=256)
-    inner = nn.Linear(2048, 256, bias=False)
-    inner.weight = mx.zeros((256, 2048), dtype=mx.float32)
-    inner.eval()
-    wrapped = BF16F32RouterLinear(inner, inner.weight.astype(mx.bfloat16))
-    wrapped.eval()
-    model = _lookahead_chain_model(tmp_path, [source, wrapped])
-
-    assert install_lookahead(model, 1) == 1
-    layers = model.model.layers
-    switch = layers[0].mlp.switch_mlp
-    mx.eval(switch.lookahead_w)
-    assert switch.lookahead_w.dtype == mx.float16
-    assert bool(mx.array_equal(switch.lookahead_w, inner.weight.astype(mx.float16)))
-    assert switch.lookahead_b is None
-    assert switch.lookahead_target is layers[1].mlp.switch_mlp
-
-
-def test_install_lookahead_gathers_compact_rows_from_source_width_router(tmp_path):
-    from moespresso.runtime.ssd_streaming_build import install_lookahead
-
-    source = _FakeDs4ScoreGateModule(n_experts=4, hidden=256)
-    target = _FakeDs4ScoreGateModule(n_experts=16, hidden=256)
-    compact_source_ids = mx.array([1, 5, 9, 14], dtype=mx.int32)
-    target._moespresso_compact_source_ids = compact_source_ids
-    model = _lookahead_chain_model(tmp_path, [source, target])
-
-    assert install_lookahead(model, 1) == 1
-    switch = model.model.layers[0].mlp.switch_mlp
-    expected_w = mx.take(target.weight, compact_source_ids, axis=0)
-    expected_b = mx.take(target.bias, compact_source_ids, axis=0)
-    mx.eval(switch.lookahead_w, switch.lookahead_b, expected_w, expected_b)
-    assert switch.lookahead_w.shape == (4, 256)
-    assert bool(mx.array_equal(switch.lookahead_w, expected_w))
-    assert bool(mx.array_equal(switch.lookahead_b, expected_b))
-
-
-def test_deepseek_v4_lookahead_export_uses_bias_aware_scoring(
-        tmp_path, monkeypatch):
-    """The DS4 block's prediction export ranks candidates with the target
-    gate's scoring form: the monotone softplus transform plus the
-    per-expert bias. A bias that promotes low-logit
-    experts must land them in the exported top-16."""
-    import sys
-    import types
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_DECODE_ROUTED_FUSED", True)
-    monkeypatch.setattr(psg, "_DECODE_RING_FUSED", True)
-    monkeypatch.setattr(psg, "_RING_DECODE", True)
-    monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
-    monkeypatch.setattr(psg, "_RING_SEQ", [0])
-    fake_gate_mod = types.SimpleNamespace(
-        gate=lambda x, token, seq: x,
-        signal_event=lambda seq: None,
-        signaled_value=lambda: 0,
-    )
-    monkeypatch.setattr(psg, "_GATE_MOD", [fake_gate_mod])
-
-    model, block = _full_resident_kquant_ds4_block(
-        tmp_path, capacity=3, top_k=2)
-    switch = block.switch_mlp
-    monkeypatch.setattr(
-        switch, "export_inds",
-        lambda inds, seq: mx.zeros((1,), dtype=mx.uint32))
-
-    def _fake_ring_install(seq, K, gate_mod=None):
-        switch.publish_slots(mx.array([1, 2], dtype=mx.uint32))
-
-    monkeypatch.setattr(switch, "ring_install", _fake_ring_install)
-    gather_calls, pair_calls, sum_calls = [], [], []
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant",
-        _fake_kquant_decode_fused_module(gather_calls, pair_calls, sum_calls))
-
-    # Target router: logits strictly increase with the expert id (raw
-    # ranking selects 48..63) and stay small enough that softplus never
-    # saturates; the bias promotes experts 0..7 far past any logit gap, so
-    # the bias-aware top-16 is {0..7, 56..63}.
-    n_target = 64
-    lookahead_w = (
-        mx.arange(n_target)[:, None].astype(mx.float16) * 1e-4
-        * mx.ones((1, 256), dtype=mx.float16))
-    bias = np.zeros(n_target, dtype=np.float32)
-    bias[:8] = 100.0
-    switch.lookahead_w = lookahead_w
-    switch.lookahead_b = mx.array(bias)
-    mx.eval(switch.lookahead_w, switch.lookahead_b)
-
-    exported = []
-
-    def _spy_export_pred(ids, seq):
-        exported.append(np.array(ids).reshape(-1).tolist())
-        return mx.zeros((1,), dtype=mx.uint32)
-
-    monkeypatch.setattr(switch, "export_pred", _spy_export_pred)
-
-    x = mx.ones((1, 1, 256)).astype(mx.float16)
-    y = block(x, input_ids=mx.array([[1]], dtype=mx.int32))
-    mx.eval(y)
-
-    assert len(exported) == 1
-    got = {int(e) for e in exported[0]}
-    assert got == set(range(8)) | set(range(56, 64))
-    # The routed block still served the fused ring path.
-    assert switch.pipelined_decode_fused_calls == 1
-
-
-def test_lookahead_prefetch_pools_dedup_combined_and_forced_miss(
-        tmp_path, monkeypatch):
-    """On a combined K-quant gate/up switch the spare placement runs over
-    the two unique physical pools (one combined-row pread per placement
-    instead of two), and a predicted expert placed in a spare slot becomes
-    a demand hit: the demand ensure takes no pread and counts no miss."""
-    from moespresso.runtime import expert_slot_pool as esp
-
-    pkg, _expected = _kquant_package(tmp_path, n_experts=8)
-    model = _Model(hidden=256, intermediate=256, n_experts=8, n_layers=1)
-    index = build_expert_index(pkg)
-    install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=4,
-        seed=42, spare_slots=2)
-    switch = model.language_model.model.layers[0].mlp.switch_mlp
-
-    real_trio = esp.place_spare_trio
-    seen_pool_counts = []
-
-    def _spy_trio(pools, expert, spare_index):
-        seen_pool_counts.append(len(tuple(pools)))
-        return real_trio(pools, expert, spare_index)
-
-    monkeypatch.setattr(esp, "place_spare_trio", _spy_trio)
-
-    switch._prefetch_pools([5])
-    assert switch.lookahead_errors == 0
-    assert seen_pool_counts == [2]  # combined gate/up + down, deduplicated
-    assert switch.lookahead_prefetch_loads == 1
-    gate_pool = switch.gate_proj.pool
-    down_pool = switch.down_proj.pool
-    assert gate_pool.slot_of(5) == gate_pool.capacity  # first spare slot
-    assert down_pool.slot_of(5) == down_pool.capacity
-
-    stats = ssd_streaming_stats(model)
-    assert stats["lookahead_prefetch_loads"] == 1
-    assert stats["expert_spec_prefetch_loads"] == 2
-    rows = ssd_streaming_layer_stats(model)
-    assert rows[0]["lookahead_prefetch_loads"] == 1
-
-    # Forced miss becomes a hit: no pread, no miss count on the demand path.
-    preads = {"n": 0}
-    real_pread = esp.pread_view_cached
-
-    def _count_pread(*args, **kwargs):
-        preads["n"] += 1
-        return real_pread(*args, **kwargs)
-
-    monkeypatch.setattr(esp, "pread_view_cached", _count_pread)
-    misses_before = gate_pool.total_misses
-    hits_before = gate_pool.total_hits
-    gate_pool.ensure([5])
-    assert gate_pool.total_misses == misses_before
-    assert gate_pool.total_hits == hits_before + 1
-    assert preads["n"] == 0
-
-
-def test_lookahead_spare_contention_with_demand_ensures(tmp_path):
-    """Concurrent demand ensures and spare placements on the same combined
-    pools stay consistent: bookkeeping reconciles slot-for-slot, no double
-    residency, reservations drain, and the speculative path records no
-    errors."""
-    import concurrent.futures
-
-    pkg, _expected = _kquant_package(tmp_path, n_experts=12)
-    model = _Model(hidden=256, intermediate=256, n_experts=12, n_layers=1)
-    index = build_expert_index(pkg)
-    install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=6,
-        seed=42, spare_slots=2)
-    switch = model.language_model.model.layers[0].mlp.switch_mlp
-    rng = np.random.default_rng(7)
-    demand_sets = [
-        {int(e) for e in rng.integers(0, 12, 4)} for _ in range(150)
-    ]
-    predictions = [
-        [int(e) for e in rng.integers(0, 12, 3)] for _ in range(150)
-    ]
-
-    def _demand():
-        pools = switch._projection_pools()
-        for active in demand_sets:
-            for pool in pools:
-                pool.ensure(active)
-
-    def _speculate():
-        for pred in predictions:
-            switch._prefetch_pools(pred)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        futures = [ex.submit(_demand), ex.submit(_speculate)]
-        for future in futures:
-            future.result()
-
-    assert switch.lookahead_errors == 0
-    for pool in switch._projection_pools():
-        for expert, slot in pool._slot_of.items():
-            assert pool._expert_at[slot] == expert
-        resident = pool.resident_ids()
-        assert len(resident) <= pool.capacity + pool.spare_slots
-        assert pool._prefetch_reserved == set()
-        assert pool._prefetch_inflight == 0
-
-
-def test_lookahead_submissions_shed_load_when_executor_is_busy(
-        tmp_path, monkeypatch):
-    """Speculation never queues behind itself: while the lookahead executor
-    holds the in-flight cap, further submissions are dropped and counted,
-    and the pending count drains back to zero when the tasks finish."""
-    import threading
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    switch = _kquant_switch(tmp_path, capacity=3, n_experts=4)
-    switch.lookahead_w = mx.zeros((4, 256), dtype=mx.float16)
-    switch.lookahead_target = switch
-
-    release = threading.Event()
-    started = threading.Event()
-
-    def _slow_task(seq):
-        started.set()
-        release.wait(5.0)
-        with psg._LOOKAHEAD_PENDING_LOCK:
-            psg._LOOKAHEAD_PENDING[0] -= 1
-
-    monkeypatch.setattr(switch, "_lookahead_task", _slow_task)
-    assert psg._LOOKAHEAD_PENDING[0] == 0
-    for seq in range(6):
-        switch._maybe_lookahead(seq)
-    started.wait(5.0)
-    # The cap admits _LOOKAHEAD_MAX_PENDING tasks; the rest dropped.
-    assert psg._LOOKAHEAD_PENDING[0] == psg._LOOKAHEAD_MAX_PENDING
-    assert switch.lookahead_dropped == 6 - psg._LOOKAHEAD_MAX_PENDING
-    release.set()
-    psg._lookahead_executor().submit(lambda: None).result()
-    assert psg._LOOKAHEAD_PENDING[0] == 0
-    # With the executor idle again, a fresh submission is admitted.
-    switch._maybe_lookahead(99)
-    psg._lookahead_executor().submit(lambda: None).result()
-    assert psg._LOOKAHEAD_PENDING[0] == 0
-    assert switch.lookahead_dropped == 6 - psg._LOOKAHEAD_MAX_PENDING
-
-
-def test_deepseek_v4_lookahead_install_gating(tmp_path, monkeypatch):
-    """The DS4 build wires the lookahead only when explicitly requested,
-    the native-gate path is live, and residency is bounded; spares come
-    out of the same capacity budget."""
-    import types
-
-    from mlx_lm.models.switch_layers import SwitchGLU
-
-    import moespresso.runtime.pooled_switchglu as psg
-    from moespresso.runtime.deepseek_v4.model import (
-        _install_deepseek_v4_pooled_bundles,
-    )
-
-    monkeypatch.setattr(psg, "_RING_DECODE", True)
-    monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
-    fake_gate_mod = types.SimpleNamespace(signaled_value=lambda: 0)
-    monkeypatch.setattr(psg, "_GATE_MOD", [fake_gate_mod])
-    monkeypatch.setenv("MOESPRESSO_SSD_LOOKAHEAD", "1")
-
-    def _build_model(n_experts):
-        return _DeepseekV4SparseModel(
-            gate=_DeepseekV4HashGate(n_experts=n_experts, top_k=2),
-            switch_mlp=SwitchGLU(256, 256, n_experts),
-            shared_experts=_TinySharedMLP(hidden=256, intermediate=32),
-        )
-
-    # Full residency: refused, no spares carved, capacity untouched.
-    d1 = tmp_path / "full"
-    d1.mkdir()
-    pkg, _ = _kquant_package(d1, n_experts=4)
-    model = _build_model(4)
-    _install_deepseek_v4_pooled_bundles(
-        model, pkg, build_expert_index(pkg), seed=42, capacity_per_layer=4)
-    switch = model.language_model.model.layers[0].mlp.switch_mlp
-    assert switch.gate_proj.pool.capacity == 4
-    assert switch.gate_proj.pool.spare_slots == 0
-    assert getattr(model, "_moespresso_ssd_lookahead", None) is None
-
-    # Bounded residency: spares carved out of the same budget.
-    d2 = tmp_path / "bounded"
-    d2.mkdir()
-    pkg2, _ = _kquant_package(d2, n_experts=32)
-    model2 = _build_model(32)
-    _install_deepseek_v4_pooled_bundles(
-        model2, pkg2, build_expert_index(pkg2), seed=42,
-        capacity_per_layer=28)
-    switch2 = model2.language_model.model.layers[0].mlp.switch_mlp
-    assert switch2.gate_proj.pool.capacity == 24
-    assert switch2.gate_proj.pool.spare_slots == 4
-    assert model2._moespresso_ssd_lookahead == {
-        "delta": 1, "wired": 0, "spare_slots": 4}
-
-    # Native gate not live: refused, nothing carved.
-    monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    d3 = tmp_path / "nogate"
-    d3.mkdir()
-    pkg3, _ = _kquant_package(d3, n_experts=32)
-    model3 = _build_model(32)
-    _install_deepseek_v4_pooled_bundles(
-        model3, pkg3, build_expert_index(pkg3), seed=42,
-        capacity_per_layer=28)
-    switch3 = model3.language_model.model.layers[0].mlp.switch_mlp
-    assert switch3.gate_proj.pool.capacity == 28
-    assert switch3.gate_proj.pool.spare_slots == 0
-    assert getattr(model3, "_moespresso_ssd_lookahead", None) is None
-
-
 # --- Qwen sparse MoE block barrier-free decode -------------------------------
 
 
@@ -3487,8 +3012,7 @@ def _full_resident_kquant_qwen_block(
         layer.mlp.shared_expert_gate = non_pool["shared_expert_gate"]
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=capacity,
-        seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=capacity)
     if capacity >= 4:
         seed_all_expert_residency(model)
     block = model.language_model.model.layers[0].mlp
@@ -3504,13 +3028,9 @@ def test_qwen_decode_barrier_free_when_full_resident(tmp_path, monkeypatch):
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_QWEN_DECODE_SCHED", True)
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
     monkeypatch.setattr(psg, "_DECODE_FLUSH_LAYERS", 1)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
 
     _model, block = _full_resident_kquant_qwen_block(tmp_path, capacity=4)
     switch = block.switch_mlp
@@ -3538,7 +3058,7 @@ def test_qwen_decode_barrier_free_when_full_resident(tmp_path, monkeypatch):
     assert mlx_asarray_hits == []
     assert switch.barrier_free_decode_calls == 1
     assert switch.barrier_free_decode_flush_calls == 1  # depth 1, layer 0
-    # The ring/native-gate machinery never ran: the off-arm counters.
+    # The resident path does not use the ring or native gate.
     assert switch.pipelined_layers == 0
     assert switch.block_exit_kick_calls == 0
     assert switch.router_export_seconds == 0.0
@@ -3559,70 +3079,6 @@ def test_qwen_decode_barrier_free_when_full_resident(tmp_path, monkeypatch):
     assert switch.barrier_free_decode_flush_calls == 1
 
 
-def test_qwen_decode_barrier_free_matches_ring_and_kill_switch(
-        tmp_path, monkeypatch):
-    """The Qwen barrier-free decode route selects exactly the slots the ring
-    path publishes (value-bearing fake kernel), and the kill switch
-    (MOESPRESSO_SSD_DECODE_SCHED=0, the module constant) keeps the ring path
-    with its counters."""
-    import sys
-
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_RING_DECODE", True)
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
-    monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
-    monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
-    monkeypatch.setitem(
-        sys.modules, "mlx_kquant", _value_kquant_decode_module())
-
-    mx.random.seed(11)
-    xs = [mx.random.normal((1, 1, 256)).astype(mx.float16) for _ in range(4)]
-    mx.eval(*xs)
-    # Shared non-pool weights so both arms route identically and add the same
-    # shared expert; only the pooled routed dispatch (barrier-free vs ring)
-    # differs between them.
-    non_pool = {
-        "gate": nn.Linear(256, 4, bias=False),
-        "shared_expert": _TinySharedMLP(hidden=256, intermediate=32),
-        "shared_expert_gate": nn.Linear(256, 1, bias=False),
-    }
-    mx.eval(non_pool["gate"].parameters(),
-            non_pool["shared_expert"].parameters(),
-            non_pool["shared_expert_gate"].parameters())
-    outs = {}
-    switches = {}
-
-    for sched_on in (False, True):
-        monkeypatch.setattr(psg, "_QWEN_DECODE_SCHED", sched_on)
-        root = tmp_path / ("bf" if sched_on else "ring")
-        root.mkdir()
-        _model, block = _full_resident_kquant_qwen_block(
-            root, capacity=4, non_pool=non_pool)
-        got = []
-        for x in xs:
-            y = block(x)
-            mx.eval(y)
-            got.append(np.array(y))
-        outs[sched_on] = got
-        switches[sched_on] = block.switch_mlp
-
-    for ring_y, bf_y in zip(outs[False], outs[True]):
-        np.testing.assert_array_equal(ring_y, bf_y)
-    assert switches[True].barrier_free_decode_calls == len(xs)
-    assert switches[True].pipelined_layers == 0
-    assert switches[True].block_exit_kick_calls == 0
-    assert switches[False].barrier_free_decode_calls == 0
-    # The kill switch short-circuits the branch before the certificate check,
-    # so the OFF arm never evaluates the certificate (stays None) and takes the
-    # ring path for every token.
-    assert switches[False]._barrier_free_decode_ready_cached is None
-    assert switches[False].pipelined_layers == len(xs)
-    assert switches[False].block_exit_kick_calls == len(xs)
-
-
 def test_qwen_decode_barrier_free_fails_closed_on_partial_residency(
         tmp_path, monkeypatch):
     """capacity < num_experts fails the decode certificate closed: the Qwen
@@ -3631,13 +3087,9 @@ def test_qwen_decode_barrier_free_fails_closed_on_partial_residency(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_QWEN_DECODE_SCHED", True)
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
     monkeypatch.setattr(psg, "_RING_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
     monkeypatch.setitem(
         sys.modules, "mlx_kquant", _value_kquant_decode_module())
 
@@ -3652,7 +3104,7 @@ def test_qwen_decode_barrier_free_fails_closed_on_partial_residency(
     assert switch.barrier_free_decode_calls == 0
     assert switch._barrier_free_decode_ready_cached is False
     assert switch.pipelined_layers == 1
-    assert switch.block_exit_kick_calls == 1
+    assert switch.block_exit_kick_calls == 2
 
 
 def test_qwen_decode_barrier_free_forced_miss_serves_rail_identical(
@@ -3667,13 +3119,9 @@ def test_qwen_decode_barrier_free_forced_miss_serves_rail_identical(
 
     import moespresso.runtime.pooled_switchglu as psg
 
-    monkeypatch.setattr(psg, "_QWEN_DECODE_SCHED", True)
     monkeypatch.setattr(psg, "_RING_DECODE", True)
-    monkeypatch.setattr(psg, "_BARRIER_FREE_DECODE", True)
     monkeypatch.setattr(psg, "_RING_SELF_TEST", [True])
     monkeypatch.setattr(psg, "_GATE_MOD", [False])
-    monkeypatch.setattr(psg, "_PIPE_PREV", [])
-    monkeypatch.setattr(psg, "_GATE_PENDING", [])
     monkeypatch.setitem(
         sys.modules, "mlx_kquant", _value_kquant_decode_module())
 
@@ -3744,7 +3192,7 @@ def _dense_kquant_manifest(*, codec="q4_k", kind="affine"):
             {
                 # a routed expert bundle is skipped by the dense codec map
                 "source_name": "layers.0.mlp.experts",
-                "format": "tq",
+                "format": "mxfp4",
                 "kind": "expert",
             },
         ]
@@ -3761,7 +3209,7 @@ def _affine_dense_manifest():
             },
             {
                 "source_name": "layers.0.mlp.experts",
-                "format": "tq",
+                "format": "mxfp4",
                 "kind": "expert",
             },
         ]
@@ -3835,31 +3283,6 @@ def test_maybe_install_kquant_dense_fails_closed_on_unknown_codec():
     manifest = _dense_kquant_manifest(codec="q2_not_real")
     with pytest.raises(KQuantInstallError, match="unknown K-quant codec"):
         ssb._maybe_install_kquant_dense(_Model(n_layers=1), manifest)
-
-
-def test_maybe_install_kquant_dense_kill_switch_refuses(monkeypatch):
-    from moespresso.runtime import ssd_streaming_build as ssb
-
-    monkeypatch.setenv("MOESPRESSO_QWEN_STREAMING_KQUANT_DENSE", "0")
-    # With the kill switch off the install is skipped even though the manifest
-    # carries K-quant dense: the diagnostic that restores the refuse/crash path.
-    import builtins
-
-    real_import = builtins.__import__
-
-    def guard(name, *args, **kwargs):
-        if name == "mlx_kquant" or name.startswith("mlx_kquant."):
-            raise AssertionError("kill switch off must not import mlx_kquant")
-        return real_import(name, *args, **kwargs)
-
-    builtins.__import__ = guard
-    try:
-        installed = ssb._maybe_install_kquant_dense(
-            _Model(n_layers=1), _dense_kquant_manifest(codec="q4_k"))
-    finally:
-        builtins.__import__ = real_import
-
-    assert installed == 0
 
 
 def test_read_manifest_absent_and_malformed(tmp_path):
@@ -3951,7 +3374,7 @@ def _kquant_switch(tmp_path, *, capacity, n_experts=4, hidden=256,
     index = build_expert_index(pkg)
     install_pooled_switchglus(
         model, package_dir=pkg, index=index,
-        capacity_per_layer=capacity, seed=42)
+        capacity_per_layer=capacity)
     return model.language_model.model.layers[0].mlp.switch_mlp
 
 
@@ -4009,7 +3432,7 @@ def test_unified_prefill_matches_full_capacity_bitexact(tmp_path):
     model_full = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     install_pooled_switchglus(
         model_full, package_dir=pkg_full, index=build_expert_index(pkg_full),
-        capacity_per_layer=4, seed=42)
+        capacity_per_layer=4)
     seed_all_expert_residency(model_full)  # prewarm-all, as the product serves
     full = model_full.language_model.model.layers[0].mlp.switch_mlp
     out_full = full(x, indices)
@@ -4025,16 +3448,20 @@ def test_unified_prefill_matches_full_capacity_bitexact(tmp_path):
     np.testing.assert_array_equal(np.array(out_full), np.array(out_partial))
 
 
-def test_unified_prefill_kill_switch_falls_back_to_segmented(tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_UNIFIED_SORTED_PREFILL", False)
+def test_unified_prefill_falls_back_when_fused_kernel_is_unavailable(
+        tmp_path, monkeypatch):
+    import sys
+
     switch = _kquant_switch(tmp_path, n_experts=4, capacity=2)
     x = mx.random.normal((32, 256)).astype(mx.float16)
     indices = _bulk_prefill_indices(4, rows=32, top_k=4)
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_kquant",
+        _fake_kquant_module([], [], sorted_calls=[]),
+    )
 
     mx.eval(switch(x, indices))
-    # With the kill switch off the unified compute never runs; the chunks fall
-    # to the pre-unification segmented (or general) compute.
     assert switch.unified_sorted_prefill_calls == 0
     assert switch.sorted_chunked_calls > 0
 
@@ -4053,7 +3480,7 @@ def test_unified_sorted_prefill_calls_exported_in_stats(tmp_path):
     model = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=2, seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=2)
     switch = model.language_model.model.layers[0].mlp.switch_mlp
     x = mx.random.normal((32, 256)).astype(mx.float16)
     indices = _bulk_prefill_indices(4, rows=32, top_k=4)
@@ -4067,7 +3494,7 @@ def test_unified_sorted_prefill_calls_exported_in_stats(tmp_path):
     assert "unified_sorted_prefill_calls" in rows[0]
 
 
-# --- Cross-chunk predictive expert prefetch (MOESPRESSO_SSD_PREFETCH) ---------
+# --- Cross-chunk predictive expert prefetch --------------------------------
 #
 # These exercise the ticket lifecycle on the over-capacity sorted-chunked path.
 # A capacity below n_experts and a bulk-prefill-shaped call whose active set
@@ -4083,9 +3510,6 @@ def _prefetch_switch(tmp_path, *, n_experts=8, capacity=4, sub="pf"):
 
 def test_prefetch_ticket_submits_then_a_matching_next_call_consumes_it(
         tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4)
     x = mx.random.normal((32, 256)).astype(mx.float16)
     indices = _bulk_prefill_indices(8, rows=32, top_k=4)
@@ -4116,9 +3540,6 @@ def test_prefetch_ticket_submit_protects_final_chunk(tmp_path, monkeypatch):
     never waited before the submit, so its slots must not be prefetch
     victims. The loop drains every earlier chunk's readers, so the
     prefetch may only reclaim drained chunks."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4)
     protects = []
     for pool in switch._projection_pools():
@@ -4150,9 +3571,6 @@ def test_prefetch_ticket_submit_protects_final_chunk(tmp_path, monkeypatch):
 
 def test_prefetch_ticket_mismatch_is_counted_but_still_serves(
         tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4)
     x = mx.random.normal((32, 256)).astype(mx.float16)
     # Two over-capacity prompt chunks with different expert sets: the first
@@ -4182,9 +3600,6 @@ def test_prefetch_ticket_mismatch_is_counted_but_still_serves(
 
 def test_prefetch_ticket_goes_stale_when_next_call_is_not_over_capacity(
         tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4)
     x = mx.random.normal((32, 256)).astype(mx.float16)
     over = _bulk_prefill_indices(8, rows=32, top_k=4)  # over capacity, submits
@@ -4202,36 +3617,13 @@ def test_prefetch_ticket_goes_stale_when_next_call_is_not_over_capacity(
     assert switch._prefetch_ticket is None
 
 
-def test_prefetch_kill_switch_off_never_submits_or_consumes(
-        tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", False)
-
-    switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4)
-    x = mx.random.normal((32, 256)).astype(mx.float16)
-    indices = _bulk_prefill_indices(8, rows=32, top_k=4)
-
-    mx.eval(switch(x, indices))
-    mx.eval(switch(x, indices))
-
-    assert switch.sorted_chunked_calls == 2  # the over-capacity path still ran
-    assert switch.prefetch_ticket_submitted == 0
-    assert switch.prefetch_ticket_consumed == 0
-    assert switch.prefetch_ticket_stale == 0
-    assert switch._prefetch_ticket is None
-
-
 def test_prefetch_never_engages_on_full_capacity_certificate_path(
         tmp_path, monkeypatch):
     """The full-capacity prewarmed build never dispatches over-capacity, so no
-    ticket is ever submitted or consumed even with the switch on. The
-    barrier-free certificate path must stay untouched."""
+    ticket is submitted or consumed. The barrier-free certificate path stays
+    untouched."""
     import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-    # Force the barrier-free certificate route on (it ships gated off, measured
-    # served-neutral) so the test exercises the real full-resident bulk path the
-    # certificate serves in addition to a full-capacity direct call.
-    monkeypatch.setattr(psg, "_BARRIER_FREE_PREFILL", True)
+
     monkeypatch.setattr(psg, "_SEGMENTED_PREFILL_MIN_ROWS", 8)
 
     switch = _full_resident_kquant_switch(tmp_path, capacity=4)  # n_experts==4
@@ -4251,48 +3643,13 @@ def test_prefetch_never_engages_on_full_capacity_certificate_path(
     assert switch._prefetch_ticket is None
 
 
-def test_prefetch_on_off_are_bit_identical(tmp_path):
-    """The prefetch is a pure pre-fill of slots: the routed output over two
-    prompt chunks is bit-identical with the switch on and off. This is the
-    unit-level one-rail check; the served identity run covers the real model."""
-    import moespresso.runtime.pooled_switchglu as psg
-
-    rows = 1100  # >= 4096 routed pairs so the fused sorted route runs
-    x = mx.random.normal((rows, 256)).astype(mx.float16)
-    indices = _bulk_prefill_indices(8, rows=rows, top_k=4)
-    assert indices.size >= 4096
-
-    def _run(prefetch_on):
-        import pytest as _pytest
-        with _pytest.MonkeyPatch.context() as mp:
-            mp.setattr(psg, "_PREFILL_PREFETCH", prefetch_on)
-            sub = "on" if prefetch_on else "off"
-            switch = _prefetch_switch(tmp_path, n_experts=8, capacity=4, sub=sub)
-            out0 = switch(x, indices)
-            mx.eval(out0)
-            out1 = switch(x, indices)
-            mx.eval(out1)
-            return np.array(out0), np.array(out1), switch
-
-    on0, on1, on_switch = _run(True)
-    off0, off1, off_switch = _run(False)
-
-    np.testing.assert_array_equal(on0, off0)
-    np.testing.assert_array_equal(on1, off1)
-    assert on_switch.prefetch_ticket_consumed == 1
-    assert off_switch.prefetch_ticket_consumed == 0
-
-
 def test_prefetch_partial_capacity_matches_full_capacity_bitexact(
         tmp_path, monkeypatch):
     """One-rail identity holds with the prefetch engaged: a cap-below-full
     prefill with prefetch on reproduces the full-capacity prewarmed rail
     bit-for-bit, mirroring test_unified_prefill_matches_full_capacity_bitexact
-    with the prefetch switch forced on."""
+    with predictive prefetch engaged."""
     from moespresso.runtime.ssd_streaming_build import seed_all_expert_residency
-
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
 
     rows = 1100
     x = mx.random.normal((rows, 256)).astype(mx.float16)
@@ -4306,7 +3663,7 @@ def test_prefetch_partial_capacity_matches_full_capacity_bitexact(
     model_full = _Model(hidden=256, intermediate=256, n_experts=4, n_layers=1)
     install_pooled_switchglus(
         model_full, package_dir=pkg_full, index=build_expert_index(pkg_full),
-        capacity_per_layer=4, seed=42)
+        capacity_per_layer=4)
     seed_all_expert_residency(model_full)
     full = model_full.language_model.model.layers[0].mlp.switch_mlp
     out_full = full(x, indices)
@@ -4332,9 +3689,6 @@ def test_prefetch_survives_contention_over_many_iterations(
     with drifting predictions, over enough iterations to surface a race. The
     output shape stays invariant and the ticket lifecycle stays consistent
     (never negative, consumed + stale <= submitted, one ticket at a time)."""
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     switch = _prefetch_switch(tmp_path, n_experts=12, capacity=4)
     rng = np.random.default_rng(1234)
     x = mx.random.normal((32, 256)).astype(mx.float16)
@@ -4365,14 +3719,11 @@ def test_prefetch_survives_contention_over_many_iterations(
 
 
 def test_prefetch_counters_exported_in_stats(tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
-
     pkg, _expected = _kquant_package(tmp_path, n_experts=8)
     model = _Model(hidden=256, intermediate=256, n_experts=8, n_layers=1)
     index = build_expert_index(pkg)
     install_pooled_switchglus(
-        model, package_dir=pkg, index=index, capacity_per_layer=4, seed=42)
+        model, package_dir=pkg, index=index, capacity_per_layer=4)
     switch = model.language_model.model.layers[0].mlp.switch_mlp
     x = mx.random.normal((32, 256)).astype(mx.float16)
     indices = _bulk_prefill_indices(8, rows=32, top_k=4)

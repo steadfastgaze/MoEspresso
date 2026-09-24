@@ -38,6 +38,21 @@ from moespresso.toolcalls.dsml import render_dsml_tool_calls
 STRIDE = 256
 
 
+@pytest.mark.parametrize("cache_format,prefill_only", [
+    ("qwen_kvarn_k4v4", True), ("raw", False), (None, False),
+])
+def test_cache_accounting_uses_the_declared_live_format(cache_format, prefill_only):
+    from moespresso.agentlib.roadtest.ledger import SessionLedger
+
+    run = object.__new__(RoadtestRun)
+    run.ledgers = {"a": SessionLedger("a", stride=256)}
+    run._configure_cache_accounting({
+        "prompt_cache": {"default_live_kv_format": cache_format},
+    })
+    assert run._prefill_only_cache is prefill_only
+    assert run.ledgers["a"].prefill_only is prefill_only
+
+
 def test_process_tree_rss_includes_supervised_worker_session():
     listing = """
       10   1  100
@@ -67,6 +82,15 @@ def test_package_run_settings_use_default_served_context_limit(tmp_path):
 
     assert loop is None
     assert context_limit == 131072
+
+
+def test_package_without_profile_accepts_explicit_native_tool_settings(tmp_path):
+    loop, limit = _package_run_settings(tmp_path, dialect="native", no_thinking=True)
+    assert loop.dialect == "native"
+    assert loop.thinking_for_tools is False
+    assert loop.repair is False
+    assert loop.reprompt_enabled is False
+    assert limit is None
 
 
 def _dsml(name: str, arguments: dict) -> str:

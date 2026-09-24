@@ -27,11 +27,6 @@ the routed-expert bytes come from:
   the tensor-by-tensor codec allocation and, with `--copy-gguf-expert-bytes`,
   the routed-expert bytes themselves.
 
-The remaining planning route, the probe/optimizer path behind
-`moespresso-convert`, measures a source model and optimizes its own allocation.
-It is described in [`package_format.md`](package_format.md) and is not covered
-here.
-
 Every route converges on one `package_plan` before the writer runs, then writes
 safetensors shards, package-owned sidecars, and `package_manifest.json`. The
 runtime reconstructs the model from that manifest and never reads the source
@@ -81,9 +76,9 @@ GGUF tensor name, which is exactly the set a K-quant recipe covers; no GGUF
 file is read. The remainder keeps the conservative storage the recipe route
 also gives it, 8-bit affine or mxfp8 for an fp8 source that ships its own block
 scales. The embedding has no such mapping and stays affine, while the head has
-one and takes the codec. The default is `q8_0`; the release package uses `q6_k`. A dense IQ_K
-member is also accepted and is always imatrix-steered, so the writer fails
-closed without dense imatrix vectors.
+one and takes the codec. The default is `q8_0`; the release package uses
+`q6_k`. Dense tensors use the K-quant codec registry; IQ_K remains specific to
+the routed experts in this builder.
 
 ```bash
 uv run --locked moespresso-ds4-iqk-package \

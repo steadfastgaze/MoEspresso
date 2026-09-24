@@ -23,14 +23,9 @@ magnitude (float16 +0.1019 combined against a 5e-4 bar), so the route stages
 in float32 only. The quality ladder judges any staging change, and an on-rail
 fork is expected.
 
-Kill switch and default: the route is on by default (the memory-lever form
-passed the full quality ladder); `MOESPRESSO_QWEN_PREFILL_FLASH_D256=0` is the
-kill switch, which installs nothing and serves the stock composed path byte
-for byte on its own recorded rail. `MOESPRESSO_QWEN_PREFILL_FLASH_D256_STAGE`
-selects the query-tile width (f32, the default, is the wide BQ=64 tile;
-f32w32 is the BQ=32 width for re-pricing, bit-identical to the default).
-With the route on, eligibility is fail-closed per call: the wrapper falls back
-to the stock path unless the call is prefill shaped (more than one query row),
+The promoted route uses the float32 BQ=64 staging form. Eligibility is
+fail-closed per call: the wrapper falls back to the stock path unless the call
+is prefill shaped (more than one query row),
 the cache is a `QuantizedKVCache` at group 64 and 8 bits with a nonempty past,
 the mask is the causal string, the geometry is the served head layout (16
 query heads, 2 KV heads, head dim 256, batch 1), the queries are float32, and
@@ -45,45 +40,21 @@ carry the depth-scaling cost.
 An optional decode route dispatches long q8 prefixes to
 `mlx_kquant.sdpa_decode_q8` with the 16-key SIMD staging tile. It keeps the
 float32 query, dequantization, softmax, accumulation, and output contract, but
-changes the split reduction order. The route is on by default after passing
-the long-context NLL checks and the full Ornith quality gate. Setting
-`MOESPRESSO_QWEN_DECODE_Q8_TILE16=0` disables it. It applies at cache depths of
-at least 8,192 keys; shorter prefixes retain the stock composed path.
+changes the split reduction order. It applies at cache depths of at least 8,192
+keys; shorter prefixes retain the stock composed path.
 
 When the installed mlx-kquant exposes its exact dimension-parallel split
-merge, the decode route requests it by default. The merge preserves every
-float32 reduction order and is bit-identical to the shared merge while
-distributing the 256 output dimensions across eight SIMD groups. Setting
-`MOESPRESSO_QWEN_DECODE_Q8_DIMENSION_MERGE=0` retains the shared merge without
-disabling the tile-16 decode route. An older mlx-kquant build fails closed to
-the shared merge.
+merge, the decode route requests it. The merge preserves every float32
+reduction order and is bit-identical to the shared merge while distributing the
+256 output dimensions across eight SIMD groups. An older mlx-kquant build fails
+closed to the shared merge.
 """
 
 from __future__ import annotations
 
-import os
-
 import mlx.core as mx
 import mlx.nn as nn
 
-# Family kill switch. Default on (the float32 memory-lever form, full ladder
-# green). Setting MOESPRESSO_QWEN_PREFILL_FLASH_D256=0 installs nothing and
-# restores the stock composed path exactly.
-_QWEN_PREFILL_FLASH_D256 = (
-    os.environ.get("MOESPRESSO_QWEN_PREFILL_FLASH_D256", "1") == "1"
-)
-
-# Long-context q8 decode route. The 16-key SIMD stage has a depth-scaled gain;
-# below 8K the served graph sits at its submission/overlap floor. Default on
-# after the accumulation-order variant passed the long-context NLL checks and
-# the full Ornith quality gate. Setting the environment variable to 0 restores
-# the stock composed path.
-_QWEN_DECODE_Q8_TILE16 = (
-    os.environ.get("MOESPRESSO_QWEN_DECODE_Q8_TILE16", "1") == "1"
-)
-_QWEN_DECODE_Q8_DIMENSION_MERGE = (
-    os.environ.get("MOESPRESSO_QWEN_DECODE_Q8_DIMENSION_MERGE", "1") == "1"
-)
 _DECODE_Q8_TILE16_MIN_KEYS = 8192
 
 # Staging form. The route stages in float32, the memory-lever form: it carries
@@ -95,36 +66,22 @@ _DECODE_Q8_TILE16_MIN_KEYS = 8192
 # by two orders of magnitude (float16 +0.1019 combined against the 5e-4 bar),
 # so no half-precision stage is selectable.
 #
-# The default runs the wide query tile (BQ=64). The threadgroup staging memory
+# The promoted route runs the wide query tile (BQ=64). The threadgroup staging memory
 # depends on BK and D alone (20 KB at BK=16, D=256), so BK stays 16 and BQ is
 # the only fold; BQ=64 folds twice the query positions onto each staged KV
 # tile, halving the per-row staging and dequant work. The staging precision is
 # identical to the BQ=32 width, so the served token stream is unchanged: the
-# 4K anchor rail and the 37K greedy stream are bit-identical to the BQ=32
-# width (full chunks pin at 16 splits at depth; only a short tail could shift
-# the split count, which the served chunk layout does not hit). It recovers
-# about +37 t/s at 37K prefill (789 to 826 resident, 789 to 821 streamed
-# full-cap) at an unchanged peak. "f32w32" selects the BQ=32 width for
-# re-pricing.
-_STAGE_CONFIGS = {
-    # stage id, query rows per threadgroup, keys per tile
-    "f32": (2, 64, 16),
-    "f32w32": (2, 32, 16),
-}
-_STAGE_NAME = os.environ.get("MOESPRESSO_QWEN_PREFILL_FLASH_D256_STAGE", "f32")
-if _STAGE_NAME not in _STAGE_CONFIGS:
-    _STAGE_NAME = "f32"  # unknown value fails closed to the memory-lever form
-_FLASH_STAGE, _FLASH_BQ, _FLASH_BK = _STAGE_CONFIGS[_STAGE_NAME]
+# 4K anchor rail and the 37K greedy stream are bit-identical to the former
+# BQ=32 width. It recovers about +37 t/s at 37K prefill (789 to 826 resident,
+# 789 to 821 streamed full-cap) at an unchanged peak.
+_FLASH_STAGE = 2
+_FLASH_BQ = 64
+_FLASH_BK = 16
 
 # The served full-attention geometry the kernel is fenced and certified for.
 _FLASH_N_Q_HEADS = 16
 _FLASH_N_KV_HEADS = 2
 _FLASH_HEAD_DIM = 256
-
-
-def flash_prefill_enabled() -> bool:
-    """Whether the flash prefill route is enabled for this process."""
-    return _QWEN_PREFILL_FLASH_D256
 
 
 def _kernel_available() -> bool:
@@ -178,15 +135,12 @@ class FlashPrefillD256Attention(nn.Module):
     def __init__(self, inner):
         super().__init__()
         self.inner = inner
-        self.decode_dimension_merge_enabled = (
-            _QWEN_DECODE_Q8_DIMENSION_MERGE and _decode_dimension_merge_available()
-        )
+        self.decode_dimension_merge_enabled = _decode_dimension_merge_available()
 
         # Engagement counters (read through flash_prefill_attention_stats).
         self.flash_calls = 0
         self.decode_calls = 0
         self.decode_dimension_merge_calls = 0
-        self.fallback_prefill_disabled = 0
         self.fallback_no_cache = 0
         self.fallback_decode = 0
         self.fallback_cache = 0
@@ -199,9 +153,6 @@ class FlashPrefillD256Attention(nn.Module):
 
     def _flash_eligible(self, queries, cache, mask) -> bool:
         """Per-call fail-closed eligibility; counts the first failing branch."""
-        if not _QWEN_PREFILL_FLASH_D256:
-            self.fallback_prefill_disabled += 1
-            return False
         if queries.shape[2] <= 1:
             self.fallback_decode += 1
             return False
@@ -237,9 +188,6 @@ class FlashPrefillD256Attention(nn.Module):
 
     def _decode_eligible(self, queries, cache, mask) -> bool:
         """Whether one decode row can use the long-context q8 kernel."""
-        if not _QWEN_DECODE_Q8_TILE16:
-            self.fallback_decode += 1
-            return False
         qcls = _quantized_cache_class()
         if (
             qcls is None
@@ -425,12 +373,12 @@ def _iter_full_attention_layers(model):
 def install_flash_prefill_attention(model) -> int:
     """Wrap full-attention layers for enabled q8 attention dispatches.
 
-    A no-op returning 0 when both routes are disabled or their kernels are
-    unavailable. Layers already wrapped are left alone (idempotent). Returns
+    A no-op returning 0 when neither kernel is available. Layers already wrapped
+    are left alone (idempotent). Returns
     the number of layers wrapped.
     """
-    prefill_ready = _QWEN_PREFILL_FLASH_D256 and _kernel_available()
-    decode_ready = _QWEN_DECODE_Q8_TILE16 and _decode_kernel_available()
+    prefill_ready = _kernel_available()
+    decode_ready = _decode_kernel_available()
     if not (prefill_ready or decode_ready):
         return 0
     installed = 0
@@ -449,7 +397,6 @@ def flash_prefill_attention_stats(model) -> dict:
         "flash_calls": 0,
         "decode_calls": 0,
         "decode_dimension_merge_calls": 0,
-        "fallback_prefill_disabled": 0,
         "fallback_no_cache": 0,
         "fallback_decode": 0,
         "fallback_cache": 0,

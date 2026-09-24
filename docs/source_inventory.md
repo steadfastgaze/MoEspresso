@@ -143,7 +143,7 @@ Two helpers compute the on-disk module paths the packaged/runtime layout uses,
 both derived from the same sanitized head so the conventions can never drift:
 
 - `switch_mlp_key(source_name, projection)`: rewrites a fused expert source
-  (`...mlp.experts.gate_up_proj`) to the TQ-kernel's expected
+  (`...mlp.experts.gate_up_proj`) to the routed runtime's expected
   `...switch_mlp.<proj>_proj`, also applying mlx_lm's
   `model.language_model.` → `language_model.model.` rename.
 - `switch_mlp_bundle_prefix(source_name)`: the per-layer bundle prefix
@@ -216,7 +216,7 @@ wired into the convert/serve/verify path.
 The `role_quant` map covers every role in the inventory's vocabulary, assigning
 each one to a quant regime:
 
-- **`tq`**: TurboQuant. Owned exclusively by MoE experts (`moe.expert.*`).
+- **`routed_expert`**: explicit K-quant, IQ_K or source-MXFP4 expert storage.
 - **`affine`**: MLX affine quantization. Every other 2D non-expert weight:
   attention projections, the SSM `in_proj_*`/`out_proj`, dense FFN gate/up/down,
   shared-expert gate/up/down, embeddings, and `lm_head`. Notably the SSM

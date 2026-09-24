@@ -181,7 +181,7 @@ def test_l0_treats_deepseek_v4_codec_sources_as_owned_inputs():
          "role": "attn.attn_sink", "kind": "passthrough", "layer_index": 0},
     ])
     man = _manifest([
-        {"source_name": "layers.0.ffn.experts.gate", "format": "tq",
+        {"source_name": "layers.0.ffn.experts.gate", "format": "mxfp4",
          "projection": "gate", "layer_index": 0},
         {"source_name": "layers.0.attn.wq_a.weight", "format": "affine"},
         {"source_name": "layers.0.attn.attn_sink", "format": "raw_dtype_passthrough"},
@@ -321,8 +321,8 @@ def test_l0_validates_every_duplicate_manifest_entry_format():
                        "role": "moe.expert.gate", "kind": "expert"}])
     bad_first = _manifest([
         {"source_name": "L0.mlp.experts.gate_up_proj", "format": "fp16",
-         "projection": "gate"},                                    # wrong (should be tq)
-        {"source_name": "L0.mlp.experts.gate_up_proj", "format": "tq",
+         "projection": "gate"},                                    # wrong (should be routed_expert)
+        {"source_name": "L0.mlp.experts.gate_up_proj", "format": "mxfp4",
          "projection": "up"},                                      # correct
     ])
     bad_last = _manifest([bad_first["tensors"][1], bad_first["tensors"][0]])  # reversed

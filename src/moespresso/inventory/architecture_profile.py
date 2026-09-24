@@ -32,7 +32,7 @@ def _profile(subject: dict, **fields) -> dict:
 def qwen3_5_moe_profile() -> dict:
     """The contract a qwen3_5_moe (Qwen3.5/3.6-A3B) text package must satisfy.
 
-    Declares: text-only scope + vision/mtp exclusions; per-role quant ownership (TQ
+    Declares: text-only scope + vision/mtp exclusions; per-role quant ownership (routed
     experts, affine non-experts incl. SSM in_proj, fp16 routing gates); the source->
     runtime transforms (conv1d layout, the coupled RMSNorm +1.0 shift, fused gate_up
     split, the model.language_model.* -> language_model.model.* rename); layer kinds;
@@ -53,10 +53,10 @@ def qwen3_5_moe_profile() -> dict:
                    "makes the conv1d-shape predicate the sole shift trigger)",
         },
         # Per typed-role quant ownership (the inventory's role vocabulary). This is the
-        # contract: experts are TurboQuant, every other 2D non-expert weight is affine,
-        # only the discrete-routing gates stay fp16. (Matches decide.FP16_ROLES.)
+        # contract: routed experts use their declared codecs, dense projections
+        # have affine ownership, and discrete-routing gates stay fp16.
         role_quant={
-            "moe.expert": "tq",
+            "moe.expert": "routed_expert",
             "moe.router_gate": "fp16",
             "moe.shared_expert_gate": "fp16",
             "moe.shared_expert.gate_proj": "affine",
@@ -183,6 +183,60 @@ def qwen3_5_dense_profile() -> dict:
     )
 
 
+def qwen4_exp_profile() -> dict:
+    """The released Qwen3.8-Flash-Next text-source contract.
+
+    Quant ownership is intentionally unassigned. The profile registers the
+    released family and its exact text/provider boundary without allowing the
+    Qwen3.5 conversion path or its coupled RMSNorm transform to be inferred.
+    """
+    layer_kinds = [
+        kind
+        for _ in range(12)
+        for kind in (
+            "linear_attention", "linear_attention", "linear_attention",
+            "qwen_sparse_attention",
+        )
+    ]
+    return _profile(
+        {"family": "qwen4_exp", "modality": "text"},
+        family="qwen4_exp",
+        modality="text",
+        source_partition={
+            "text_graph_tensors": 1163,
+            "ple_provider_tensors": 131,
+            "excluded_vision_tensors": 333,
+            "excluded_mtp_tensors": 31,
+        },
+        excluded_namespaces={
+            "model.visual": "vision tower tensors are not part of the text runtime",
+            "mtp": "multi-token-prediction layers are postponed",
+        },
+        role_quant={},
+        quantization={"status": "unassigned", "reference_storage": "source_bf16"},
+        structural_passthrough=[
+            "gr.final.hc_norm", "gr.attention.hc_norm", "gr.mlp.hc_norm",
+            "gdn.A_log", "gdn.conv1d", "gdn.dt_bias", "gdn.norm",
+            "qsa.q_norm", "qsa.k_norm", "qsa.indexer.q_layernorm",
+            "qsa.indexer.k_layernorm", "ple.conv1d", "ple.norm_key",
+            "ple.norm_query", "ple.norm_conv",
+        ],
+        transforms=[
+            {"name": "expert_fused_gate_up", "source": "mlp.experts.gate_up_proj",
+             "note": "the released source stores routed gate and up projections together"},
+            {"name": "ple_provider_boundary", "source": "layers.1.ple.ple_embedding.*",
+             "note": "three metadata tensors and 128 tables remain provider-owned"},
+        ],
+        layer_kinds=layer_kinds,
+        router={"top_k_present": True, "experts_per_layer_stacked": True,
+                "experts_per_layer": 512, "experts_per_token": 10},
+        ple={"layer_index": 1, "ngram_size": 3, "physical_table_shards": 128},
+        tokenizer={"required": True},
+        cache_policy={"kind": "qwen4_hybrid_reference", "gdn_state": "fixed",
+                      "qsa_kv": "growing"},
+    )
+
+
 DEEPSEEK_V4_FLASH_COMPRESS_RATIOS = (
     [0, 0] + [v for _ in range(20) for v in (4, 128)] + [4, 0]
 )
@@ -221,7 +275,7 @@ def deepseek_v4_flash_profile() -> dict:
             "mtp": "multi-token-prediction draft layers; base text packages exclude them",
         },
         role_quant={
-            "moe.expert": "tq",
+            "moe.expert": "routed_expert",
             "attn.wq_a": "affine", "attn.wq_b": "affine",
             "attn.wkv": "affine", "attn.wo_a": "affine", "attn.wo_b": "affine",
             "attn.indexer.wq_b": "affine",
@@ -327,6 +381,7 @@ PROFILES = {
     "deepseek_v4_flash": deepseek_v4_flash_profile,
     "qwen3_5_dense": qwen3_5_dense_profile,
     "qwen3_5_moe": qwen3_5_moe_profile,
+    "qwen4_exp": qwen4_exp_profile,
     "synthetic_dense": synthetic_profile,
 }
 
@@ -339,6 +394,8 @@ _FAMILY_ALIASES = {
     "qwen3_5_moe": "qwen3_5_moe",
     "qwen3_5_moe_text": "qwen3_5_moe",
     "qwen3_5_dense": "qwen3_5_dense",
+    "qwen4_exp": "qwen4_exp",
+    "qwen4_exp_text": "qwen4_exp",
     "synthetic_dense": "synthetic_dense",
 }
 
@@ -358,6 +415,11 @@ def family_of(config: dict) -> str | None:
 
     if mt == "deepseek_v4" or text_mt == "deepseek_v4":
         return "deepseek_v4_flash"
+
+    if mt in {"qwen4_exp", "qwen4_exp_text"}:
+        return "qwen4_exp"
+    if text_mt in {"qwen4_exp", "qwen4_exp_text"}:
+        return "qwen4_exp"
 
     # MoE tokens are explicit and win before the dense qwen3_5 wrapper branch.
     if mt in {"qwen3_moe", "qwen3_5_moe", "qwen3_5_moe_text"}:

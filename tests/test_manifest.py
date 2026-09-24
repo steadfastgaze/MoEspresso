@@ -13,8 +13,8 @@ import hashlib
 
 from moespresso.core.artifact import compute_artifact_id, make_artifact, validate_base
 from moespresso.inventory.architecture_profile import DEEPSEEK_V4_FLASH_COMPRESS_RATIOS
-from moespresso.optimize.allocate import AFFINE_BITS, EXPERT_BITS
-from moespresso.optimize.decide import decide
+from package_fixtures import AFFINE_BITS, EXPERT_BITS
+from package_fixtures import synthetic_decision
 from moespresso.package.manifest import build_package_manifest, file_identity, located_key
 from moespresso.package.plan import package_plan_from_decision
 
@@ -100,7 +100,7 @@ def _decision():
         _expert_unit("model.language_model.layers.0.mlp.experts.gate_up_proj", 0, "gate"),
         _expert_unit("model.language_model.layers.0.mlp.experts.gate_up_proj", 0, "up"),
     ]
-    return _plan(decide(_evidence(units), target_quality=0.5))
+    return _plan(synthetic_decision(_evidence(units)))
 
 
 def _mxfp4_decision():
@@ -164,7 +164,7 @@ def _calibrated_decision():
         required_features=["calibration"],
         units=units,
     )
-    return _plan(decide(ev, target_quality=0.5))
+    return _plan(synthetic_decision(ev))
 
 
 def _dense_decision():
@@ -176,7 +176,7 @@ def _dense_decision():
         _affine_unit("model.language_model.layers.3.self_attn.q_proj.weight",
                      "attn.q_proj", layer_index=3),
     ]
-    return _plan(decide(_evidence(units), target_quality=0.5))
+    return _plan(synthetic_decision(_evidence(units)))
 
 
 def _dense_mxfp8_decision():
@@ -216,9 +216,29 @@ def test_manifest_is_a_valid_artifact(tmp_path):
     assert man["status"] == "valid"
 
 
+def test_qwen4_manifest_materializes_released_ple_seed_default(tmp_path):
+    arch = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "num_hidden_layers": 2,
+            "hidden_size": 2560,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "layer_types": ["linear_attention", "linear_attention"],
+            "ple_layer_ids": [2],
+        },
+    }
+
+    dec = _decision()
+    manifest = build_package_manifest(dec, arch, _located(dec), _files(tmp_path))
+
+    assert manifest["architecture"]["config"]["seed"] == 1234
+
+
 def _entry_key(t):
     """Expert entries share a source_name (fused gate_up) -> qualify by projection."""
-    return f"{t['source_name']}::{t['projection']}" if t["format"] == "tq" else t["source_name"]
+    return f"{t['source_name']}::{t['projection']}" if t["kind"] == "expert" else t["source_name"]
 
 
 def test_every_allocation_becomes_a_tensor_entry_with_right_format(tmp_path):
@@ -231,11 +251,11 @@ def test_every_allocation_becomes_a_tensor_entry_with_right_format(tmp_path):
     fmt = {_entry_key(t): t["format"] for t in man["tensors"]}
     assert fmt["model.language_model.layers.1.self_attn.q_proj.weight"] == "affine"
     assert fmt["model.language_model.layers.0.mlp.gate.weight"] == "fp16"
-    assert fmt["model.language_model.layers.0.mlp.experts.gate_up_proj::gate"] == "tq"
-    assert fmt["model.language_model.layers.0.mlp.experts.gate_up_proj::up"] == "tq"
-    # tq entries carry version + seed; affine carries group_size.
+    assert fmt["model.language_model.layers.0.mlp.experts.gate_up_proj::gate"] == "mxfp4"
+    assert fmt["model.language_model.layers.0.mlp.experts.gate_up_proj::up"] == "mxfp4"
+    # MXFP4 entries carry scale geometry; affine entries carry group_size.
     g = by_key["model.language_model.layers.0.mlp.experts.gate_up_proj::gate"]
-    assert g["format_params"]["tq_version"] == 1 and "seed" in g["format_params"]
+    assert g["format_params"]["group_size"] == 32 and g["format_params"]["scale_dtype"] == "ue8m0"
     q = by_key["model.language_model.layers.1.self_attn.q_proj.weight"]
     assert "group_size" in q["format_params"]
 
@@ -290,6 +310,102 @@ def test_f32_passthrough_tensors_keep_declared_format(tmp_path):
     assert man["status"] == "valid"
 
 
+def test_manifest_preserves_explicit_module_hydration_paths(tmp_path):
+    dec = _dense_mxfp8_decision()
+    target = next(
+        alloc
+        for alloc in dec["allocation"]
+        if alloc["source_name"].endswith("q_proj.weight")
+    )
+    target["module_path"] = "layers.3.mixer.module.q_proj"
+    target["module_weight_key"] = "layers.3.mixer.module.q_proj.weight"
+
+    nm = "released.structural.weight"
+    passthrough = [{
+        "source_name": nm,
+        "role": "norm.input_layernorm",
+        "kind": "passthrough",
+        "layer_index": 3,
+        "module_path": "layers.3.mixer.module.q_norm",
+    }]
+    pt_located = {
+        nm: {
+            "shard": "model-00001-of-00001.safetensors",
+            "key_prefix": nm,
+        }
+    }
+
+    man = build_package_manifest(
+        dec,
+        DENSE_ARCH,
+        _located(dec),
+        _files(tmp_path),
+        passthrough=passthrough,
+        passthrough_located=pt_located,
+    )
+    by_name = {entry["source_name"]: entry for entry in man["tensors"]}
+
+    dense = by_name[target["source_name"]]
+    assert dense["module_path"] == "layers.3.mixer.module.q_proj"
+    assert dense["module_weight_key"] == "layers.3.mixer.module.q_proj.weight"
+    structural = by_name[nm]
+    assert structural["module_path"] == "layers.3.mixer.module.q_norm"
+    assert "module_weight_key" not in structural
+
+
+def test_manifest_does_not_derive_missing_module_hydration_paths(tmp_path):
+    dec = _dense_mxfp8_decision()
+
+    man = build_package_manifest(dec, DENSE_ARCH, _located(dec), _files(tmp_path))
+
+    entry = next(t for t in man["tensors"] if t["format"] == "mxfp8")
+    assert "module_path" not in entry
+    assert "module_weight_key" not in entry
+
+
+def test_manifest_binds_ple_provider_to_top_level_file_identities(tmp_path):
+    dec = _dense_mxfp8_decision()
+    files = _files(tmp_path) + [
+        {"path": "ple/rows-000-of-001.bf16", "size_bytes": 4, "sha256": "2" * 64}
+    ]
+    component = {
+        "schema": "qwen4_ple_provider_v1",
+        "shards": [{"path": "ple/rows-000-of-001.bf16"}],
+    }
+
+    manifest = build_package_manifest(
+        dec,
+        DENSE_ARCH,
+        _located(dec),
+        files,
+        ple_provider=component,
+    )
+
+    assert manifest["status"] == "valid"
+    assert manifest["ple_provider"] == component
+
+
+def test_manifest_rejects_unbound_ple_provider_file(tmp_path):
+    dec = _dense_mxfp8_decision()
+
+    manifest = build_package_manifest(
+        dec,
+        DENSE_ARCH,
+        _located(dec),
+        _files(tmp_path),
+        ple_provider={
+            "schema": "qwen4_ple_provider_v1",
+            "shards": [{"path": "ple/missing.bf16"}],
+        },
+    )
+
+    assert manifest["status"] == "invalid"
+    assert any(
+        item["code"] == "package.missing_ple_provider_file"
+        for item in manifest["validation"]
+    )
+
+
 def test_control_tensor_routed_to_fp16_passthrough_fails_closed(tmp_path):
     dec = _decision()
     nm = "layers.2.attn.compressor.ape"
@@ -316,8 +432,7 @@ def test_passthrough_without_location_fails_closed(tmp_path):
 
 
 def test_manifest_declares_our_format_identity(tmp_path):
-    # The package self-identifies as the strict format (mjtq = MoEspresso Jang TurboQuant),
-    # not upstream "jangtq". jang is only the compression codec.
+    # Tensor codecs are declared independently of the package container identifier.
     dec = _decision()
     man = build_package_manifest(dec, ARCH, _located(dec), _files(tmp_path))
     assert man["package_format"] == "mjtq"
@@ -342,7 +457,7 @@ def test_dense_qwen_manifest_declares_dense_family_without_expert_layout(tmp_pat
     assert a["wrapper_model_type"] == "qwen3_5"
     assert a["text_model_type"] == "qwen3_5_text"
     assert a["source_nesting"] == "model.language_model."
-    assert "tq_dequant" not in man["required_ops"]
+    assert "mxfp4_dequant" not in man["required_ops"]
     assert "expert_layout" not in man
 
 
@@ -389,7 +504,7 @@ def test_deepseek_v4_smoke_manifest_clamps_n_routed_experts(tmp_path):
 def test_required_ops_declared(tmp_path):
     dec = _decision()
     man = build_package_manifest(dec, ARCH, _located(dec), _files(tmp_path))
-    assert set(man["required_ops"]) == {"tq_dequant", "affine_dequant", "fp16_passthrough"}
+    assert set(man["required_ops"]) == {"mxfp4_dequant", "affine_dequant", "fp16_passthrough"}
 
 
 def test_mxfp4_expert_manifest_declares_explicit_codec(tmp_path):

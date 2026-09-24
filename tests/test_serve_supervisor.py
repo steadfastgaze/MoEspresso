@@ -13,7 +13,7 @@ def _run_sequence(results, seen):
     remaining = list(results)
 
     def run_worker(argv, *, prog, state):
-        seen.append((list(argv), prog, state))
+        seen.append((list(argv), prog))
         return remaining.pop(0)
 
     return run_worker
@@ -66,11 +66,15 @@ def test_repeated_pre_ready_abort_stops_after_second_attempt():
 def test_does_not_retry_abort_after_readiness():
     seen = []
     run_worker = _run_sequence(
-        [supervisor.WorkerResult(-signal.SIGABRT, True)], seen
+        [
+            supervisor.WorkerResult(-signal.SIGABRT, True),
+        ],
+        seen,
     )
 
     result = supervisor._supervise(
-        ["pkg"], prog="moespresso-serve", run_worker=run_worker
+        ["pkg"], prog="moespresso-serve", run_worker=run_worker,
+        sleep=lambda _: None,
     )
 
     assert result == 128 + signal.SIGABRT
@@ -86,6 +90,40 @@ def test_does_not_retry_ordinary_startup_failure():
     )
 
     assert result == 2
+    assert len(seen) == 1
+
+
+def test_does_not_retry_unrelated_signal_after_readiness():
+    seen = []
+    run_worker = _run_sequence(
+        [supervisor.WorkerResult(-signal.SIGSEGV, True)], seen,
+    )
+
+    result = supervisor._supervise(
+        ["pkg"], prog="moespresso-serve", run_worker=run_worker,
+    )
+
+    assert result == 128 + signal.SIGSEGV
+    assert len(seen) == 1
+
+
+def test_shutdown_during_abort_retry_delay_prevents_new_worker():
+    seen = []
+    holder = {}
+
+    def run_worker(argv, *, prog, state):
+        seen.append((argv, prog))
+        holder["state"] = state
+        return supervisor.WorkerResult(-signal.SIGABRT, False)
+
+    def sleep(_seconds):
+        holder["state"].handle(signal.SIGTERM, None)
+
+    result = supervisor._supervise(
+        ["pkg"], prog="moespresso-serve", run_worker=run_worker, sleep=sleep,
+    )
+
+    assert result == 128 + signal.SIGTERM
     assert len(seen) == 1
 
 

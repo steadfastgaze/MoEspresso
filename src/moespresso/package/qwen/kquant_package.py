@@ -16,10 +16,6 @@ from moespresso.package.kquant_recipe import (
     read_gguf_tensor_types,
     validate_kquant_target_fit,
 )
-from moespresso.package.qwen.expert_allocation import (
-    build_tq_expert_allocations_from_decision,
-    load_expert_allocation_decision,
-)
 from moespresso.package.qwen.recipe import (
     build_dense_kquant_targets,
     build_expert_kquant_targets,
@@ -30,7 +26,7 @@ from moespresso.package.qwen.recipe import (
 from moespresso.package.plan import force_override_preview_lines, parse_force_overrides
 from moespresso.package.write import write_package
 from moespresso.probe.calibration import imatrix_calibration
-from moespresso.package.convert import _layer_types, _read_config
+from moespresso.package.source import _layer_types, _read_config
 from moespresso.package.constants import MANIFEST_NAME
 
 KQUANT_RECIPE_REPORT_NAME = "qwen_kquant_recipe_report.json"
@@ -122,12 +118,9 @@ def _validate_targets_against_source(
 def _expert_byte_source(
     *,
     copy_gguf_expert_bytes: bool,
-    expert_decision_id: str | None,
     gguf_recipe_path,
 ) -> dict:
     """Describe where the package's routed-expert content came from."""
-    if expert_decision_id is not None:
-        return {"mode": "optimizer_decision_tq", "decision_id": expert_decision_id}
     if copy_gguf_expert_bytes:
         return {"mode": "gguf_bytes", "name": Path(gguf_recipe_path).name}
     return {"mode": "source_reencode", "name": None}
@@ -220,7 +213,6 @@ def build_qwen_kquant_package(
     kquant_cache_dir: str | Path | None = None,
     kquant_encoder=None,
     copy_gguf_expert_bytes: bool = False,
-    expert_allocation_from: str | Path | None = None,
     source_identity: str | None = None,
     optimized_kernels_expected: bool = False,
     force_format: list[str] | tuple[str, ...] | None = None,
@@ -228,43 +220,19 @@ def build_qwen_kquant_package(
     force_format_dry_run: bool = False,
     verbose: bool = False,
 ) -> dict:
-    """Build a Qwen package from a GGUF K-quant recipe.
-
-    With `expert_allocation_from` set to an `optimizer_decision` artifact (or the
-    package directory that contains one), the routed-expert rows come from that
-    TurboQuant decision while the dense/backbone tensors keep the recipe's
-    imatrix-calibrated K-quant encode. This is the hybrid arm: K-quant-calibrated
-    dense plus TQ experts. Copying GGUF expert bytes cannot be combined with it
-    (K-quant wire bytes are not a TQ allocation).
-
-    """
+    """Build a Qwen package from a calibrated GGUF K-quant recipe."""
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if copy_gguf_expert_bytes and _is_remote_ref(gguf_recipe_path):
         raise KQuantRecipeError(
             "copying GGUF expert bytes requires a local GGUF file")
-    if copy_gguf_expert_bytes and expert_allocation_from is not None:
-        raise KQuantRecipeError(
-            "--copy-gguf-expert-bytes cannot be combined with "
-            "--expert-allocation-from: GGUF K-quant wire bytes are not a "
-            "TurboQuant expert allocation")
     def log(message: str) -> None:
         if verbose:
             print(message, flush=True)
 
     log("[1/5] source, recipe, and imatrix preflight")
     parts = _recipe_parts(model_dir, gguf_recipe_path, imatrix_path)
-    expert_allocations = None
-    expert_decision_id = None
-    if expert_allocation_from is not None:
-        decision = load_expert_allocation_decision(expert_allocation_from)
-        expert_decision_id = decision.get("artifact_id")
-        expert_allocations = build_tq_expert_allocations_from_decision(
-            decision, parts["inventory"])
-        log(
-            f"[1/5] routed experts from optimizer_decision {expert_decision_id} "
-            f"({len(expert_allocations)} TQ groups); dense stays recipe K-quant")
     package_plan = build_kquant_plan(
         _package_subject(parts["inventory"], source_identity),
         parts["expert_targets"],
@@ -275,8 +243,6 @@ def build_qwen_kquant_package(
         force_overrides=parse_force_overrides(force_format),
         allow_unmatched_force=allow_unmatched_force,
         dry_run=force_format_dry_run,
-        expert_allocations=expert_allocations,
-        source_decision_id=expert_decision_id,
     )
     if package_plan["status"] != "valid":
         blocking = [
@@ -328,7 +294,6 @@ def build_qwen_kquant_package(
 
         kquant_expert_loader = _load_gguf_expert_bytes
     write_kwargs = {
-        "seed": seed,
         "shard_size_gb": shard_size_gb,
         "passthrough": parts["passthrough"],
         "tokenizer": tokenizer,
@@ -361,8 +326,8 @@ def build_qwen_kquant_package(
     (out_dir / "config.json").write_text(json.dumps(config_json, indent=2))
     (out_dir / "jang_config.json").write_text(json.dumps(jang_config, indent=2))
 
-    # Cold-start expert hotlist from the imatrix routing counts: serve seeds
-    # residency from it when no saved-demand hotlist exists. Alignment
+    # Cold-start expert hotlist from the imatrix routing counts: seed package
+    # residency from it before live request demand adapts the pools. Alignment
     # failures skip the artifact with a loud warning: a wrong hotlist would
     # silently seed the wrong layers; no hotlist just means a colder start.
     from moespresso.package.hotlist import (
@@ -383,13 +348,8 @@ def build_qwen_kquant_package(
             log(f"  expert hotlist: {hotlist_layers} layer(s) from imatrix "
                 f"routing counts")
 
-    achieved = package_plan.get("achieved", {})
-    if expert_allocations is not None:
-        expert_target_count = len(expert_allocations)
-        expert_codec_counts = achieved.get("expert_tq_bit_counts")
-    else:
-        expert_target_count = len(parts["expert_targets"])
-        expert_codec_counts = _codec_counts(parts["expert_targets"])
+    expert_target_count = len(parts["expert_targets"])
+    expert_codec_counts = _codec_counts(parts["expert_targets"])
     report = {
         "status": "valid",
         "manifest_id": manifest["artifact_id"],
@@ -400,7 +360,6 @@ def build_qwen_kquant_package(
             "expert_codec_counts": expert_codec_counts,
             "expert_byte_source": _expert_byte_source(
                 copy_gguf_expert_bytes=copy_gguf_expert_bytes,
-                expert_decision_id=expert_decision_id,
                 gguf_recipe_path=gguf_recipe_path,
             ),
             "f32_passthrough": len(parts["passthrough"]),
@@ -446,13 +405,6 @@ def main(argv: list[str] | None = None) -> int:
               "the recipe GGUF for routed experts; dense tensors still follow "
               "the normal package recipe path."))
     parser.add_argument(
-        "--expert-allocation-from", default=None, metavar="PATH",
-        help=("Take routed-expert allocations from a TurboQuant optimizer_decision "
-              "artifact (a package directory or an optimizer_decision.json). The "
-              "experts become TQ per that decision; dense tensors keep the recipe's "
-              "imatrix-calibrated K-quant. Cannot be combined with "
-              "--copy-gguf-expert-bytes."))
-    parser.add_argument(
         "--source-identity", default=None, metavar="IDENTITY",
         help=("Stable source model identity recorded in the package, for example "
               "org/model@revision. Defaults to the source directory name."))
@@ -461,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force-format", action="append", default=[],
                         metavar="PATTERN=FORMAT",
                         help="Force matched package-plan rows to a format such as "
-                             "tq2, tq4, mxfp4, mxfp8, affine4, or kquant:q2_k.")
+                             "mxfp4, mxfp8, affine4, or kquant:q2_k.")
     parser.add_argument("--allow-unmatched-force", action="store_true")
     parser.add_argument("--force-format-dry-run", action="store_true",
                         help="Write package_plan/report and exit before encoding.")
@@ -499,7 +451,6 @@ def main(argv: list[str] | None = None) -> int:
             max_experts=max_experts,
             kquant_cache_dir=args.kquant_cache_dir,
             copy_gguf_expert_bytes=args.copy_gguf_expert_bytes,
-            expert_allocation_from=args.expert_allocation_from,
             source_identity=args.source_identity,
             optimized_kernels_expected=args.optimized_kernels_expected,
             force_format=args.force_format,

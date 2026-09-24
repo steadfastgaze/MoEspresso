@@ -154,13 +154,7 @@ def _decode_cache(conv_state, recurrent_state):
     return result
 
 
-@pytest.mark.parametrize("rms_scale_fused", [False, True])
-def test_full_fused_decode_matches_stock_output_and_both_cache_members(
-    monkeypatch,
-    rms_scale_fused,
-):
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
-    monkeypatch.setattr(gd, "_QWEN_GDN_RMS_SCALE_FUSED", rms_scale_fused)
+def test_full_fused_decode_matches_stock_output_and_both_cache_members():
     inner, input_key, state_key = _served_inner()
     wrapped = FusedDecodeGatedDeltaNet(inner)
     wrapped.eval()
@@ -190,15 +184,13 @@ def test_full_fused_decode_matches_stock_output_and_both_cache_members(
     )
 
     assert wrapped.fused_calls == 1
-    assert wrapped.rms_scale_fused_calls == int(rms_scale_fused)
+    assert wrapped.rms_scale_fused_calls == 1
     assert _bitwise_equal(fused_output, stock_output)
     assert _bitwise_equal(fused_cache[0], stock_cache[0])
     assert _bitwise_equal(fused_cache[1], stock_cache[1])
 
 
-def test_consecutive_decode_reuses_lazy_cache_bit_identically(monkeypatch):
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
-    monkeypatch.setattr(gd, "_QWEN_GDN_RMS_SCALE_FUSED", False)
+def test_consecutive_decode_reuses_lazy_cache_bit_identically():
     inner, input_key, state_key = _served_inner(seed=601)
     wrapped = FusedDecodeGatedDeltaNet(inner)
     wrapped.eval()
@@ -235,8 +227,7 @@ def test_consecutive_decode_reuses_lazy_cache_bit_identically(monkeypatch):
     assert wrapped.fused_calls == 3
 
 
-def test_prefill_and_masked_calls_delegate_to_inner(monkeypatch):
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
+def test_prefill_and_masked_calls_delegate_to_inner():
     inner = _EchoInner()
     inner.eval()
     wrapped = FusedDecodeGatedDeltaNet(inner)
@@ -252,8 +243,7 @@ def test_prefill_and_masked_calls_delegate_to_inner(monkeypatch):
     assert inner.calls == 2
 
 
-def test_lengths_cache_delegates_without_advancing_in_wrapper(monkeypatch):
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
+def test_lengths_cache_delegates_without_advancing_in_wrapper():
     inner = _EchoInner()
     inner.eval()
     wrapped = FusedDecodeGatedDeltaNet(inner)
@@ -274,11 +264,6 @@ def _model_with_linear_layers(modules):
 
 def test_install_is_guarded_and_idempotent(monkeypatch):
     model = _model_with_linear_layers([_EchoInner(), _EchoInner()])
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", False)
-    assert install_fused_gdn_decode(model) == 0
-    assert isinstance(model.layers[0].linear_attn, _EchoInner)
-
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
     monkeypatch.setattr(gd, "_kernel_available", lambda: True)
     assert install_fused_gdn_decode(model) == 2
     assert isinstance(model.layers[0].linear_attn, FusedDecodeGatedDeltaNet)
@@ -288,7 +273,6 @@ def test_install_is_guarded_and_idempotent(monkeypatch):
 
 def test_install_rejects_uncertified_mlx_lm(monkeypatch):
     model = _model_with_linear_layers([_EchoInner()])
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
     monkeypatch.setattr(gd, "_MLX_LM_VERSION", "99.0.0")
     monkeypatch.setattr(gd, "_kernel_available", lambda: True)
     assert install_fused_gdn_decode(model) == 0
@@ -296,7 +280,6 @@ def test_install_rejects_uncertified_mlx_lm(monkeypatch):
 
 
 def test_stats_aggregate_all_wrapped_layers(monkeypatch):
-    monkeypatch.setattr(gd, "_QWEN_GDN_CONV_STATE_FUSED", True)
     monkeypatch.setattr(gd, "_kernel_available", lambda: True)
     model = _model_with_linear_layers([_EchoInner(), _EchoInner()])
     install_fused_gdn_decode(model)

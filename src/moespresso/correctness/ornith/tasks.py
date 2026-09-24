@@ -41,7 +41,6 @@ LONG_CONTEXT_SOURCES = (
     "src/moespresso/runtime/build.py",
     "src/moespresso/runtime/kv_policy.py",
     "src/moespresso/runtime/generation.py",
-    "src/moespresso/correctness/gate.py",
     "src/moespresso/correctness/ladder.py",
     "src/moespresso/correctness/reconstruct.py",
     "src/moespresso/core/artifact.py",

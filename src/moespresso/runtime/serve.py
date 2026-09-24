@@ -4,7 +4,7 @@ The model is built by the strict manifest-driven backend (runtime/build): the
 graph is instantiated from the manifest's architecture and packed weights are
 installed into the declared quantized modules. Generated config sidecars are
 compatibility views. The manifest remains the package source of truth and the
-runtime never performs source-model archaeology.
+runtime does not inspect source-model conventions.
 
 The engine does not repeat whole-package verification on load. Run
 `moespresso verify` after a build, download, copy, or move; the expensive
@@ -33,7 +33,19 @@ from pathlib import Path
 from moespresso.core.artifact import ArtifactError, read_artifact
 from moespresso.package.constants import MANIFEST_NAME
 from moespresso.runtime.generation import GenerationResult
+from moespresso.runtime.pooled_moe import pooled_generation_scope
 from moespresso.runtime.kv_policy import KVPolicy, stream_generate_kv_kwargs, validate_runtime_policy
+from moespresso.runtime.qwen4.cache_routing_config import (
+    CACHE_ROUTING_POLICIES,
+    DEFAULT_CACHE_FACTOR,
+    MAX_CACHE_FACTOR,
+    DEFAULT_PROTECTED_ROUTES,
+    MAX_PROTECTED_ROUTES,
+    MIN_CACHE_FACTOR,
+    MIN_PROTECTED_ROUTES,
+    CacheRoutingConfig,
+    resolve_cache_routing,
+)
 from moespresso.runtime.verify import verify_generated_sidecars, verify_package
 
 
@@ -110,7 +122,7 @@ def _preflight_manifest_for_cli(package_dir: Path) -> dict | None:
 def _uses_ssd_streaming_runtime(manifest: dict) -> bool:
     from moespresso.runtime.build import _runtime_adapter_kind
 
-    return _runtime_adapter_kind(manifest) in {"jangtq_moe", "qwen_kquant_moe"}
+    return _runtime_adapter_kind(manifest) == "qwen_kquant_moe"
 
 
 def build_manifest_runtime(
@@ -121,6 +133,9 @@ def build_manifest_runtime(
     streaming_builder: Callable[[Path], tuple] | None = None,
     context_limit: int | None = None,
     context_limit_explicit: bool = False,
+    cache_routing: str = "auto",
+    cache_routing_factor: float | None = None,
+    cache_routing_protected_routes: int | None = None,
 ):
     """Build the runtime declared by the manifest.
 
@@ -129,6 +144,10 @@ def build_manifest_runtime(
     stream.
     """
     package_dir = Path(package_dir)
+    routing = validate_cache_routing_option(
+        manifest, cache_routing, factor=cache_routing_factor,
+        protected_routes=cache_routing_protected_routes,
+    )
     if _uses_ssd_streaming_runtime(manifest):
         if streaming_builder is None:
             from moespresso.runtime.ssd_streaming_build import build_ssd_streaming_model
@@ -145,8 +164,12 @@ def build_manifest_runtime(
             package_dir,
             context_limit=context_limit,
             context_limit_explicit=context_limit_explicit,
+            **routing.load_options(include_off=True),
         )
-    return resident_builder(manifest, package_dir)
+    return resident_builder(
+        manifest, package_dir,
+        **routing.load_options(),
+    )
 
 
 def _manifest_driven_backend(
@@ -155,19 +178,20 @@ def _manifest_driven_backend(
     *,
     context_limit: int | None = None,
     context_limit_explicit: bool = False,
+    cache_routing: str = "auto",
+    cache_routing_factor: float | None = None,
+    cache_routing_protected_routes: int | None = None,
 ):
-    """The mjtq backend: build via the proven jang loader (runtime.build).
-
-    The package carries jang-compatible sidecars (config.json/jang_config.json)
-    generated from the manifest; build_model feeds them to jang's load_jangtq_model
-    (TQ experts -> metal-kernel modules, affine -> mlx QuantizedLinear, per-tensor
-    bits via tensor_map): no dequant at load. Returns (model, tokenizer); the
-    tokenizer is loaded from the package by mlx_lm."""
+    """Build the manifest-selected model adapter and package tokenizer."""
     return build_manifest_runtime(
         manifest,
         package_dir,
         context_limit=context_limit,
         context_limit_explicit=context_limit_explicit,
+        **resolve_cache_routing(
+            cache_routing, factor=cache_routing_factor,
+            protected_routes=cache_routing_protected_routes,
+        ).load_options(include_off=True),
     )
 
 
@@ -231,19 +255,18 @@ def _installed_mlx_version() -> str | None:
         return None
 
 
-_ORNITH_COMMAND_BUFFER_MLX_VERSION = "0.31.2"
-# Ornith routed-MoE runtimes the limit is measured on. The TQ streaming route
-# is unmeasured here and stays on the MLX default.
+_COMMAND_BUFFER_MLX_VERSION = "0.31.2"
+# Apply the command-buffer limit only to the compatible Qwen K-quant adapter.
 _ORNITH_COMMAND_BUFFER_ADAPTERS = frozenset({"qwen_kquant_moe"})
 
 
 def _ornith_command_buffer_package(manifest: dict) -> bool:
-    """Whether the manifest serves an Ornith runtime the limit was measured on.
+    """Whether the manifest selects an Ornith runtime compatible with the limit.
 
     The predicate is the served shape, not a package identity: the Qwen MoE
-    family, a non-smoke expert count, and a routed adapter from the measured
-    set. Rebuilds of the public package therefore keep the tuning, and
-    unmeasured runtimes never acquire it.
+    family, a non-smoke expert count, and a routed adapter from the compatible
+    set. Rebuilds with the same served shape retain the limit; other runtimes
+    leave it unset.
     """
     architecture = manifest.get("architecture", {})
     if architecture.get("family") != "qwen3_5_moe":
@@ -271,18 +294,14 @@ def default_ornith_mlx_command_buffer_limit(
     generation: int | None = None,
     total_memory_bytes: int | None = None,
 ) -> str | None:
-    """Set the measured Ornith MLX command-buffer element limit before load.
+    """Set the Ornith MLX command-buffer element limit before load.
 
-    MLX 0.31.2 counts array elements for ``MLX_MAX_MB_PER_BUFFER`` even though
-    the variable name refers to bytes. The measured Ornith Q4_K_M routed
-    gate/up pool is exactly 288 Mi-elements. That limit keeps gate/up and down
-    in one command buffer while retaining a bounded commit after the pair.
-
-    The public Ornith package takes it. On the K-quant package it adds roughly
-    5 GiB to the 37K decode peak.
-    Hosts below 64 GiB keep MLX's smaller default. An explicit MLX setting
-    always wins. Other families and MLX versions remain unchanged until
-    measured.
+    MLX 0.31.2 interprets ``MLX_MAX_MB_PER_BUFFER`` as an element count despite
+    the variable name. The selected limit keeps the routed gate/up and down
+    operations in one command buffer with a bounded commit after the pair.
+    It applies to the compatible M3 package shape when the reported memory is
+    at least 64 GiB. An explicit MLX setting takes precedence. Other package
+    shapes and MLX versions leave the setting unchanged.
     """
     if "MLX_MAX_MB_PER_BUFFER" in os.environ:
         return None
@@ -303,12 +322,12 @@ def default_ornith_mlx_command_buffer_limit(
         return None
 
     mlx_version = _installed_mlx_version()
-    if mlx_version != _ORNITH_COMMAND_BUFFER_MLX_VERSION:
+    if mlx_version != _COMMAND_BUFFER_MLX_VERSION:
         detected_version = mlx_version or "unavailable"
         print(
             f"[serve] Ornith decode: command-buffer tuning was not applied "
             f"because the installed MLX version ({detected_version}) is not the measured "
-            f"version {_ORNITH_COMMAND_BUFFER_MLX_VERSION}. Set "
+            f"version {_COMMAND_BUFFER_MLX_VERSION}. Set "
             "MLX_MAX_MB_PER_BUFFER=288 at process launch to opt in.",
             flush=True,
         )
@@ -333,6 +352,34 @@ def default_ornith_mlx_command_buffer_limit(
     return limit
 
 
+def default_qwen4_mlx_command_buffer_limits(manifest: dict) -> dict[str, str]:
+    """Apply Qwen submission defaults before MLX initializes its device."""
+    if manifest.get("architecture", {}).get("family") not in ("qwen4_exp", "qwen4_exp_text"):
+        return {}
+    defaults = {"MLX_MAX_OPS_PER_BUFFER": "50", "MLX_MAX_MB_PER_BUFFER": "200"}
+    missing = {name: value for name, value in defaults.items() if name not in os.environ}
+    if not missing:
+        return {}
+    if _installed_mlx_version() != _COMMAND_BUFFER_MLX_VERSION:
+        print(
+            "[serve] Qwen4 submission defaults were not applied: "
+            f"they require MLX {_COMMAND_BUFFER_MLX_VERSION}.",
+            flush=True,
+        )
+        return {}
+    if _mlx_core_already_imported():
+        print(
+            "[serve] Qwen4 submission defaults were not applied: MLX is already imported. "
+            "Set MLX_MAX_OPS_PER_BUFFER=50 and MLX_MAX_MB_PER_BUFFER=200 before startup.",
+            flush=True,
+        )
+        return {}
+    os.environ.update(missing)
+    resolved = ", ".join(f"{name}={os.environ[name]}" for name in defaults)
+    print(f"[serve] Qwen4 submission: {resolved}. Explicit environment settings take precedence.", flush=True)
+    return missing
+
+
 def load_served_model(
     package_dir: Path,
     *,
@@ -340,6 +387,9 @@ def load_served_model(
     build_fn: Callable[[dict, Path], tuple] = _manifest_driven_backend,
     drafter: Path | None = None,
     max_context_tokens: int | None = None,
+    cache_routing: str = "auto",
+    cache_routing_factor: float | None = None,
+    cache_routing_protected_routes: int | None = None,
 ):
     """Build (model, tokenizer, manifest) from a mjtq package.
 
@@ -366,7 +416,12 @@ def load_served_model(
                 f"{MANIFEST_NAME}")
         manifest = read_artifact(manifest_path)
 
+    routing_options = validate_cache_routing_option(
+        manifest, cache_routing, factor=cache_routing_factor,
+        protected_routes=cache_routing_protected_routes,
+    ).load_options(include_off=build_fn is _manifest_driven_backend)
     default_ornith_mlx_command_buffer_limit(manifest)
+    default_qwen4_mlx_command_buffer_limits(manifest)
     default_kq_seg_tile_for_hardware()
     if build_fn is _manifest_driven_backend:
         from moespresso.runtime.prefix_cache import effective_context_limit
@@ -380,9 +435,10 @@ def load_served_model(
             package_dir,
             context_limit=context_limit,
             context_limit_explicit=max_context_tokens is not None,
+            **routing_options,
         )
     else:
-        model, tokenizer = build_fn(manifest, package_dir)
+        model, tokenizer = build_fn(manifest, package_dir, **routing_options)
     _install_detokenizer_clone_factory(tokenizer)
     # Speculative-drafter resolution (DeepSeek-V4 packages only; other
     # families resolve to no drafter). An absent or empty
@@ -410,8 +466,7 @@ def load_served_model(
 def _runtime_truth_line(
     model, manifest: dict, *, spec_state: str | None = None,
 ) -> str:
-    """One honest line stating which runtime the user actually got:
-    the user must never guess whether gate/hotlist/capacity/drafter are live."""
+    """Report the active runtime, residency, routing, and drafter settings."""
     spec = f" spec={spec_state}" if spec_state else ""
     capacity = getattr(model, "_moespresso_ssd_streaming_capacity", None)
     if capacity is None:
@@ -447,42 +502,63 @@ def _runtime_truth_line(
             decode_path = "legacy"
     except Exception:
         decode_path = "unknown"
-    lookahead = getattr(model, "_moespresso_ssd_lookahead", None)
     import os as _os_cap
+    budget = getattr(
+        model, "_moespresso_ssd_streaming_capacity_budget", None)
+    resolution = (
+        budget.get("planner_resolution", {})
+        if isinstance(budget, dict)
+        else {}
+    )
+    resolved_bytes = resolution.get("resolved_bytes")
+    limiting_source = resolution.get("limiting_source")
+    wired_source = resolution.get("wired_budget_source")
+    if limiting_source == "automatic-wired-headroom" and wired_source:
+        limiting_source = f"{limiting_source}:{wired_source}"
     cap_note = _os_cap.environ.get("MOESPRESSO_SSD_MAX_MEMORY_GB")
-    cap_note = f" max_memory={cap_note}GB" if cap_note else ""
+    if cap_note:
+        cap_note = f" max_memory={cap_note}GB"
+        if isinstance(resolved_bytes, int) and limiting_source:
+            cap_note += (
+                f" planner_memory={resolved_bytes / (1 << 30):.2f}GB"
+                f" planner_limit_source={limiting_source}"
+            )
+    else:
+        cap_note = (
+            f" auto_memory={resolved_bytes / (1 << 30):.2f}GB"
+            f" planner_limit_source={limiting_source}"
+            if isinstance(resolved_bytes, int) and limiting_source
+            else ""
+        )
+    routing_resolution = getattr(
+        model,
+        "_moespresso_cache_routing_resolution",
+        None,
+    )
+    routing_config = getattr(model, "_cache_routing_config", None)
+    if routing_resolution == "auto-full-resident":
+        routing_note = " cache_routing=auto->off(full-resident)"
+    elif routing_resolution == "auto-bounded" and routing_config is not None:
+        routing_note = (
+            " cache_routing=auto->prefer-resident"
+            f" factor={routing_config.cache_factor:g}"
+            f" protected_routes={routing_config.protected_routes}"
+        )
+    elif routing_resolution == "explicit" and routing_config is not None:
+        routing_note = (
+            f" cache_routing={routing_config.policy}"
+            f" factor={routing_config.cache_factor:g}"
+            f" protected_routes={routing_config.protected_routes}"
+        )
+    elif routing_resolution == "explicit":
+        routing_note = " cache_routing=off"
+    else:
+        routing_note = ""
     return (f"[serve] runtime=ssd-streaming package="
             f"{manifest.get('artifact_id', '?')[:16]} capacity={capacity_label}"
             f"{cap_note}"
             f" hotlist={hot.get('source')} seeded={hot.get('seeded', 0)}"
-            f" decode={decode_path}"
-            f" lookahead={'off' if not lookahead else lookahead}{spec}")
-
-
-_HOTLIST_SAVE_WARNED = [False]
-
-
-def _persist_expert_demand(model) -> None:
-    """Persist per-request expert demand (default-on, kill switch
-    MOESPRESSO_SSD_HOTLIST=0) so the next session warm-starts from the
-    saved-demand tier (~0.60 demand-mass capture vs 0.40 package hotlist vs
-    0.27 arbitrary). A failed save degrades the next cold
-    start, never this request: warn once, don't raise."""
-    import os
-
-    info = getattr(model, "_moespresso_ssd_hotlist", None)
-    if info is None or os.environ.get("MOESPRESSO_SSD_HOTLIST", "1") == "0":
-        return
-    try:
-        from moespresso.runtime.ssd_streaming_build import save_expert_hotlist
-
-        save_expert_hotlist(model, Path(info["save_path"]))
-    except Exception as e:  # noqa: BLE001 - availability over loudness here
-        if not _HOTLIST_SAVE_WARNED[0]:
-            _HOTLIST_SAVE_WARNED[0] = True
-            print(f"[serve] WARNING: expert-demand hotlist save failed "
-                  f"({type(e).__name__}: {e}); next cold start loses the "
-                  f"saved-demand tier", flush=True)
+            f" decode={decode_path}{routing_note}{spec}")
 
 
 def _token_int(token) -> int:
@@ -567,7 +643,7 @@ def _ornith_raw_greedy_eligible(
     presence_penalty: float | None,
     top_logprobs: int | None,
 ) -> bool:
-    """Gate raw argmax to the measured deterministic Ornith request shape."""
+    """Restrict raw argmax to the supported deterministic Ornith request shape."""
     return (
         getattr(model, "model_type", None) == "qwen3_5_moe"
         and temperature == 0.0
@@ -629,6 +705,7 @@ def prefill_prompt_cache_chunks(
     return consumed
 
 
+@pooled_generation_scope
 def generate_with_metadata(
     model,
     tokenizer,
@@ -656,7 +733,6 @@ def generate_with_metadata(
     spec_prefill_plan: list[int] | None = None,
     spec_prefill_progress_callback: Callable[[object], None] | None = None,
     spec_prefill_progress_frontiers: list[int] | None = None,
-    persist_expert_demand: bool = True,
     stream_generate_fn: Callable | None = None,
     raw_greedy_stream_fn: Callable | None = None,
     sampler_factory: Callable | None = None,
@@ -694,6 +770,55 @@ def generate_with_metadata(
     ``prompt_tokens`` and the progress callback both count the whole prompt,
     so the accounting is identical with and without a plan.
     """
+    from moespresso.runtime.qwen4.generation import (
+        generate_qwen4_with_metadata,
+        is_qwen4_generation_model,
+    )
+
+    if is_qwen4_generation_model(model):
+        unsupported = {
+            "prefill_plan": prefill_plan,
+            "spec_continuation_ready_callback": spec_continuation_ready_callback,
+            "spec_continuation": spec_continuation,
+            "spec_prefill_plan": spec_prefill_plan,
+            "spec_prefill_progress_callback": spec_prefill_progress_callback,
+            "spec_prefill_progress_frontiers": spec_prefill_progress_frontiers,
+            "stream_generate_fn": stream_generate_fn,
+            "raw_greedy_stream_fn": raw_greedy_stream_fn,
+            "prefill_chunks_fn": prefill_chunks_fn,
+        }
+        requested = sorted(
+            name for name, value in unsupported.items() if value is not None
+        )
+        if requested:
+            raise ValueError(
+                "Qwen4 composite generation does not support: "
+                + ", ".join(requested)
+            )
+        return generate_qwen4_with_metadata(
+            model,
+            tokenizer,
+            prompt,
+            prompt_cache=prompt_cache,
+            cached_tokens=cached_tokens,
+            kv_policy=kv_policy,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            presence_context_size=presence_context_size,
+            top_logprobs=top_logprobs,
+            prefill_step_size=prefill_step_size,
+            prompt_progress_callback=prompt_progress_callback,
+            response_callback=response_callback,
+            response_stop_callback=response_stop_callback,
+            first_token_callback=first_token_callback,
+            sampler_factory=sampler_factory,
+            logits_processors_factory=logits_processors_factory,
+        )
+
     kv_kwargs = {}
     if kv_policy is not None:
         validate_runtime_policy(kv_policy)
@@ -830,8 +955,6 @@ def generate_with_metadata(
                 continuation_ready_callback=spec_continuation_ready_callback,
                 continuation=spec_continuation,
             )
-            if persist_expert_demand:
-                _persist_expert_demand(model)
             return result
 
     if spec_continuation is not None or spec_prefill_requested:
@@ -943,9 +1066,6 @@ def generate_with_metadata(
 
     generation_seconds = time.perf_counter() - t_start
 
-    if persist_expert_demand:
-        _persist_expert_demand(model)
-
     if last is None:
         prompt_tokens = (
             len(prompt) + plan_consumed if not isinstance(prompt, str) else None)
@@ -1017,6 +1137,9 @@ def _generation_json_payload(
     top_p: float,
     thinking: str | None,
     result: GenerationResult,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    presence_penalty: float | None = None,
 ) -> dict:
     return {
         "artifact_kind": "generation_smoke",
@@ -1029,6 +1152,9 @@ def _generation_json_payload(
             "max_tokens": int(max_tokens),
             "temperature": float(temperature),
             "top_p": float(top_p),
+            "top_k": int(top_k),
+            "min_p": float(min_p),
+            "presence_penalty": presence_penalty,
             "thinking": thinking,
         },
         "text": result.text,
@@ -1046,6 +1172,43 @@ def _generation_json_payload(
         "generation_seconds": result.generation_seconds,
         "speculative": result.speculative,
     }
+
+
+def add_cache_routing_argument(parser) -> None:
+    parser.add_argument(
+        "--cache-routing", choices=CACHE_ROUTING_POLICIES, default="auto",
+        help="Qwen4 defaults to factor-two cache-biased routing with two protected "
+             "routes when expert residency is bounded; full residency stays unbiased. "
+             "prefer-resident and off are explicit overrides.",
+    )
+    parser.add_argument(
+        "--cache-routing-factor", type=float, default=None,
+        help=f"Finite resident-expert selection multiplier from {MIN_CACHE_FACTOR:g} "
+             f"to {MAX_CACHE_FACTOR:g} "
+             f"(default: {DEFAULT_CACHE_FACTOR:g}); "
+             f"{MIN_CACHE_FACTOR:g} applies no bias. Requires --cache-routing prefer-resident.",
+    )
+    parser.add_argument(
+        "--cache-routing-protected-routes", type=int, default=None,
+        choices=range(MIN_PROTECTED_ROUTES, MAX_PROTECTED_ROUTES + 1),
+        help="Number of strongest original routes retained in the selected ten "
+             f"(default: {DEFAULT_PROTECTED_ROUTES}); zero allows every route to change. "
+             "Requires --cache-routing prefer-resident.",
+    )
+
+
+def validate_cache_routing_option(
+    manifest, policy, *, factor=None, protected_routes=None,
+) -> CacheRoutingConfig:
+    config = resolve_cache_routing(policy, factor=factor, protected_routes=protected_routes)
+    qwen4 = manifest.get("architecture", {}).get("family") in (
+        "qwen4_exp", "qwen4_exp_text",
+    )
+    if config.enabled and not qwen4:
+        raise ValueError("--cache-routing requires the Qwen4 full512 pooled adapter")
+    if config.policy == "auto" and not qwen4:
+        return resolve_cache_routing("off")
+    return config
 
 
 def add_runtime_limit_arguments(parser) -> None:
@@ -1106,10 +1269,29 @@ def main(
                              "ceiling (GB). This selects expert-pool geometry and "
                              "can simulate a smaller pool; it is not an RSS cap.")
     add_runtime_limit_arguments(parser)
+    add_cache_routing_argument(parser)
     parser.add_argument("--prompt", default="Hello", help="Prompt to generate from")
     parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--temperature", type=float, default=None,
+        help="Sampling temperature. Default: the package generation contract, "
+             "or 0.7 when the package declares none.")
+    parser.add_argument(
+        "--top-p", type=float, default=None,
+        help="Nucleus sampling probability. Default: the package generation "
+             "contract, or 1.0 when the package declares none.")
+    parser.add_argument(
+        "--top-k", type=int, default=None,
+        help="Top-k sampling width. Default: the package generation contract, "
+             "or 0 when the package declares none.")
+    parser.add_argument(
+        "--min-p", type=float, default=None,
+        help="Minimum relative token probability. Default: the package "
+             "generation contract, or 0.0 when the package declares none.")
+    parser.add_argument(
+        "--presence-penalty", type=float, default=None,
+        help="Penalty applied to recently seen tokens. Default: the package "
+             "generation contract, or neutral when the package declares none.")
     parser.add_argument("--thinking", choices=("off", "on", "high", "max"),
                         default=None,
                         help="Select the package's thinking mode: off, on "
@@ -1127,6 +1309,18 @@ def main(
 
     pkg = Path(args.package_dir)
     preflight_manifest = _preflight_manifest_for_cli(pkg)
+    request_contract = None
+    if preflight_manifest is not None:
+        from moespresso.runtime.http import (
+            PackageRequestContractError,
+            package_request_contract,
+        )
+
+        try:
+            request_contract = package_request_contract(pkg, preflight_manifest)
+        except PackageRequestContractError as e:
+            print(f"FAILED: {e}")
+            return 2
     context_limit = None
     if preflight_manifest is not None:
         from moespresso.runtime.prefix_cache import effective_context_limit
@@ -1161,26 +1355,28 @@ def main(
     )
 
     try:
-        if preflight_manifest is None:
-            if external_drafter is None:
-                model, tokenizer, manifest = load_served_model(
-                    pkg,
-                    max_context_tokens=args.max_context_tokens,
-                )
-            else:
-                model, tokenizer, manifest = load_served_model(
-                    pkg,
-                    drafter=external_drafter,
-                    max_context_tokens=args.max_context_tokens,
-                )
-        else:
-            load_kwargs = {
-                "manifest": preflight_manifest,
-                "max_context_tokens": args.max_context_tokens,
-            }
-            if external_drafter is not None:
-                load_kwargs["drafter"] = external_drafter
-            model, tokenizer, manifest = load_served_model(pkg, **load_kwargs)
+        load_kwargs = {"max_context_tokens": args.max_context_tokens}
+        routing = resolve_cache_routing(
+            args.cache_routing, factor=args.cache_routing_factor,
+            protected_routes=args.cache_routing_protected_routes,
+        )
+        if preflight_manifest is not None:
+            routing = validate_cache_routing_option(
+                preflight_manifest, args.cache_routing, factor=args.cache_routing_factor,
+                protected_routes=args.cache_routing_protected_routes,
+            )
+            load_kwargs["manifest"] = preflight_manifest
+        if external_drafter is not None:
+            load_kwargs["drafter"] = external_drafter
+        preflight_qwen4 = (
+            preflight_manifest is None
+            or preflight_manifest.get("architecture", {}).get("family")
+            in ("qwen4_exp", "qwen4_exp_text")
+        )
+        load_kwargs.update(routing.load_options(
+            include_off=args.cache_routing == "off" and preflight_qwen4,
+        ))
+        model, tokenizer, manifest = load_served_model(pkg, **load_kwargs)
         validate_min_resident_experts(
             model,
             requested=args.min_resident_experts,
@@ -1189,6 +1385,7 @@ def main(
         PackageNotFoundError,
         StreamingCapacityError,
         DrafterConfigError,
+        ValueError,
     ) as e:
         print(f"FAILED: {e}")
         return 2
@@ -1196,6 +1393,36 @@ def main(
         declared_context_limit,
         effective_context_limit,
     )
+
+    from moespresso.runtime.http import (
+        PackageRequestContractError,
+        RequestError,
+        package_request_contract,
+        resolve_sampling_kwargs,
+    )
+    if request_contract is None:
+        try:
+            request_contract = package_request_contract(pkg, manifest)
+        except PackageRequestContractError as e:
+            print(f"FAILED: {e}")
+            return 2
+    explicit_sampling = {
+        name: value
+        for name, value in {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "presence_penalty": args.presence_penalty,
+        }.items()
+        if value is not None
+    }
+    try:
+        sampling_kwargs = resolve_sampling_kwargs(
+            explicit_sampling, request_contract.generation_defaults)
+    except RequestError as e:
+        print(f"FAILED: {e.message}")
+        return 2
 
     try:
         context_limit = effective_context_limit(
@@ -1229,9 +1456,12 @@ def main(
     # prompt: generate_once no longer templates. Family-owned render defaults are applied
     # before generation; DS4 maps --thinking onto its official encoder modes.
     from moespresso.runtime.http import (
+        QWEN4_DEFAULT_REASONING_EFFORT,
+        QWEN4_FAMILIES,
         deepseek_v4_contract_template_kwargs,
         is_deepseek_v4_manifest,
         normalize_thinking_selection,
+        qwen4_contract_template_kwargs,
         render_prompt,
         thinking_effort_option_error,
     )
@@ -1250,6 +1480,18 @@ def main(
             "on" if template_kwargs["enable_thinking"] else "off")
         print(f"[generate] thinking={effective_thinking} "
               f"via=deepseek_v4_contract")
+    elif manifest.get("architecture", {}).get("family") in QWEN4_FAMILIES:
+        family = manifest["architecture"]["family"]
+        template_kwargs = qwen4_contract_template_kwargs(
+            tokenizer,
+            selection,
+            family=family,
+        )
+        effective_thinking = "off" if selection == "off" else "on"
+        print(
+            f"[generate] thinking={effective_thinking} via=qwen4_contract "
+            f"effort={QWEN4_DEFAULT_REASONING_EFFORT}"
+        )
     elif selection is not None:
         from moespresso.runtime.thinking import resolve_thinking_kwargs
         template_kwargs = resolve_thinking_kwargs(
@@ -1276,7 +1518,7 @@ def main(
         return 2
     result = generate_with_metadata(
         model, tokenizer, prompt_tokens, max_tokens=args.max_tokens,
-        temperature=args.temperature, top_p=args.top_p)
+        **sampling_kwargs)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
@@ -1287,8 +1529,11 @@ def main(
                     user_prompt=args.prompt,
                     rendered_prompt=prompt,
                     max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
+                    temperature=sampling_kwargs["temperature"],
+                    top_p=sampling_kwargs["top_p"],
+                    top_k=sampling_kwargs.get("top_k", 0),
+                    min_p=sampling_kwargs.get("min_p", 0.0),
+                    presence_penalty=sampling_kwargs.get("presence_penalty"),
                     thinking=effective_thinking,
                     result=result,
                 ),
@@ -1303,7 +1548,7 @@ def main(
 def verify_main(
     argv: list[str] | None = None, *, prog: str = "moespresso-verify"
 ) -> int:
-    """`moespresso verify <package_dir>`: the on-demand integrity gate.
+    """`moespresso verify <package_dir>`: the on-demand integrity check.
 
     Runs the manifest-contract, declared-file, tensor-key, and generated-sidecar
     checks the serve hot path deliberately skips. Exit 0 = clean, 2 = failed.

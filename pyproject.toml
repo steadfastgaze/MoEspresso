@@ -1,6 +1,6 @@
 [project]
 name = "moespresso"
-version = "2.1.2"
+version = "3.0.0"
 description = "Run large Mixture-of-Experts language models well on the memory you have."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -28,9 +28,9 @@ classifiers = [
 ]
 dependencies = [
     "jang>=2.5.29",
-    "mlx>=0.31.2",
-    "mlx-iqk==0.1.2",
-    "mlx-kquant @ git+https://github.com/steadfastgaze/mlx-kquant.git@6fbfd4f5c925c7ce8dc8239ac7d8e2783d49f089",
+    "mlx==0.31.2",
+    "mlx-iqk==0.1.3",
+    "mlx-kquant @ git+https://github.com/steadfastgaze/mlx-kquant.git@c4928ba74b6b119c3613e1ec68ef85d2238c636b",
     "mlx-lm==0.31.3",
     "numpy>=1.26",
     "psutil>=7.0.0",
@@ -48,15 +48,13 @@ Issues = "https://github.com/steadfastgaze/MoEspresso/issues"
 # tooling may need safetensors' torch path for BF16 and other non-NumPy-friendly
 # dtypes.
 build = [
-    "torch>=2.0.0; sys_platform == 'darwin'",
+    "torch>=2.5; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
 # User-facing command group. The hyphenated runtime commands remain
 # compatibility aliases backed by the same parsers.
 moespresso = "moespresso.cli:main"
-# Streamed end-to-end conversion: inventory->probe->optimize->package -> SSD.
-moespresso-convert = "moespresso.package.convert:main"
 # One-shot generate from a package (prompt in, text out); no integrity
 # verification, see moespresso-verify.
 moespresso-generate = "moespresso.runtime.serve:main"
@@ -82,6 +80,11 @@ moespresso-ds4-q4 = "moespresso.correctness.deepseek_v4.q4:main"
 moespresso-ds4-kquant-package = "moespresso.package.deepseek_v4.kquant_package:main"
 # Manual DeepSeek-V4 package builder from converted IQ_K routed-expert artifacts.
 moespresso-ds4-iqk-package = "moespresso.package.deepseek_v4.iqk_package:main"
+# Manual released Qwen4 text builder from calibrated IQ_K expert cells.
+moespresso-qwen4-iqk-package = "moespresso.package.qwen4.iqk_package:main"
+moespresso-qwen4-mtp = "moespresso.runtime.qwen4.mtp_generate:main"
+# Manual released Qwen4 routed-expert conversion to package-ready IQ_K rows.
+moespresso-qwen4-iqk-convert = "moespresso.package.qwen4.iqk_convert:main"
 # Manual relayout of a built IQ_K package's routed bundles onto the decode
 # kernels' wire, without re-encoding a byte.
 moespresso-ds4-iqk-relayout = "moespresso.package.deepseek_v4.iqk_relayout:main"
@@ -109,18 +112,6 @@ moespresso-qwen35-hard-questions = "moespresso.correctness.qwen35.hard_questions
 moespresso-ornith-gate = "moespresso.correctness.ornith.gate:main"
 # Manual DeepSeek-V4 speed snapshot: generation plus SSD structural counters.
 moespresso-ds4-speed-stats = "moespresso.runtime.deepseek_v4.speed_stats:main"
-# Manual DeepSeek-V4 synthetic primitive-count screen for speed ideas.
-moespresso-ds4-speed-primitives = "moespresso.runtime.deepseek_v4.speed_primitives:main"
-# Manual DeepSeek-V4 one-layer ratio-4 compressed-attention replay.
-moespresso-ds4-ratio4-attention-replay = "moespresso.runtime.deepseek_v4.ratio4_attention_replay:main"
-# Manual DeepSeek-V4 decoder-layer stage replay for speed attribution.
-moespresso-ds4-layer-stage-replay = "moespresso.runtime.deepseek_v4.layer_stage_replay:main"
-# Manual DeepSeek-V4 indexed mixed-attention kernel probe.
-moespresso-ds4-indexed-attention-probe = "moespresso.runtime.deepseek_v4.indexed_attention_kernel:main"
-# Manual DeepSeek-V4 MoE layer replay for speed-scheduler value checks.
-moespresso-ds4-moe-block-replay = "moespresso.correctness.deepseek_v4.moe_block_replay:main"
-# Manual DeepSeek-V4 full-graph replay for direct-vs-wrapped scheduler diffs.
-moespresso-ds4-moe-graph-replay = "moespresso.correctness.deepseek_v4.moe_graph_replay:main"
 
 [dependency-groups]
 dev = [
@@ -128,38 +119,49 @@ dev = [
     "ruff>=0.1.0",
     "vulture>=2.11",
 ]
-native = [
-    # Must match MLX's nanobind pin for shared mlx.core mx.array casters.
-    "nanobind==2.12.0",
-]
 
 [build-system]
-requires = ["hatchling==1.31.0"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core==1.0.3", "nanobind==2.12.0", "mlx==0.31.2"]
+build-backend = "scikit_build_core.build"
 
-[tool.hatch.build]
-exclude = [
-    "/specs_archive",
-    "/specs_archive/**",
-    "/native/gate/build",
-    "/native/gate/build/**",
-    "/native/ds4_moe/build",
-    "/native/ds4_moe/build/**",
-    "**/private",
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.27"
+cmake.build-type = "Release"
+cmake.define.CMAKE_OSX_DEPLOYMENT_TARGET = "26.2"
+cmake.define.CMAKE_OSX_ARCHITECTURES = "arm64"
+wheel.packages = ["src/moespresso"]
+wheel.reproducible = true
+wheel.exclude = ["**/private/**", "**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
+editable.rebuild = false
+sdist.exclude = [
+    ".research/**",
+    "specs_archive/**",
+    "native/*/build/**",
     "**/private/**",
-    "**/__pycache__",
+    "**/__pycache__/**",
     "**/*.pyc",
     "**/*.pyo",
+    "**/*.so",
+    "**/*.dylib",
+    "**/*.metallib",
+    "**/*.a",
+    "**/*.o",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/moespresso"]
-
-[tool.hatch.build.targets.wheel.sources]
-"src/moespresso" = "moespresso"
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "README.md" },
+    { file = "LICENSE-MIT" },
+    { file = "LICENSE-APACHE-2.0" },
+    { file = "THIRD-PARTY-NOTICES" },
+    { file = "CMakeLists.txt" },
+    { file = "native/*/CMakeLists.txt" },
+    { file = "native/*/*.cpp" },
+    { file = "native/*/*.h" },
+    { env = "MACOSX_DEPLOYMENT_TARGET" },
+]
 
 [tool.ruff]
 line-length = 100
@@ -169,6 +171,7 @@ line-length = 100
 extend-exclude = ["src/moespresso/correctness/fixtures/*/private/"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "real_model: opt-in tests that convert/load locally downloaded full model artifacts",
 ]

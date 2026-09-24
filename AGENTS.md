@@ -1,276 +1,234 @@
 # Agent and contributor guide
 
-Read this before changing anything. It covers how to work in this repo and the
-invariants that must hold. For the architecture, see `DEVGUIDE.md` and `docs/`.
+Read this before changing anything. `DEVGUIDE.md` and `docs/` cover the
+architecture.
 
 ## Public product and fixture boundary
 
-The public product models are DeepSeek-V4-Flash and Ornith. Source paths and
-entry points containing `qwen` describe the Qwen architecture implementation
-used by Ornith, plus engineering harnesses around that implementation. Their
-presence does not add a third public product.
+DeepSeek-V4-Flash and Ornith are the public product models. Ornith uses the
+`qwen` architecture adapter. Qwen3.8-Flash-Next uses the separate `qwen4`
+adapter with composite state, a KVarN attention cache and PLE storage.
+Architecture support and engineering commands do not declare a published
+model package.
 
-The DeepSeek-V4 fixture boundary is drawn by provenance, not by ladder rung.
-Material the upstream antirez/ds4 suite published stays public and committed so
-the gates run against those fixtures. Anything captured from a provider stays
-under `src/moespresso/correctness/fixtures/deepseek_v4/private/`: API-derived
-continuations, selected-token records, and top-logprob payloads, whether they
-serve Q1 or Q2, together with the Q4 teacher and candidate logit dumps and the
-marker set they are scored against. The WikiText corpus is third-party text
-referenced by digest and never copied in. `docs/deepseek_v4_quality.md` is the
-authority on which side a given fixture falls.
+DeepSeek-V4 fixtures are separated by provenance, regardless of ladder rung.
+Keep published antirez/ds4 material committed so public gates can use it.
+Provider-captured Q1 and Q2 continuations, selected-token records and
+top-logprob payloads belong under
+`src/moespresso/correctness/fixtures/deepseek_v4/private/`. Keep Q4 teacher
+and candidate logit dumps and their scored marker set there too. Reference the
+third-party WikiText corpus by digest without copying it. Consult
+`docs/deepseek_v4_quality.md` for each fixture's boundary.
 
-Unpublished Ornith benchmark questions, answer keys, and verification programs
-remain under `src/moespresso/correctness/fixtures/ornith/private/`. Never copy
-either private set into source, tests, logs, documentation, wheels, or source
-distributions.
+Keep unpublished Ornith benchmark questions, answer keys and verification
+programs under `src/moespresso/correctness/fixtures/ornith/private/`. Neither
+private fixture set belongs in source, tests, logs, documentation, wheels or
+source distributions.
 
-The public Ornith gate surface covers the project-owned agentic-coding and
-long-context instruments:
+The public Ornith gate covers project-owned agentic-coding and long-context
+instruments:
 
 ```
 uv run --locked moespresso-ornith-gate <package> \
   --families agentic_coding,long_context
 ```
 
-The full hard-reasoning gate additionally requires the ignored private Ornith
-fixtures. Source-release tests must inject synthetic questions and keys instead
-of reading those files.
+The full hard-reasoning gate also requires ignored private Ornith fixtures.
+Source-release tests inject synthetic questions and keys.
+
+## Private research location
+
+Put investigation plans, campaign logs, measurements, throwaway probes and
+research worktrees in sibling `moespresso-dev-support-private`. Do not recreate
+`.research/` or `specs_archive/` here. Product implementation, tests and public
+documentation stay in this repository.
 
 ## Tooling discipline
 
-- **Use `uv` for everything.** `uv sync` sets up the complete runtime and
-  development environment. Tests and lint run lock-strict (`uv run --locked`), so an
-  unlocked dependency edit fails immediately. `make lock` is the deliberate
-  re-resolve step; commit the updated `uv.lock`. `make dist-check` builds and
-  audits the public wheel and source distribution. Never call `python` directly
-  and never `pip install` into the environment.
-- **Search with `rg`.** Do not use `find ... -exec grep`.
-- **Edit with a tool that fails loudly on a missing anchor.** A scripted patch
-  that silently misses its anchor and writes nothing is the most common way a
-  change appears done but is not. Prefer an editor that errors on a miss; if you
-  must script an edit, assert the anchor.
-- **No heredocs**, and do not chain shell commands with `&&` or `;` when each is
-  already a separate allowed command. Run them as separate calls.
-- **Put throwaway scripts in temporary files** and run them via `uv`.
+Use `uv` for everything. `uv sync` installs the runtime and development
+environment, and tests and lint run lock-strict with `uv run --locked`. Resolve
+dependency changes deliberately with `make lock` and commit the resulting
+`uv.lock`. `make dist-check` builds and audits the public wheel and source
+distribution. Never call `python` directly or `pip install` into the
+environment. Put throwaway scripts in temporary files and run them through
+`uv`.
+
+Search with `rg`, never `find ... -exec grep`. Use edits that fail on missing
+anchors and assert anchors in scripted edits. Do not use heredocs. Run separate
+shell commands as separate calls instead of chaining them.
 
 ## Writing comments and docs (this repo is public)
 
-Every comment, docstring, and doc ships to a public GitHub repo. Write them the
-way a large OSS project does: about the code, impersonal, and dateless. Write for
-an unfamiliar reader. These mandatory rules came from real cleanup work.
-
-- **No machine references.** Never "this box", "on this box", "my box/machine/
-  laptop/mac", "the rig", "small box", "big box", "16 GB box". The computer is
-  never the subject of a sentence. Say "the runtime", "the host", "under memory
-  pressure", "when the system is idle".
-- **No dates or dev-diary notes.** No "NOTE (2026-06-10):", "Measured on the rig
-  (date):", "(owner decision 2026-06-12)". State the finding as a present-tense
-  fact and keep the measurement number; drop the date and the first person.
-  ("Extending the kick to all-hit layers measured flat (5.42 vs 5.48 tok/s), so
-  the gate stays miss-only.")
-- **No authority-by-person.** No "owner decision", "owner priority", "product
-  priority (owner)". State the decision as a fact: "Default ON; `FOO=0` is the
-  kill switch."
-- **No private version archaeology.** "pre-v8 gibberish", "the v4 collapse" mean
-  nothing to an outside reader. Name the *failure mode* instead: "storing conv1d
-  pre-transposed suppresses the coupled norm shift, so norms load ~1.0 too low
-  and the model emits garbage."
-- **No shouting-caps for emphasis.** Not "THIS", "ONLY", "MUST", "NOT", "GARBAGE",
-  "LOUD". Caps are for real identifiers and acronyms (MLX, GPU, IO, LFU, env-var
-  names) only. Use plain words or `**bold**` in docs if you must stress a point.
-- **No lazy LLM-ese in docs.** Avoid em dashes, antithetical definitions,
-  parallel equal-length sentence pairs, and phrases such as "front door",
-  "heart of", "by construction", "first-class", or "the tool you reach for".
-  Use plain declarative sentences that state the mechanism. Say a fact once.
-- **Leave program output and content strings alone.** Error messages, log lines,
-  and calibration prompt strings are not comments; do not de-shout or reword them
-  for tone.
+Comments, docstrings and docs are public. Write for unfamiliar readers in an
+impersonal, dateless OSS style. Describe the runtime or host, never "this box",
+"my machine", "the rig" or a named development computer. Keep measurement
+numbers while removing diary dates, first person and authority-by-person such
+as "owner decision". Explain failure modes directly instead of referring to
+private version history. Reserve capitals for identifiers and acronyms, using
+plain words for emphasis. Avoid em dashes, antithetical definitions, patterned
+sentence pairs and stock phrases such as "front door", "heart of", "by
+construction", "first-class" and "the tool you reach for". State each
+mechanism once. Leave program output, error messages, logs and calibration
+prompt strings verbatim.
 
 ## Invariants (do not break these)
 
-These are properties the system depends on. Each was learned from a real
-failure; respect them or prove with a measurement that the constraint no longer
-holds.
+These properties hold unless a measurement proves a constraint obsolete.
 
 **Pipeline and artifacts**
-- Resolve once. The inventory maps every tensor name to a role a single time;
-  every later phase reads typed fields and never reparses names. Shared/Qwen
-  rules live in `inventory.roles`; model-specific naming contracts live under
-  model inventory subpackages such as `inventory.deepseek_v4.roles`.
-- Every phase reads and writes a content-hashed, versioned artifact. Keep the
-  contract in `core/artifact.py` as the single implementation. Fail closed on an
-  unknown kind, an unknown major version, an unknown required feature, or a
-  missing/mismatched file.
-- Package builders use `package_plan` as the writer-facing allocation artifact.
-  GGUF recipe import and probe/optimizer output both converge there. The writer
-  consumes the plan; the manifest records the resolved tensor decisions.
-- Build-time entry points live in `moespresso.package`: `package.convert` for
-  probe/optimizer conversion and model-specific subpackages such as
-  `package.deepseek_v4.kquant_package` or `package.qwen.kquant_package` for
-  GGUF-recipe package builders. Model-specific GGUF recipe mapping lives beside
-  those builders, for example `package.deepseek_v4.recipe` and
-  `package.qwen.recipe`; `package.kquant_recipe` is the shared GGUF parser and
-  fit-check helper. Three further builder groups live in the same package.
-  `package.deepseek_v4.iqk_package` assembles converted IQ_K routed-expert
-  artifacts under an allocation and reads no GGUF recipe;
-  `package.deepseek_v4.iqk_relayout` rewrites a built package's routed bundles
-  onto the decode kernels' wire, and `package.iqk_format` plus
-  `package.iqk_relayout` hold the shared member and layout contracts. Drafter
-  sidecars are package construction too: `package.deepseek_v4.dspark_sidecar`,
-  `mtp_sidecar`, and `dflash_sidecar` write a sidecar, and `dspark_bundle`
-  attaches a built DSpark sidecar to a package as its declared optional drafter
-  component. Do not put conversion orchestration back under `runtime/`.
-- Package-owned compatibility files live in `moespresso.package`: tokenizer
-  copying, vendored chat templates, and generated jang sidecars are package
-  construction concerns. Runtime loads the resulting package files.
-- Model-specific correctness gates and replay/debug tools live below a model
-  subpackage such as `moespresso.correctness.deepseek_v4`. Keep the
-  `correctness` root for shared ladder, gate, golden, reconstruction, and
-  reference-codec helpers.
-- Model-specific probe codecs, source loaders, and evidence builders live below
-  a model subpackage such as `moespresso.probe.deepseek_v4`. Keep the `probe`
-  root for shared calibration, quality, roundtrip, GGUF parsing, and weight IO.
-- Model-specific source validators and naming contracts live below an inventory
-  model subpackage such as `moespresso.inventory.deepseek_v4.static` and
-  `moespresso.inventory.deepseek_v4.roles`. Keep the `inventory` root for shared
-  header scanning, architecture profiles, and shared/Qwen-style resolver helpers.
-- Recipe paths do not emit optimizer decisions. An `optimizer_decision` artifact
-  means the probe/optimizer path made the allocation.
-- Runtime code reads packages and manifests. It must not import probe,
-  optimizer, or recipe-reader internals.
-- Model-specific runtime graph adapters, cache contracts, and served-path probes
-  live below a model subpackage such as `moespresso.runtime.deepseek_v4`. Keep
-  the `runtime` root for shared serving, HTTP, generation, verification, cache
-  policy, and generic streaming infrastructure.
-- `optimized_kernels_expected` is manifest metadata, default false. Setting it
-  is an explicit package-build promotion, and runtime fast paths still validate
-  actual tensor formats and shapes before use.
-- Package-plan force overrides are build-time tools. They fail closed on unknown
-  formats and unmatched patterns unless explicitly allowed, support dry-run
-  previews, and record forced decisions in the manifest.
-- Calibration is a required input for a calibrated probe. The uniform fallback is
-  an explicit opt-in that cannot pass as calibrated.
+- Resolve each tensor name to a role once in the inventory. Later phases use
+  typed fields without reparsing names. Shared and Qwen-style rules live in
+  `inventory.roles`. Model naming contracts belong in subpackages such as
+  `inventory.deepseek_v4.roles`.
+- Each phase reads and writes content-hashed, versioned artifacts through the
+  single contract in `core/artifact.py`. Unknown kinds, major versions and
+  required features fail closed, as do missing or mismatched files.
+- GGUF recipe import and probe/optimizer output converge on `package_plan`, the
+  writer-facing allocation artifact. The writer follows the plan, and the
+  manifest records resolved tensor decisions. Recipe paths never emit
+  `optimizer_decision`. That artifact means a probe/optimizer path made the
+  allocation.
+- Keep build entry points in model-specific `moespresso.package` subpackages.
+  GGUF-recipe builders include `package.deepseek_v4.kquant_package` and
+  `package.qwen.kquant_package`, with mappings beside them in
+  `package.deepseek_v4.recipe` and `package.qwen.recipe`.
+  `package.kquant_recipe` supplies shared GGUF parsing and fit checks.
+  `package.qwen4.iqk_convert` prepares package-ready IQ_K rows for
+  `package.qwen4.iqk_package`. `package.deepseek_v4.iqk_package` assembles
+  converted routed-expert IQ_K artifacts under an allocation without reading a
+  GGUF recipe. `package.deepseek_v4.iqk_relayout` moves built routed bundles to
+  the decode-kernel wire, while `package.iqk_format` and
+  `package.iqk_relayout` define shared member and layout contracts.
+- Drafter construction also belongs in `moespresso.package`.
+  `package.deepseek_v4.dspark_sidecar`, `mtp_sidecar` and `dflash_sidecar`
+  write sidecars. `dspark_bundle` attaches a built DSpark sidecar as a declared
+  optional drafter component. Keep conversion orchestration out of `runtime/`.
+  Tokenizer copying, vendored chat templates and generated jang sidecars are
+  likewise package construction. Runtime loads the resulting files.
+- Put model-specific correctness gates and replay/debug tools under subpackages
+  such as `moespresso.correctness.deepseek_v4`. The `correctness` root holds
+  shared ladder, golden, reconstruction and reference-codec helpers. Model
+  probe codecs, source loaders and evidence builders belong under
+  `moespresso.probe.deepseek_v4` or its family equivalent. The `probe` root
+  holds shared calibration, quality, roundtrip, GGUF parsing and weight IO.
+  Model source validators and naming contracts belong under
+  `moespresso.inventory.deepseek_v4.static`,
+  `moespresso.inventory.deepseek_v4.roles` or corresponding family packages.
+  The `inventory` root holds header scanning, architecture profiles and
+  shared/Qwen-style resolver helpers.
+- Model runtime graph adapters, cache contracts and served-path probes belong
+  under packages such as `moespresso.runtime.deepseek_v4`. The `runtime` root
+  holds shared serving, HTTP, generation, verification, cache policy and generic
+  streaming. Runtime reads packages and manifests without importing probe,
+  optimizer or recipe-reader internals.
+- `optimized_kernels_expected` defaults to false in manifest metadata. A build
+  must explicitly promote it, and runtime fast paths still check tensor formats
+  and shapes. Package-plan force overrides act only at build time, offer dry-run
+  previews, record forced decisions in the manifest and fail closed on unknown
+  formats or unmatched patterns unless explicitly allowed. A calibrated probe
+  requires calibration. The uniform fallback needs explicit opt-in and cannot
+  pass as calibrated.
 
 **Runtime**
-- Serve from the manifest. Build the model from the package's own declared
-  facts; never reparse source files or guess conventions at load.
-- One template render per request. Multiple renders break KV-cache identity.
-  `http.render_prompt` is the only render site; the generate path consumes
-  pre-rendered text.
-- Verification (sha256 + manifest checks) stays off the serve hot path as the
-  separate `moespresso-verify` gate. Do not add it to the load path.
-- KV cache and prefix reuse are in-memory first. The in-memory store keeps
-  plain and speculative producers on separate rails, where a speculative rail
-  identifies the cache schema, the numeric producer lattice, the drafter
-  family, the sidecar artifact, and the resolved schedule. A resumable DSpark
-  entry pairs its target cache with a state capsule at the same public token
-  frontier, and lookup probes both rails without moving either entry. Only
-  committed public state is published: rejected proposal rows and transient
-  verify frontiers never enter a cache tier. A speculative path without the
-  complete state protocol serves from a fresh per-request cache and bypasses
-  both tiers.
-- The disk KV read path restores a target cache only from exact token-prefix
-  checkpoints at 256-aligned frontiers, fails closed to cold serving on any
-  mismatch, and is gated by the recorded safety evidence that aligned saves
-  round-trip bit-identically on hybrid (KV + recurrent-state) caches.
-  Serving enables the store by
-  default under a per-package root in the user cache directory with an
-  LRU byte budget and a write-depth cap (checkpoints cover the shallow
-  shared-prefix region; deep cumulative snapshots are write traffic with
-  no cross-session value); `MOESPRESSO_DISK_KV=off` is the kill switch,
-  and a default-enabled store that cannot open degrades to memory-only
-  serving while an explicitly requested one refuses startup. Checkpoint
-  writes happen only at proven live frontiers during prefill: token
-  accounting proposes, and every positional cache must independently
-  report exactly the frontier offset before a write, so an unaligned
-  write is structurally impossible. Writes are blocking and atomic; a
-  hard write failure logs once and disables the writer for the request,
-  restore-time validation failures quarantine the payload, and the TTFT
-  cost of writes is measured and logged, never hidden.
-- A DSpark drafter-state companion is a second disk persistence class bound to
-  a validated target, with its own schema version, index, payload tree, and
-  quarantine tree. It never substitutes for a target. The paired prefill
-  callback writes only at allowlisted aligned frontiers, and only after both
-  the target caches and the drafter state independently report exactly that
-  frontier; it commits the target first and the companion second. Restore
-  follows the same order: a companion is selected only after its target
-  restores, and only for the exact target identity and producer rail. Companion
-  failure stays local. A companion that is missing, unreadable, invalid, or
-  identity-incompatible is skipped or quarantined on its own while the restored
-  target keeps serving the suffix with plain decoding, and companion read and
-  write faults set a separate disable flag, so target checkpointing keeps
-  running. Target eviction cascades removal to every dependent companion.
-- Never split a routed-MoE op by residency. Issuing separate resident and
-  missing partial matmuls measured slower despite better wait counters, so the
-  pooled routed path keeps one fused operation per layer behind one dispatch
-  boundary to Python. Dispatch count on its own is not the rule.
+- Build from the package manifest's declared facts. Loading never reparses
+  source files or guesses conventions. Render each request once in
+  `http.render_prompt` and pass pre-rendered text to generation so KV-cache
+  identity stays stable. SHA-256 and manifest verification remain in the
+  separate `moespresso-verify` gate, outside the load and serve hot paths.
+- Consult in-memory KV and prefix state first. Plain and speculative producers
+  use separate rails. A speculative rail identifies cache schema, numeric
+  producer lattice, drafter family, sidecar artifact and resolved schedule.
+  Resumable DSpark entries pair target cache and state capsule at the same
+  public token frontier. Lookup probes both rails without moving entries.
+  Publish committed public state only, excluding rejected proposal rows and
+  transient verify frontiers. Speculative paths lacking the complete state
+  protocol use a fresh per-request cache and bypass both tiers.
+- Disk KV restores a target only from exact token-prefix checkpoints at
+  256-aligned frontiers. Any mismatch falls back to cold serving. The read path
+  requires recorded evidence that aligned saves round-trip bit-identically for
+  hybrid KV and recurrent-state caches. Serving enables the store by default
+  under a per-package user-cache root, with an LRU byte budget and write-depth
+  cap for shallow shared prefixes. Deep cumulative snapshots add write traffic
+  without cross-session value. `MOESPRESSO_DISK_KV=off` disables the store. An
+  unavailable default store degrades to memory-only serving, while an explicitly
+  requested store refuses startup.
+- Disk checkpoints are written during prefill only at proven live frontiers.
+  Token accounting proposes a frontier, and every positional cache must report
+  that exact offset independently before a write. Writes are blocking and
+  atomic. A hard failure logs once and disables writes for that request.
+  Restore validation failures quarantine the payload. Measure and log the
+  checkpoint's TTFT cost.
+- DSpark drafter-state companions form a separate disk persistence class bound
+  to validated targets, with their own schema version, index, payload tree and
+  quarantine tree. They never replace a target. At allowlisted aligned
+  frontiers, paired prefill writes require exact, independent target-cache and
+  drafter-state offsets. Commit target first, then companion. Restore target
+  first, selecting a companion only for its exact identity and producer rail.
+  Missing, unreadable, invalid or incompatible companions are skipped or
+  quarantined separately. The target then serves the suffix with plain decoding.
+  Companion read or write faults set their own disable flag so target
+  checkpointing continues. Target eviction removes every dependent companion.
+- Keep one fused routed-MoE operation per layer behind one Python dispatch
+  boundary. Splitting resident and missing partial matmuls measured slower
+  despite better wait counters. Dispatch count alone does not decide the path.
 
 **Correctness**
-- Correctness requires token or logit identity. Plausible text can still hide
-  wrong logits. Any change to caching, routing, KV, or
-  artifact loading must compare logits or top-tokens against a reference.
-- Quality ladders are model-specific. DeepSeek-V4 keeps Q0 through Q4 plus the
-  teacher-forced WikiText perplexity arm. A package recipe or quantized-math
-  change requires Q1, Q2, Q3, Q4, and the perplexity arm; the perplexity arm is
-  the only instrument that has caught a numeric blowup every numbered gate
-  scored as finite. `docs/deepseek_v4_quality.md` records which gates each kind
-  of change requires. Other model families need their own quality gates.
-- DS4-derived evaluation fixtures need an explicit public/private boundary.
-  Before adding expected continuations, official-answer files, or top-logprob
-  arrays, check the upstream release boundary. Private oracle material belongs
-  outside the committed tree.
+- Correctness requires token or logit identity. Plausible text can hide wrong
+  logits. Compare logits or top tokens against a reference after changing
+  caching, routing, KV or artifact loading.
+- Quality ladders are model-specific. DeepSeek-V4 uses Q0 through Q4 and a
+  teacher-forced WikiText perplexity arm. Recipe or quantized-math changes
+  require Q1, Q2, Q3, Q4 and perplexity. That arm alone caught a numeric blowup
+  while every numbered gate remained finite. See `docs/deepseek_v4_quality.md`
+  for change-specific gates. Other families need their own quality gates.
+- Check the upstream release boundary before adding DS4-derived expected
+  continuations, official answers or top-logprob arrays. Keep private oracle
+  material outside the committed tree.
 
 ## Working method
 
-- Measure or revert. A performance change must clear a real numeric threshold on
-  a same-artifact A/B; below it, revert with a short note on why.
-- Benchmark with the disk KV tier off (`MOESPRESSO_DISK_KV=off`) unless the
-  disk KV tier is itself the subject. The tier writes checkpoints on the first
-  request over a prompt and skips or restores on later ones, so request timing
-  depends on store state that persists across requests and processes:
-  first-request writes inflate TTFT, warm-store runs omit that cost, and an
-  estimator that compares two requests absorbs the difference into its result.
-  That failure mode inflated a recorded decode level by ten percent.
-- Pin `MOESPRESSO_DS4_DRAFTER` to the same value in both arms unless
-  speculation is the subject, and record which arm drafted. Automatic drafter
-  selection is capacity-gated, so the decision depends on the host's usable
-  wired budget and can land differently across two runs of the same code. The
-  in-memory speculative producer rail is a second source of request-to-request
-  state that `MOESPRESSO_DISK_KV=off` does not clear. The startup line names
-  the resolved drafter state, so an unpinned arm can still be identified from
-  the log.
-- Prove an A/B's two arms actually differ before trusting a null result. A common
-  trap is two arms that silently run the same code path.
-- A metric used to judge a change must be independent of the change.
-- When you repurpose a probe or a one-off script as a builder, re-run the full
-  builder checklist; a shortcut once shipped packages missing the cold-start
-  hotlist.
-- For any shared-mutable-state code (the streaming expert pools), pre-reason the
-  failure modes and test under contention. Publish after all loads complete and
-  under all locks.
-- Run `make lint` and `make test` before considering a change done, including
-  for changes touching conversion, package writing, runtime serving,
-  MLX/Jang/mlx-kquant/mlx-iqk paths or
-  model-specific quality gates.
-- Run `make roadtest` for cache, checkpoint, and restart-resume changes. It
-  drives a cumulative agentic session against a really served package through
-  the `agentlib/` runner and asserts cache events, disk checkpoints, and
-  restart resume turn over turn, which no unit test covers. It is opt-in and
-  GPU-bound, so it is never part of `make test`.
-- Run `make dist-check` for release-facing changes. The wheel and source
-  distribution must exclude `specs_archive/`, every `*/private/` fixture tree,
-  environment files, caches, bytecode, and machine-local paths. They must carry
-  `LICENSE-MIT`, `LICENSE-APACHE-2.0`, and `THIRD-PARTY-NOTICES`, and
-  the expected DeepSeek-V4, Ornith, and technical Qwen architecture surfaces. The
-  audit pins the wheel's `License-File` metadata to exactly those three names
-  and compares each one byte for byte against the repository copy, so it
-  confirms the files ship and says nothing about their content. Vendoring code
-  means updating `THIRD-PARTY-NOTICES` by hand.
+- Measure or revert performance changes against a real numeric threshold in a
+  same-artifact A/B. Below threshold, revert and briefly record why. Verify
+  that both arms actually run different paths before trusting a null result.
+  Judge the change with an independent metric.
+- Set `MOESPRESSO_DISK_KV=off` for benchmarks unless measuring that tier.
+  First-request writes inflate TTFT while later requests skip writes or restore
+  checkpoints. Store state persists across processes and once inflated a
+  recorded decode level by ten percent.
+- Pin `MOESPRESSO_DS4_DRAFTER` identically in both arms unless measuring
+  speculation, and record which arm drafted. Automatic selection depends on
+  usable wired capacity and can differ across runs of the same code. The
+  in-memory speculative producer rail also carries request-to-request state
+  after disk KV is disabled. The startup line identifies an unpinned arm's
+  resolved drafter state.
+- Rerun the full builder checklist when turning a probe or one-off script into
+  a builder. A shortcut previously omitted the cold-start hotlist. For shared
+  mutable state such as streaming expert pools, reason through failure modes,
+  test under contention, then publish while holding every required lock and
+  only after all loads complete.
+- Run `make lint` and `make test` before declaring any change done, including
+  conversion, package writing, runtime serving, MLX/Jang/mlx-kquant/mlx-iqk
+  paths and model-specific quality gates.
+- Run `make roadtest` for cache, checkpoint and restart-resume changes. This
+  opt-in, GPU-bound, multi-hour served-package soak is outside `make test`.
+  Its fixed protocol precedes optional context growth and can exceed 50k tokens.
+  `--target-tokens` stops only the extension phase, whose default target is
+  110k tokens. It does not bound total context or runtime. The `agentlib/`
+  runner checks cache events, disk checkpoints and restart resume across turns,
+  beyond unit-test coverage. Review the full command and expected duration
+  before starting it.
+- Run `make dist-check` for release-facing changes. Wheel and source
+  distributions must exclude `specs_archive/`, all `*/private/` fixture trees,
+  environment files, caches, bytecode and machine-local paths. They must carry
+  `LICENSE-MIT`, `LICENSE-APACHE-2.0`, `THIRD-PARTY-NOTICES` and the expected
+  DeepSeek-V4, Ornith and technical Qwen architecture surfaces. The audit pins
+  wheel `License-File` metadata to exactly those three names and compares each
+  file byte for byte with the repository copy. The audit does not assess notice
+  content. Update `THIRD-PARTY-NOTICES` by hand when vendoring code.
 
 ## Where to start
 
 1. `README.md` for what the project is and how to run it.
 2. `DEVGUIDE.md` for the architecture and the source map.
 3. The `docs/` file for the subsystem you are touching.
-4. The tests for that subsystem; they are the behavior specification.
+4. The tests for that subsystem, which specify its behavior.

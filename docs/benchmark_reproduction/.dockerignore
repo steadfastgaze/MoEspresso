@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!common.py
+!grade_one.py

@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
-pytest.importorskip("jang_tools.turboquant")
 
 from moespresso.package.kquant_backend import KQuantEncodedWeight  # noqa: E402
 from moespresso.package.kquant_backend import KQuantBackendError  # noqa: E402
@@ -25,7 +24,7 @@ from moespresso.package.deepseek_v4.kquant_package import (  # noqa: E402
     preflight_ds4_kquant_package,
 )
 from moespresso.package.constants import MANIFEST_NAME  # noqa: E402
-from moespresso.package.convert import INVENTORY_NAME  # noqa: E402
+from moespresso.package.source import INVENTORY_NAME  # noqa: E402
 from moespresso.runtime.expert_index import build_expert_index  # noqa: E402
 from moespresso.runtime.verify import verify_package  # noqa: E402
 
@@ -623,7 +622,7 @@ def test_ds4_kquant_force_dry_run_reports_matched_tensors(tmp_path):
         out,
         gguf_recipe_path=recipe,
         imatrix_path=imatrix,
-        force_format=["*ffn_gate_exps.weight=tq2"],
+        force_format=["*ffn_gate_exps.weight=mxfp4"],
         force_format_dry_run=True,
     )
 
@@ -634,11 +633,11 @@ def test_ds4_kquant_force_dry_run_reports_matched_tensors(tmp_path):
     assert gate["format"] == "kquant"
     assert "forced_format" not in gate
     assert plan["force_override_preview"]["matched"][0]["before"] == "kquant:iq2_xxs"
-    assert plan["force_override_preview"]["matched"][0]["after"] == "tq2"
+    assert plan["force_override_preview"]["matched"][0]["after"] == "mxfp4"
     report = json.loads((out / KQUANT_RECIPE_REPORT_NAME).read_text())
     assert report["matched"][0]["gguf_tensor"] == "blk.0.ffn_gate_exps.weight"
     assert report["matched"][0]["before"] == "kquant:iq2_xxs"
-    assert report["matched"][0]["after"] == "tq2"
+    assert report["matched"][0]["after"] == "mxfp4"
     assert (out / PACKAGE_PLAN_NAME).is_file()
     assert not (out / MANIFEST_NAME).exists()
 

@@ -282,6 +282,17 @@ def test_non_streaming_override_uses_json_response(fake_server):
     assert result.content == "served text"
 
 
+def test_stream_usage_can_be_omitted_without_disabling_streaming(fake_server):
+    state, url = fake_server
+    events = []
+    result = CompletionsClient(url, include_stream_usage=False).complete(
+        [{"role": "user", "content": "x"}], on_chunk=events.append)
+    assert _last_body(state)["stream"] is True
+    assert "stream_options" not in _last_body(state)
+    assert result.content == "served text"
+    assert events and any(event.get("choices") for event in events)
+
+
 def test_stream_callbacks_receive_reasoning_and_content(fake_server):
     state, url = fake_server
     state.completion = {

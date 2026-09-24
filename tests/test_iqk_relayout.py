@@ -34,7 +34,7 @@ from moespresso.package.iqk_format import (
 )
 from moespresso.package.manifest import PACKAGE_FORMAT, file_identity
 
-MEMBERS = ("iq2_ks", "iq2_k", "iq1_s_r4")
+MEMBERS = rl.RELAYOUT_MEMBERS
 E, OUT, IN = 2, 16, 256
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
@@ -108,9 +108,65 @@ def test_relayout_rows_decode_to_the_wire_rows_bit_for_bit(codec):
     assert np.array_equal(want.view(np.uint16), got.view(np.uint16))
 
 
+@pytest.mark.parametrize("codec", MEMBERS)
+def test_stream_major_round_trips_every_row_relayout_byte(codec):
+    wire = _wire(codec, 8, IN, seed=13)
+    rows = rl.pack_rows(codec, wire, IN)
+    packed = rl.pack_stream_major(codec, rows, IN)
+    assert packed.shape == rows.shape
+    assert np.array_equal(rl.unpack_stream_major(codec, packed, IN), rows)
+
+
+@pytest.mark.parametrize("codec", MEMBERS)
+def test_stream_major_preserves_the_reference_decode(codec):
+    from mlx_iqk import codec as iqk_codec
+
+    wire = _wire(codec, 8, IN, seed=17)
+    rows = rl.pack_rows(codec, wire, IN)
+    packed = rl.pack_stream_major(codec, rows, IN)
+    want = iqk_codec.dequantize(codec, wire, IN).astype(np.float16)
+    got = rl.decode_rows(codec, rl.unpack_stream_major(codec, packed, IN), IN).astype(np.float16)
+    assert np.array_equal(want.view(np.uint16), got.view(np.uint16))
+
+
+@pytest.mark.parametrize("codec", MEMBERS)
+def test_stream_major_descriptor_covers_one_expert_component(codec):
+    out_features = 8
+    spans = rl.stream_major_spans(codec, out_features, IN)
+    assert tuple(span.name for span in spans) == tuple(
+        span.name for span in rl.relayout_stream_spans(codec, IN)
+    )
+    assert spans[0].offset == 0
+    assert sum(span.nbytes for span in spans) == (out_features * rl.relayout_row_bytes(codec, IN))
+    assert all(span.shape[0] == out_features for span in spans)
+
+
+def test_stream_major_descriptor_refuses_zero_output_rows():
+    with pytest.raises(ValueError, match="positive out_features"):
+        rl.stream_major_spans("iq2_ks", 0, IN)
+
+
+@pytest.mark.parametrize("transform", (rl.pack_stream_major, rl.unpack_stream_major))
+def test_stream_major_refuses_malformed_expert_components(transform):
+    with pytest.raises(ValueError, match="uint8 \\[out_features"):
+        transform("iq2_ks", np.zeros((8, 7), dtype=np.uint8), IN)
+    with pytest.raises(ValueError, match="positive out_features"):
+        transform(
+            "iq2_ks",
+            np.zeros((0, rl.relayout_row_bytes("iq2_ks", IN)), dtype=np.uint8),
+            IN,
+        )
+    with pytest.raises(ValueError, match="uint8 \\[out_features"):
+        transform(
+            "iq2_ks",
+            np.zeros((8, rl.relayout_row_bytes("iq2_ks", IN)), dtype=np.float16),
+            IN,
+        )
+
+
 def test_relayout_refuses_a_member_with_no_relayout():
     with pytest.raises(ValueError):
-        rl.relayout_row_bytes("iq3_k", 2048)
+        rl.relayout_row_bytes("iq4_k", 2048)
 
 
 def test_split_streams_refuses_a_row_of_the_wrong_width():

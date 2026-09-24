@@ -2,8 +2,8 @@
 
 One bundle tensor per routed layer replaces the six stacked expert tensors:
 `...switch_mlp.experts.tq_bundle` is uint8 `[n_experts, row_bytes]`, where row
-e concatenates expert e's full payload. TQ projections store `packed + norms`;
-source-mxfp4 projections store `packed + scales`. The projection codec is
+e concatenates expert e's full payload. MXFP4 projections store packed words
+and scales; K-quant and IQ_K projections carry their declared block layouts. The projection codec is
 declared in the bundle metadata, so readers never infer it from bit width.
 
 Row stride is the exact component sum, no padding: plain pread needs no
@@ -29,6 +29,7 @@ import numpy as np
 from moespresso.package.iqk_format import (
     IQK_GEOMETRY,
     IQK_LAYOUT_IK_WIRE,
+    IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
     IQK_LAYOUTS,
     normalize_iqk_layout,
 )
@@ -39,32 +40,19 @@ SCHEMA_VERSION = 1
 BUNDLE_KEY_SUFFIX = "tq_bundle"
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-TQ_CODEC = "tq"
 MXFP4_CODEC = "mxfp4"
 KQUANT_CODEC = "kquant"
 IQK_CODEC = "iqk"
-TQ_COMPONENTS = ("packed", "norms")
 MXFP4_COMPONENTS = ("packed", "scales")
 KQUANT_COMPONENTS = ("weight", "scales")
 # IQ_K members carry every scale inside the row, so one opaque byte block per
 # expert is the whole payload: `[n_experts, out_features, bytes_per_row]`.
 IQK_COMPONENTS = ("blocks",)
+IQK_STREAM_DTYPES = frozenset({"uint8", "uint16", "uint32", "float16"})
 
-# The fixed within-row component order. Readers must derive offsets from the
-# metadata, never from this tuple: it exists so the writer is deterministic
-# and the metadata validator can require exact, gap-free tiling.
-ROW_ORDER = (
-    ("gate_proj", "packed"), ("gate_proj", "norms"),
-    ("up_proj", "packed"), ("up_proj", "norms"),
-    ("down_proj", "packed"), ("down_proj", "norms"),
-)
-
-# safetensors dtype token <-> numpy dtype, per component kind. TQ packed words
-# and mxfp4 packed words are uint32; TQ norms are float16; mxfp4 scales are
-# uint8 UE8M0.
+# Safetensors dtype token and numpy dtype for each component.
 _COMPONENT_DTYPES = {
     "packed": ("U32", np.uint32),
-    "norms": ("F16", np.float16),
     "scales": ("U8", np.uint8),
     "weight": ("U8", np.uint8),
     "blocks": ("U8", np.uint8),
@@ -81,8 +69,6 @@ class BundleFormatError(ValueError):
 
 
 def _components_for_codec(codec: str) -> tuple[str, ...]:
-    if codec == TQ_CODEC:
-        return TQ_COMPONENTS
     if codec == MXFP4_CODEC:
         return MXFP4_COMPONENTS
     if codec == KQUANT_CODEC:
@@ -93,8 +79,6 @@ def _components_for_codec(codec: str) -> tuple[str, ...]:
 
 
 def _component_ndim(codec: str, component: str) -> int:
-    if codec == TQ_CODEC:
-        return 2 if component == "norms" else 3
     if codec == MXFP4_CODEC:
         return 3
     if codec == KQUANT_CODEC:
@@ -104,9 +88,8 @@ def _component_ndim(codec: str, component: str) -> int:
     raise BundleFormatError(f"unsupported expert codec {codec!r}")
 
 
-def row_order_for_codecs(codecs: dict[str, str] | None = None) -> tuple[tuple[str, str], ...]:
+def row_order_for_codecs(codecs: dict[str, str]) -> tuple[tuple[str, str], ...]:
     """Return the within-row component order for projection codecs."""
-    codecs = codecs or {proj: TQ_CODEC for proj in PROJECTIONS}
     if sorted(codecs) != sorted(PROJECTIONS):
         raise BundleFormatError(
             f"codecs must cover exactly {PROJECTIONS}, got {sorted(codecs)}")
@@ -150,7 +133,7 @@ def ds4_source_to_mxfp4_components(
 def assemble_layer_bundle(
     components: dict[tuple[str, str], np.ndarray],
     bits: dict[str, int],
-    codecs: dict[str, str] | None = None,
+    codecs: dict[str, str],
     kquant_codecs: dict[str, str] | None = None,
     iqk_codecs: dict[str, str] | None = None,
     iqk_layout: str = IQK_LAYOUT_IK_WIRE,
@@ -158,8 +141,7 @@ def assemble_layer_bundle(
     """Stacked per-projection arrays -> (bundle uint8 [N, row_bytes], geometry).
 
     `components` maps every (projection, component) required by the projection's
-    codec to its stacked array. TQ uses packed `[n_experts, out, packed_cols]`
-    uint32 and norms `[n_experts, out]` float16. mxfp4 uses packed
+    codec to its stacked array. MXFP4 uses packed
     `[n_experts, out, in/8]` uint32 and scales `[n_experts, out, in/32]` uint8.
     IQ_K uses blocks `[n_experts, out, bytes_per_row]` uint8, one member per
     projection named in `iqk_codecs` and one wire layout for the bundle.
@@ -167,7 +149,6 @@ def assemble_layer_bundle(
     records, per component, the exact within-row byte range + per-expert shape
     + dtype.
     """
-    codecs = codecs or {p: TQ_CODEC for p in PROJECTIONS}
     kquant_codecs = kquant_codecs or {}
     iqk_codecs = iqk_codecs or {}
     if iqk_layout not in IQK_LAYOUTS:
@@ -200,14 +181,7 @@ def assemble_layer_bundle(
     for proj in PROJECTIONS:
         b = bits[proj]
         codec = codecs[proj]
-        if codec == TQ_CODEC:
-            if components[(proj, "packed")].shape[1] != components[(proj, "norms")].shape[1]:
-                raise BundleFormatError(
-                    f"{proj}: packed rows {components[(proj, 'packed')].shape[1]} != "
-                    f"norms rows {components[(proj, 'norms')].shape[1]}")
-            if not isinstance(b, int) or not (1 <= b <= 8):
-                raise BundleFormatError(f"{proj}: bits {b!r} outside [1, 8]")
-        elif codec == MXFP4_CODEC:
+        if codec == MXFP4_CODEC:
             if b != 4:
                 raise BundleFormatError(f"{proj}: mxfp4 bits must be 4, got {b!r}")
             _validate_mxfp4_packed_scales_shape(
@@ -347,7 +321,7 @@ def _validate_layer_geometry(layer: int, geo: dict) -> dict:
 
     codecs = {}
     for proj in PROJECTIONS:
-        codec = projections[proj].get("codec", TQ_CODEC)
+        codec = projections[proj].get("codec")
         _components_for_codec(codec)
         codecs[proj] = codec
 
@@ -355,11 +329,8 @@ def _validate_layer_geometry(layer: int, geo: dict) -> dict:
     for proj, comp in row_order_for_codecs(codecs):
         p = projections[proj]
         b = p.get("bits")
-        codec = p.get("codec", TQ_CODEC)
-        if codec == TQ_CODEC:
-            if not isinstance(b, int) or not (1 <= b <= 8):
-                raise BundleFormatError(f"{where} {proj}: bits {b!r} outside [1, 8]")
-        elif codec == MXFP4_CODEC:
+        codec = p.get("codec")
+        if codec == MXFP4_CODEC:
             if b != 4 or p.get("group_size") != 32 or p.get("scale_dtype") != "ue8m0":
                 raise BundleFormatError(f"{where} {proj}: bad mxfp4 params {p!r}")
         elif codec == KQUANT_CODEC:
@@ -412,6 +383,20 @@ def _validate_layer_geometry(layer: int, geo: dict) -> dict:
                 raise BundleFormatError(
                     f"{where} {proj}: IQ_K in_features {p.get('in_features')!r} "
                     f"!= {in_features} implied by the row width")
+            streams = p.get("streams")
+            if p["layout"] == IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1:
+                _validate_iqk_streams(
+                    where,
+                    proj,
+                    streams,
+                    out_features=blocks_shape[0],
+                    component_nbytes=blocks_shape[0] * blocks_shape[1],
+                )
+            elif streams is not None:
+                raise BundleFormatError(
+                    f"{where} {proj}: native streams require the "
+                    f"{IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1!r} layout"
+                )
         c = p.get(comp)
         if not isinstance(c, dict):
             raise BundleFormatError(f"{where} {proj}.{comp}: missing component")
@@ -441,7 +426,120 @@ def _validate_layer_geometry(layer: int, geo: dict) -> dict:
         raise BundleFormatError(
             f"{where}: components end at {expect_offset} but row_bytes is "
             f"{row_bytes} (format has no padding)")
+    for projection in PROJECTIONS:
+        _validate_declared_input_geometry(where, projection, projections[projection])
     return geo
+
+
+def _validate_iqk_streams(
+    where: str,
+    projection: str,
+    streams: object,
+    *,
+    out_features: int,
+    component_nbytes: int,
+) -> None:
+    """Validate exact, gap-free native stream spans without importing a backend."""
+    if not isinstance(streams, list) or not streams:
+        raise BundleFormatError(
+            f"{where} {projection}: stream-major IQ_K metadata has no streams"
+        )
+    names: set[str] = set()
+    expected_offset = 0
+    for index, stream in enumerate(streams):
+        prefix = f"{where} {projection}.streams[{index}]"
+        if not isinstance(stream, dict) or set(stream) != {
+            "name",
+            "dtype",
+            "shape",
+            "offset",
+            "nbytes",
+        }:
+            raise BundleFormatError(f"{prefix}: malformed native stream descriptor")
+        name = stream["name"]
+        if not isinstance(name, str) or not name or name in names:
+            raise BundleFormatError(f"{prefix}: duplicate or invalid name {name!r}")
+        names.add(name)
+        dtype = stream["dtype"]
+        if dtype not in IQK_STREAM_DTYPES:
+            raise BundleFormatError(f"{prefix}: invalid dtype {dtype!r}")
+        try:
+            dtype_itemsize = np.dtype(dtype).itemsize
+        except (TypeError, ValueError) as exc:
+            raise BundleFormatError(f"{prefix}: invalid dtype {dtype!r}") from exc
+        shape = stream["shape"]
+        if (
+            not isinstance(shape, list)
+            or not shape
+            or shape[0] != out_features
+            or not all(isinstance(value, int) and value > 0 for value in shape)
+        ):
+            raise BundleFormatError(f"{prefix}: invalid shape {shape!r}")
+        elements = 1
+        for value in shape:
+            elements *= value
+        nbytes = stream["nbytes"]
+        if nbytes != elements * dtype_itemsize:
+            raise BundleFormatError(
+                f"{prefix}: nbytes {nbytes!r} does not match shape and dtype"
+            )
+        if stream["offset"] != expected_offset:
+            raise BundleFormatError(
+                f"{prefix}: offset {stream['offset']!r} != expected {expected_offset}"
+            )
+        expected_offset += nbytes
+    if expected_offset != component_nbytes:
+        raise BundleFormatError(
+            f"{where} {projection}: native streams end at {expected_offset}, "
+            f"component has {component_nbytes} bytes"
+        )
+
+
+def _validate_declared_input_geometry(where: str, projection: str, params: dict) -> None:
+    fields = ("logical_in_features", "stored_in_features", "zero_padding")
+    present = [field in params for field in fields]
+    if not any(present):
+        return
+    if not all(present):
+        raise BundleFormatError(
+            f"{where} {projection}: logical/stored input geometry is incomplete"
+        )
+    logical = params["logical_in_features"]
+    stored = params["stored_in_features"]
+    padding = params["zero_padding"]
+    if (
+        not isinstance(logical, int)
+        or not isinstance(stored, int)
+        or not isinstance(padding, int)
+        or logical <= 0
+        or stored < logical
+        or padding != stored - logical
+    ):
+        raise BundleFormatError(
+            f"{where} {projection}: bad logical/stored input geometry {params!r}"
+        )
+    codec = params.get("codec")
+    if codec == IQK_CODEC:
+        encoded_in = params.get("in_features")
+    elif codec == KQUANT_CODEC:
+        member = params.get("kquant_codec")
+        geometry = KQUANT_GEOMETRY.get(member)
+        shape = (params.get("weight") or {}).get("shape")
+        if geometry is None or not isinstance(shape, list) or len(shape) != 2:
+            raise BundleFormatError(
+                f"{where} {projection}: cannot derive K-quant stored width"
+            )
+        encoded_in = (
+            int(shape[1]) // geometry.bytes_per_block
+        ) * geometry.weights_per_block
+    else:
+        raise BundleFormatError(
+            f"{where} {projection}: declared input geometry on codec {codec!r}"
+        )
+    if encoded_in != stored:
+        raise BundleFormatError(
+            f"{where} {projection}: stored_in_features {stored} != encoded {encoded_in}"
+        )
 
 
 def _validate_mxfp4_packed_scales_shape(

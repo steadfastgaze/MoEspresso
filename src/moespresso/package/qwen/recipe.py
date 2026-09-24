@@ -419,30 +419,12 @@ def build_kquant_plan(
     force_overrides=None,
     allow_unmatched_force: bool = False,
     dry_run: bool = False,
-    expert_allocations: list[dict] | tuple[dict, ...] | None = None,
-    source_decision_id: str | None = None,
 ) -> dict:
-    """Build the shared package-plan artifact for a Qwen GGUF recipe.
-
-    The GGUF recipe supplies the dense allocation. MoEspresso's optimizer may
-    supply the routed-expert override described below.
-    F32 passthrough tensors travel separately through
-    `write_package(..., passthrough=...)`.
-
-    `expert_allocations` overrides the recipe's routed-expert rows with rows
-    consumed from an `optimizer_decision` (the TurboQuant hybrid path). The dense
-    rows stay the recipe's imatrix-calibrated K-quant. `source_decision_id`
-    records the cited decision on the plan so the manifest provenance shows the
-    honest mixed source; the plan producer stays `gguf_recipe` (a recipe path
-    does not emit an optimizer decision, it consumes and cites one).
-    """
+    """Build a package plan from the GGUF dense and routed-expert allocation."""
     validation: list[Validation] = []
     try:
         allocation = build_dense_kquant_allocations(dense_targets)
-        if expert_allocations is None:
-            allocation.extend(build_expert_kquant_allocations(expert_targets))
-        else:
-            allocation.extend(dict(row) for row in expert_allocations)
+        allocation.extend(build_expert_kquant_allocations(expert_targets))
     except KQuantRecipeError as exc:
         allocation = []
         validation.append(Validation(
@@ -455,7 +437,6 @@ def build_kquant_plan(
     counts: dict[str, int] = {}
     expert_counts: dict[str, int] = {}
     dense_counts: dict[str, int] = {}
-    tq_expert_counts: dict[str, int] = {}
     format_counts: dict[str, int] = {}
     for alloc in allocation:
         fmt = alloc.get("format")
@@ -465,17 +446,11 @@ def build_kquant_plan(
             counts[codec] = counts.get(codec, 0) + 1
             by_kind = expert_counts if alloc.get("kind") == "expert" else dense_counts
             by_kind[codec] = by_kind.get(codec, 0) + 1
-        elif fmt == "tq" and alloc.get("kind") == "expert":
-            label = f"TQ{int(alloc.get('bits', 0))}"
-            tq_expert_counts[label] = tq_expert_counts.get(label, 0) + 1
     constraints = {
         "objective": "gguf_recipe_kquant_allocation",
         "recipe_source": recipe_source,
         "imatrix": imatrix_identity,
     }
-    if expert_allocations is not None:
-        constraints["expert_allocation_source"] = "optimizer_decision"
-        constraints["expert_allocation_decision_id"] = source_decision_id
     if diagnostic is not None:
         constraints["diagnostic"] = diagnostic
     achieved = {
@@ -490,8 +465,6 @@ def build_kquant_plan(
                                if a.get("kind") == "expert"})
         } if allocation else {},
     }
-    if tq_expert_counts:
-        achieved["expert_tq_bit_counts"] = dict(sorted(tq_expert_counts.items()))
     plan, _summary = make_package_plan(
         subject,
         allocation,
@@ -505,7 +478,6 @@ def build_kquant_plan(
         status="valid" if not validation else "invalid",
         validation=validation,
         source_constraints=constraints,
-        source_decision_id=source_decision_id,
         achieved=achieved,
     )
     return plan

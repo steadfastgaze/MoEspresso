@@ -13,6 +13,7 @@ import json
 import struct
 import threading
 import time
+from dataclasses import replace
 
 import mlx.core as mx
 import numpy as np
@@ -25,6 +26,7 @@ from moespresso.package.iqk_format import (
     IQK_LAYOUT_IK_WIRE,
     IQK_LAYOUT_IQK_RELAYOUT,
     IQK_LAYOUT_LEGACY_RELAYOUT,
+    IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
     iqk_geometry,
 )
 from moespresso.package.manifest import (
@@ -32,6 +34,8 @@ from moespresso.package.manifest import (
     PACKAGE_FORMAT_VERSION,
     file_identity,
 )
+from moespresso.package.iqk_write import annotate_iqk_stream_geometry
+import moespresso.runtime.expert_slot_pool as expert_slot_pool
 from moespresso.runtime.deepseek_v4.iqk_experts import (
     IqkInstallError,
     install_deepseek_v4_iqk_experts,
@@ -112,11 +116,16 @@ def _package(
         in_features = model_width if projection != "down_proj" else expert_width
         out_features = expert_width if projection != "down_proj" else model_width
         wire = _wire(codec, E * out_features, in_features, seed=11 + 7 * i)
-        rows = (rl.pack_rows(codec, wire, in_features)
-                if layout == IQK_LAYOUT_IQK_RELAYOUT else wire)
+        relayout_rows = rl.pack_rows(codec, wire, in_features)
+        if layout == IQK_LAYOUT_IQK_RELAYOUT:
+            rows = relayout_rows
+        elif layout == IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1:
+            rows = rl.pack_stream_major(codec, relayout_rows, in_features)
+        else:
+            rows = wire
         comps[(projection, "blocks")] = rows.reshape(E, out_features, -1)
         reference[projection] = rl.decode_rows(
-            codec, rl.pack_rows(codec, wire, in_features), in_features
+            codec, relayout_rows, in_features
         ).reshape(E, out_features, in_features).astype(np.float32)
     bundle, geometry = assemble_layer_bundle(
         comps,
@@ -125,6 +134,8 @@ def _package(
         iqk_codecs=members,
         iqk_layout=layout,
     )
+    if layout == IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1:
+        annotate_iqk_stream_geometry(geometry)
     key = f"layers.{layer}.ffn.experts.tq_bundle"
     header = {
         "__metadata__": {
@@ -315,6 +326,228 @@ def test_pooled_projection_forced_miss_preserves_iqk_streams_and_output(tmp_path
     assert pooled.pool.resident_ids() == {1}
     assert pooled.pool.total_loads == 2
     assert pooled.pool.total_evictions == 1
+
+
+def test_qwen_stream_major_pool_lands_native_streams_without_splitter(tmp_path, monkeypatch):
+    pkg, _reference = _package(tmp_path, layout=IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1)
+    index = build_expert_index(pkg)
+    pooled = PooledIqkSwitchLinear(
+        package_dir=pkg,
+        index=index,
+        layer=0,
+        projection="gate_proj",
+        capacity=1,
+    )
+    geometry = index.geometry(layer=0, projection="gate_proj")
+    component = index.locate(
+        layer=0,
+        expert=0,
+        projection="gate_proj",
+        component="blocks",
+    )
+    with open(pkg / component.shard, "rb") as source:
+        source.seek(component.offset)
+        blocks = np.frombuffer(source.read(component.nbytes), dtype=np.uint8).reshape(
+            geometry.out_features, geometry.packed_cols
+        )
+    rows = rl.unpack_stream_major(geometry.iqk_codec, blocks, geometry.in_features)
+    expected = rl.split_streams(geometry.iqk_codec, rows, geometry.in_features)
+
+    def split_must_not_run(*_args, **_kwargs):
+        raise AssertionError("stream-major loader called split_streams")
+
+    monkeypatch.setattr(expert_slot_pool, "split_streams", split_must_not_run)
+    pooled.pool.ensure([0])
+
+    slot = pooled.pool.slot_of(0)
+    for name, value in expected.items():
+        got = np.asarray(getattr(pooled.pool.iqk, name)[slot])
+        assert got.shape == value.shape
+        assert got.dtype == value.dtype
+        assert got.tobytes() == np.ascontiguousarray(value).tobytes()
+
+
+def test_qwen_stream_major_projection_loads_use_row_cache_sized_rounds(
+    tmp_path,
+    monkeypatch,
+):
+    pkg, _reference = _package(
+        tmp_path,
+        layout=IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
+    )
+    resident = _StubSwitch(_activation())
+    pooled = _pooled_switch(
+        pkg,
+        resident,
+        capacity=E,
+        shared_row_cache=True,
+    )
+    pools = pooled._projection_pools_lockstep()
+    row_cache = pools[0].row_cache
+    assert row_cache is not None
+    row_cache.max_rows = 1
+
+    calls = []
+
+    def record_ensure(projection, original):
+        def wrapped(expert_ids, *, protect=None, fence=True):
+            calls.append((
+                projection,
+                tuple(sorted(expert_ids)),
+                tuple(sorted(protect or ())),
+                fence,
+            ))
+            return original(expert_ids, protect=protect, fence=fence)
+        return wrapped
+
+    for pool in pools:
+        monkeypatch.setattr(
+            pool,
+            "ensure",
+            record_ensure(pool.projection, pool.ensure),
+        )
+
+    assert pooled._ensure_stream_major_projection_batches(
+        set(range(E)),
+        protect=set(),
+        fence=False,
+    )
+
+    assert len(calls) == 3 * E
+    for expert in range(E):
+        batch = [call for call in calls if call[1] == (expert,)]
+        assert {call[0] for call in batch} == set(PROJECTIONS)
+        assert all(
+            call[2] == tuple(other for other in range(E) if other != expert)
+            for call in batch
+        )
+        assert all(call[3] is False for call in batch)
+    assert row_cache.total_preads == E
+    assert row_cache.total_cached_takes == 2 * E
+    assert not row_cache._rows and not row_cache._inflight
+    assert all(pool.resident_ids() == set(range(E)) for pool in pools)
+
+
+def test_qwen_stream_major_projection_batch_failure_cleans_cache_and_retries(
+    tmp_path,
+    monkeypatch,
+):
+    pkg, _reference = _package(
+        tmp_path,
+        layout=IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
+    )
+    resident = _StubSwitch(_activation())
+    pooled = _pooled_switch(
+        pkg,
+        resident,
+        capacity=E,
+        shared_row_cache=True,
+    )
+    pools = pooled._projection_pools_lockstep()
+    row_cache = pools[0].row_cache
+    assert row_cache is not None
+    row_cache.max_rows = 1
+    failed_pool = pools[1]
+    original_load = failed_pool._load_iqk_stream_major
+
+    def fail_second_row(source, *, slot):
+        if slot == 1:
+            raise OSError("synthetic stream-major projection failure")
+        return original_load(source, slot=slot)
+
+    monkeypatch.setattr(failed_pool, "_load_iqk_stream_major", fail_second_row)
+    with pytest.raises(OSError, match="synthetic stream-major"):
+        pooled._ensure_stream_major_projection_batches(
+            set(range(E)),
+            protect=set(),
+            fence=False,
+        )
+
+    assert not row_cache._rows and not row_cache._inflight
+    assert failed_pool.resident_ids() == {0}
+    assert all(pool._loads_inflight == 0 for pool in pools)
+
+    monkeypatch.setattr(failed_pool, "_load_iqk_stream_major", original_load)
+    assert pooled._ensure_stream_major_projection_batches(
+        set(range(E)),
+        protect=set(),
+        fence=False,
+    )
+    assert not row_cache._rows and not row_cache._inflight
+    assert all(pool.resident_ids() == set(range(E)) for pool in pools)
+
+
+def test_projection_row_cache_batching_rejects_the_incumbent_layout(tmp_path):
+    pkg, _reference = _package(tmp_path, layout=IQK_LAYOUT_IQK_RELAYOUT)
+    pooled = _pooled_switch(
+        pkg,
+        _StubSwitch(_activation()),
+        capacity=E,
+        shared_row_cache=True,
+    )
+    row_cache = pooled.gate_proj.pool.row_cache
+    assert row_cache is not None
+    row_cache.max_rows = 1
+
+    assert not pooled._ensure_stream_major_projection_batches(
+        set(range(E)),
+        protect=set(),
+        fence=False,
+    )
+    assert row_cache.total_preads == 0
+    assert all(
+        not pool.resident_ids()
+        for pool in pooled._projection_pools_lockstep()
+    )
+
+
+def test_qwen_stream_major_pool_rejects_short_component_without_publication(tmp_path):
+    pkg, _reference = _package(tmp_path, layout=IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1)
+    index = build_expert_index(pkg)
+    component = index.locate(
+        layer=0,
+        expert=0,
+        projection="gate_proj",
+        component="blocks",
+    )
+
+    class ShortRowCache:
+        def take(self, _expert):
+            return memoryview(bytearray(component.nbytes - 1))
+
+    pooled = PooledIqkSwitchLinear(
+        package_dir=pkg,
+        index=index,
+        layer=0,
+        projection="gate_proj",
+        capacity=1,
+        row_cache=ShortRowCache(),
+    )
+    with pytest.raises(ValueError, match="stream-major IQ_K component"):
+        pooled.pool.ensure([0])
+    assert pooled.pool.resident_ids() == set()
+    assert pooled.pool._expert_at == [None]
+
+
+def test_qwen_stream_major_pool_rejects_non_native_stream_names(tmp_path):
+    pkg, _reference = _package(tmp_path, layout=IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1)
+    pooled = PooledIqkSwitchLinear(
+        package_dir=pkg,
+        index=build_expert_index(pkg),
+        layer=0,
+        projection="gate_proj",
+        capacity=1,
+    )
+    pooled.pool.geometry = replace(
+        pooled.pool.geometry,
+        streams=tuple(reversed(pooled.pool.geometry.streams)),
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        pooled.pool.ensure([0])
+    assert pooled.pool.resident_ids() == set()
+    assert pooled.pool._expert_at == [None]
+
+
 
 
 def test_iqk_pool_failed_load_never_publishes_a_slot(tmp_path, monkeypatch):
@@ -733,12 +966,9 @@ def test_iqk_dual_gemv_matches_words_at_ds4_gate_up_geometry(tmp_path):
 
 def test_compact_iqk_dual_gemv_is_bit_identical_and_fails_closed(
     tmp_path,
-    monkeypatch,
 ):
-    import moespresso.runtime.pooled_switchglu as psg
     from moespresso.runtime.deepseek_v4.speed_stats import _COUNT_KEYS
 
-    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
     model, _reference, _ = _install(tmp_path)
     resident = model.layers[0].mlp.switch_mlp
     pooled = _pooled_switch(tmp_path / "pkg", resident, capacity=E)
@@ -759,13 +989,10 @@ def test_compact_iqk_dual_gemv_is_bit_identical_and_fails_closed(
     )
     mismatch = pooled.build_barrier_free_decode(x, indices)
     assert getattr(pooled, "iqk_dual_gemv_calls", 0) == 0
-    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", False)
-    assert not install_compact_iqk_dual_gemv(pooled, compact_source_ids)
     assert (
         pooled.build_barrier_free_decode.__func__
         is PooledSwitchGLU.build_barrier_free_decode
     )
-    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
     assert install_compact_iqk_dual_gemv(pooled, compact_source_ids)
     assert (
         pooled.build_barrier_free_decode.__func__
@@ -778,12 +1005,6 @@ def test_compact_iqk_dual_gemv_is_bit_identical_and_fails_closed(
     assert np.array_equal(np.asarray(compact), np.asarray(incumbent))
     assert pooled.iqk_dual_gemv_calls == 1
     assert pooled.iqk_dual_gemv_pairs == 2
-
-    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", False)
-    killed = pooled.build_barrier_free_decode(x, indices)
-    mx.eval(killed)
-    assert np.array_equal(np.asarray(killed), np.asarray(incumbent))
-    assert pooled.iqk_dual_gemv_calls == 1
 
     model.layers[0].mlp.switch_mlp = pooled
     engagement = iqk_engagement(model)
@@ -875,9 +1096,6 @@ def test_pooled_switch_partial_sorted_route_matches_resident_across_eviction(
     tmp_path,
     monkeypatch,
 ):
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_PREFILL_PREFETCH", True)
     monkeypatch.setenv("MOESPRESSO_DSV4_IQK_SORT_PAIRS", "1")
     monkeypatch.setenv("MOESPRESSO_DSV4_IQK_SORT_NSPLIT", "2")
     model, _reference, _ = _install(tmp_path)
@@ -964,7 +1182,7 @@ def test_deepseek_iqk_pooled_installer_and_full_prewarm_share_the_pool_path(
         model,
         pkg,
         index,
-        seed=42,
+
         capacity_per_layer=E,
     ) == 1
     seeded = seed_expert_residency(model, pkg)
@@ -999,8 +1217,11 @@ def test_pooled_iqk_block_preserves_decode_and_verify_commit_cadence(
         pool.ensure(range(E))
 
     class _Gate:
+        def __init__(self):
+            self.input_ids = []
+
         def __call__(self, x, input_ids=None):
-            del input_ids
+            self.input_ids.append(input_ids)
             shape = (*x.shape[:-1], 1)
             return (
                 mx.zeros(shape, dtype=mx.uint32),
@@ -1011,18 +1232,21 @@ def test_pooled_iqk_block_preserves_decode_and_verify_commit_cadence(
         def __call__(self, x):
             return mx.zeros_like(x)
 
+    gate = _Gate()
+
     class _Original:
-        gate = _Gate()
         shared_experts = _Shared()
         sharding_group = None
 
         def __init__(self, switch_mlp):
+            self.gate = gate
             self.switch_mlp = switch_mlp
 
     block = PooledDeepseekV4MoEBlock(_Original(switch))
     block.eval()
 
-    decode = block(mx.ones((1, D), dtype=mx.float16))
+    decode_ids = object()
+    decode = block(mx.ones((1, D), dtype=mx.float16), input_ids=decode_ids)
     verify = block(mx.ones((1, 6, D), dtype=mx.float16))
     wider = block(mx.ones((1, 9, D), dtype=mx.float16))
     mx.eval(decode, verify, wider)
@@ -1040,12 +1264,10 @@ def test_pooled_iqk_block_preserves_decode_and_verify_commit_cadence(
     assert census["iqk_decode_flush_calls"] == 1
     assert census["iqk_verify_flush_calls"] == 1
     assert census["iqk_gemv_calls"] == switch.gemv_calls
+    assert gate.input_ids == [decode_ids, None, None]
 
 
-def test_compact_install_engages_the_iqk_dual_gemv(tmp_path, monkeypatch):
-    import moespresso.runtime.pooled_switchglu as psg
-
-    monkeypatch.setattr(psg, "_IQK_DUAL_GEMV", True)
+def test_compact_install_engages_the_iqk_dual_gemv(tmp_path):
     model, _reference, _ = _install(tmp_path)
     resident = model.layers[0].mlp.switch_mlp
     switch = _pooled_switch(tmp_path / "pkg", resident, capacity=E)

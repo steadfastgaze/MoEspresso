@@ -107,7 +107,7 @@ def test_real_ds4_source_expert_rows_roundtrip_with_recipe_codecs():
     from moespresso.inventory.build import build_inventory
     from moespresso.package.deepseek_v4.kquant import load_ds4_kquant_imatrix_vectors
     from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup
-    from moespresso.package.convert import _layer_types, _read_config
+    from moespresso.package.source import _layer_types, _read_config
 
     source = _required_path("MOESPRESSO_DEEPSEEK_V4_SOURCE")
     recipe_path = _required_path("MOESPRESSO_DS4_KQUANT_GGUF_RECIPE")

@@ -7,46 +7,11 @@ import numpy as np
 from moespresso.package.bundle import assemble_layer_bundle, ds4_source_to_mxfp4_components
 from moespresso.package.deepseek_v4.recipe import expert_target_from_allocation
 from moespresso.package.iqk_format import IQK_GEOMETRY, IQK_LAYOUT_IK_WIRE
+from moespresso.package.iqk_write import iqk_bundle_row
 from moespresso.package.kquant_backend import encode_kquant_weight
 from moespresso.package.kquant_cache import KQuantEncodeCache, source_identity_from_arrays
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
-from moespresso.package.tq import quantize_tq
 from moespresso.probe.deepseek_v4.experts import DecodedExpertGroup
-
-
-def quantize_experts_streamed(
-    group: DecodedExpertGroup,
-    layer: int,
-    projection: str,
-    bits: int,
-    seed: int,
-    max_experts: int | None = None,
-) -> dict[str, np.ndarray]:
-    """TQ-quantize DS4 decoded separate FP4 experts one expert at a time."""
-    import mlx.core as mx
-
-    experts = group.experts(layer)
-    if max_experts is not None:
-        experts = experts[:max_experts]
-    packed_list, norms_list = [], []
-    for expert_index in experts:
-        decoded = group.decode(
-            layer=layer,
-            expert_index=expert_index,
-            projection=projection,
-            out_dtype=np.float32,
-        )
-        quantized = quantize_tq(decoded, bits, seed)
-        packed_list.append(quantized["tq_packed"])
-        norms_list.append(quantized["tq_norms"])
-        del decoded
-        mx.eval()
-        mx.clear_cache()
-    return {
-        "tq_packed": np.stack(packed_list, axis=0),
-        "tq_norms": np.stack(norms_list, axis=0),
-        "tq_bits": np.array([bits], dtype=np.uint8),
-    }
 
 
 def bundle_row(
@@ -54,7 +19,6 @@ def bundle_row(
     layer: int,
     expert_index: int,
     allocs: dict[str, dict],
-    seed: int,
     *,
     kquant_imatrix_vectors: dict[str, np.ndarray] | None = None,
     kquant_encoder=None,
@@ -66,6 +30,19 @@ def bundle_row(
     """Quantize one DS4 expert's gate/up/down payload into one bundle row."""
     import mlx.core as mx
 
+    if all(allocs[projection].get("format") == "iqk" for projection in ("gate", "up", "down")):
+        if iqk_expert_loader is None:
+            raise ValueError(
+                "IQ_K DS4 expert codec requires a converted-artifact expert loader "
+                f"for layer={layer}"
+            )
+        return iqk_bundle_row(
+            layer,
+            expert_index,
+            allocs,
+            expert_loader=iqk_expert_loader,
+        )
+
     comps: dict[tuple[str, str], np.ndarray] = {}
     bits: dict[str, int] = {}
     codecs: dict[str, str] = {}
@@ -75,7 +52,7 @@ def bundle_row(
     for projection in ("gate", "up", "down"):
         alloc = allocs[projection]
         proj_key = f"{projection}_proj"
-        codec = alloc.get("codec", alloc.get("format", "tq"))
+        codec = alloc.get("codec", alloc.get("format"))
         if alloc.get("format") == "iqk" or codec == "iqk":
             # Already-encoded bytes: the conversion stage owns the encode, so
             # the writer only checks that what it stores has the row geometry
@@ -115,21 +92,6 @@ def bundle_row(
             bits[proj_key] = 4
             codecs[proj_key] = "mxfp4"
             del packed_i8, scales_u8, converted
-        elif codec == "tq":
-            decoded = group.decode(
-                layer=layer,
-                expert_index=expert_index,
-                projection=projection,
-                out_dtype=np.float32,
-            )
-            quantized = quantize_tq(decoded, alloc["bits"], seed)
-            comps[(proj_key, "packed")] = quantized["tq_packed"][None, ...]
-            comps[(proj_key, "norms")] = quantized["tq_norms"][None, ...]
-            bits[proj_key] = int(alloc["bits"])
-            codecs[proj_key] = "tq"
-            del decoded, quantized
-            mx.eval()
-            mx.clear_cache()
         elif alloc.get("format") == "kquant" or codec == "kquant":
             if kquant_imatrix_vectors is None and kquant_expert_loader is None:
                 raise ValueError(

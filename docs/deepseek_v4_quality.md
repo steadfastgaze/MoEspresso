@@ -299,13 +299,12 @@ The default window count is 32, the count every recorded package limit was
 measured at. `--window-count` still overrides; the older 8-window readings are
 comparable only against other 8-window readings.
 
-The matched cross-artifact panel in
-[`benchmark_reproduction.md`](benchmark_reproduction.md#deepseek-v4-flash-quality-comparison)
-uses the same first 32 windows but scores only the final 1,023 targets in each,
-for 32,736 target losses. It reports 5.5548 for the release package. The normal
-release gate scores all 2,047 targets in each window, for 65,504 losses, and
-reports 6.4774. The two results use different target positions and are not
-directly comparable.
+A historical matched cross-artifact panel scores only the final 1,023 targets
+in each of the first 32 windows: 32,736 losses, with a release-package score
+of 5.5548.
+The normal release gate scores all 2,047 targets per window, giving 65,504
+losses and a score of 6.4774. Their target positions differ, so the values are
+not directly comparable.
 
 **The limit is declared, never assumed.** Perplexity is package-family
 dependent: two packages of the same weights read differently on the same corpus,
@@ -358,8 +357,7 @@ payload remains private; the counts state the scope of the comparison without
 publishing its token or logit contents.
 
 Serving speed for this package is in
-[`deepseek_v4_speed.md`](deepseek_v4_speed.md); the acquisition and measurement
-controls are in [`benchmark_reproduction.md`](benchmark_reproduction.md).
+[`deepseek_v4_speed.md`](deepseek_v4_speed.md).
 
 ## Speculative decoding correctness
 

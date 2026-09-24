@@ -153,22 +153,6 @@ def token_prefix_hash(tokens: list[int] | tuple[int, ...]) -> str:
     return h.hexdigest()
 
 
-def _dsv4_banded_prefill_offset_route() -> bool:
-    """Whether the DS4 banded-prefill offset route is enabled for this process.
-
-    The offset route changes the attention values on every chunk past the
-    first, so hidden states downstream of any later chunk differ from the
-    composed lattice. A checkpoint written under one route must never
-    restore under the other; the scope carries the route flag so the two
-    rails key separate buckets. Frontier geometry is unchanged either way.
-    """
-    from moespresso.runtime.deepseek_v4.model import (
-        _banded_prefill_offset_enabled,
-    )
-
-    return _banded_prefill_offset_enabled()
-
-
 def build_cache_scope(model_key: tuple, cache_class_names: tuple[str, ...]) -> dict:
     """Fields that decide whether one checkpoint may restore for another request.
 
@@ -176,10 +160,10 @@ def build_cache_scope(model_key: tuple, cache_class_names: tuple[str, ...]) -> d
     ``prefix_cache.cache_model_key`` (artifact id, rendering id, live KV format,
     group size, quantized KV start, cache payload kind). The scope extends it with
     the cache-class list and the disk schema version, so a checkpoint written for
-    one cache-class layout never restores into another. Math-affecting
-    route flags join the scope only when engaged: a disabled route keeps
-    the recorded scope bytes, and an engaged rail keys its own bucket, so
-    a checkpoint written under one rail never restores under the other.
+    one cache-class layout never restores into another. The promoted
+    DeepSeek-V4 banded-offset route remains in the scope so
+    current checkpoints stay distinct from legacy checkpoints produced on
+    the retired composed-offset lattice.
     """
     scope = {
         "schema_version": SCHEMA_VERSION,
@@ -191,8 +175,7 @@ def build_cache_scope(model_key: tuple, cache_class_names: tuple[str, ...]) -> d
         "cache_payload_kind": model_key[5],
         "cache_class_names": list(cache_class_names),
     }
-    if _dsv4_banded_prefill_offset_route():
-        scope["dsv4_banded_prefill_offset"] = True
+    scope["dsv4_banded_prefill_offset"] = True
     return scope
 
 
@@ -1587,6 +1570,7 @@ class DiskCheckpointStore:
         *,
         make_cache_fn: Callable[[], list],
         registry: set[str],
+        validate_fn: Callable[[list, DiskKVEntry], None] | None = None,
     ) -> DiskKVHit | None:
         """Restore the longest valid checkpoint for these tokens, or return None.
 
@@ -1596,6 +1580,9 @@ class DiskCheckpointStore:
         state. A persisted-data refusal quarantines the entry and re-raises the
         domain error. A live runtime failure retains the entry and disables
         restores until the store reopens.
+
+        An optional model validator checks the reconstructed payload against
+        the selected entry before any successful restore is recorded.
 
         Every fault on this path surfaces as ``DiskKVError`` so the caller's
         cold-serve fallback always fires: a corrupt index or an unreadable
@@ -1631,6 +1618,8 @@ class DiskCheckpointStore:
             )
             prompt_cache = self._reconstruct(
                 make_cache_fn, state_trees, meta_state_trees, entry)
+            if validate_fn is not None:
+                validate_fn(prompt_cache, entry)
         except (DiskKVInvalidPayload, DiskKVMetadataMismatch):
             self.quarantine(entry)
             raise

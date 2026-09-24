@@ -16,3 +16,4 @@ src/moespresso/correctness/fixtures/*/private/
 
 # Local research.
 specs_archive/
+/.research/

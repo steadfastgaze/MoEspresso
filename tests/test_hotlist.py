@@ -104,6 +104,26 @@ def test_build_payload_slices_counts_for_smoke_packages():
     assert list(payload["layers"]["0"]) == ["1", "0"]  # expert 3 ignored
 
 
+def test_build_payload_accepts_per_layer_compact_counts():
+    payload = build_package_expert_hotlist(
+        {
+            0: np.array([1.0, 9.0, 5.0]),
+            1: np.array([3.0, 2.0]),
+        },
+        layers_indexed=(0, 1),
+        num_experts={0: 3, 1: 2},
+    )
+    assert list(payload["layers"]["0"]) == ["1", "2", "0"]
+    assert list(payload["layers"]["1"]) == ["0", "1"]
+
+    with pytest.raises(HotlistAlignmentError, match="per-layer expert counts"):
+        build_package_expert_hotlist(
+            {0: np.ones(2), 1: np.ones(2)},
+            layers_indexed=(0, 1),
+            num_experts={0: 2},
+        )
+
+
 def test_alignment_mismatch_fails_closed():
     with pytest.raises(HotlistAlignmentError, match="refusing"):
         build_package_expert_hotlist(

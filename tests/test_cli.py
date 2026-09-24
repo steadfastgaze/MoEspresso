@@ -91,6 +91,8 @@ def test_top_level_cli_help_and_version(capsys):
     help_text = capsys.readouterr().out
     assert "usage: moespresso" in help_text
     assert "serve" in help_text and "generate" in help_text and "verify" in help_text
+    assert "speed" in help_text
+    assert "completions-api-timing" in help_text
 
     with pytest.raises(SystemExit) as exc:
         main(["--version"])

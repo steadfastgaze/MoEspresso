@@ -53,6 +53,8 @@ from moespresso.runtime.tool_stream import (
     QWENXML_DIALECT,
     ToolCallStreamer,
 )
+from moespresso.runtime.thinking import QWEN4_DEFAULT_REASONING_EFFORT
+from moespresso.runtime.qwen4.cache_routing_config import resolve_cache_routing
 from moespresso.toolcalls.dsml import render_dsml_tool_calls
 from moespresso.toolcalls.dsml import render_tools as render_dsml_tools_block
 
@@ -64,6 +66,10 @@ from moespresso.toolcalls.dsml import render_tools as render_dsml_tools_block
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 1.0
+PACKAGE_GENERATION_CONFIG = "generation_config.json"
+QWEN4_FAMILY = "qwen4_exp"
+QWEN4_FAMILIES = frozenset({QWEN4_FAMILY, "qwen4_exp_text"})
+QWEN4_REASONING_EFFORTS = frozenset({"xhigh", "medium", "low"})
 
 # Chat-template kwargs MoEspresso applies by default for thinking-capable families.
 # preserve_thinking=True keeps past <think> blocks in history so the rendered prefix is
@@ -110,6 +116,19 @@ class RequestError(Exception):
 
 class ClientDisconnected(ConnectionError):
     """The peer closed a streaming response while generation was active."""
+
+
+class PackageRequestContractError(ValueError):
+    """A package declares a request default the runtime cannot serve."""
+
+
+@dataclass(frozen=True)
+class PackageRequestContract:
+    """Request behavior resolved once from a package manifest and its files."""
+
+    family: str | None = None
+    modality: str | None = None
+    generation_defaults: dict | None = None
 
 
 def request_stream_options(request: dict) -> tuple[bool, bool]:
@@ -449,6 +468,119 @@ def is_deepseek_v4_manifest(manifest: dict) -> bool:
     )
 
 
+def _manifest_declares_tokenizer_file(manifest: dict, name: str) -> bool:
+    tokenizer = manifest.get("tokenizer") or {}
+    files = tokenizer.get("files") or []
+    return any(
+        isinstance(entry, dict) and entry.get("path") == name
+        for entry in files
+    )
+
+
+def _package_sampling_number(config: dict, name: str) -> float | None:
+    value = config.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PackageRequestContractError(
+            f"{PACKAGE_GENERATION_CONFIG} field {name!r} must be a number")
+    return float(value)
+
+
+def load_package_generation_defaults(
+    package_dir: Path,
+    manifest: dict,
+) -> dict:
+    """Read supported generation defaults from a manifest-declared package file.
+
+    The file is package-owned compatibility data copied beside the tokenizer.
+    Only runtime-supported sampling fields are returned. Integrity verification
+    remains the separate ``moespresso verify`` gate.
+    """
+    if not _manifest_declares_tokenizer_file(
+            manifest, PACKAGE_GENERATION_CONFIG):
+        return {}
+    path = Path(package_dir) / PACKAGE_GENERATION_CONFIG
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise PackageRequestContractError(
+            f"cannot read declared {PACKAGE_GENERATION_CONFIG}: {e}") from e
+    if not isinstance(config, dict):
+        raise PackageRequestContractError(
+            f"{PACKAGE_GENERATION_CONFIG} must contain a JSON object")
+
+    do_sample = config.get("do_sample")
+    if do_sample is not None and not isinstance(do_sample, bool):
+        raise PackageRequestContractError(
+            f"{PACKAGE_GENERATION_CONFIG} field 'do_sample' must be a boolean")
+
+    defaults: dict = {}
+    temperature = _package_sampling_number(config, "temperature")
+    if temperature is not None:
+        if temperature < 0.0:
+            raise PackageRequestContractError(
+                f"{PACKAGE_GENERATION_CONFIG} temperature must be non-negative")
+        defaults["temperature"] = temperature
+    top_p = _package_sampling_number(config, "top_p")
+    if top_p is not None:
+        if not 0.0 <= top_p <= 1.0:
+            raise PackageRequestContractError(
+                f"{PACKAGE_GENERATION_CONFIG} top_p must be between 0 and 1")
+        defaults["top_p"] = top_p
+    top_k = config.get("top_k")
+    if top_k is not None:
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+            raise PackageRequestContractError(
+                f"{PACKAGE_GENERATION_CONFIG} top_k must be a non-negative integer")
+        defaults["top_k"] = top_k
+    min_p = _package_sampling_number(config, "min_p")
+    if min_p is not None:
+        if not 0.0 <= min_p <= 1.0:
+            raise PackageRequestContractError(
+                f"{PACKAGE_GENERATION_CONFIG} min_p must be between 0 and 1")
+        defaults["min_p"] = min_p
+    presence_penalty = _package_sampling_number(config, "presence_penalty")
+    if presence_penalty is not None:
+        defaults["presence_penalty"] = presence_penalty
+    repetition_penalty = _package_sampling_number(config, "repetition_penalty")
+    if repetition_penalty is not None and repetition_penalty != 1.0:
+        raise PackageRequestContractError(
+            f"{PACKAGE_GENERATION_CONFIG} requests repetition_penalty="
+            f"{repetition_penalty}, but the runtime supports only its neutral "
+            "value 1.0")
+    if repetition_penalty is not None:
+        defaults["repetition_penalty"] = repetition_penalty
+
+    if do_sample is False:
+        defaults.update({
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "presence_penalty": 0.0,
+        })
+    return defaults
+
+
+def package_request_contract(
+    package_dir: Path,
+    manifest: dict,
+) -> PackageRequestContract:
+    """Resolve the package-owned request surface once at server startup."""
+    architecture = manifest.get("architecture") or {}
+    family = architecture.get("family")
+    return PackageRequestContract(
+        family=family,
+        modality=architecture.get("modality"),
+        generation_defaults=(
+            load_package_generation_defaults(package_dir, manifest)
+            if family in QWEN4_FAMILIES
+            else {}
+        ),
+    )
+
+
 def deepseek_v4_contract_template_kwargs(thinking: str | None = None) -> dict:
     """DS4 render kwargs for a `--thinking` selection (off, on, high, max).
 
@@ -472,25 +604,73 @@ def deepseek_v4_contract_template_kwargs(thinking: str | None = None) -> dict:
     return kwargs
 
 
+def qwen4_contract_template_kwargs(
+    tokenizer,
+    thinking: str | None = None,
+    *,
+    family: str = QWEN4_FAMILY,
+) -> dict:
+    """Resolve the Qwen package default and optional on/off override."""
+    if family not in QWEN4_FAMILIES:
+        raise ValueError(f"unsupported Qwen reasoning family: {family!r}")
+    if thinking not in (None, "off", "on"):
+        raise ValueError(f"invalid Qwen thinking selection: {thinking!r}")
+    kwargs = {"reasoning_effort": QWEN4_DEFAULT_REASONING_EFFORT}
+    if thinking is not None:
+        from moespresso.runtime.thinking import resolve_thinking_kwargs
+
+        kwargs.update(
+            resolve_thinking_kwargs(
+                tokenizer,
+                thinking=thinking == "on",
+                family=family,
+            )
+        )
+    return kwargs
+
+
 def _request_template_kwargs(
     request: dict,
     *,
     prompt_renderer: str | None = None,
+    family: str | None = None,
 ) -> dict:
     raw = request.get("chat_template_kwargs")
     if raw is None:
-        return {}
-    if not isinstance(raw, dict):
+        out = {}
+    elif not isinstance(raw, dict):
         raise RequestError(400, "chat_template_kwargs must be a JSON object")
-    if is_deepseek_v4_renderer(prompt_renderer) and raw:
-        joined = ", ".join(sorted(raw))
+    else:
+        out = dict(raw)
+    if is_deepseek_v4_renderer(prompt_renderer) and out:
+        joined = ", ".join(sorted(out))
         raise RequestError(
             400,
             "DeepSeek-V4 owns its render policy as part of the "
             f"cache/attention contract; chat_template_kwargs are not "
             f"request options: {joined}",
         )
-    return raw
+    top_level_effort = request.get("reasoning_effort")
+    has_top_level_effort = "reasoning_effort" in request
+    if family not in QWEN4_FAMILIES:
+        if has_top_level_effort:
+            raise RequestError(
+                400, "reasoning_effort is not supported by this package")
+        return out
+
+    supplied_effort = (
+        top_level_effort
+        if has_top_level_effort
+        else out.get("reasoning_effort")
+    )
+    if ((has_top_level_effort or "reasoning_effort" in out)
+            and supplied_effort not in QWEN4_REASONING_EFFORTS):
+        allowed = ", ".join(sorted(QWEN4_REASONING_EFFORTS))
+        raise RequestError(
+            400, f"reasoning_effort must be one of: {allowed}")
+    if has_top_level_effort:
+        out["reasoning_effort"] = top_level_effort
+    return out
 
 
 SUPPORTED_SAMPLING_FIELDS = (
@@ -544,6 +724,88 @@ def _request_sampling_kwargs(request: dict) -> dict:
             f"{SUPPORTED_SAMPLING_FIELDS}",
         )
     return out
+
+
+def resolve_sampling_kwargs(
+    request: dict,
+    defaults: dict | None,
+) -> dict:
+    """Merge package sampling defaults with explicit request fields."""
+    supported = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+    }
+    values = dict(defaults or {})
+    values.update({key: request[key] for key in supported if key in request})
+
+    temperature = values.get("temperature", DEFAULT_TEMPERATURE)
+    if (isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))):
+        raise RequestError(400, "temperature must be a number")
+    temperature = float(temperature)
+    if temperature < 0.0:
+        raise RequestError(400, "temperature must be non-negative")
+
+    top_p = values.get("top_p", DEFAULT_TOP_P)
+    if isinstance(top_p, bool) or not isinstance(top_p, (int, float)):
+        raise RequestError(400, "top_p must be a number")
+    top_p = float(top_p)
+    if not 0.0 <= top_p <= 1.0:
+        raise RequestError(400, "top_p must be between 0 and 1")
+
+    return {
+        "temperature": temperature,
+        "top_p": top_p,
+        **_request_sampling_kwargs(values),
+    }
+
+
+def _validate_text_only_messages(messages: list[dict]) -> None:
+    """Reject multimodal content before a text-only package is rendered."""
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            raise RequestError(
+                400,
+                f"messages[{message_index}].content must be text or a list "
+                "of text parts for this text-only package",
+            )
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict):
+                raise RequestError(
+                    400,
+                    f"messages[{message_index}].content[{part_index}] must "
+                    "be an object",
+                )
+            part_type = part.get("type")
+            has_image = (
+                "image" in part
+                or "image_url" in part
+                or part_type in {"image", "image_url", "input_image"}
+            )
+            has_video = (
+                "video" in part
+                or "video_url" in part
+                or part_type in {"video", "video_url", "input_video"}
+            )
+            if has_image or has_video:
+                kind = "image" if has_image else "video"
+                raise RequestError(
+                    400,
+                    f"{kind} content is not supported by this text-only package",
+                )
+            if "text" not in part or not isinstance(part["text"], str):
+                raise RequestError(
+                    400,
+                    f"messages[{message_index}].content[{part_index}] must "
+                    "contain text",
+                )
 
 
 def _request_session_cache_key(request: dict) -> str | None:
@@ -650,6 +912,7 @@ def effective_kv_policy(
     request: dict,
     *,
     prompt_renderer: str | None = None,
+    family: str | None = None,
 ) -> KVPolicy:
     """Resolve the live KV policy after model-family contracts are applied."""
     if is_deepseek_v4_renderer(prompt_renderer):
@@ -660,6 +923,16 @@ def effective_kv_policy(
                 400,
                 "DeepSeek-V4 owns live KV/cache policy as part of its "
                 f"attention contract; these are not request options: {joined}",
+            )
+        return parse_kv_policy({"live_kv_format": LIVE_KV_RAW})
+    if family in QWEN4_FAMILIES:
+        forbidden = sorted(REQUEST_KV_POLICY_FIELDS & set(request))
+        if forbidden:
+            joined = ", ".join(forbidden)
+            raise RequestError(
+                400,
+                "Qwen4 owns its K4/V4 live-cache format; these are not "
+                f"request options: {joined}",
             )
         return parse_kv_policy({"live_kv_format": LIVE_KV_RAW})
     return parse_kv_policy(request)
@@ -719,6 +992,7 @@ def run_startup_warmup(
     tokenizer,
     *,
     prompt_renderer: str | None = None,
+    family: str | None = None,
     server_template_kwargs: dict | None = None,
     generate_fn: Callable | None = None,
     clock: Callable[[], float] | None = None,
@@ -729,9 +1003,8 @@ def run_startup_warmup(
     and kernel/graph setup inside time to first token. Serving primes those
     paths with one small deterministic generation. The direct generation seam
     bypasses ``PrefixCacheGenerator``: its prompt cache dies with this call, no
-    memory or disk KV key is inserted, and synthetic expert demand is not
-    persisted. In-memory expert residency and runtime counters may still
-    reflect the prime.
+    memory or disk KV key is inserted. In-memory expert residency and runtime
+    counters may still reflect the prime.
     """
     if generate_fn is None:
         from moespresso.runtime.serve import generate_with_metadata
@@ -747,7 +1020,11 @@ def run_startup_warmup(
         template_kwargs=server_template_kwargs,
         prompt_renderer=prompt_renderer,
     )
-    kv_policy = effective_kv_policy({}, prompt_renderer=prompt_renderer)
+    kv_policy = effective_kv_policy(
+        {},
+        prompt_renderer=prompt_renderer,
+        family=family,
+    )
     started = clock()
     generate_fn(
         model,
@@ -758,7 +1035,6 @@ def run_startup_warmup(
         max_tokens=STARTUP_WARMUP_MAX_TOKENS,
         temperature=0.0,
         top_p=1.0,
-        persist_expert_demand=False,
     )
     return clock() - started
 
@@ -772,6 +1048,7 @@ def chat_completion(
     rendering_id: str | None = None,
     prompt_renderer: str | None = None,
     server_template_kwargs: dict | None = None,
+    request_contract: PackageRequestContract | None = None,
     created: int = 0,
     ready_callback: Callable[[], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -797,6 +1074,7 @@ def chat_completion(
     if not isinstance(messages, list) or not messages:
         raise RequestError(400, "request must include a non-empty 'messages' list")
     config = tool_config or DEFAULT_TOOL_CALL_CONFIG
+    contract = request_contract or PackageRequestContract()
     # A verbatim-mode request opts out of every served tool-call behavior
     # for this one request, so the exact pre-parsing request contract
     # (strict content validation, tools rendered as sent) applies to it.
@@ -811,6 +1089,8 @@ def chat_completion(
             _validate_history_tool_calls(calls)
         elif "content" not in m:
             raise RequestError(400, "each message needs a 'content' field")
+    if contract.modality == "text":
+        _validate_text_only_messages(messages)
 
     ds4 = is_deepseek_v4_renderer(prompt_renderer)
     tools = _request_tools(request) if parse_enabled else None
@@ -819,6 +1099,7 @@ def chat_completion(
         kv_policy = effective_kv_policy(
             request,
             prompt_renderer=prompt_renderer,
+            family=contract.family,
         )
         validate_runtime_policy(kv_policy)
     except KVPolicyError as e:
@@ -827,15 +1108,22 @@ def chat_completion(
     # precedence: module defaults < package/family contract < server launch flags
     # < per-request kwargs. DS4 removes the request layer entirely: its prompt mode
     # is fixed by the package/runtime contract and cannot be changed by callers.
-    contract_template_kwargs = (
-        deepseek_v4_contract_template_kwargs()
-        if is_deepseek_v4_renderer(prompt_renderer)
-        else {}
-    )
+    if is_deepseek_v4_renderer(prompt_renderer):
+        contract_template_kwargs = deepseek_v4_contract_template_kwargs()
+    elif contract.family in QWEN4_FAMILIES:
+        contract_template_kwargs = {
+            "reasoning_effort": QWEN4_DEFAULT_REASONING_EFFORT,
+        }
+    else:
+        contract_template_kwargs = {}
     template_kwargs = {
         **contract_template_kwargs,
         **(server_template_kwargs or {}),
-        **_request_template_kwargs(request, prompt_renderer=prompt_renderer),
+        **_request_template_kwargs(
+            request,
+            prompt_renderer=prompt_renderer,
+            family=contract.family,
+        ),
     }
     resolved_template_kwargs = effective_template_kwargs(
         template_kwargs, prompt_renderer=prompt_renderer)
@@ -930,14 +1218,14 @@ def chat_completion(
             def response_stop_callback() -> bool:
                 return streamer.terminal
 
+    sampling_kwargs = resolve_sampling_kwargs(
+        request, contract.generation_defaults)
     generate_kwargs = {
         "max_tokens": int(request.get("max_tokens", DEFAULT_MAX_TOKENS)),
-        "temperature": float(request.get("temperature", DEFAULT_TEMPERATURE)),
-        "top_p": float(request.get("top_p", DEFAULT_TOP_P)),
         "kv_policy": kv_policy,
         "effective_rendering_id": effective_rendering_id,
         "session_cache_key": _request_session_cache_key(request),
-        **_request_sampling_kwargs(request),
+        **sampling_kwargs,
     }
     if ready_callback is not None:
         generate_kwargs["ready_callback"] = ready_callback
@@ -1256,6 +1544,25 @@ def build_cache_generator(
     except ImportError:
         maybe_adapt_ssd_streaming_capacity = None
 
+    from moespresso.runtime.qwen4.generation import (
+        Qwen4RequestGenerator,
+        is_qwen4_generation_model,
+    )
+
+    if is_qwen4_generation_model(model):
+        return Qwen4RequestGenerator(
+            model,
+            tokenizer,
+            context_limit=(
+                effective_context_limit(manifest)
+                if context_limit is None
+                else int(context_limit)
+            ),
+            after_generate_fn=maybe_adapt_ssd_streaming_capacity,
+            cache_store=memory_store_factory(prompt_cache_size, prompt_cache_bytes),
+            disk_store=disk_store,
+        )
+
     return PrefixCacheGenerator(
         model,
         tokenizer,
@@ -1279,8 +1586,10 @@ def make_handler(
     rendering_id: str | None = None,
     prompt_renderer: str | None = None,
     server_template_kwargs: dict | None = None,
+    request_contract: PackageRequestContract | None = None,
     stats: Callable[[], dict] | None = None,
     runtime_stats: Callable[[], dict] | None = None,
+    diagnostics: Callable[[], dict] | None = None,
     clock: Callable[[], int] = lambda: 0,
     tool_config: ToolCallConfig | None = None,
 ) -> type[BaseHTTPRequestHandler]:
@@ -1309,6 +1618,8 @@ def make_handler(
                     payload["prompt_cache"] = stats()
                 if runtime_stats is not None:
                     payload["ssd_streaming"] = runtime_stats()
+                if diagnostics is not None:
+                    payload["diagnostics"] = diagnostics()
                 self._send_json(200, payload)
             else:
                 self._send_json(404, {"error": {"message": "not found"}})
@@ -1337,6 +1648,7 @@ def make_handler(
                     tokenizer=tokenizer, rendering_id=rendering_id,
                     prompt_renderer=prompt_renderer,
                     server_template_kwargs=server_template_kwargs,
+                    request_contract=request_contract,
                     created=created,
                     ready_callback=(stream_writer.start if stream_writer else None),
                     progress_callback=(
@@ -1440,6 +1752,9 @@ def serve(
     prompt_cache_bytes: int | None = None,
     max_context_tokens: int | None = None,
     min_resident_experts: int | None = None,
+    cache_routing: str = "auto",
+    cache_routing_factor: float | None = None,
+    cache_routing_protected_routes: int | None = None,
     thinking: str | None = None,
     startup_warmup: bool = True,
     external_drafter: Path | None = None,
@@ -1486,6 +1801,22 @@ def serve(
     )
 
     disk_kv_config = None
+    preflight = _preflight_manifest_for_cli(package_dir)
+    from moespresso.runtime.serve import validate_cache_routing_option
+
+    try:
+        routing = resolve_cache_routing(
+            cache_routing, factor=cache_routing_factor,
+            protected_routes=cache_routing_protected_routes,
+        )
+        if preflight is not None:
+            routing = validate_cache_routing_option(
+                preflight, cache_routing, factor=cache_routing_factor,
+                protected_routes=cache_routing_protected_routes,
+            )
+    except ValueError as error:
+        print(f"FAILED: {error}")
+        return 2
     try:
         disk_kv_config = resolve_disk_kv_config(package_dir=package_dir)
         disk_store = open_disk_store(disk_kv_config)
@@ -1497,8 +1828,7 @@ def serve(
         disk_store = None
     if disk_store is not None:
         budget = disk_kv_config.budget_bytes
-        budget_label = (
-            "unlimited" if budget is None else f"{budget / 1024**3:.0f}GiB")
+        budget_label = "unlimited" if budget is None else f"{budget / 1024**3:.0f}GiB"
         depth = disk_kv_config.write_depth_tokens
         depth_label = "unlimited" if depth is None else str(depth)
         print(
@@ -1512,32 +1842,37 @@ def serve(
 
     try:
         try:
-            if external_drafter is None and default_load_model:
-                model, tokenizer, manifest = load_model_fn(
-                    package_dir,
-                    max_context_tokens=max_context_tokens,
+            load_options = {"max_context_tokens": max_context_tokens} if default_load_model else {}
+            if external_drafter is not None:
+                load_options["drafter"] = external_drafter
+            if default_load_model or routing.policy != "auto":
+                preflight_qwen4 = (
+                    preflight is None
+                    or preflight.get("architecture", {}).get("family")
+                    in ("qwen4_exp", "qwen4_exp_text")
                 )
-            elif external_drafter is None:
-                model, tokenizer, manifest = load_model_fn(package_dir)
-            elif default_load_model:
-                model, tokenizer, manifest = load_model_fn(
-                    package_dir,
-                    drafter=external_drafter,
-                    max_context_tokens=max_context_tokens,
-                )
-            else:
-                model, tokenizer, manifest = load_model_fn(
-                    package_dir, drafter=external_drafter
-                )
+                load_options.update(routing.load_options(
+                    include_off=(
+                        default_load_model
+                        and cache_routing == "off"
+                        and preflight_qwen4
+                    ),
+                ))
+            model, tokenizer, manifest = load_model_fn(package_dir, **load_options)
             validate_min_resident_experts(
                 model,
                 requested=min_resident_experts,
             )
-        except (FileNotFoundError, StreamingCapacityError, DrafterConfigError) as e:
+        except (FileNotFoundError, StreamingCapacityError, DrafterConfigError, ValueError) as e:
             # PackageNotFoundError and friends: one clear line, no traceback
             print(f"FAILED: {e}")
             return 2
         model_id = manifest["subject"].get("source_root", "moespresso")
+        try:
+            request_contract = package_request_contract(package_dir, manifest)
+        except PackageRequestContractError as e:
+            print(f"FAILED: {e}", flush=True)
+            return 2
         from moespresso.runtime.prefix_cache import (
             declared_context_limit,
             effective_context_limit,
@@ -1580,6 +1915,8 @@ def serve(
         # binding the socket. An unsupported selection refuses loudly at
         # startup, never silently serves the template default.
         ds4_contract = is_deepseek_v4_manifest(manifest)
+        family = manifest.get("architecture", {}).get("family")
+        qwen4_contract = family in QWEN4_FAMILIES
         option_error = thinking_effort_option_error(
             thinking, supports_reasoning_effort=ds4_contract)
         if option_error is not None:
@@ -1592,6 +1929,18 @@ def serve(
                 "on" if server_template_kwargs["enable_thinking"] else "off")
             print(f"[serve] thinking={effective} via=deepseek_v4_contract",
                   flush=True)
+        elif qwen4_contract:
+            server_template_kwargs = qwen4_contract_template_kwargs(
+                tokenizer,
+                thinking,
+                family=family,
+            )
+            effective = "off" if thinking == "off" else "on"
+            print(
+                f"[serve] thinking={effective} via=qwen4_contract "
+                f"effort={QWEN4_DEFAULT_REASONING_EFFORT}",
+                flush=True,
+            )
         elif thinking is not None:
             from moespresso.runtime.thinking import resolve_thinking_kwargs
             server_template_kwargs = resolve_thinking_kwargs(
@@ -1614,6 +1963,7 @@ def serve(
                     tokenizer,
                     prompt_renderer=manifest.get("architecture", {}).get(
                         "prompt_renderer"),
+                    family=family,
                     server_template_kwargs=server_template_kwargs,
                 )
             except Exception as e:  # noqa: BLE001 - fail before readiness
@@ -1660,14 +2010,24 @@ def serve(
             print("[serve] tool_calls=off (verbatim completions)", flush=True)
 
         serve_lock = threading.Lock()
+        from moespresso.runtime.diagnostics import make_server_diagnostics
+
+        diagnostics = make_server_diagnostics(
+            manifest,
+            context_limit=context_limit,
+            template_kwargs=server_template_kwargs,
+            generation_defaults=request_contract.generation_defaults,
+        )
         handler = make_handler(
             serialized_generator(generate, serve_lock),
             model_id=model_id, tokenizer=tokenizer,
             rendering_id=manifest.get("tokenizer", {}).get("rendering_id"),
             prompt_renderer=manifest.get("architecture", {}).get("prompt_renderer"),
             server_template_kwargs=server_template_kwargs,
+            request_contract=request_contract,
             stats=serialized_stats(cache_generator.cache_stats, serve_lock),
             runtime_stats=serialized_stats(runtime_stats, serve_lock),
+            diagnostics=serialized_stats(diagnostics, serve_lock),
             clock=lambda: int(time.time()),
             tool_config=tool_config)
         # Single-threaded on purpose: every request is handled on the thread
@@ -1729,10 +2089,12 @@ def main(
                              "RSS remains a separate process measurement.")
     from moespresso.runtime.serve import (
         add_runtime_limit_arguments,
+        add_cache_routing_argument,
         validate_runtime_limit_arguments,
     )
 
     add_runtime_limit_arguments(parser)
+    add_cache_routing_argument(parser)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--prompt-cache-size", type=int, default=None,
@@ -1788,6 +2150,9 @@ def main(
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_context_tokens=args.max_context_tokens,
         min_resident_experts=args.min_resident_experts,
+        cache_routing=args.cache_routing,
+        cache_routing_factor=args.cache_routing_factor,
+        cache_routing_protected_routes=args.cache_routing_protected_routes,
         thinking=args.thinking,
         startup_warmup=args.startup_warmup != "off",
         external_drafter=external_drafter,

@@ -19,16 +19,23 @@ import pytest
 
 from moespresso.package.bundle import (
     KQUANT_CODEC,
-    ROW_ORDER,
+    row_order_for_codecs,
     MXFP4_CODEC,
-    assemble_layer_bundle,
+    assemble_layer_bundle as _assemble_layer_bundle,
     encode_bundle_metadata,
 )
 from moespresso.runtime.expert_index import (
     ExpertByteRange,
-    StackedLayoutError,
     build_expert_index,
 )
+
+
+_MXFP4_CODECS = {p: "mxfp4" for p in ("gate_proj", "up_proj", "down_proj")}
+ROW_ORDER = row_order_for_codecs(_MXFP4_CODECS)
+
+
+def assemble_layer_bundle(components, bits, codecs=None, **kwargs):
+    return _assemble_layer_bundle(components, bits, codecs or _MXFP4_CODECS, **kwargs)
 
 
 def _write_safetensors(path, tensors, metadata=None):
@@ -49,13 +56,7 @@ def _write_safetensors(path, tensors, metadata=None):
 
 
 def _layer_components(n_exp, out, cols, seed):
-    rng = np.random.default_rng(seed)
-    comps = {}
-    for proj in ("gate_proj", "up_proj", "down_proj"):
-        comps[(proj, "packed")] = rng.integers(
-            0, 2**32, (n_exp, out, cols), dtype=np.uint32)
-        comps[(proj, "norms")] = rng.standard_normal((n_exp, out)).astype(np.float16)
-    return comps
+    return _mxfp4_layer_components(n_exp, out, max(4, cols), seed)
 
 
 def _mxfp4_layer_components(n_exp, out, packed_words, seed):
@@ -88,8 +89,9 @@ def _kquant_codecs():
     return {p: KQUANT_CODEC for p in ("gate_proj", "up_proj", "down_proj")}
 
 
-def _tiny_package(tmp_path, *, n_layers=2, n_exp=4, out=8, cols=2, bits=2):
+def _tiny_package(tmp_path, *, n_layers=2, n_exp=4, out=8, cols=4, bits=4):
     """A minimal bundle-format package: 1 shard, N layers of switch_mlp bundles."""
+    cols = max(4, cols)
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     tensors, layer_geo = {}, {}
@@ -237,7 +239,6 @@ def test_index_exposes_live_mxfp4_bundle_geometry(tmp_path):
     assert gate.codec == MXFP4_CODEC
     assert gate.packed_dtype == "U32"
     assert gate.scales_dtype == "U8"
-    assert gate.norms_dtype is None
     assert idx.locate(
         layer=0,
         expert=1,
@@ -281,7 +282,6 @@ def test_index_exposes_kquant_bundle_geometry(tmp_path):
     assert gate.bytes_per_block == 84
     assert gate.weights_per_block == 256
     assert gate.scales_dtype == "U8"
-    assert gate.norms_dtype is None
     weight = idx.locate(
         layer=0,
         expert=1,
@@ -315,9 +315,9 @@ def test_component_ranges_stride_by_full_row(tmp_path):
     assert e1.offset == e0.offset + row_bytes
     assert e0.shard == "model-00001-of-00001.safetensors"
 
-    n0 = idx.locate(layer=0, expert=0, projection="down_proj", component="norms")
-    n1 = idx.locate(layer=0, expert=1, projection="down_proj", component="norms")
-    assert n0.nbytes == out * 2  # F16
+    n0 = idx.locate(layer=0, expert=0, projection="down_proj", component="scales")
+    n1 = idx.locate(layer=0, expert=1, projection="down_proj", component="scales")
+    assert n0.nbytes == out * (cols // 4)  # UE8M0
     assert n1.offset == n0.offset + row_bytes
 
 
@@ -363,11 +363,11 @@ def test_index_exposes_projection_geometry_and_bits(tmp_path):
 
     geo = idx.geometry(layer=0, projection="gate_proj")
     assert geo.out_features == 8
-    assert geo.packed_cols == 2
-    assert geo.bits == 2
+    assert geo.packed_cols == 4
+    assert geo.bits == 4
     assert geo.packed_dtype == "U32"
-    assert geo.norms_dtype == "F16"
-    assert idx.bits(layer=0, projection="gate_proj") == 2
+    assert geo.scales_dtype == "U8"
+    assert idx.bits(layer=0, projection="gate_proj") == 4
 
 
 def test_index_accepts_mixed_num_experts_within_one_shard(tmp_path):
@@ -377,7 +377,7 @@ def test_index_accepts_mixed_num_experts_within_one_shard(tmp_path):
     for layer, n_exp in ((0, 4), (1, 5)):
         comps = _layer_components(n_exp, 8, 2, seed=layer)
         bundle, geo = assemble_layer_bundle(
-            comps, {p: 2 for p in ("gate_proj", "up_proj", "down_proj")})
+            comps, {p: 4 for p in ("gate_proj", "up_proj", "down_proj")})
         base = f"language_model.model.layers.{layer}.mlp.switch_mlp"
         tensors[f"{base}.experts.tq_bundle"] = ("U8", bundle.shape, bundle.tobytes())
         layer_geo[layer] = geo
@@ -396,7 +396,7 @@ def test_index_rejects_header_metadata_shape_mismatch(tmp_path):
     pkg.mkdir()
     comps = _layer_components(4, 8, 2, seed=0)
     bundle, geo = assemble_layer_bundle(
-        comps, {p: 2 for p in ("gate_proj", "up_proj", "down_proj")})
+        comps, {p: 4 for p in ("gate_proj", "up_proj", "down_proj")})
     base = "language_model.model.layers.0.mlp.switch_mlp"
     # lie about the tensor shape: one expert short
     _write_safetensors(pkg / "model-00001-of-00001.safetensors", {
@@ -413,25 +413,12 @@ def test_index_rejects_bundle_without_metadata(tmp_path):
     pkg.mkdir()
     comps = _layer_components(4, 8, 2, seed=0)
     bundle, _geo = assemble_layer_bundle(
-        comps, {p: 2 for p in ("gate_proj", "up_proj", "down_proj")})
+        comps, {p: 4 for p in ("gate_proj", "up_proj", "down_proj")})
     base = "language_model.model.layers.0.mlp.switch_mlp"
     _write_safetensors(pkg / "model-00001-of-00001.safetensors", {
         f"{base}.experts.tq_bundle": ("U8", bundle.shape, bundle.tobytes()),
     })
     with pytest.raises(ValueError, match="metadata"):
-        build_expert_index(pkg)
-
-
-def test_stacked_layout_fails_loud_with_reconvert_message(tmp_path):
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    base = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
-    _write_safetensors(pkg / "model-00001-of-00001.safetensors", {
-        f"{base}.tq_packed": ("U32", (4, 8, 2), bytes(4 * 8 * 2 * 4)),
-        f"{base}.tq_norms": ("F16", (4, 8), bytes(4 * 8 * 2)),
-        f"{base}.tq_bits": ("U8", (1,), bytes([2])),
-    })
-    with pytest.raises(StackedLayoutError, match="re-convert"):
         build_expert_index(pkg)
 
 

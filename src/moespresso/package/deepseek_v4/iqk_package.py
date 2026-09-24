@@ -20,9 +20,7 @@ into a decode kernel's layout and record the new value without re-encoding.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -31,21 +29,20 @@ from moespresso.core.artifact import write_artifact
 from moespresso.inventory.build import build_inventory
 from moespresso.inventory.deepseek_v4 import roles as deepseek_v4_roles
 from moespresso.package.constants import MANIFEST_NAME
-from moespresso.package.convert import INVENTORY_NAME, _layer_types, _read_config
+from moespresso.package.source import INVENTORY_NAME, _layer_types, _read_config
 from moespresso.package.deepseek_v4.recipe import (
     DS4KQuantDenseTarget,
     build_ds4_iqk_expert_allocations,
     build_ds4_iqk_plan,
 )
 from moespresso.package.iqk_format import (
-    IQK_DENSE_MEMBERS,
     IQK_GEOMETRY,
     IQK_LAYOUT_IK_WIRE,
     IQK_LAYOUT_IQK_RELAYOUT,
     IQKFormatError,
-    iqk_geometry,
     validate_iqk_layout,
 )
+from moespresso.package.iqk_artifacts import IQKConvertedArtifacts
 from moespresso.package.kquant_backend import check_kquant_backend_available
 from moespresso.package.kquant_cache import KQuantEncodeCache
 from moespresso.package.kquant_format import KQUANT_GEOMETRY
@@ -124,15 +121,8 @@ def allocation_member_counts(members: dict[int, dict[str, str]]) -> dict[str, in
 # The converted routed stack
 
 
-class IQKRoutedArtifacts:
-    """Read side of a converted IQ_K routed stack.
-
-    One file per cell, `layer<LL>_<role>.<member>`, holding `num_experts`
-    experts in index order with no header and no padding, each expert's rows in
-    row order at the member's own row size. Every file's size is checked
-    against that arithmetic before a byte is read, so a cell converted at a
-    different member or a truncated write fails at open rather than at serve.
-    """
+class IQKRoutedArtifacts(IQKConvertedArtifacts):
+    """DeepSeek wrapper preserving the builder's public error type."""
 
     def __init__(
         self,
@@ -143,150 +133,14 @@ class IQKRoutedArtifacts:
         *,
         max_open: int = 6,
     ):
-        self.root = Path(root)
-        self.members = {int(k): dict(v) for k, v in members.items()}
-        self.num_experts = int(num_experts)
-        self._max_open = int(max_open)
-        self._fds: dict[tuple[int, str], int] = {}
-        self.cells: dict[tuple[int, str], dict] = {}
-        total = 0
-        for layer in sorted(self.members):
-            for projection in PROJECTIONS:
-                codec = self.members[layer][projection]
-                geometry = iqk_geometry(codec)
-                out_features, in_features = shapes[layer][projection]
-                bytes_per_row = geometry.bytes_per_row(in_features)
-                bytes_per_expert = out_features * bytes_per_row
-                path = self.root / f"layer{layer:02d}_{projection}.{codec}"
-                if not path.exists():
-                    raise IQKPackageError(
-                        f"converted artifact missing: {path}")
-                size = path.stat().st_size
-                expect = bytes_per_expert * self.num_experts
-                if size != expect:
-                    raise IQKPackageError(
-                        f"{path}: size {size} != {expect} "
-                        f"({self.num_experts} experts x {out_features} rows x "
-                        f"{bytes_per_row} B at {codec})")
-                total += size
-                self.cells[(layer, projection)] = {
-                    "path": path,
-                    "codec": codec,
-                    "out_features": int(out_features),
-                    "in_features": int(in_features),
-                    "bytes_per_row": int(bytes_per_row),
-                    "bytes_per_expert": int(bytes_per_expert),
-                    "size_bytes": int(size),
-                    "bpw": geometry.bpw(in_features),
-                }
-        self.total_bytes = total
-
-    def layers(self) -> list[int]:
-        return sorted(self.members)
-
-    def _fd(self, layer: int, projection: str) -> int:
-        key = (layer, projection)
-        fd = self._fds.get(key)
-        if fd is None:
-            if len(self._fds) >= self._max_open:
-                oldest = next(iter(self._fds))
-                os.close(self._fds.pop(oldest))
-            fd = os.open(self.cells[key]["path"], os.O_RDONLY)
-            self._fds[key] = fd
-        return fd
-
-    def expert_blocks(self, layer: int, expert_index: int, projection: str) -> np.ndarray:
-        """One expert's packed bytes as `[out_features, bytes_per_row]` uint8."""
-        cell = self.cells.get((int(layer), str(projection)))
-        if cell is None:
-            raise IQKPackageError(
-                f"no converted cell for layer {layer} {projection}")
-        if not (0 <= int(expert_index) < self.num_experts):
-            raise IQKPackageError(
-                f"expert {expert_index} outside [0, {self.num_experts})")
-        nbytes = cell["bytes_per_expert"]
-        offset = int(expert_index) * nbytes
-        raw = os.pread(self._fd(int(layer), str(projection)), nbytes, offset)
-        if len(raw) != nbytes:
-            raise IQKPackageError(
-                f"{cell['path']}: short read of {len(raw)} B at offset {offset}")
-        return np.frombuffer(raw, dtype=np.uint8).reshape(
-            cell["out_features"], cell["bytes_per_row"])
-
-    def verify_digests(self, inventory_path: str | Path) -> dict:
-        """Re-read every artifact and require the conversion's recorded sha256."""
-        recorded = _conversion_inventory_files(inventory_path)
-        checked = 0
-        for (layer, projection), cell in sorted(self.cells.items()):
-            name = cell["path"].name
-            want = recorded.get(name)
-            if want is None:
-                raise IQKPackageError(
-                    f"{inventory_path}: no recorded digest for {name}")
-            if int(want["size_bytes"]) != cell["size_bytes"]:
-                raise IQKPackageError(
-                    f"{name}: size {cell['size_bytes']} != recorded "
-                    f"{want['size_bytes']}")
-            got = _sha256_file(cell["path"])
-            if got != want["sha256"]:
-                raise IQKPackageError(
-                    f"{name}: sha256 {got} != recorded {want['sha256']}")
-            checked += 1
-        return {
-            "inventory": str(inventory_path),
-            "files_checked": checked,
-            "bytes_checked": self.total_bytes,
-        }
-
-    def identity(self) -> dict:
-        by_codec: dict[str, int] = {}
-        for cell in self.cells.values():
-            by_codec[cell["codec"]] = by_codec.get(cell["codec"], 0) + 1
-        return {
-            "root": str(self.root),
-            "cells": len(self.cells),
-            "layers": len(self.members),
-            "num_experts": self.num_experts,
-            "routed_bytes": self.total_bytes,
-            "member_counts": dict(sorted(by_codec.items())),
-        }
-
-    def close(self) -> None:
-        for fd in self._fds.values():
-            os.close(fd)
-        self._fds.clear()
-
-
-def _conversion_inventory_files(path: str | Path) -> dict[str, dict]:
-    """`{artifact file name: {size_bytes, sha256}}` from a conversion inventory."""
-    data = json.loads(Path(path).read_text())
-    entries = data.get("files") or data.get("artifacts") or data
-    out: dict[str, dict] = {}
-    if isinstance(entries, dict):
-        items = entries.items()
-    elif isinstance(entries, list):
-        items = [(e.get("name") or e.get("file") or e.get("path"), e) for e in entries]
-    else:
-        raise IQKPackageError(f"{path}: unreadable conversion inventory")
-    for name, entry in items:
-        if name is None or not isinstance(entry, dict):
-            continue
-        size = entry.get("size_bytes", entry.get("size", entry.get("bytes")))
-        digest = entry.get("sha256")
-        if size is None or digest is None:
-            continue
-        out[Path(str(name)).name] = {"size_bytes": int(size), "sha256": str(digest)}
-    if not out:
-        raise IQKPackageError(f"{path}: conversion inventory records no digests")
-    return out
-
-
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 22), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        super().__init__(
+            root,
+            members,
+            shapes,
+            num_experts,
+            max_open=max_open,
+            error_type=IQKPackageError,
+        )
 
 
 def routed_artifact_shapes(
@@ -370,7 +224,7 @@ def _conservative_dense_allocation(entry: dict, scale_names: set[str]) -> dict:
 
 
 def build_dense_allocations(inventory: dict, *, codec: str = DEFAULT_DENSE_CODEC) -> list[dict]:
-    """Dense allocation for the IQ_K path: one codec, everywhere it fits.
+    """Dense K-quant allocation for a converted routed-IQ_K package.
 
     The set of dense tensors that carry a GGUF key is exactly the set a
     K-quant recipe maps, so allocating that set at one codec reproduces the
@@ -379,26 +233,12 @@ def build_dense_allocations(inventory: dict, *, codec: str = DEFAULT_DENSE_CODEC
     8-bit affine, or mxfp8 for an fp8 source that ships its own block scales.
     The embedding has no GGUF key and therefore stays affine; the head has one
     and takes the codec, which is the split the recipe path produces.
-
-    `codec` names either a K-quant codec (the q8_0 default and the q6_k/q5_k
-    variants) or a dense IQ_K member (`iq4_ks`, `iq4_k`, `iq5_k`, `iq6_k`).
-    A dense IQ_K row is always imatrix-steered: the members' no-imatrix
-    objectives differ by member, so an unweighted encode is a different
-    instrument, and the writer fails closed on a missing vector.
     """
-    if codec in IQK_GEOMETRY:
-        # Refuses the routed-only members by name before any row builds.
-        iqk_geometry(codec)
-        from moespresso.package.iqk_format import iqk_dense_geometry
-
-        iqk_dense_geometry(codec)
-        return _build_dense_iqk_allocations(inventory, codec=codec)
     geometry = KQUANT_GEOMETRY.get(codec)
     if geometry is None:
         raise IQKPackageError(
-            f"unknown dense codec {codec!r}; known: "
-            f"{sorted(KQUANT_GEOMETRY)} plus IQ_K dense members "
-            f"{list(IQK_DENSE_MEMBERS)}")
+            f"unknown dense codec {codec!r}; known: {sorted(KQUANT_GEOMETRY)}"
+        )
     scale_names = {
         entry["source_name"]
         for entry in inventory.get("tensors", [])
@@ -453,67 +293,12 @@ def build_dense_allocations(inventory: dict, *, codec: str = DEFAULT_DENSE_CODEC
     return sorted(out, key=lambda a: a["source_name"])
 
 
-def _build_dense_iqk_allocations(inventory: dict, *, codec: str) -> list[dict]:
-    """Dense allocation rows for one IQ_K dense member.
-
-    The GGUF-keyed set takes the member; the remainder keeps the
-    conservative affine/mxfp8 treatment. Every row's reduction width must
-    fill whole 256-wide blocks, checked here against the inventory shape so
-    a tensor the member cannot encode fails at planning rather than encode.
-    """
-    geometry = iqk_geometry(codec)
-    scale_names = {
-        entry["source_name"]
-        for entry in inventory.get("tensors", [])
-        if entry.get("kind") == "codec_scale"
-    }
-    out: list[dict] = []
-    for entry in inventory.get("tensors", []):
-        if entry.get("kind") != "affine" or _is_ds4_router_gate(entry):
-            continue
-        keys = [k for k in entry.get("gguf_keys", []) if k]
-        if not keys:
-            out.append(_conservative_dense_allocation(entry, scale_names))
-            continue
-        if len(keys) > 1:
-            raise IQKPackageError(
-                f"{entry['source_name']}: {len(keys)} GGUF keys, expected one")
-        shape = [int(v) for v in entry.get("shape", [])]
-        if len(shape) != 2:
-            raise IQKPackageError(
-                f"{entry['source_name']}: dense IQ_K needs a 2D weight, "
-                f"shape is {shape}")
-        # Raises when in_features does not fill whole blocks.
-        geometry.blocks_per_row(shape[1])
-        module_path = deepseek_v4_roles.module_path(entry["source_name"])
-        out.append(
-            {
-                "source_name": entry["source_name"],
-                "kind": "affine",
-                "role": entry["role"],
-                "layer_index": entry.get("layer_index"),
-                "bits": int(geometry.bits),
-                "format": "iqk",
-                "codec": codec,
-                "iqk_codec": codec,
-                "layout": IQK_LAYOUT_IK_WIRE,
-                "gguf_tensor": keys[0],
-                "imatrix_key": keys[0],
-                "module_path": module_path,
-                "module_weight_key": f"{module_path}.weight",
-            }
-        )
-    return sorted(out, key=lambda a: a["source_name"])
-
-
 def dense_format_counts(allocation: list[dict]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for alloc in allocation:
         key = alloc["format"]
         if key == "kquant":
             key = f"kquant:{alloc['kquant_codec']}"
-        elif key == "iqk":
-            key = f"iqk:{alloc['iqk_codec']}"
         counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
 
@@ -571,8 +356,6 @@ def build_ds4_iqk_package(
     chunk_bytes: int | None = None,
     max_experts: int | None = None,
     kquant_encoder=None,
-    iqk_dense_encoder=None,
-    dense_imatrix_vectors: dict | None = None,
     kquant_cache_dir: str | Path | None = None,
     optimized_kernels_expected: bool = False,
     force_format: list[str] | tuple[str, ...] | None = None,
@@ -649,15 +432,18 @@ def build_ds4_iqk_package(
     log(f"  dense: {dense_counts}")
 
     subject = dict(inventory["subject"])
+    artifacts_identity = {
+        **artifacts.identity(),
+        "allocation_candidate": candidate_record.get("name"),
+        "allocation_accounting": candidate_record.get("accounting"),
+        "digests": digest_report,
+    }
+    if digest_report is not None:
+        artifacts_identity["inventory_sha256"] = digest_report["inventory_sha256"]
     package_plan = build_ds4_iqk_plan(
         subject,
         expert_allocation,
-        artifacts_identity={
-            **artifacts.identity(),
-            "allocation_candidate": candidate_record.get("name"),
-            "allocation_accounting": candidate_record.get("accounting"),
-            "digests": digest_report,
-        },
+        artifacts_identity=artifacts_identity,
         allocation_source=Path(allocation_path).name,
         extra_allocation=dense_allocation,
         optimized_kernels_expected=optimized_kernels_expected,
@@ -690,22 +476,6 @@ def build_ds4_iqk_package(
     if kquant_encoder is None and any(
             a.get("format") == "kquant" for a in package_plan["allocation"]):
         check_kquant_backend_available()
-    has_dense_iqk = any(
-        a.get("format") == "iqk" and a.get("kind") == "affine"
-        for a in package_plan["allocation"])
-    if has_dense_iqk and iqk_dense_encoder is None:
-        # Fail before any shard is written: the dense IQ_K encode is ik's
-        # own quantizer behind an injected callable, and a build that would
-        # discover the missing encoder mid-write leaves a partial package.
-        raise IQKPackageError(
-            f"dense codec {dense_codec!r} requires an iqk_dense_encoder "
-            "(the linked ik quantizer); none was provided")
-    if has_dense_iqk and not dense_imatrix_vectors:
-        raise IQKPackageError(
-            f"dense codec {dense_codec!r} requires dense imatrix vectors "
-            "keyed by GGUF tensor name; dense IQ_K encodes are always "
-            "steered")
-
     write_artifact(out_dir / INVENTORY_NAME, inventory)
     write_artifact(out_dir / PACKAGE_PLAN_NAME, package_plan)
 
@@ -717,7 +487,6 @@ def build_ds4_iqk_package(
 
     agentic_profile = write_agentic_profile(out_dir, family=family)
     write_kwargs = {
-        "seed": seed,
         "shard_size_gb": shard_size_gb,
         "passthrough": passthrough,
         "tokenizer": tokenizer,
@@ -728,8 +497,6 @@ def build_ds4_iqk_package(
         "kquant_cache": cache,
         "kquant_cache_context": {"recipe_mode": "iqk_converted_artifacts"},
         "iqk_expert_loader": artifacts.expert_blocks,
-        "iqk_dense_encoder": iqk_dense_encoder,
-        "kquant_imatrix_vectors": dense_imatrix_vectors,
     }
     if chunk_bytes is not None:
         write_kwargs["chunk_bytes"] = chunk_bytes
@@ -846,7 +613,11 @@ def main(argv: list[str] | None = None) -> int:
         "--calibration-capture", default=None,
         help="Calibration capture imatrix directory (layer<LL>_train.npz) used "
              "for the cold-start expert hotlist ranking")
-    parser.add_argument("--dense-codec", default=DEFAULT_DENSE_CODEC)
+    parser.add_argument(
+        "--dense-codec",
+        choices=sorted(KQUANT_GEOMETRY),
+        default=DEFAULT_DENSE_CODEC,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shard-size-gb", type=float, default=4.0)
     parser.add_argument("--chunk-bytes", type=int, default=None)

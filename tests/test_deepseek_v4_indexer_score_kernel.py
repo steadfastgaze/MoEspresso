@@ -517,8 +517,6 @@ def test_decode_indexer_qat_routes_by_gate_and_shape(monkeypatch):
 
     monkeypatch.setattr(indexer_score_kernel, "indexer_qat_rows", spy)
 
-    monkeypatch.delenv(
-        "MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", raising=False)
     routed, used = _dsv4_decode_indexer_qat(mx, x)
     composed = _dsv4_indexer_qat(mx, x)
     mx.eval(routed, composed)
@@ -528,21 +526,9 @@ def test_decode_indexer_qat_routes_by_gate_and_shape(monkeypatch):
         np.asarray(routed, dtype=np.float32).view(np.uint32),
         np.asarray(composed, dtype=np.float32).view(np.uint32))
 
-    # Kill switch restores the composed chain.
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", "0")
-    fallback, used = _dsv4_decode_indexer_qat(mx, x)
-    mx.eval(fallback)
-    assert not used
-    assert calls == [(1, 64, 1, 128)]
-    np.testing.assert_array_equal(
-        np.asarray(fallback, dtype=np.float32).view(np.uint32),
-        np.asarray(composed, dtype=np.float32).view(np.uint32))
-
     # Unsupported dtypes fail closed to the composed chain. Non-128-wide
     # rows are outside the QAT contract on both paths (the composed chain
     # raises the same load error the kernel wrapper would).
-    monkeypatch.delenv(
-        "MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", raising=False)
     _out, used = _dsv4_decode_indexer_qat(
         mx, mx.zeros((1, 2, 1, 128), dtype=mx.int32))
     assert not used
@@ -591,8 +577,6 @@ def test_indexer_score_contract_counts_decode_qat_kernel(monkeypatch):
         cfg["index_n_heads"] * cfg["index_head_dim"])
     indexer._original.weights_proj = FakeLinear(cfg["index_n_heads"])
     monkeypatch.setattr(indexer_score_kernel, "_ENABLED", False)
-    monkeypatch.delenv(
-        "MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", raising=False)
 
     x = mx.zeros((1, 1, cfg["hidden_size"]), dtype=mx.float32)
     q_residual = mx.zeros((1, 1, cfg["q_lora_rank"]), dtype=mx.float32)
@@ -607,14 +591,6 @@ def test_indexer_score_contract_counts_decode_qat_kernel(monkeypatch):
         mx.zeros((1, 2, cfg["hidden_size"]), dtype=mx.float32),
         mx.zeros((1, 2, cfg["q_lora_rank"]), dtype=mx.float32),
         IdentityRope(), IdentityRope(), None, 7))
-    counter = (
-        indexer._moespresso_dsv4_indexer_score_contract_decode_qat_kernel_calls
-    )
-    assert counter == 1
-
-    # Kill switch keeps the counter flat on decode shapes.
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", "0")
-    mx.eval(indexer(x, q_residual, IdentityRope(), IdentityRope(), None, 24))
     counter = (
         indexer._moespresso_dsv4_indexer_score_contract_decode_qat_kernel_calls
     )
@@ -646,19 +622,14 @@ def test_prefill_pooled_qat_routes_to_kernel_and_matches_composed(monkeypatch):
         return original(rows)
 
     monkeypatch.setattr(indexer_score_kernel, "indexer_qat_rows", spy)
-    monkeypatch.setenv("MOESPRESSO_DSV4_R4_PREFILL_POOLED_QAT_KERNEL", "1")
     got = _dsv4_prefill_pooled_qat(mx, x)
-    monkeypatch.setenv("MOESPRESSO_DSV4_R4_PREFILL_POOLED_QAT_KERNEL", "0")
-    composed = _dsv4_prefill_pooled_qat(mx, x)
     expected = _dsv4_indexer_qat(mx, x)
-    mx.eval(got, composed, expected)
+    mx.eval(got, expected)
 
     assert calls == [(1, 33, 128)]
     got_bits = np.asarray(got, dtype=np.float32).view(np.uint32)
     expected_bits = np.asarray(expected, dtype=np.float32).view(np.uint32)
     np.testing.assert_array_equal(got_bits, expected_bits)
-    composed_bits = np.asarray(composed, dtype=np.float32).view(np.uint32)
-    np.testing.assert_array_equal(composed_bits, expected_bits)
 
 
 def _composed_score_tail_reference(mx, scores4, weights_raw, *, valid, scale):
@@ -863,24 +834,11 @@ def test_score_tail_eligible_gate_and_shape_predicate(monkeypatch):
         return indexer_score_kernel.score_tail_eligible(
             args["scores"], args["weights_raw"], args["params"])
 
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS", raising=False)
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", raising=False)
-    assert indexer_score_kernel.score_tail_enabled()
     assert eligible()
     assert eligible(weights_raw=weights.astype(mx.float16))
     assert eligible(weights_raw=weights.astype(mx.float32))
     assert eligible(scores=mx.zeros((1, 32, 1, 7), dtype=mx.float32),
                     weights_raw=mx.zeros((1, 1, 32), dtype=mx.float32))
-
-    # Both kill switches are read per call: the family switch covers every
-    # indexer chain trim, the piece switch only this seam.
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS", "0")
-    assert not eligible()
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS", raising=False)
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", "0")
-    assert not eligible()
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", raising=False)
-    assert eligible()
 
     # Shape and dtype vetoes fail closed.
     assert not eligible(scores=mx.zeros((1, 64, 2, 1024), dtype=mx.float32))
@@ -966,8 +924,6 @@ def test_indexer_score_contract_score_tail_matches_composed(monkeypatch):
     indexer._original.wq_b = FakeWqB()
     indexer._original.weights_proj = FakeWeightsProj()
     monkeypatch.setattr(indexer_score_kernel, "_ENABLED", False)
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_CHAIN_TRIMS", raising=False)
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", raising=False)
     monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_DUMP_PREFIX", raising=False)
 
     x = mx.zeros((1, 1, cfg["hidden_size"]), dtype=mx.float32)
@@ -982,7 +938,8 @@ def test_indexer_score_contract_score_tail_matches_composed(monkeypatch):
     assert counts["indexer_score_contract_fixed_state_calls"] == 1
     assert counts["indexer_score_contract_decode_qat_kernel_calls"] == 1
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", "0")
+    # The retained selection-dump hook requires the composed score tail.
+    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DUMP_PREFIX", "/tmp/never")
     composed_topk = indexer(
         x, q_residual, IdentityRope(), IdentityRope(),
         _engaged_indexer_fixed_cache(16), 16)
@@ -995,17 +952,3 @@ def test_indexer_score_contract_score_tail_matches_composed(monkeypatch):
     # the selection matches in both set and order.
     np.testing.assert_array_equal(
         np.asarray(fused_topk), np.asarray(composed_topk))
-
-    # The selection dump rides the composed chain, so the dump env vetoes
-    # the fused tail.
-    monkeypatch.delenv("MOESPRESSO_DSV4_INDEXER_SCORE_TAIL", raising=False)
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DUMP_PREFIX", "/tmp/never")
-    dump_topk = indexer(
-        x, q_residual, IdentityRope(), IdentityRope(),
-        _engaged_indexer_fixed_cache(16), 16)
-    mx.eval(dump_topk)
-    counts = deepseek_v4_indexer_layer_stats(model)[0]
-    assert counts["indexer_score_contract_score_tail_kernel_calls"] == 1
-    assert counts["indexer_score_contract_fixed_state_calls"] == 3
-    np.testing.assert_array_equal(
-        np.asarray(dump_topk), np.asarray(composed_topk))

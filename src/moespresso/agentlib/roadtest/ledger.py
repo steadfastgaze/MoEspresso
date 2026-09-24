@@ -10,6 +10,8 @@ value the accounting predicts. The facts it encodes:
   sequence including the generated tokens, so the next request of an
   append-only session must report a ``hit`` with ``cached_tokens`` equal to
   the previous request's ``cached + prompt + completion``.
+  Qwen KVarN4 stores the completed prefill only, so its next memory hit
+  excludes the generated tokens.
 - Frontier checkpoints land on stride multiples strictly inside the prefilled
   region: a frontier ``f`` is written when ``cached < f < full`` and no entry
   for the same prefix exists. A frontier equal to the full prompt length is
@@ -17,6 +19,8 @@ value the accounting predicts. The facts it encodes:
   offset gate refuses it; frontiers inside a generated span are below the
   next request's restored prefix and are never written. Both stay permanently
   unwritten holes and the ledger models them as such.
+  Qwen KVarN4 also saves the final prefill logits and can checkpoint at
+  ``f == full``. Its generated spans are prefilled on a later request.
 - After a server restart the memory store is empty, so the first request of a
   session must restore from disk (``disk_hit``) with ``cached_tokens`` equal
   to the longest frontier written for that session's prefix chain.
@@ -75,6 +79,7 @@ class SessionLedger:
         stride: int,
         disk_enabled: bool = True,
         write_depth_tokens: int | None = None,
+        prefill_only: bool = False,
     ):
         if stride <= 0:
             raise ValueError("stride must be positive")
@@ -83,6 +88,7 @@ class SessionLedger:
         self.name = name
         self.stride = int(stride)
         self.disk_enabled = bool(disk_enabled)
+        self.prefill_only = bool(prefill_only)
         self.write_depth_tokens = (
             None if write_depth_tokens is None else int(write_depth_tokens))
         self.written_frontiers: set[int] = set()
@@ -106,6 +112,10 @@ class SessionLedger:
     def last_full_tokens(self) -> int:
         return self._last_full
 
+    @property
+    def memory_key_tokens(self) -> int:
+        return self._memory_key_len or 0
+
     def note_restart(self) -> None:
         """Forget in-memory expectations; the disk bookkeeping survives."""
         self._memory_key_len = None
@@ -126,7 +136,7 @@ class SessionLedger:
         first = (cached // self.stride + 1) * self.stride
         out = []
         frontier = first
-        while frontier < full:
+        while frontier < full or (self.prefill_only and frontier == full):
             if (self.write_depth_tokens is not None
                     and frontier > self.write_depth_tokens):
                 break
@@ -197,7 +207,7 @@ class SessionLedger:
             ))
 
         self.written_frontiers.update(new_frontiers)
-        self._memory_key_len = full + completion_tokens
+        self._memory_key_len = full if self.prefill_only else full + completion_tokens
         self._last_cached = cached
         self._last_full = full
         self.requests += 1

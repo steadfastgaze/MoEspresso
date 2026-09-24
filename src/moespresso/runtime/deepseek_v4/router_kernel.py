@@ -38,21 +38,13 @@ fast math disabled, so the same functions round the same way):
   into a float32 total initialized at +0.0. Selection widths above 64
   pick a different reduce kernel and fail closed to the composed chain.
 
-``MOESPRESSO_DSV4_ROUTER_TRIMS=0`` kills every router trim;
-``MOESPRESSO_DSV4_ROUTER_PRECAST=0`` kills only the hoisted router weight
-operand; ``MOESPRESSO_DSV4_ROUTER_SELECT_TAIL=0`` kills only the two
-select kernels. All three are read per call.
+Callers retain the composed path for unsupported shapes, dtypes, and Metal
+availability.
 """
 
 from __future__ import annotations
 
 import math
-import os
-
-
-_ROUTER_TRIMS_ENV = "MOESPRESSO_DSV4_ROUTER_TRIMS"
-_ROUTER_PRECAST_ENV = "MOESPRESSO_DSV4_ROUTER_PRECAST"
-_ROUTER_SELECT_ENV = "MOESPRESSO_DSV4_ROUTER_SELECT_TAIL"
 
 # row_reduce_small accumulates a whole row in one thread only while the
 # row fits 64 elements; wider selections dispatch a different reduce
@@ -72,27 +64,6 @@ def _metal_available() -> bool:
         except ImportError:
             _METAL_AVAILABLE = False
     return _METAL_AVAILABLE
-
-
-def router_trims_enabled() -> bool:
-    """Return True unless the router trim family is killed."""
-    return os.environ.get(_ROUTER_TRIMS_ENV, "1") != "0"
-
-
-def router_precast_enabled() -> bool:
-    """Return True when the hoisted router weight operand may engage."""
-    if not router_trims_enabled():
-        return False
-    return os.environ.get(_ROUTER_PRECAST_ENV, "1") != "0"
-
-
-def router_select_enabled() -> bool:
-    """Return True when the fused router select kernels may engage."""
-    if not router_trims_enabled():
-        return False
-    if os.environ.get(_ROUTER_SELECT_ENV, "1") != "0":
-        return _metal_available()
-    return False
 
 
 def _f32_hex(value: float) -> str:
@@ -219,7 +190,7 @@ def score_head_eligible(gates, bias) -> bool:
     same expert count in a supported dtype. Everything else fails closed
     to the composed chain.
     """
-    if not router_select_enabled():
+    if not _metal_available():
         return False
     import mlx.core as mx
 
@@ -290,7 +261,7 @@ def topk_weights_eligible(orig, sel) -> bool:
     transcribed row_reduce_small envelope. Everything else fails closed
     to the composed chain.
     """
-    if not router_select_enabled():
+    if not _metal_available():
         return False
     import mlx.core as mx
 

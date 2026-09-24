@@ -3,8 +3,8 @@
 Maps (layer, expert, projection, component) to an exact byte range in a package
 shard, so the miss loader can read expert bytes without faulting whole tensors.
 One routed layer stores a uint8 bundle tensor with one contiguous row per
-expert. The historical `.tq_bundle` suffix names this shared container; bundle
-metadata declares the actual codec of each projection, including TQ, K-quant,
+expert. The `.tq_bundle` suffix names this shared container; bundle
+metadata declares the actual codec of each projection, including K-quant,
 MXFP4, and IQ_K. The index can also return the whole row through `locate_row`,
 allowing one read to feed all three projection pools.
 
@@ -12,10 +12,6 @@ The within-row geometry travels in each shard's safetensors `__metadata__`
 (package/bundle.py is the schema's single source of truth), so this stays
 header-only and import-light: safetensors headers + metadata JSON, no weight
 bytes, no mlx, no jang, no manifest file.
-
-Legacy packages (stacked `...tq_packed/tq_norms/tq_bits` tensors) are not
-readable: there is no compatibility path; they fail loud here with a
-re-convert message, never a silent miss.
 """
 
 from __future__ import annotations
@@ -34,15 +30,14 @@ from moespresso.package.bundle import (
     METADATA_KEY,
     MXFP4_CODEC,
     PROJECTIONS,
-    TQ_CODEC,
     BundleFormatError,
     decode_bundle_metadata,
     row_order_for_codecs,
 )
 
 __all__ = [
-    "PROJECTIONS", "ExpertByteRange", "ProjectionGeometry",
-    "ExpertIndex", "StackedLayoutError", "build_expert_index",
+    "PROJECTIONS", "ExpertByteRange", "ProjectionGeometry", "ProjectionStreamGeometry",
+    "ExpertIndex", "build_expert_index",
 ]
 
 # bundle key: prefixed MoE layers or DS4 root `layers.<L>.ffn.experts.tq_bundle`
@@ -51,14 +46,6 @@ _BUNDLE_KEY = re.compile(
 # Routed bundle suffixes outside the shared `.tq_bundle` container contract.
 _UNSUPPORTED_BUNDLE_KEY = re.compile(
     r"(?:^|\.)layers\.\d+\..*experts\.(?P<suffix>mxfp4_bundle)$")
-# legacy stacked keys, matched only to fail loud with a useful message.
-_STACKED_KEY = re.compile(
-    r"(?:^|\.)layers\.\d+\..*switch_mlp\."
-    r"(?:gate_proj|up_proj|down_proj)\.tq_(?:packed|norms|bits)$")
-
-
-class StackedLayoutError(ValueError):
-    """The package uses the legacy stacked expert layout (no longer readable)."""
 
 
 @dataclass(frozen=True)
@@ -72,6 +59,17 @@ class ExpertByteRange:
 
 
 @dataclass(frozen=True)
+class ProjectionStreamGeometry:
+    """One contiguous native stream inside an IQ_K expert projection."""
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    offset: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
 class ProjectionGeometry:
     """Shape facts for one routed projection."""
     codec: str
@@ -79,7 +77,6 @@ class ProjectionGeometry:
     packed_cols: int
     bits: int
     packed_dtype: str
-    norms_dtype: str | None = None
     scales_dtype: str | None = None
     kquant_codec: str | None = None
     group_size: int | None = None
@@ -89,6 +86,7 @@ class ProjectionGeometry:
     iqk_codec: str | None = None
     layout: str | None = None
     row_meta_bytes: int | None = None
+    streams: tuple[ProjectionStreamGeometry, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -239,24 +237,12 @@ class ExpertIndex:
                 f"layer={layer} {projection}.{weight_component}: expected per-expert 2D, "
                 f"got {packed['shape']}")
         out_features = packed["shape"][0]
-        norms_dtype = None
         scales_dtype = None
         kquant_codec = None
         group_size = None
         bytes_per_block = None
         weights_per_block = None
-        if codec == TQ_CODEC:
-            norms = b.components[(projection, "norms")]
-            if len(norms["shape"]) != 1:
-                raise ValueError(
-                    f"layer={layer} {projection}.norms: expected per-expert 1D, "
-                    f"got {norms['shape']}")
-            if norms["shape"][0] != out_features:
-                raise ValueError(
-                    f"layer={layer} {projection}: packed rows {out_features} "
-                    f"!= norms rows {norms['shape'][0]}")
-            norms_dtype = norms["dtype"]
-        elif codec == MXFP4_CODEC:
+        if codec == MXFP4_CODEC:
             scales = b.components[(projection, "scales")]
             if len(scales["shape"]) != 2:
                 raise ValueError(
@@ -291,7 +277,6 @@ class ExpertIndex:
             packed_cols=packed["shape"][1],
             bits=self.bits(layer=layer, projection=projection),
             packed_dtype=packed["dtype"],
-            norms_dtype=norms_dtype,
             scales_dtype=scales_dtype,
             kquant_codec=kquant_codec,
             group_size=group_size,
@@ -326,6 +311,20 @@ class ExpertIndex:
             iqk_codec=proj_geo.get("iqk_codec"),
             layout=proj_geo.get("layout"),
             row_meta_bytes=proj_geo.get("row_meta_bytes"),
+            streams=(
+                None
+                if proj_geo.get("streams") is None
+                else tuple(
+                    ProjectionStreamGeometry(
+                        name=stream["name"],
+                        dtype=stream["dtype"],
+                        shape=tuple(stream["shape"]),
+                        offset=stream["offset"],
+                        nbytes=stream["nbytes"],
+                    )
+                    for stream in proj_geo["streams"]
+                )
+            ),
         )
 
     def num_layers_indexed(self) -> int:
@@ -383,11 +382,10 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
     Scans every shard for `...experts.tq_bundle` tensors, pairs each
     with its layer's geometry from the shard's `__metadata__` (strictly
     validated by package/bundle.py), and records absolute offsets. Weight
-    tensors themselves are never read. Legacy stacked packages fail loud.
+    tensors themselves are never read.
     """
     package_dir = Path(package_dir)
     bundles: dict[int, _LayerBundle] = {}
-    stacked_keys_seen: list[str] = []
 
     for shard in sorted(package_dir.glob("model-*.safetensors")):
         headers = read_headers_with_offsets(shard)
@@ -401,9 +399,6 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
 
         matched_layers: set[int] = set()
         for th in headers:
-            if _STACKED_KEY.search(th.name):
-                stacked_keys_seen.append(th.name)
-                continue
             unsupported = _UNSUPPORTED_BUNDLE_KEY.search(th.name)
             if unsupported is not None:
                 suffix = unsupported.group("suffix")
@@ -430,7 +425,7 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
                     f"{th.name}: header {th.dtype} {th.shape} does not match "
                     f"metadata uint8 ({num_experts}, {row_bytes})")
             codecs = {
-                proj: geo["projections"][proj].get("codec", TQ_CODEC)
+                proj: geo["projections"][proj]["codec"]
                 for proj in PROJECTIONS
             }
             components = {
@@ -457,16 +452,6 @@ def build_expert_index(package_dir: str | Path) -> ExpertIndex:
                 f"{shard.name}: {METADATA_KEY} metadata declares layer(s) "
                 f"{sorted(unmatched)} but the shard has no matching bundle tensor")
 
-    if stacked_keys_seen and not bundles:
-        raise StackedLayoutError(
-            f"{package_dir} uses the legacy STACKED expert layout "
-            f"(e.g. {stacked_keys_seen[0]}). There is no compatibility path; "
-            f"re-convert the package with the current moespresso-convert to "
-            f"produce the bundle format.")
     if not bundles:
         raise ValueError(f"no routed-expert bundle tensors found in {package_dir}")
-    if stacked_keys_seen:
-        raise ValueError(
-            f"{package_dir} mixes bundle and stacked expert tensors "
-            f"(e.g. {stacked_keys_seen[0]}): corrupt or half-converted package")
     return ExpertIndex(bundles=bundles, num_layers=len(bundles))

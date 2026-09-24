@@ -1,37 +1,17 @@
-"""DS4 ratio-4 indexed mixed-attention probe kernel.
-
-This module is intentionally not wired into serving yet. It provides a
-DS4-c-shaped one-token indexed compressed-attention consumer so speed work can
-measure the real candidate surface before replacing the served MLX composition.
-"""
+"""Metal kernels for DeepSeek-V4 indexed mixed attention."""
 
 from __future__ import annotations
 
-import argparse
-from dataclasses import dataclass
-import json
-from pathlib import Path
-import time
-from typing import Any, Callable, Sequence
-
-import numpy as np
-
-
-_KERNEL_CACHE: dict[tuple[int, int], object] = {}
-_PREFILL_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 _PREFILL_LIVE_F16_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 _PREFILL_LIVE_F32_KERNEL_CACHE: dict[tuple[int, int], object] = {}
-_PREFILL_LIVE_V2_F16_KERNEL_CACHE: dict[tuple[int, int], object] = {}
-_PREFILL_LIVE_V2_F32_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 _PREFILL_LIVE_MMA_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 _INDEXER_SCORE_KERNEL_CACHE: dict[tuple[int, int, str], object] = {}
-_INDEXER_Q_QAT_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 _INDEXER_Q_QAT_V2_KERNEL_CACHE: dict[tuple[int, int], object] = {}
 
 # Served prefill consumer engagement counts by kernel variant, exported
 # through `ssd_streaming_stats` and the speed-stats count keys so served
 # A/B arms can prove which consumer ran.
-_CONSUMER_CALL_COUNTS = {"mma": 0, "v2": 0, "v1": 0}
+_CONSUMER_CALL_COUNTS = {"mma": 0, "v1": 0}
 
 # Tiled indexer score kernel engagement counts by operand dtype, exported
 # the same way so served A/B arms can prove which operand form ran.
@@ -51,252 +31,12 @@ def indexer_scores_call_counts() -> dict[str, int]:
 def indexer_score_operands(q, index_comp):
     """Return the tiled score kernel operand pair in float32.
 
-    Both served prefill and the ratio-4 replay route their score-kernel
-    operands through this helper so the two compositions stay identical.
+    The served prefill path routes its score-kernel operands through this
+    helper so its composition stays identical across callers.
     """
     import mlx.core as mx
 
     return q.astype(mx.float32), index_comp.astype(mx.float32)
-
-_SOURCE = """
-    uint lane = thread_position_in_threadgroup.x;
-    uint head = thread_position_in_grid.y;
-
-    uint n_head    = meta[0];
-    uint head_dim  = meta[1];
-    uint n_raw     = meta[2];
-    uint raw_cap   = meta[3];
-    uint raw_start = meta[4];
-    uint n_comp    = meta[5];
-    uint top_k     = meta[6];
-    uint pos0      = meta[7];
-    uint window    = meta[8];
-    uint ratio     = meta[9];
-
-    if (lane >= 32u || head >= n_head) return;
-
-    device const float4 *q4 = (device const float4 *)(q + head * head_dim);
-    half4 q0 = (half4)q4[lane +  0u];
-    half4 q1 = (half4)q4[lane + 32u];
-    half4 q2 = (half4)q4[lane + 64u];
-    half4 q3 = (half4)q4[lane + 96u];
-
-    float M = -1.701411733e38f;
-    float S = 0.0f;
-    float4 o0 = 0.0f;
-    float4 o1 = 0.0f;
-    float4 o2 = 0.0f;
-    float4 o3 = 0.0f;
-    float scale = rsqrt((float)head_dim);
-
-    auto attend_h4_row = [&](const half4 k0,
-                             const half4 k1,
-                             const half4 k2,
-                             const half4 k3) {
-        float score = dot((float4)q0, (float4)k0) +
-                      dot((float4)q1, (float4)k1) +
-                      dot((float4)q2, (float4)k2) +
-                      dot((float4)q3, (float4)k3);
-        score = simd_sum(score) * scale;
-
-        float old_m = M;
-        float new_m = max(M, score);
-        float old_scale = exp(old_m - new_m);
-        float row_scale = exp(score - new_m);
-
-        S = S * old_scale + row_scale;
-        o0 *= old_scale;
-        o1 *= old_scale;
-        o2 *= old_scale;
-        o3 *= old_scale;
-
-        o0 += (float4)k0 * row_scale;
-        o1 += (float4)k1 * row_scale;
-        o2 += (float4)k2 * row_scale;
-        o3 += (float4)k3 * row_scale;
-        M = new_m;
-    };
-
-    if (n_raw > 0u) {
-        uint qpos = pos0;
-        uint first_raw_pos = qpos + 1u - n_raw;
-        uint raw_last_pos = first_raw_pos + n_raw - 1u;
-        uint window_first = (window != 0u && qpos + 1u > window)
-            ? qpos + 1u - window
-            : 0u;
-        uint first = max(first_raw_pos, window_first);
-        uint last = min(qpos, raw_last_pos);
-        if (first <= last) {
-            for (uint pos = first; pos <= last; pos++) {
-                uint logical = pos - first_raw_pos;
-                uint row = (raw_start + logical) % raw_cap;
-                device const half4 *src =
-                    (device const half4 *)(raw_kv + row * head_dim);
-                attend_h4_row(src[lane + 0u],
-                              src[lane + 32u],
-                              src[lane + 64u],
-                              src[lane + 96u]);
-            }
-        }
-    }
-
-    uint visible = ratio == 0u ? n_comp : (pos0 + 1u) / ratio;
-    visible = min(visible, n_comp);
-    for (uint i = 0u; i < top_k; i++) {
-        int idx = topk[i];
-        if (idx < 0) continue;
-        if ((uint)idx >= visible) break;
-        device const half4 *src =
-            (device const half4 *)(comp_kv + ((uint)idx) * head_dim);
-        attend_h4_row(src[lane + 0u],
-                      src[lane + 32u],
-                      src[lane + 64u],
-                      src[lane + 96u]);
-    }
-
-    float sink_score = sinks[head];
-    float old_m = M;
-    float new_m = max(M, sink_score);
-    float old_scale = exp(old_m - new_m);
-    float row_scale = exp(sink_score - new_m);
-    S = S * old_scale + row_scale;
-    o0 *= old_scale;
-    o1 *= old_scale;
-    o2 *= old_scale;
-    o3 *= old_scale;
-
-    float inv_s = S == 0.0f ? 0.0f : 1.0f / S;
-    device float4 *dst4 = (device float4 *)(out + head * head_dim);
-    dst4[lane +  0u] = o0 * inv_s;
-    dst4[lane + 32u] = o1 * inv_s;
-    dst4[lane + 64u] = o2 * inv_s;
-    dst4[lane + 96u] = o3 * inv_s;
-"""
-
-_PREFILL_SOURCE = """
-    uint lane = thread_position_in_threadgroup.x;
-    uint sg = thread_position_in_threadgroup.y;
-    uint tid = sg * 32u + lane;
-    uint token = threadgroup_position_in_grid.x;
-    uint head = threadgroup_position_in_grid.y * 8u + sg;
-
-    uint n_tokens  = meta[0];
-    uint n_head    = meta[1];
-    uint head_dim  = meta[2];
-    uint n_raw     = meta[3];
-    uint raw_cap   = meta[4];
-    uint raw_start = meta[5];
-    uint n_comp    = meta[6];
-    uint top_k     = meta[7];
-    uint pos0      = meta[8];
-    uint window    = meta[9];
-    uint ratio     = meta[10];
-
-    if (lane >= 32u || sg >= 8u || token >= n_tokens || head >= n_head) return;
-
-    threadgroup half4 kv_shared[128];
-
-    device const float4 *q4 = (device const float4 *)(
-        q + ((uint64_t)token * n_head + head) * head_dim);
-    half4 q0 = (half4)q4[lane +  0u];
-    half4 q1 = (half4)q4[lane + 32u];
-    half4 q2 = (half4)q4[lane + 64u];
-    half4 q3 = (half4)q4[lane + 96u];
-
-    float M = -1.701411733e38f;
-    float S = 0.0f;
-    float4 o0 = 0.0f;
-    float4 o1 = 0.0f;
-    float4 o2 = 0.0f;
-    float4 o3 = 0.0f;
-    float scale = rsqrt((float)head_dim);
-
-    auto attend_shared = [&]() {
-        half4 k0 = kv_shared[lane +  0u];
-        half4 k1 = kv_shared[lane + 32u];
-        half4 k2 = kv_shared[lane + 64u];
-        half4 k3 = kv_shared[lane + 96u];
-        float score = dot((float4)q0, (float4)k0) +
-                      dot((float4)q1, (float4)k1) +
-                      dot((float4)q2, (float4)k2) +
-                      dot((float4)q3, (float4)k3);
-        score = simd_sum(score) * scale;
-
-        float old_m = M;
-        float new_m = max(M, score);
-        float old_scale = exp(old_m - new_m);
-        float row_scale = exp(score - new_m);
-
-        S = S * old_scale + row_scale;
-        o0 *= old_scale;
-        o1 *= old_scale;
-        o2 *= old_scale;
-        o3 *= old_scale;
-
-        o0 += (float4)k0 * row_scale;
-        o1 += (float4)k1 * row_scale;
-        o2 += (float4)k2 * row_scale;
-        o3 += (float4)k3 * row_scale;
-        M = new_m;
-    };
-
-    uint qpos = pos0 + token;
-    uint last_pos = pos0 + n_tokens - 1u;
-    uint first_raw_pos = last_pos + 1u - n_raw;
-    uint raw_last_pos = first_raw_pos + n_raw - 1u;
-    uint window_first = (window != 0u && qpos + 1u > window)
-        ? qpos + 1u - window
-        : 0u;
-    uint first = max(first_raw_pos, window_first);
-    uint last = min(qpos, raw_last_pos);
-
-    if (first <= last) {
-        for (uint pos = first; pos <= last; pos++) {
-            uint logical = pos - first_raw_pos;
-            uint row = (raw_start + logical) % raw_cap;
-            device const half4 *src =
-                (device const half4 *)(raw_kv + row * head_dim);
-            if (tid < 128u) kv_shared[tid] = src[tid];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            attend_shared();
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    uint visible = (qpos + 1u) / ratio;
-    visible = min(visible, n_comp);
-    device const int32_t *row_topk = topk + (uint64_t)token * top_k;
-    for (uint i = 0u; i < top_k; i++) {
-        int idx = row_topk[i];
-        if (idx < 0) continue;
-        if ((uint)idx >= visible) break;
-        device const half4 *src =
-            (device const half4 *)(comp_kv + ((uint)idx) * head_dim);
-        if (tid < 128u) kv_shared[tid] = src[tid];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_shared();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float sink_score = sinks[head];
-    float old_m = M;
-    float new_m = max(M, sink_score);
-    float old_scale = exp(old_m - new_m);
-    float row_scale = exp(sink_score - new_m);
-    S = S * old_scale + row_scale;
-    o0 *= old_scale;
-    o1 *= old_scale;
-    o2 *= old_scale;
-    o3 *= old_scale;
-
-    float inv_s = S == 0.0f ? 0.0f : 1.0f / S;
-    device float4 *dst4 = (device float4 *)(
-        out + ((uint64_t)token * n_head + head) * head_dim);
-    dst4[lane +  0u] = o0 * inv_s;
-    dst4[lane + 32u] = o1 * inv_s;
-    dst4[lane + 64u] = o2 * inv_s;
-    dst4[lane + 96u] = o3 * inv_s;
-"""
 
 _PREFILL_LIVE_F16_SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
@@ -436,226 +176,6 @@ _PREFILL_LIVE_F16_SOURCE = """
 """
 
 _PREFILL_LIVE_F32_SOURCE = _PREFILL_LIVE_F16_SOURCE.replace(
-    """device const half4 *q4 = (device const half4 *)(q + q_base);
-    half4 q0 = q4[lane +  0u];
-    half4 q1 = q4[lane + 32u];
-    half4 q2 = q4[lane + 64u];
-    half4 q3 = q4[lane + 96u];""",
-    """device const float4 *q4 = (device const float4 *)(q + q_base);
-    half4 q0 = (half4)q4[lane +  0u];
-    half4 q1 = (half4)q4[lane + 32u];
-    half4 q2 = (half4)q4[lane + 64u];
-    half4 q3 = (half4)q4[lane + 96u];""",
-)
-
-_PREFILL_LIVE_V2_F16_SOURCE = """
-    uint lane = thread_position_in_threadgroup.x;
-    uint sg = thread_position_in_threadgroup.y;
-    uint tid = sg * 32u + lane;
-    uint token = threadgroup_position_in_grid.x;
-    uint head = threadgroup_position_in_grid.y * 16u + sg;
-    uint batch = threadgroup_position_in_grid.z;
-
-    uint batch_size = meta[0];
-    uint n_tokens   = meta[1];
-    uint n_head     = meta[2];
-    uint head_dim   = meta[3];
-    uint n_raw      = meta[4];
-    uint raw_cap    = meta[5];
-    uint raw_start  = meta[6];
-    uint n_comp     = meta[7];
-    uint top_k      = meta[8];
-    uint pos0       = meta[9];
-    uint window     = meta[10];
-    uint ratio      = meta[11];
-
-    // The wrapper requires n_head % 16 == 0, so every simdgroup owns a valid
-    // head and the batch/token guards below are threadgroup-uniform: no
-    // thread returns while others still hit threadgroup barriers.
-    if (batch >= batch_size || token >= n_tokens || head >= n_head) return;
-
-    // Four staged KV rows per barrier round, 16 heads sharing each staged tile.
-    // The 512-thread shape remains below the lower Apple GPU threadgroup limit.
-    threadgroup half4 kv_shared[4u * 128u];
-    threadgroup int staged_ok[4];
-    threadgroup int staged_stop[4];
-
-    uint srow = tid >> 7u;
-    uint selem = tid & 127u;
-
-    uint64_t q_base =
-        (uint64_t)batch * (uint64_t)q_strides[0] +
-        (uint64_t)head  * (uint64_t)q_strides[1] +
-        (uint64_t)token * (uint64_t)q_strides[2];
-    device const half4 *q4 = (device const half4 *)(q + q_base);
-    half4 q0 = q4[lane +  0u];
-    half4 q1 = q4[lane + 32u];
-    half4 q2 = q4[lane + 64u];
-    half4 q3 = q4[lane + 96u];
-
-    float M = -1.701411733e38f;
-    float S = 0.0f;
-    float4 o0 = 0.0f;
-    float4 o1 = 0.0f;
-    float4 o2 = 0.0f;
-    float4 o3 = 0.0f;
-    float scale = rsqrt((float)head_dim);
-
-    // Same per-row math as the one-row-per-round kernel: keeping the dot
-    // structure, simd_sum order, and row visit order bit-identical is what
-    // makes this a pure composition swap. Unrolled tile-wide score
-    // precomputation and a two-deep score/update software pipeline both
-    // measured slower than this plain loop (register pressure); the compiler
-    // schedules the simple form best.
-    auto row_score = [&](uint r) {
-        uint off = r * 128u;
-        half4 k0 = kv_shared[off + lane +  0u];
-        half4 k1 = kv_shared[off + lane + 32u];
-        half4 k2 = kv_shared[off + lane + 64u];
-        half4 k3 = kv_shared[off + lane + 96u];
-        float score = dot((float4)q0, (float4)k0) +
-                      dot((float4)q1, (float4)k1) +
-                      dot((float4)q2, (float4)k2) +
-                      dot((float4)q3, (float4)k3);
-        return simd_sum(score) * scale;
-    };
-
-    auto row_update = [&](uint r, float score) {
-        uint off = r * 128u;
-        half4 k0 = kv_shared[off + lane +  0u];
-        half4 k1 = kv_shared[off + lane + 32u];
-        half4 k2 = kv_shared[off + lane + 64u];
-        half4 k3 = kv_shared[off + lane + 96u];
-
-        float old_m = M;
-        float new_m = max(M, score);
-        if (new_m == old_m) {
-            // Running max unchanged (the common case once it stabilizes):
-            // old_scale would be exp(0) == 1.0 exactly, so S * old_scale and
-            // the o rescale are bit-exact no-ops and are skipped.
-            float row_scale = exp(score - new_m);
-            S = S + row_scale;
-            o0 += (float4)k0 * row_scale;
-            o1 += (float4)k1 * row_scale;
-            o2 += (float4)k2 * row_scale;
-            o3 += (float4)k3 * row_scale;
-            return;
-        }
-        float old_scale = exp(old_m - new_m);
-        float row_scale = exp(score - new_m);
-
-        S = S * old_scale + row_scale;
-        o0 *= old_scale;
-        o1 *= old_scale;
-        o2 *= old_scale;
-        o3 *= old_scale;
-
-        o0 += (float4)k0 * row_scale;
-        o1 += (float4)k1 * row_scale;
-        o2 += (float4)k2 * row_scale;
-        o3 += (float4)k3 * row_scale;
-        M = new_m;
-    };
-
-    uint qpos = pos0 + token;
-    uint last_pos = pos0 + n_tokens - 1u;
-    uint first_raw_pos = last_pos + 1u - n_raw;
-    uint raw_last_pos = first_raw_pos + n_raw - 1u;
-    uint window_first = (window != 0u && qpos + 1u > window)
-        ? qpos + 1u - window
-        : 0u;
-    uint first = max(first_raw_pos, window_first);
-    uint last = min(qpos, raw_last_pos);
-
-    if (first <= last) {
-        for (uint base = first; base <= last; base += 4u) {
-            uint count = min(last - base + 1u, 4u);
-            if (srow < count) {
-                uint pos = base + srow;
-                uint logical = pos - first_raw_pos;
-                uint row = (raw_start + logical) % raw_cap;
-                uint64_t raw_base =
-                    (uint64_t)batch * (uint64_t)raw_kv_strides[0] +
-                    (uint64_t)row   * (uint64_t)raw_kv_strides[2];
-                device const half4 *src = (device const half4 *)(raw_kv + raw_base);
-                kv_shared[srow * 128u + selem] = src[selem];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint r = 0u; r < count; r++) {
-                row_update(r, row_score(r));
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    uint visible = (qpos + 1u) / ratio;
-    visible = min(visible, n_comp);
-    // topk is indexed through the buffer name rather than a bound device
-    // pointer: inputs under 8 elements arrive in the constant address space.
-    uint64_t topk_base =
-        (uint64_t)batch * (uint64_t)topk_strides[0] +
-        (uint64_t)token * (uint64_t)topk_strides[1];
-    for (uint i = 0u; i < top_k; i += 4u) {
-        uint count = min(top_k - i, 4u);
-        if (srow < count) {
-            int idx = topk[topk_base + i + srow];
-            bool ok = idx >= 0 && (uint)idx < visible;
-            if (selem == 0u) {
-                staged_ok[srow] = ok ? 1 : 0;
-                // The caller passes ascending row ids, so a whole tile past
-                // the visibility limit means every later tile is too; a
-                // negative id (skipped, never a stop) keeps parity with the
-                // one-row kernel's continue-then-break order.
-                staged_stop[srow] = (idx >= 0 && (uint)idx >= visible) ? 1 : 0;
-            }
-            if (ok) {
-                uint64_t comp_base =
-                    (uint64_t)batch * (uint64_t)comp_kv_strides[0] +
-                    (uint64_t)((uint)idx) * (uint64_t)comp_kv_strides[1];
-                device const half4 *src = (device const half4 *)(comp_kv + comp_base);
-                kv_shared[srow * 128u + selem] = src[selem];
-            }
-        } else if (selem == 0u) {
-            staged_ok[srow] = 0;
-            staged_stop[srow] = 1;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        bool all_stop = true;
-        for (uint r = 0u; r < count; r++) {
-            if (staged_ok[r] != 0) {
-                row_update(r, row_score(r));
-            }
-        }
-        for (uint r = 0u; r < 4u; r++) {
-            all_stop = all_stop && staged_stop[r] != 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (all_stop) {
-            break;
-        }
-    }
-
-    float sink_score = sinks[head];
-    float old_m = M;
-    float new_m = max(M, sink_score);
-    float old_scale = exp(old_m - new_m);
-    float row_scale = exp(sink_score - new_m);
-    S = S * old_scale + row_scale;
-    o0 *= old_scale;
-    o1 *= old_scale;
-    o2 *= old_scale;
-    o3 *= old_scale;
-
-    float inv_s = S == 0.0f ? 0.0f : 1.0f / S;
-    device float4 *dst4 = (device float4 *)(
-        out + (((uint64_t)batch * n_head + head) * n_tokens + token) * head_dim);
-    dst4[lane +  0u] = o0 * inv_s;
-    dst4[lane + 32u] = o1 * inv_s;
-    dst4[lane + 64u] = o2 * inv_s;
-    dst4[lane + 96u] = o3 * inv_s;
-"""
-
-_PREFILL_LIVE_V2_F32_SOURCE = _PREFILL_LIVE_V2_F16_SOURCE.replace(
     """device const half4 *q4 = (device const half4 *)(q + q_base);
     half4 q0 = q4[lane +  0u];
     half4 q1 = q4[lane + 32u];
@@ -1123,89 +643,6 @@ _INDEXER_SCORE_SOURCE = """
     }
 """
 
-_INDEXER_Q_QAT_SOURCE = """
-    float e2m1_values[8] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    };
-
-    auto e2m1_dequant = [&](float x) {
-        float sign = x < 0.0f ? -1.0f : 1.0f;
-        float ax = min(abs(x), 6.0f);
-        int best = 0;
-        float best_diff = abs(ax - e2m1_values[0]);
-        for (int i = 1; i < 8; i++) {
-            float diff = abs(ax - e2m1_values[i]);
-            if (diff < best_diff ||
-                (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
-                best = i;
-                best_diff = diff;
-            }
-        }
-        return sign * e2m1_values[best];
-    };
-
-    uint tid = thread_position_in_threadgroup.x;
-    uint row = threadgroup_position_in_grid.x;
-
-    uint batch_size = meta[0];
-    uint n_head     = meta[1];
-    uint n_tokens   = meta[2];
-    uint head_dim   = meta[3];
-    uint n_rows     = batch_size * n_head * n_tokens;
-
-    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
-
-    threadgroup float vals[128];
-    threadgroup float absbuf[128];
-
-    uint rem = row;
-    uint token = rem % n_tokens;
-    rem = rem / n_tokens;
-    uint head = rem % n_head;
-    uint batch = rem / n_head;
-
-    uint64_t in_base =
-        (uint64_t)batch * (uint64_t)q_strides[0] +
-        (uint64_t)head  * (uint64_t)q_strides[1] +
-        (uint64_t)token * (uint64_t)q_strides[2];
-
-    vals[tid] = q[in_base + (uint64_t)tid * (uint64_t)q_strides[3]];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 1u; stride < 128u; stride <<= 1u) {
-        if ((tid & stride) == 0u) {
-            uint base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
-            float a = vals[base];
-            float b = vals[base + stride];
-            vals[base] = a + b;
-            vals[base + stride] = a - b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float v = vals[tid] * 0.08838834764831845f;
-    uint block = tid >> 5u;
-    uint lane = tid & 31u;
-    uint block_base = block * 32u;
-    absbuf[tid] = abs(v);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            absbuf[block_base + lane] = max(
-                absbuf[block_base + lane],
-                absbuf[block_base + lane + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float amax = max(absbuf[block_base], 7.052966104933725e-38f);
-    float scale = exp2(ceil(log2(amax / 6.0f)));
-    out[((uint64_t)row * 128u) + tid] =
-        e2m1_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;
-"""
-
-
 _INDEXER_Q_QAT_V2_SOURCE = """
     // Same math as the one-row-per-threadgroup QAT kernel, restructured to
     // one row per simdgroup with four elements per lane and simd_shuffle_xor
@@ -1293,40 +730,6 @@ _INDEXER_Q_QAT_V2_SOURCE = """
 """
 
 
-def _get_kernel(n_heads: int, head_dim: int):
-    key = (int(n_heads), int(head_dim))
-    cached = _KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    import mlx.core as mx
-
-    kernel = mx.fast.metal_kernel(
-        name=f"moespresso_dsv4_indexed_attention_h{n_heads}_d{head_dim}",
-        input_names=["q", "raw_kv", "comp_kv", "topk", "sinks", "meta"],
-        output_names=["out"],
-        source=_SOURCE,
-    )
-    _KERNEL_CACHE[key] = kernel
-    return kernel
-
-
-def _get_prefill_kernel(n_heads: int, head_dim: int):
-    key = (int(n_heads), int(head_dim))
-    cached = _PREFILL_KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    import mlx.core as mx
-
-    kernel = mx.fast.metal_kernel(
-        name=f"moespresso_dsv4_indexed_attention_prefill_h{n_heads}_d{head_dim}",
-        input_names=["q", "raw_kv", "comp_kv", "topk", "sinks", "meta"],
-        output_names=["out"],
-        source=_PREFILL_SOURCE,
-    )
-    _PREFILL_KERNEL_CACHE[key] = kernel
-    return kernel
-
-
 def _get_prefill_live_f16_kernel(n_heads: int, head_dim: int):
     key = (int(n_heads), int(head_dim))
     cached = _PREFILL_LIVE_F16_KERNEL_CACHE.get(key)
@@ -1363,54 +766,6 @@ def _get_prefill_live_f32_kernel(n_heads: int, head_dim: int):
     return kernel
 
 
-def _get_prefill_live_v2_f16_kernel(n_heads: int, head_dim: int):
-    key = (int(n_heads), int(head_dim))
-    cached = _PREFILL_LIVE_V2_F16_KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    import mlx.core as mx
-
-    kernel = mx.fast.metal_kernel(
-        name=f"moespresso_dsv4_indexed_attention_prefill_live_v2_f16_h{n_heads}_d{head_dim}",
-        input_names=["q", "raw_kv", "comp_kv", "topk", "sinks", "meta"],
-        output_names=["out"],
-        source=_PREFILL_LIVE_V2_F16_SOURCE,
-        ensure_row_contiguous=False,
-    )
-    _PREFILL_LIVE_V2_F16_KERNEL_CACHE[key] = kernel
-    return kernel
-
-
-def _get_prefill_live_v2_f32_kernel(n_heads: int, head_dim: int):
-    key = (int(n_heads), int(head_dim))
-    cached = _PREFILL_LIVE_V2_F32_KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    import mlx.core as mx
-
-    kernel = mx.fast.metal_kernel(
-        name=f"moespresso_dsv4_indexed_attention_prefill_live_v2_f32_h{n_heads}_d{head_dim}",
-        input_names=["q", "raw_kv", "comp_kv", "topk", "sinks", "meta"],
-        output_names=["out"],
-        source=_PREFILL_LIVE_V2_F32_SOURCE,
-        ensure_row_contiguous=False,
-    )
-    _PREFILL_LIVE_V2_F32_KERNEL_CACHE[key] = kernel
-    return kernel
-
-
-def _prefill_live_v2_enabled() -> bool:
-    """Gate for the 4-row-staged, 16-heads-per-threadgroup prefill consumer.
-
-    The v2 kernel is bit-identical to the one-row kernel (same per-row dot
-    structure, simd_sum order, and row visit order); the gate exists so the
-    two compositions can be A/B'd on the served path.
-    """
-    import os
-
-    return os.environ.get("MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_V2", "1") != "0"
-
-
 def _get_prefill_live_mma_kernel(n_heads: int, head_dim: int):
     key = (int(n_heads), int(head_dim))
     cached = _PREFILL_LIVE_MMA_KERNEL_CACHE.get(key)
@@ -1427,29 +782,6 @@ def _get_prefill_live_mma_kernel(n_heads: int, head_dim: int):
     )
     _PREFILL_LIVE_MMA_KERNEL_CACHE[key] = kernel
     return kernel
-
-
-def _prefill_live_mma_enabled() -> bool:
-    """Gate for the simdgroup-mma prefill consumer, default on.
-
-    Unlike the v2 gate this selects a numerically valid f32
-    accumulation-order variant. Its lack of bit identity means
-    the default was set through the math-change gate campaign: the engaged
-    cached-path teacher-forced long-NLL holds parity with the scalar
-    consumer (combined 0.0397102275 versus 0.0400776353, mixed sign across
-    the two long prompts), Q2 avg_nll and Q3 recall are unchanged, Q1
-    reproduces the fused-default realization token for token, and served
-    64-token arms are token-identical to the fused anchor. The fenced
-    same-stage A/B at the anchor prefill shape reads 62.4 versus 41.9 ms
-    (1.49x). The cache-less scorer forwards (Q2, the stock long-prompt NLL
-    probe) never reach the ratio-4 fast path, which is why the engaged
-    cached-path probe is the discriminating NLL. Kill switch
-    ``MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_MMA=0`` falls back to the scalar
-    consumers.
-    """
-    import os
-
-    return os.environ.get("MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_MMA", "1") != "0"
 
 
 def _get_indexer_score_kernel(n_heads: int, head_dim: int, operand_form: str):
@@ -1474,99 +806,6 @@ def _get_indexer_score_kernel(n_heads: int, head_dim: int, operand_form: str):
     )
     _INDEXER_SCORE_KERNEL_CACHE[key] = kernel
     return kernel
-
-
-def _get_indexer_q_qat_kernel(n_heads: int, head_dim: int):
-    key = (int(n_heads), int(head_dim))
-    cached = _INDEXER_Q_QAT_KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    import mlx.core as mx
-
-    kernel = mx.fast.metal_kernel(
-        name=f"moespresso_dsv4_indexer_q_qat_h{n_heads}_d{head_dim}",
-        input_names=["q", "meta"],
-        output_names=["out"],
-        source=_INDEXER_Q_QAT_SOURCE,
-        ensure_row_contiguous=False,
-    )
-    _INDEXER_Q_QAT_KERNEL_CACHE[key] = kernel
-    return kernel
-
-
-def indexed_mixed_attention_decode(
-    q,
-    raw_kv,
-    comp_kv,
-    topk,
-    sinks,
-    *,
-    pos0: int,
-    window: int = 128,
-    ratio: int = 4,
-    raw_start: int = 0,
-):
-    """Run the one-token DS4 indexed mixed-attention probe kernel.
-
-    Args:
-        q: float32 ``[n_heads, 512]`` query heads.
-        raw_kv: float16 ``[raw_cap, 512]`` contiguous/circular raw KV rows.
-        comp_kv: float16 ``[n_comp, 512]`` compressed KV rows.
-        topk: int32 ``[top_k]`` selected compressed row ids.
-        sinks: float32 ``[n_heads]`` attention sink logits.
-    """
-    import mlx.core as mx
-
-    if q.ndim != 2 or raw_kv.ndim != 2 or comp_kv.ndim != 2:
-        raise ValueError("q, raw_kv, and comp_kv must be rank-2")
-    n_heads = int(q.shape[0])
-    head_dim = int(q.shape[1])
-    if head_dim != 512:
-        raise ValueError("DS4 indexed attention probe currently requires head_dim=512")
-    if int(raw_kv.shape[1]) != head_dim or int(comp_kv.shape[1]) != head_dim:
-        raise ValueError("raw_kv and comp_kv width must match q")
-    if topk.ndim != 1:
-        raise ValueError("topk must be rank-1")
-    if sinks.shape != (n_heads,):
-        raise ValueError("sinks must have shape [n_heads]")
-    if q.dtype != mx.float32:
-        raise ValueError("q must be float32, matching DS4-c's q buffer contract")
-    if raw_kv.dtype != mx.float16 or comp_kv.dtype != mx.float16:
-        raise ValueError("raw_kv and comp_kv must be float16")
-    if topk.dtype != mx.int32:
-        topk = topk.astype(mx.int32)
-    if sinks.dtype != mx.float32:
-        sinks = sinks.astype(mx.float32)
-
-    raw_cap = int(raw_kv.shape[0])
-    if raw_cap <= 0:
-        raise ValueError("raw_kv must contain at least one row")
-    if not (0 <= int(raw_start) < raw_cap):
-        raise ValueError("raw_start must be inside raw_kv")
-    meta = mx.array(
-        [
-            n_heads,
-            head_dim,
-            raw_cap,
-            raw_cap,
-            int(raw_start),
-            int(comp_kv.shape[0]),
-            int(topk.shape[0]),
-            int(pos0),
-            int(window),
-            int(ratio),
-        ],
-        dtype=mx.uint32,
-    )
-    kernel = _get_kernel(n_heads, head_dim)
-    out, = kernel(
-        inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
-        output_shapes=[(n_heads, head_dim)],
-        output_dtypes=[mx.float32],
-        grid=(32, n_heads, 1),
-        threadgroup=(32, 1, 1),
-    )
-    return out
 
 
 def indexed_mixed_attention_prefill_live_f16(
@@ -1643,7 +882,7 @@ def indexed_mixed_attention_prefill_live_f16(
         ],
         dtype=mx.uint32,
     )
-    if n_heads % 16 == 0 and _prefill_live_mma_enabled():
+    if n_heads % 16 == 0:
         kernel = _get_prefill_live_mma_kernel(n_heads, head_dim)
         _CONSUMER_CALL_COUNTS["mma"] += 1
         out, = kernel(
@@ -1652,17 +891,6 @@ def indexed_mixed_attention_prefill_live_f16(
             output_dtypes=[mx.float32],
             grid=(256 * n_tokens, n_heads // 16, batch),
             threadgroup=(256, 1, 1),
-        )
-        return out
-    if n_heads % 16 == 0 and _prefill_live_v2_enabled():
-        kernel = _get_prefill_live_v2_f16_kernel(n_heads, head_dim)
-        _CONSUMER_CALL_COUNTS["v2"] += 1
-        out, = kernel(
-            inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
-            output_shapes=[(batch, n_heads, n_tokens, head_dim)],
-            output_dtypes=[mx.float32],
-            grid=(32 * n_tokens, 16 * (n_heads // 16), batch),
-            threadgroup=(32, 16, 1),
         )
         return out
     kernel = _get_prefill_live_f16_kernel(n_heads, head_dim)
@@ -1743,7 +971,7 @@ def indexed_mixed_attention_prefill_live_f32(
         ],
         dtype=mx.uint32,
     )
-    if n_heads % 16 == 0 and _prefill_live_mma_enabled():
+    if n_heads % 16 == 0:
         # The scalar f32 kernel casts each query row to half on load; one
         # up-front cast is the identical rounding and lets the half-operand
         # mma kernel serve both input dtypes.
@@ -1755,17 +983,6 @@ def indexed_mixed_attention_prefill_live_f32(
             output_dtypes=[mx.float32],
             grid=(256 * n_tokens, n_heads // 16, batch),
             threadgroup=(256, 1, 1),
-        )
-        return out
-    if n_heads % 16 == 0 and _prefill_live_v2_enabled():
-        kernel = _get_prefill_live_v2_f32_kernel(n_heads, head_dim)
-        _CONSUMER_CALL_COUNTS["v2"] += 1
-        out, = kernel(
-            inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
-            output_shapes=[(batch, n_heads, n_tokens, head_dim)],
-            output_dtypes=[mx.float32],
-            grid=(32 * n_tokens, 16 * (n_heads // 16), batch),
-            threadgroup=(32, 16, 1),
         )
         return out
     kernel = _get_prefill_live_f32_kernel(n_heads, head_dim)
@@ -1814,9 +1031,8 @@ def banded_prefill_attention_live(
 
     The model wrapper counts engagement. The ratio-4
     ``r4_prefill_consumer_*`` counters keep counting only ratio-4 layers.
-    Requires the mma consumer; callers fail closed to the batched banded
-    SDPA form when ``_prefill_live_mma_enabled()`` is off or the head count
-    is not a multiple of 16.
+    Requires a head count divisible by 16; callers fail closed to the batched
+    banded SDPA form for unsupported geometry.
     """
     import mlx.core as mx
 
@@ -1830,8 +1046,8 @@ def banded_prefill_attention_live(
         raise ValueError("q must contain at least one batch and token")
     if head_dim != 512:
         raise ValueError("banded mma attention requires head_dim=512")
-    if n_heads % 16 != 0 or not _prefill_live_mma_enabled():
-        raise ValueError("banded mma attention requires the mma consumer")
+    if n_heads % 16 != 0:
+        raise ValueError("banded mma attention requires n_heads divisible by 16")
     if int(raw_kv.shape[0]) != batch or int(comp_kv.shape[0]) != batch:
         raise ValueError("raw_kv and comp_kv batch size must match q")
     if int(raw_kv.shape[-1]) != head_dim or int(comp_kv.shape[-1]) != head_dim:
@@ -1980,13 +1196,6 @@ def _get_indexer_q_qat_v2_kernel(n_heads: int, head_dim: int):
     return kernel
 
 
-def _indexer_q_qat_v2_enabled() -> bool:
-    """Gate for the simdgroup-shuffle QAT restructure (bit-identical math)."""
-    import os
-
-    return os.environ.get("MOESPRESSO_DSV4_R4_PREFILL_QAT_V2", "1") != "0"
-
-
 def indexer_q_qat_live(q):
     """Apply DS4 indexer Hadamard-128 + FP4 QAT to live BHLD q rows."""
     import mlx.core as mx
@@ -2006,333 +1215,13 @@ def indexer_q_qat_live(q):
 
     meta = mx.array([batch, n_heads, n_tokens, head_dim], dtype=mx.uint32)
     n_rows = batch * n_heads * n_tokens
-    if _indexer_q_qat_v2_enabled():
-        kernel = _get_indexer_q_qat_v2_kernel(n_heads, head_dim)
-        groups = (n_rows + 3) // 4
-        out, = kernel(
-            inputs=[q, meta],
-            output_shapes=[(batch, n_heads, n_tokens, head_dim)],
-            output_dtypes=[mx.float32],
-            grid=(128 * groups, 1, 1),
-            threadgroup=(128, 1, 1),
-        )
-        return out
-    kernel = _get_indexer_q_qat_kernel(n_heads, head_dim)
+    kernel = _get_indexer_q_qat_v2_kernel(n_heads, head_dim)
+    groups = (n_rows + 3) // 4
     out, = kernel(
         inputs=[q, meta],
         output_shapes=[(batch, n_heads, n_tokens, head_dim)],
         output_dtypes=[mx.float32],
-        grid=(128 * n_rows, 1, 1),
+        grid=(128 * groups, 1, 1),
         threadgroup=(128, 1, 1),
     )
     return out
-
-
-def indexed_mixed_attention_prefill(
-    q,
-    raw_kv,
-    comp_kv,
-    topk,
-    sinks,
-    *,
-    pos0: int,
-    window: int = 128,
-    ratio: int = 4,
-    raw_start: int = 0,
-):
-    """Run a DS4-c-shaped batch-token indexed mixed-attention probe kernel.
-
-    Args:
-        q: float32 ``[tokens, n_heads, 512]`` query heads.
-        raw_kv: float16 ``[raw_cap, 512]`` local raw KV rows.
-        comp_kv: float16 ``[n_comp, 512]`` compressed KV rows.
-        topk: int32 ``[tokens, top_k]`` selected compressed row ids.
-        sinks: float32 ``[n_heads]`` attention sink logits.
-    """
-    import mlx.core as mx
-
-    if q.ndim != 3 or raw_kv.ndim != 2 or comp_kv.ndim != 2:
-        raise ValueError("q must be rank-3 and raw_kv/comp_kv rank-2")
-    n_tokens = int(q.shape[0])
-    n_heads = int(q.shape[1])
-    head_dim = int(q.shape[2])
-    if n_tokens <= 0:
-        raise ValueError("q must contain at least one token")
-    if head_dim != 512:
-        raise ValueError("DS4 indexed prefill probe currently requires head_dim=512")
-    if n_heads % 8 != 0:
-        raise ValueError("DS4 indexed prefill probe requires n_heads to be divisible by 8")
-    if int(raw_kv.shape[1]) != head_dim or int(comp_kv.shape[1]) != head_dim:
-        raise ValueError("raw_kv and comp_kv width must match q")
-    if topk.ndim != 2 or int(topk.shape[0]) != n_tokens:
-        raise ValueError("topk must have shape [tokens, top_k]")
-    if sinks.shape != (n_heads,):
-        raise ValueError("sinks must have shape [n_heads]")
-    if q.dtype != mx.float32:
-        raise ValueError("q must be float32, matching DS4-c's q buffer contract")
-    if raw_kv.dtype != mx.float16 or comp_kv.dtype != mx.float16:
-        raise ValueError("raw_kv and comp_kv must be float16")
-    if topk.dtype != mx.int32:
-        topk = topk.astype(mx.int32)
-    if sinks.dtype != mx.float32:
-        sinks = sinks.astype(mx.float32)
-
-    raw_cap = int(raw_kv.shape[0])
-    if raw_cap <= 0:
-        raise ValueError("raw_kv must contain at least one row")
-    if not (0 <= int(raw_start) < raw_cap):
-        raise ValueError("raw_start must be inside raw_kv")
-    meta = mx.array(
-        [
-            n_tokens,
-            n_heads,
-            head_dim,
-            raw_cap,
-            raw_cap,
-            int(raw_start),
-            int(comp_kv.shape[0]),
-            int(topk.shape[1]),
-            int(pos0),
-            int(window),
-            int(ratio),
-        ],
-        dtype=mx.uint32,
-    )
-    kernel = _get_prefill_kernel(n_heads, head_dim)
-    out, = kernel(
-        inputs=[q, raw_kv, comp_kv, topk, sinks, meta],
-        output_shapes=[(n_tokens, n_heads, head_dim)],
-        output_dtypes=[mx.float32],
-        grid=(32 * n_tokens, 8 * (n_heads // 8), 1),
-        threadgroup=(32, 8, 1),
-    )
-    return out
-
-
-def mlx_selected_rows_attention_reference(
-    q,
-    raw_kv,
-    comp_kv,
-    topk,
-    sinks,
-):
-    """Current MLX-style selected-row consumer used as correctness/speed reference."""
-    import mlx.core as mx
-
-    selected = mx.take(comp_kv, topk.astype(mx.int32), axis=0)
-    full = mx.concatenate([raw_kv, selected], axis=0)
-    return mx.fast.scaled_dot_product_attention(
-        q.astype(mx.float16)[None, :, None, :],
-        full[None, None, :, :],
-        full[None, None, :, :],
-        scale=float(q.shape[-1]) ** -0.5,
-        mask=None,
-        sinks=sinks.astype(mx.float16),
-    ).reshape(q.shape).astype(mx.float32)
-
-
-def mlx_indexed_mixed_attention_prefill_reference(
-    q,
-    raw_kv,
-    comp_kv,
-    topk,
-    sinks,
-    *,
-    pos0: int,
-    window: int = 128,
-    ratio: int = 4,
-):
-    """Reference for the indexed prefill probe using MLX SDPA per token."""
-    import mlx.core as mx
-
-    n_tokens, n_heads, head_dim = q.shape
-    n_raw = int(raw_kv.shape[0])
-    raw_last_pos = int(pos0) + int(n_tokens) - 1
-    first_raw_pos = raw_last_pos + 1 - n_raw
-    rows = []
-    for token in range(int(n_tokens)):
-        qpos = int(pos0) + token
-        window_first = qpos + 1 - int(window) if window and qpos + 1 > window else 0
-        first = max(first_raw_pos, window_first)
-        last = min(qpos, raw_last_pos)
-        parts = []
-        if first <= last:
-            raw_idx = mx.arange(first - first_raw_pos, last - first_raw_pos + 1)
-            parts.append(mx.take(raw_kv, raw_idx.astype(mx.int32), axis=0))
-        visible = min((qpos + 1) // int(ratio), int(comp_kv.shape[0]))
-        selected_np = np.asarray(topk[token], dtype=np.int32)
-        selected_np = selected_np[(selected_np >= 0) & (selected_np < visible)]
-        if selected_np.size:
-            selected = mx.array(selected_np, dtype=mx.int32)
-            parts.append(mx.take(comp_kv, selected, axis=0))
-        if parts:
-            full = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
-        else:
-            full = mx.zeros((0, head_dim), dtype=mx.float16)
-        out = mx.fast.scaled_dot_product_attention(
-            q[token].astype(mx.float16)[None, :, None, :],
-            full[None, None, :, :],
-            full[None, None, :, :],
-            scale=float(head_dim) ** -0.5,
-            mask=None,
-            sinks=sinks.astype(mx.float16),
-        ).reshape(n_heads, head_dim).astype(mx.float32)
-        rows.append(out)
-    return mx.stack(rows, axis=0)
-
-
-@dataclass(frozen=True)
-class IndexedAttentionProbeCase:
-    name: str
-    compressed_rows: int
-    topk_rows: int = 512
-    raw_rows: int = 128
-
-
-def default_probe_cases() -> tuple[IndexedAttentionProbeCase, ...]:
-    return (
-        IndexedAttentionProbeCase("bounded_long_rows961", 961),
-        IndexedAttentionProbeCase("q3_scale_rows7618", 7618),
-    )
-
-
-def _inputs_for_case(case: IndexedAttentionProbeCase, *, seed: int):
-    import mlx.core as mx
-
-    rng = np.random.default_rng(seed)
-    q = mx.array(rng.standard_normal((64, 512), dtype=np.float32))
-    raw = mx.array(
-        rng.standard_normal((case.raw_rows, 512), dtype=np.float32)
-    ).astype(mx.float16)
-    comp = mx.array(
-        rng.standard_normal((case.compressed_rows, 512), dtype=np.float32)
-    ).astype(mx.float16)
-    topk = mx.array(np.arange(case.topk_rows, dtype=np.int32))
-    sinks = mx.array(rng.standard_normal((64,), dtype=np.float32))
-    pos0 = max(
-        case.raw_rows - 1,
-        case.compressed_rows * 4 + case.raw_rows - 1,
-    )
-    mx.eval(q, raw, comp, topk, sinks)
-    return q, raw, comp, topk, sinks, pos0
-
-
-def _time_call(fn: Callable[[], Any], *, repeats: int, warmup: int) -> float:
-    import mlx.core as mx
-
-    for _ in range(max(int(warmup), 0)):
-        y = fn()
-        mx.eval(y)
-    t0 = time.perf_counter()
-    for _ in range(max(int(repeats), 1)):
-        y = fn()
-        mx.eval(y)
-    return (time.perf_counter() - t0) / max(int(repeats), 1)
-
-
-def run_indexed_attention_probe(
-    *,
-    repeats: int = 20,
-    warmup: int = 3,
-    cases: Sequence[IndexedAttentionProbeCase] | None = None,
-    seed: int = 0,
-) -> dict[str, Any]:
-    import mlx.core as mx
-
-    rows = []
-    for i, case in enumerate(cases or default_probe_cases()):
-        q, raw, comp, topk, sinks, pos0 = _inputs_for_case(case, seed=seed + i)
-        candidate = indexed_mixed_attention_decode(
-            q,
-            raw,
-            comp,
-            topk,
-            sinks,
-            pos0=pos0,
-        )
-        reference = mlx_selected_rows_attention_reference(q, raw, comp, topk, sinks)
-        mx.eval(candidate, reference)
-        diff = mx.abs(candidate - reference)
-        ref_scale = mx.maximum(mx.sqrt(mx.mean(reference * reference)), mx.array(1e-12))
-        max_abs = float(mx.max(diff).item())
-        rel_rms = float((mx.sqrt(mx.mean(diff * diff)) / ref_scale).item())
-        kernel_s = _time_call(
-            lambda: indexed_mixed_attention_decode(q, raw, comp, topk, sinks, pos0=pos0),
-            repeats=repeats,
-            warmup=warmup,
-        )
-        mlx_s = _time_call(
-            lambda: mlx_selected_rows_attention_reference(q, raw, comp, topk, sinks),
-            repeats=repeats,
-            warmup=warmup,
-        )
-        rows.append({
-            "case": case.name,
-            "raw_rows": int(case.raw_rows),
-            "compressed_rows": int(case.compressed_rows),
-            "topk_rows": int(case.topk_rows),
-            "pos0": int(pos0),
-            "max_abs": max_abs,
-            "rel_rms": rel_rms,
-            "kernel_seconds_per_repeat": float(kernel_s),
-            "mlx_seconds_per_repeat": float(mlx_s),
-            "kernel_over_mlx": float(kernel_s / mlx_s) if mlx_s else None,
-        })
-    return {
-        "metric": "ds4_indexed_mixed_attention_probe",
-        "units": "seconds per one-token indexed mixed-attention call",
-        "quality_note": (
-            "isolated speed/correctness probe only; served integration still "
-            "requires Q1/Q2/Q3 validation"
-        ),
-        "repeats": int(repeats),
-        "warmup": int(warmup),
-        "cases": rows,
-    }
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="moespresso-ds4-indexed-attention-probe",
-        description=(
-            "Benchmark a DS4-c-shaped one-token indexed mixed-attention kernel "
-            "against the current MLX selected-row SDPA consumer."
-        ),
-    )
-    parser.add_argument("--repeats", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--compressed-rows",
-        type=int,
-        action="append",
-        help="Custom compressed row count; may be passed multiple times.",
-    )
-    parser.add_argument("--json-out", type=Path)
-    args = parser.parse_args(argv)
-    if args.repeats <= 0:
-        parser.error("--repeats must be positive")
-    if args.warmup < 0:
-        parser.error("--warmup must be non-negative")
-    cases = None
-    if args.compressed_rows:
-        cases = tuple(
-            IndexedAttentionProbeCase(f"rows{int(rows)}", int(rows))
-            for rows in args.compressed_rows
-        )
-    payload = run_indexed_attention_probe(
-        repeats=args.repeats,
-        warmup=args.warmup,
-        cases=cases,
-        seed=args.seed,
-    )
-    text = json.dumps(payload, indent=2, sort_keys=True)
-    if args.json_out is not None:
-        args.json_out.write_text(text + "\n")
-    else:
-        print(text)
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

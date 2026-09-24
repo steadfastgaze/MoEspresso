@@ -78,7 +78,7 @@ def _located(decision: dict) -> dict:
 
 def test_package_plan_force_override_dry_run_does_not_mutate_decision():
     decision = _decision()
-    overrides = parse_force_overrides(["*ffn_gate_exps.weight=tq2"])
+    overrides = parse_force_overrides(["*ffn_gate_exps.weight=mxfp4"])
 
     planned, summary = make_package_plan(
         decision["subject"],
@@ -91,22 +91,22 @@ def test_package_plan_force_override_dry_run_does_not_mutate_decision():
 
     assert summary["dry_run"] is True
     assert summary["matched"][0]["before"] == "kquant:iq2_xxs"
-    assert summary["matched"][0]["after"] == "tq2"
+    assert summary["matched"][0]["after"] == "mxfp4"
     assert planned["force_override_preview"]["matched"][0]["before"] == "kquant:iq2_xxs"
-    assert planned["force_override_preview"]["matched"][0]["after"] == "tq2"
+    assert planned["force_override_preview"]["matched"][0]["after"] == "mxfp4"
     assert planned["allocation"][0]["format"] == "kquant"
     assert planned["artifact_kind"] == "package_plan"
     assert planned["producer_kind"] == "gguf_recipe"
     assert planned["producer_reference"] == "recipe.gguf"
     assert planned["optimized_kernels_expected"] is False
     assert planned["force_overrides"] == [
-        {"pattern": "*ffn_gate_exps.weight", "target": "tq2"}
+        {"pattern": "*ffn_gate_exps.weight", "target": "mxfp4"}
     ]
 
 
 def test_package_plan_force_override_changes_format_and_records_reason():
     decision = _decision()
-    overrides = parse_force_overrides(["*ffn_gate_exps.weight=tq2"])
+    overrides = parse_force_overrides(["*ffn_gate_exps.weight=mxfp4"])
 
     planned, summary = make_package_plan(
         decision["subject"],
@@ -117,13 +117,13 @@ def test_package_plan_force_override_changes_format_and_records_reason():
 
     forced = planned["allocation"][0]
     assert summary["matched"][0]["source_name"] == forced["source_name"]
-    assert forced["format"] == "tq"
-    assert forced["codec"] == "tq"
-    assert forced["bits"] == 2
+    assert forced["format"] == "mxfp4"
+    assert forced["codec"] == "mxfp4"
+    assert forced["bits"] == 4
     assert "kquant_codec" not in forced
     assert forced["forced_format"] == {
         "pattern": "*ffn_gate_exps.weight",
-        "target": "tq2",
+        "target": "mxfp4",
         "before": "kquant:iq2_xxs",
     }
 
@@ -140,7 +140,7 @@ def test_package_plan_rejects_unmatched_force_pattern_by_default():
             decision["subject"],
             decision["allocation"],
             producer_kind="optimizer",
-            force_overrides=parse_force_overrides(["*nope*=tq2"]),
+            force_overrides=parse_force_overrides(["*nope*=mxfp4"]),
         )
 
 
@@ -152,7 +152,7 @@ def test_manifest_records_package_plan_metadata_and_forced_tensor(tmp_path):
         producer_kind="gguf_recipe",
         producer_reference="recipe.gguf",
         optimized_kernels_expected=True,
-        force_overrides=parse_force_overrides(["*ffn_gate_exps.weight=tq2"]),
+        force_overrides=parse_force_overrides(["*ffn_gate_exps.weight=mxfp4"]),
     )
     shard = tmp_path / "model-00001-of-00001.safetensors"
     shard.write_bytes(b"fake")
@@ -167,5 +167,5 @@ def test_manifest_records_package_plan_metadata_and_forced_tensor(tmp_path):
     assert manifest["optimized_kernels_expected"] is True
     assert manifest["provenance"]["package_plan"]["producer_kind"] == "gguf_recipe"
     gate = next(t for t in manifest["tensors"] if t.get("projection") == "gate")
-    assert gate["format"] == "tq"
-    assert gate["format_decision"]["forced"]["target"] == "tq2"
+    assert gate["format"] == "mxfp4"
+    assert gate["format_decision"]["forced"]["target"] == "mxfp4"

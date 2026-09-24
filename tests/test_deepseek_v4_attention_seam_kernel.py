@@ -163,29 +163,15 @@ def test_fused_partial_rope_prefill_positions_form_bit_identical(
         mx, ref, got, f"pooled positions rows={rows} width={width}")
 
 
-def test_prefill_rope_seam_gate_and_row_caps(monkeypatch):
+def test_prefill_rope_seam_row_caps(monkeypatch):
     mx = _require_metal()
     inv_freq = mx.zeros((32,), dtype=mx.float32)
     prefill_shaped = mx.zeros((1, 64, 2, 512), dtype=mx.float32)
 
-    # Default on: prefill row counts are eligible.
-    monkeypatch.delenv(seam._PREFILL_ENV_FLAG, raising=False)
-    assert seam.prefill_rope_seam_enabled()
     assert seam.partial_rope_eligible(
         prefill_shaped, inv_freq, offset=0, positions=None)
 
-    # The kill switch restores the decode-only cap without touching
-    # decode eligibility.
-    monkeypatch.setenv(seam._PREFILL_ENV_FLAG, "0")
-    assert not seam.prefill_rope_seam_enabled()
-    assert not seam.partial_rope_eligible(
-        prefill_shaped, inv_freq, offset=0, positions=None)
-    assert seam.partial_rope_eligible(
-        mx.zeros((1, 64, 1, 512), dtype=mx.float32),
-        inv_freq, offset=0, positions=None)
-
-    # The structural ceiling still fails closed with the extension on.
-    monkeypatch.delenv(seam._PREFILL_ENV_FLAG, raising=False)
+    # The structural ceiling fails closed.
     monkeypatch.setattr(seam, "_MAX_ROWS_PREFILL", 100)
     assert not seam.partial_rope_eligible(
         prefill_shaped, inv_freq, offset=0, positions=None)
@@ -249,24 +235,22 @@ def test_fused_partial_rope_raises_outside_contract(monkeypatch):
     with pytest.raises(ValueError):
         seam.fused_partial_rope(
             mx.zeros((1, 64, 1, 32), dtype=mx.float32), inv_freq, offset=0)
-    # Over the decode row cap with the prefill extension killed.
-    monkeypatch.setenv(seam._PREFILL_ENV_FLAG, "0")
+    # Over the structural row cap.
+    monkeypatch.setattr(seam, "_MAX_ROWS_PREFILL", 100)
     with pytest.raises(ValueError):
         seam.fused_partial_rope(
             mx.zeros((1, 64, 2, 512), dtype=mx.float32), inv_freq, offset=0)
 
 
-def test_rope_seam_gates(monkeypatch):
-    if not seam._metal_available():
-        pytest.skip("Metal is required for the gate check")
-    monkeypatch.delenv(seam._FAMILY_ENV_FLAG, raising=False)
-    monkeypatch.delenv(seam._ROPE_ENV_FLAG, raising=False)
-    assert seam.rope_seam_enabled()
-    monkeypatch.setenv(seam._FAMILY_ENV_FLAG, "0")
-    assert not seam.rope_seam_enabled()
-    monkeypatch.delenv(seam._FAMILY_ENV_FLAG)
-    monkeypatch.setenv(seam._ROPE_ENV_FLAG, "0")
-    assert not seam.rope_seam_enabled()
+def test_rope_seam_fails_closed_without_metal(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    monkeypatch.setattr(seam, "_METAL_AVAILABLE", False)
+    assert not seam.partial_rope_eligible(
+        mx.zeros((1, 1, 512), dtype=mx.float32),
+        mx.zeros((32,), dtype=mx.float32),
+        offset=0,
+        positions=None,
+    )
 
 
 class _RestoredRopePatch:
@@ -293,11 +277,9 @@ class _RestoredRopePatch:
         return False
 
 
-def test_seam_rope_patch_dispatch_and_counters(monkeypatch):
+def test_seam_rope_patch_dispatch_and_counters():
     mx = _require_metal()
     jm = _jang_model()
-    monkeypatch.delenv(seam._FAMILY_ENV_FLAG, raising=False)
-    monkeypatch.delenv(seam._ROPE_ENV_FLAG, raising=False)
     rope = _ropes(jm)["compress_yarn"]
     decode_x = _rope_input(mx, (1, 64, 1, 512), mx.bfloat16, 3)
     prefill_x = _rope_input(mx, (1, 64, 128, 512), mx.bfloat16, 4)
@@ -317,7 +299,6 @@ def test_seam_rope_patch_dispatch_and_counters(monkeypatch):
             mx, composed(decode_x, rope, 3855), got, "patched decode call")
 
         # Prefill-shaped rows serve the fused dispatch by default.
-        monkeypatch.delenv(seam._PREFILL_ENV_FLAG, raising=False)
         before = attention_seam_rope_call_counts()
         got_prefill = jm._apply_partial_rope(prefill_x, rope, 0)
         mx.eval(got_prefill)
@@ -327,16 +308,6 @@ def test_seam_rope_patch_dispatch_and_counters(monkeypatch):
         _assert_bit_equal(
             mx, composed(prefill_x, rope, 0), got_prefill,
             "patched prefill call")
-
-        # The prefill kill switch restores the composed path for
-        # prefill-shaped rows only.
-        monkeypatch.setenv(seam._PREFILL_ENV_FLAG, "0")
-        before = attention_seam_rope_call_counts()
-        mx.eval(jm._apply_partial_rope(prefill_x, rope, 0))
-        after = attention_seam_rope_call_counts()
-        assert after["fused"] == before["fused"]
-        assert after["composed"] == before["composed"] + 1
-        monkeypatch.delenv(seam._PREFILL_ENV_FLAG)
 
         # A foreign rope object fails closed to the composed path.
         class _OtherRope:
@@ -351,19 +322,6 @@ def test_seam_rope_patch_dispatch_and_counters(monkeypatch):
         after = attention_seam_rope_call_counts()
         assert after["fused"] == before["fused"]
         assert after["composed"] == before["composed"] + 1
-
-        # The kill switch forces the composed path per call.
-        monkeypatch.setenv(seam._FAMILY_ENV_FLAG, "0")
-        before = attention_seam_rope_call_counts()
-        killed = jm._apply_partial_rope(decode_x, rope, 3855)
-        mx.eval(killed)
-        after = attention_seam_rope_call_counts()
-        assert after["fused"] == before["fused"]
-        assert after["composed"] == before["composed"] + 1
-        _assert_bit_equal(
-            mx, composed(decode_x, rope, 3855), killed, "kill-switch call")
-        monkeypatch.delenv(seam._FAMILY_ENV_FLAG)
-
 
 def test_seam_rope_patch_is_idempotent():
     _require_metal()

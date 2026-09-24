@@ -1,10 +1,7 @@
 """Resident mixed-bit SwitchGLU safety.
 
-This is the non-streaming baseline: MoEspresso packages may assign different
-TQ bit-widths to routed gate/up projections. JANG's class-level fused SwitchGLU
-path has one bit-width parameter for both, so the resident runtime must detect
-mixed gate/up layers from package metadata and replace only those layers with a
-MoEspresso-owned forward.
+Routed projections may use different K-quant members. Header metadata selects
+an owned forward that keeps each projection's bit width independent.
 """
 
 from __future__ import annotations
@@ -57,18 +54,30 @@ def _norms(n_exp=4, out=8):
 
 
 def _tiny_expert_package(tmp_path, layer_bits):
-    from conftest import write_bundle_package
+    from conftest import write_safetensors_raw
+    from moespresso.package.bundle import assemble_layer_bundle, encode_bundle_metadata
+    from moespresso.package.kquant_format import KQUANT_GEOMETRY
+    import numpy as np
 
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    # one builder call per layer so each layer can carry its own bits map
-    for layer, bits_by_proj in sorted(layer_bits.items()):
-        write_bundle_package(
-            pkg, layers=(layer,),
-            specs={proj: (8, 2, bits_by_proj.get(proj, 2))
-                   for proj in ("gate_proj", "up_proj", "down_proj")},
-            shard_name=f"model-{layer + 1:05d}-of-{len(layer_bits):05d}"
-                       ".safetensors")
+    for layer, bit_map in sorted(layer_bits.items()):
+        codecs = {p: "q4_k" if bit_map.get(p, 2) == 4 else "q2_k"
+                  for p in ("gate_proj", "up_proj", "down_proj")}
+        components = {}
+        for p, codec in codecs.items():
+            components[p, "weight"] = np.zeros((4, 8, KQUANT_GEOMETRY[codec].bytes_per_block), np.uint8)
+            components[p, "scales"] = np.zeros((4, 1), np.uint8)
+        bundle, geometry = assemble_layer_bundle(
+            components, {p: KQUANT_GEOMETRY[c].bits for p, c in codecs.items()},
+            {p: "kquant" for p in codecs}, kquant_codecs=codecs,
+        )
+        write_safetensors_raw(
+            pkg / f"model-{layer + 1:05d}-of-{len(layer_bits):05d}.safetensors",
+            {f"language_model.model.layers.{layer}.mlp.switch_mlp.experts.tq_bundle":
+             ("U8", bundle.shape, bundle.tobytes())},
+            {"expert_bundles": encode_bundle_metadata({layer: geometry})},
+        )
     return pkg
 
 
@@ -104,7 +113,7 @@ def _model(layer_specs):
 def _moe_manifest():
     return {
         "architecture": {"family": "qwen3_5_moe"},
-        "required_ops": ["affine_dequant", "tq_dequant", "fp16_passthrough"],
+        "required_ops": ["affine_dequant", "kquant_dequant", "fp16_passthrough"],
         "tensors": [],
     }
 
@@ -151,12 +160,12 @@ def test_build_model_wraps_layers_declared_mixed_by_package_headers(tmp_path):
     })
     model = _model([{"gate_bits": 2, "up_bits": 4}])
 
-    def fake_jangtq(package_dir):
+    def fake_kquant(_manifest, package_dir):
         assert package_dir == pkg
         return model, "TOK"
 
     served, tokenizer = build_model(
-        _moe_manifest(), pkg, load_jangtq_fn=fake_jangtq)
+        _moe_manifest(), pkg, load_qwen_kquant_fn=fake_kquant)
 
     assert served is model
     assert tokenizer == "TOK"

@@ -80,10 +80,10 @@ def _manifest(*, selection_id=_SELECTION_ID, layers=None):
             {"path": "expert_selection.json"},
             {"path": "model-00001-of-00001.safetensors"},
         ],
-        "required_ops": ["tq_dequant"],
+        "required_ops": ["iqk_dequant"],
         "tensors": [
             *router_tensors,
-            {"format": "tq", "kind": "expert"},
+            {"format": "iqk", "kind": "expert"},
         ],
         "expert_layout": {
             "bundled": True,
@@ -373,7 +373,6 @@ def test_source_width_router_restores_geometry_and_returns_compact_ids(monkeypat
             name: SimpleNamespace(pool=SimpleNamespace(num_experts=count))
             for name in ("gate_proj", "up_proj", "down_proj")
         })
-        switch.lookahead_w = mx.ones((count, 1), dtype=mx.float16)
         layers.append(SimpleNamespace(mlp=SimpleNamespace(
             gate=contract,
             switch_mlp=switch,
@@ -413,8 +412,6 @@ def test_source_width_router_restores_geometry_and_returns_compact_ids(monkeypat
     removed[np.asarray(score_ids)] = False
     assert np.count_nonzero(np.asarray(bases[3].weight)[removed]) == 0
     assert np.all(np.isneginf(np.asarray(bases[3].bias)[removed]))
-    assert layers[3].mlp.switch_mlp.lookahead_w.shape == (len(score_ids), 1)
-
     compact_ids, scores = proxy(mx.array(rng.normal(size=(1, 2, 12))))
     mx.eval(compact_ids, scores)
     compact_ids_np = np.asarray(compact_ids)

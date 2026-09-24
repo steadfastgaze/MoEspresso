@@ -1,35 +1,20 @@
-"""Manifest-driven model build for mjtq serve along the established path.
+"""Build model and tokenizer instances from declared package formats.
 
-mjtq reuses the serve path already validated on Qwen3.5/3.6 mixed-affine+TQ:
-jang's `load_jangtq_model` builds the graph from the package's `config.json` (affine
-non-experts as mlx QuantizedLinear via the per-module `quantization` block; TQ experts
-as TurboQuantSwitchLinear metal-kernel modules), then a per-tensor `tensor_map`
-override fixes mixed-precision bits/group_size. No dequant at load: TQ weights stay
-packed and the GPU kernel runs them; mlx affine modules dequant in-layer at inference.
-
-The package carries `config.json` + `jang_config.json` as jang-compatible sidecars
-generated from the manifest at convert time (a compat view; the manifest stays the
-source of truth and avoids source archaeology). This module just feeds them to the
-jang loader. No numpy on this path (jang's hot path is its metal kernel + mlx).
-
-Needs the standard runtime dependencies (mlx, mlx-lm, jang). Imports are lazy.
+Family adapters bind the model graph to packed tensors and routed-expert pools.
+Dense affine modules use the package-generated Jang configuration and tensor map.
+Runtime dependencies are imported lazily.
 """
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import logging
-import sys
 from pathlib import Path
 
-# transformers (5.8.x/5.9.x) falsely fires a "fix_mistral_regex" warning for non-Mistral
-# tokenizers loaded from a dir that also holds model files (the mjtq package): an
-# upstream bug (huggingface/transformers#42591, fixed by #45444 but not in this line).
-# The tokenizer is correct (loads as Qwen2Tokenizer, round-trips exactly), so drop
-# only this one false message; never set fix_mistral_regex=True (it changes a correct
-# regex and is reported to break non-Mistral tokenization).
+# The pinned Transformers releases emit this warning for non-Mistral tokenizers
+# loaded beside model files. The tokenizer loads as ``Qwen2Tokenizer`` and its
+# tokenization is unaffected, so filter that message without changing
+# ``fix_mistral_regex``.
 class _DropMistralRegexWarning(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -42,6 +27,21 @@ class _DropDeepSeekV4RopeWarning(logging.Filter):
             "Unrecognized keys in `rope_parameters` for 'rope_type'='default': "
             "{'attention_factor'}"
         )
+
+
+class _DropQwen4ConfigTypeWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() not in {
+            "You are using a model of type `qwen4_exp` to instantiate a model "
+            "of type ``. This is not supported for all configurations of models "
+            "and can yield errors.",
+            "You are using a model of type `qwen4_exp` to instantiate a model "
+            "of type ``. This may be expected if you are loading a checkpoint that "
+            "shares a subset of the architecture (e.g., loading a `sam2_video` "
+            "checkpoint into `Sam2Model`), but is otherwise not supported and can "
+            "yield errors. Please verify that the checkpoint is compatible with the "
+            "model you are instantiating.",
+        }
 
 
 def _silence_known_transformers_warnings() -> None:
@@ -59,33 +59,36 @@ def _silence_known_transformers_warnings() -> None:
     if not any(isinstance(f, _DropDeepSeekV4RopeWarning) for f in lg.filters):
         lg.addFilter(_DropDeepSeekV4RopeWarning())
 
+    lg = logging.getLogger("transformers.configuration_utils")
+    if not any(isinstance(f, _DropQwen4ConfigTypeWarning) for f in lg.filters):
+        lg.addFilter(_DropQwen4ConfigTypeWarning())
 
-def _load_jangtq_quietly(load_fn, package_dir):
-    """Call jang's loader, discarding its verbose stdout banner on success.
 
-    jang's load_jangtq_model prints a multi-line load banner to stdout (Loading JANGTQ,
-    seed/bits_map (where bits_map is the deliberate sentinel 0, see package/sidecars),
-    Replaced N modules, [warmup]..., Done). It is third-party (cannot be edited), so
-    capture that stdout and drop it on a successful load. On failure the captured text
-    is re-emitted first, so a broken load stays diagnosable. Only this call's stdout is
-    touched.
-    """
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            return load_fn(package_dir)
-    except BaseException:
-        sys.stdout.write(buf.getvalue())  # surface jang's progress so the failure is readable
-        sys.stdout.flush()
-        raise
+def _qwen_eos_token_ids(config: dict) -> set[int] | None:
+    """Return every declared Qwen stop id from the merged model config."""
+    stop_ids: set[int] = set()
+
+    def collect(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, int):
+            stop_ids.add(value)
+            return
+        stop_ids.update(int(token_id) for token_id in value)
+
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        collect(text_config.get("eos_token_id"))
+    collect(config.get("eos_token_id"))
+    return stop_ids or None
 
 
 def _apply_tensor_map(model, tensor_map: dict) -> None:
     """Override bits/group_size on QuantizedLinear modules from the explicit map.
 
-    Mixed per-tensor affine: jang builds modules from config.json's quantization
-    block; this pins each module's exact bits/group_size so shape-guessing cannot
-    pick the wrong precision (the fix for mixed-affine)."""
+    Jang builds modules from config.json's quantization block. The explicit map
+    sets each module's bits and group size so module construction does not infer
+    an incorrect precision."""
     for name, module in model.named_modules():
         if name in tensor_map and hasattr(module, "bits"):
             alloc = tensor_map[name]
@@ -113,7 +116,7 @@ def _routed_expert_index(package_dir: Path):
 
 
 def _mixed_gate_up_layers_from_headers(package_dir: Path) -> set[int]:
-    """Return layers whose routed gate/up TQ bits differ, using headers only."""
+    """Return layers whose routed gate/up bit widths differ, using headers only."""
     index = _routed_expert_index(package_dir)
     return set() if index is None else _mixed_gate_up_layers(index)
 
@@ -150,20 +153,14 @@ def _decoder_layers(model):
     return None
 
 
-def _install_routed_experts_from_bundles(model, package_dir: Path, index,
-                                         *, seed: int) -> int:
-    """Install resident expert modules from the bundle tensors.
+def _install_routed_experts_from_bundles(model, package_dir: Path, index) -> int:
+    """Install resident K-quant projections from validated bundle geometry.
 
-    jang's loader hydrates TurboQuantSwitchLinear modules from the pre-bundle
-    stacked keys; bundle packages carry none, so the loader silently leaves the
-    plain (random-init) SwitchGLU in place. This pass owns the routed payload
-    for the resident (non-streaming) serve path: per layer it reads the bundle
-    once, splits components per the metadata geometry, and replaces each
-    projection with a TurboQuantSwitchLinear carrying the exact packed/norms
-    bytes. Anything missing fails loudly (never a quietly wrong model).
+    Each layer is read once. Component bytes populate the projection buffers
+    before replacing the graph's routed modules. Missing data fails loading.
     """
     import mlx.core as mx
-    from moespresso.package.bundle import KQUANT_CODEC, TQ_CODEC
+    from moespresso.package.bundle import KQUANT_CODEC
 
     layers = _decoder_layers(model)
     if layers is None:
@@ -193,14 +190,7 @@ def _install_routed_experts_from_bundles(model, package_dir: Path, index,
         comps = index.row_components(layer=layer_idx)
         for proj in ("gate_proj", "up_proj", "down_proj"):
             geo = index.geometry(layer=layer_idx, projection=proj)
-            if geo.codec == TQ_CODEC:
-                from jang_tools.turboquant.tq_kernel import TurboQuantSwitchLinear
-
-                in_features = geo.packed_cols * (32 // geo.bits)
-                mod = TurboQuantSwitchLinear(
-                    in_features, geo.out_features, n_exp, bits=geo.bits, seed=seed)
-                weight_component = "packed"
-            elif geo.codec == KQUANT_CODEC:
+            if geo.codec == KQUANT_CODEC:
                 from mlx_kquant.nn import KQuantSwitchLinear
 
                 bytes_per_block = int(geo.bytes_per_block or 0)
@@ -222,22 +212,11 @@ def _install_routed_experts_from_bundles(model, package_dir: Path, index,
                     f"codec {geo.codec!r}")
             # Fill persistent MLX buffers by byte copy (the pool pattern: no
             # numpy on the engine path).
-            weight_dtype = mx.uint8 if geo.codec == KQUANT_CODEC else mx.uint32
+            weight_dtype = mx.uint8
             weight = mx.zeros(
                 (n_exp, geo.out_features, geo.packed_cols),
                 dtype=weight_dtype,
             )
-            if geo.codec == TQ_CODEC:
-                norms = mx.zeros((n_exp, geo.out_features), dtype=mx.float16)
-                mx.eval(weight, norms)
-                norms_view = memoryview(norms).cast("B")
-                nc = comps[(proj, "norms")]
-                nn = nc["nbytes"]
-            else:
-                norms = None
-                norms_view = None
-                nc = None
-                nn = 0
             weight_view = memoryview(weight).cast("B")
             wc = comps[(proj, weight_component)]
             wn = wc["nbytes"]
@@ -245,16 +224,9 @@ def _install_routed_experts_from_bundles(model, package_dir: Path, index,
                 row = rows[e * row_bytes:(e + 1) * row_bytes]
                 weight_view[e * wn:(e + 1) * wn] = (
                     row[wc["offset"]:wc["offset"] + wn])
-                if norms_view is not None:
-                    norms_view[e * nn:(e + 1) * nn] = (
-                        row[nc["offset"]:nc["offset"] + nn])
-            if geo.codec == TQ_CODEC:
-                mod.packed = weight
-                mod.norms = norms
-            else:
-                mod.weight = weight
-                mod.scales = mx.zeros((1,), dtype=mx.uint8)
-                mx.eval(mod.weight, mod.scales)
+            mod.weight = weight
+            mod.scales = mx.zeros((1,), dtype=mx.uint8)
+            mx.eval(mod.weight, mod.scales)
             setattr(sw, proj, mod)
         del rows, raw
         installed += 1
@@ -313,7 +285,10 @@ def _load_qwen_kquant_model(
     )
     install_kquant_modules_fn(model, manifest)
     load_non_routed_fn(model, package_dir)
-    tokenizer = load_tokenizer_fn(package_dir)
+    tokenizer = load_tokenizer_fn(
+        package_dir,
+        eos_token_ids=_qwen_eos_token_ids(model_config),
+    )
     return model, tokenizer
 
 
@@ -395,13 +370,11 @@ def _runtime_adapter_kind(manifest: dict) -> str:
         "f32_passthrough",
     }
     qwen_kquant_ops = dense_affine_ops | {"kquant_dequant"}
-    qwen_tq_ops = qwen_kquant_ops | {"tq_dequant"}
     dsv4_ops = {
         "affine_dequant",
         "fp16_passthrough",
         "f32_passthrough",
         "raw_dtype_passthrough",
-        "tq_dequant",
         "mxfp4_dequant",
         "mxfp8_dequant",
         "kquant_dequant",
@@ -411,6 +384,11 @@ def _runtime_adapter_kind(manifest: dict) -> str:
         # by layout, where the reason can be stated.
         "iqk_dequant",
     }
+    qwen4_ops = {
+        "iqk_dequant",
+        "kquant_dequant",
+        "raw_dtype_passthrough",
+    }
 
     if family == "deepseek_v4_flash":
         unexpected = required_ops - dsv4_ops
@@ -419,21 +397,22 @@ def _runtime_adapter_kind(manifest: dict) -> str:
                 "unsupported DeepSeek V4 runtime ops "
                 f"{sorted(unexpected)!r}; required_ops={sorted(required_ops)!r}")
         return "mjtq_dsv4"
+    if family == "qwen4_exp":
+        unexpected = required_ops - qwen4_ops
+        if required_ops != qwen4_ops:
+            raise UnsupportedRuntimeAdapter(
+                "unsupported Qwen4 runtime ops "
+                f"{sorted(unexpected)!r}; required_ops={sorted(required_ops)!r}"
+            )
+        return "qwen4_iqk_moe"
     if family == "qwen3_5_dense" and required_ops <= dense_affine_ops:
         return "regular_jang_v2"
     if (
         family == "qwen3_5_moe"
         and "kquant_dequant" in required_ops
-        and "tq_dequant" not in required_ops
         and required_ops <= qwen_kquant_ops
     ):
         return "qwen_kquant_moe"
-    if (
-        family == "qwen3_5_moe"
-        and required_ops <= qwen_tq_ops
-        and "tq_dequant" in required_ops
-    ):
-        return "jangtq_moe"
 
     raise UnsupportedRuntimeAdapter(
         f"unsupported runtime adapter for family={family!r}, "
@@ -444,23 +423,27 @@ def build_model(
     manifest: dict,
     package_dir: Path,
     *,
-    load_jangtq_fn=None,
     load_jang_fn=None,
     load_dsv4_fn=None,
+    load_qwen4_fn=None,
     load_qwen_kquant_fn=None,
     context_limit: int | None = None,
     context_limit_explicit: bool = False,
+    cache_routing: str = "auto",
+    cache_routing_factor: float | None = None,
+    cache_routing_protected_routes: int | None = None,
 ):
-    """Build (model, tokenizer) from a mjtq package via the jang loader.
-
-    Reads the jang-compatible sidecars in the package dir (config.json,
-    jang_config.json) that convert generated from the manifest. Returns
-    (model, tokenizer): the tokenizer is the one jang's loader produced (mlx_lm
-    load_tokenizer + eos/chat handling), the same one the established path uses;
-    it is not re-loaded separately (that would diverge from the established path)."""
+    """Build the manifest-selected model and tokenizer from package files."""
     _silence_known_transformers_warnings()  # jang loads the tokenizer below
     package_dir = Path(package_dir)
     adapter = _runtime_adapter_kind(manifest)
+    from moespresso.runtime.qwen4.cache_routing_config import resolve_cache_routing
+
+    routing = resolve_cache_routing(
+        cache_routing, factor=cache_routing_factor, protected_routes=cache_routing_protected_routes,
+    )
+    if routing.enabled and adapter != "qwen4_iqk_moe":
+        raise UnsupportedRuntimeAdapter("cache routing is supported only by the Qwen4 pooled adapter")
 
     if adapter == "mjtq_dsv4":
         if load_dsv4_fn is None:
@@ -474,6 +457,17 @@ def build_model(
             )
         return load_dsv4_fn(manifest, package_dir)
 
+    if adapter == "qwen4_iqk_moe":
+        if load_qwen4_fn is None:
+            from moespresso.runtime.qwen4.load import (
+                load_qwen4_iqk_package_model as load_qwen4_fn,
+            )
+        kwargs = {}
+        if context_limit is not None:
+            kwargs["max_context_tokens"] = int(context_limit)
+        kwargs.update(routing.load_options(include_off=True))
+        return load_qwen4_fn(manifest, package_dir, **kwargs)
+
     if adapter == "regular_jang_v2":
         if load_jang_fn is None:
             from jang_tools.loader import load_jang_model
@@ -482,15 +476,9 @@ def build_model(
 
     index = _routed_expert_index(package_dir)
     required_mixed_layers = set() if index is None else _mixed_gate_up_layers(index)
-    if adapter == "qwen_kquant_moe":
-        if load_qwen_kquant_fn is None:
-            load_qwen_kquant_fn = _load_qwen_kquant_model
-        model, tokenizer = load_qwen_kquant_fn(manifest, package_dir)
-    else:
-        if load_jangtq_fn is None:
-            from jang_tools.load_jangtq import load_jangtq_model
-            load_jangtq_fn = load_jangtq_model
-        model, tokenizer = _load_jangtq_quietly(load_jangtq_fn, package_dir)
+    if load_qwen_kquant_fn is None:
+        load_qwen_kquant_fn = _load_qwen_kquant_model
+    model, tokenizer = load_qwen_kquant_fn(manifest, package_dir)
 
     jang_cfg_path = package_dir / "jang_config.json"
     jcfg = {}
@@ -504,7 +492,7 @@ def build_model(
         # Bundle packages: jang's loader cannot hydrate routed experts (no
         # stacked keys on disk); install them from the bundles, fail-loud.
         _install_routed_experts_from_bundles(
-            model, package_dir, index, seed=int(jcfg.get("mxtq_seed", 42)))
+            model, package_dir, index)
     _wrap_mixed_bit_switchglus(model, required_mixed_layers=required_mixed_layers)
 
     if adapter == "qwen_kquant_moe":
@@ -518,56 +506,36 @@ def build_model(
 
         install_router_bf16_f32_gemv(model)
 
-        # First optimized MoE path: swap the resident K-quant SwitchGLU seams
-        # for the sorted routed route (sorted-ids prefill GEMM over the full
-        # expert stacks). Fail-closed per layer and behind
-        # MOESPRESSO_QWEN_MOE_SORTED; a no-op when the kill switch is off or a
-        # layer's projections are not combinable K-quant stacks.
+        # Replace compatible resident K-quant SwitchGLU modules with the sorted
+        # routed implementation. A layer remains unchanged when its projections
+        # cannot form a compatible K-quant stack.
         from moespresso.runtime.qwen.sorted_switch_glu import (
             install_sorted_kquant_switchglus,
         )
 
         install_sorted_kquant_switchglus(model)
 
-        # Served prefill chunk coalescing for the sorted routed-MoE path. A
-        # larger prompt chunk reads each active expert's weights fewer times
-        # across a long prefill. Under the composed head-dimension-256 prefill
-        # attention this did not convert to served throughput (that path
-        # materializes a quadratic score tensor per chunk that grew faster than
-        # the routed-MoE saving, so peak climbed and the rate was flat at 4096
-        # and worse beyond it). The flash prefill route removes the score-tensor
-        # materialization and the re-pricing reverses that verdict: at 37K under
-        # the flash route chunk 4096 runs about 10 t/s faster than chunk 2048 and
-        # cuts about 0.6 s off the time to first token, at a 26.43 GiB peak that
-        # fits the 32 GB budget. So the default raises the chunk to 4096 for long
-        # prompts (short prompts keep the mlx_lm chunk);
-        # MOESPRESSO_QWEN_PREFILL_CHUNK=<n> overrides the value. Chunk 8192 stays
-        # out (over budget and slower). Math-affecting through the q8 KV
-        # dense/quantized boundary: chunk 4096 forks the 37K greedy stream from
-        # chunk 2048, so the change is judged by the quality ladder (gate stays
-        # 9/9 clean-pass). Token identity is not required for this numerical variant.
+        # Coalesce long-prompt prefill work for the sorted routed-MoE path so an
+        # active expert can serve more token-expert pairs per read. The default
+        # uses a 4096-token chunk for long prompts; short prompts retain the
+        # mlx-lm chunk and MOESPRESSO_QWEN_PREFILL_CHUNK overrides the value.
+        # Chunking crosses the q8 KV dense/quantized boundary, so it is a
+        # numerical variant validated with the model-family quality checks.
         from moespresso.runtime.qwen.prefill_chunk import install_prefill_chunk
 
         install_prefill_chunk(model)
 
-        # Flash D=256 prefill attention for the full-attention layers: eligible
-        # prefill chunks over the q8 KV cache dispatch to the mlx_kquant flash
-        # kernel with no materialized score tensor. The float32 memory-lever
-        # form passed the full quality ladder (engaged prefill NLL improves,
-        # gate clean, A/A rail recorded) and cuts the 37K served peak by
-        # 4.16 GB at a 3.6% TTFT cost, so it is the default.
-        # MOESPRESSO_QWEN_PREFILL_FLASH_D256=0 is the kill switch: nothing is
-        # installed and serving is the stock composed path on its own rail.
+        # Eligible full-attention prefill chunks over the q8 KV cache use the
+        # mlx_kquant flash kernel, which avoids materializing the score tensor.
         from moespresso.runtime.qwen.full_attention import (
             install_flash_prefill_attention,
         )
 
         install_flash_prefill_attention(model)
 
-        # Decode-only gated-delta convolution-state fusion. The guarded route
-        # wraps only the recurrent layers and delegates every off-contract call
-        # to the pinned MLX LM module unchanged. Its environment variable is a
-        # kill switch.
+        # The guarded decode-only fusion wraps recurrent layers and delegates
+        # off-contract calls to the pinned MLX LM implementation. Its environment
+        # variable disables the wrapper.
         from moespresso.runtime.qwen.gdn_decode import install_fused_gdn_decode
 
         install_fused_gdn_decode(model)

@@ -14,15 +14,12 @@ upstream non-transposed F32 specialization to the 256-by-2048 router decode
 shape and changes only the matrix load to BF16 followed by explicit F32
 conversion.  See ``THIRD-PARTY-NOTICES`` and ``LICENSE-MIT``.
 
-The route is on by default. Set
-``MOESPRESSO_QWEN_ROUTER_BF16_F32_GEMV=0`` to keep every router on its original
-F32 linear. Installation is transactional: all forty weights must pass an
-exact F32-to-BF16-to-F32 bit comparison before any layer is wrapped.
+Installation is transactional: all forty weights must pass an exact
+F32-to-BF16-to-F32 bit comparison before any layer is wrapped.
 """
 
 from __future__ import annotations
 
-import os
 from functools import cache as memoize
 from importlib.metadata import PackageNotFoundError, version
 
@@ -30,7 +27,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-_QWEN_ROUTER_BF16_F32_GEMV = os.environ.get("MOESPRESSO_QWEN_ROUTER_BF16_F32_GEMV", "1") == "1"
 _CERTIFIED_MLX_VERSION = "0.31.2"
 _CERTIFIED_MLX_LM_VERSION = "0.31.3"
 _MODEL_TYPE = "qwen3_5_moe"
@@ -122,7 +118,6 @@ def router_bf16_f32_resident_bytes(config: dict) -> int:
 
     if (
         not isinstance(config, dict)
-        or not _QWEN_ROUTER_BF16_F32_GEMV
         or not _versions_compatible()
         or not _kernel_available()
         or config.get("model_type") != _MODEL_TYPE
@@ -178,7 +173,6 @@ class BF16F32RouterLinear(nn.Module):
         self._validated_weight_id = id(inner.weight)
         self.validated_layers = 1
         self.kernel_calls = 0
-        self.fallback_disabled = 0
         self.fallback_training = 0
         self.fallback_input_shape = 0
         self.fallback_input_dtype = 0
@@ -198,8 +192,6 @@ class BF16F32RouterLinear(nn.Module):
         return getattr(self.inner, "bias", None)
 
     def _eligibility_failure(self, inputs: mx.array) -> str | None:
-        if not _QWEN_ROUTER_BF16_F32_GEMV:
-            return "fallback_disabled"
         if self.training or self.inner.training:
             return "fallback_training"
         if tuple(inputs.shape) != (1, 1, _IN_FEATURES):
@@ -291,8 +283,7 @@ def install_router_bf16_f32_gemv(model) -> int:
     """Install all forty exact router wrappers, or leave the model untouched."""
 
     if (
-        not _QWEN_ROUTER_BF16_F32_GEMV
-        or getattr(model, "model_type", None) != _MODEL_TYPE
+        getattr(model, "model_type", None) != _MODEL_TYPE
         or not _versions_compatible()
         or not _kernel_available()
     ):
@@ -335,7 +326,6 @@ def router_bf16_f32_stats(model) -> dict[str, int]:
     keys = (
         "validated_layers",
         "kernel_calls",
-        "fallback_disabled",
         "fallback_training",
         "fallback_input_shape",
         "fallback_input_dtype",

@@ -110,8 +110,3 @@ def copy_tokenizer_into_package(source_dir: Path, package_dir: Path,
     return {"files": files, "rendering_id": rendering,
             "chat_template_source": chat_template_source,
             "has_tokenizer": any(f["path"] == _REQUIRED for f in files)}
-
-# Serve does not load the tokenizer separately: it uses the one jang's
-# load_jangtq_model returns (mlx_lm load_tokenizer + eos/chat handling), matching the
-# proven decode path (see runtime/build.build_model). This module's job is the
-# package-side copy above; there is no serve-side tokenizer loader here.

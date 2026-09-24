@@ -174,25 +174,28 @@ In observed order of value on this project:
   alone, order-changing changes buy the full campaign. Decide which
   kind you are writing before you write it.
 
-## 6. The change contract
+## 6. The change lifecycle
 
-Every landed change ships with the same five parts, and the discipline
-is what keeps fifteen stacked levers debuggable:
+Measure each candidate with the controls below. Promotion ends the experiment:
+remove the losing branch, its switch, and diagnostics without continuing
+operational use. Permanent experiment switches obscure the selected path and
+make it harder to maintain.
 
-- A kill switch: an environment variable that restores the previous
-  route exactly, plus a family switch that closes a whole class of
-  routes at once. Remove a per-route switch only after certification,
-  as a deliberate simplification.
+- Use a temporary switch during measurement to restore the reference route
+  exactly. After promotion, keep an operational kill switch only when runtime
+  variability or an external dependency can make the selected route unavailable
+  and the fallback remains a supported product path.
 - Fail-closed eligibility: the new route checks every contract it
   depends on (dtype, dimensions, block sizes, kernel availability) per
   call and falls back to a correct path on any mismatch. Fallbacks are
   how an off-contract package serves correctly instead of crashing or,
   worse, silently corrupting.
-- Engagement counters: per-route call counts exported through one
-  stats surface, so any run can prove which code executed.
-- Tests: engagement, fail-closed behavior on each contract violation,
-  switch behavior, and a numeric bound against the exact reference
-  form.
+- Count route engagements during evaluation to prove which code each comparison
+  executed. Keep those counters after promotion only to diagnose a supported
+  runtime condition.
+- Test the promoted behavior, fail-closed handling of contract violations, and
+  a numeric bound against the exact reference form. Remove tests that only
+  select a retired branch.
 - A log entry with the numbers: mechanism, fenced and served results,
   ladder results, rail status, and the verdict.
 

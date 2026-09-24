@@ -26,17 +26,72 @@ import mlx.core as mx
 import numpy as np
 
 from moespresso.runtime.expert_index import ExpertIndex, ProjectionGeometry
-from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC, TQ_CODEC
+from moespresso.package.bundle import IQK_CODEC, KQUANT_CODEC, MXFP4_CODEC
 from moespresso.package.iqk_format import (
     IQK_LAYOUT_IQK_RELAYOUT,
+    IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
     normalize_iqk_layout,
 )
-from moespresso.package.iqk_relayout import split_streams
+from moespresso.package.iqk_relayout import (
+    relayout_stream_spans,
+    split_streams,
+    stream_major_spans,
+)
 from moespresso.runtime.pread_into import pread_view_cached
 
 
 class ExpertCapacityExceeded(RuntimeError):
     pass
+
+
+class _IqkSlotCopyPlan:
+    """Byte views bound to one persistent relayout-stream allocation.
+
+    Writers own disjoint slots through the pool's existing reservation protocol.
+    The plan has no shared scratch. Growth prepares a replacement plan while
+    detached and publishes it with the replacement storage.
+    """
+
+    def __init__(self, geometry, total_slots, views, slot_nbytes):
+        self.rows = int(geometry.out_features)
+        self.row_bytes = int(geometry.packed_cols)
+        self.total_slots = int(total_slots)
+        if min(self.rows, self.row_bytes, self.total_slots) <= 0:
+            raise ValueError("IQ_K copy plan requires positive storage geometry")
+        spans = relayout_stream_spans(geometry.iqk_codec, geometry.in_features)
+        if tuple(views) != tuple(span.name for span in spans):
+            raise ValueError("IQ_K copy plan stream membership or order differs")
+        fields = []
+        offset = 0
+        for span in spans:
+            view = views[span.name]
+            expected = self.rows * span.nbytes
+            if (
+                span.offset != offset or span.nbytes <= 0
+                or slot_nbytes.get(span.name) != expected
+                or view.nbytes != self.total_slots * expected
+                or view.readonly or not view.c_contiguous
+            ):
+                raise ValueError("IQ_K copy plan stream storage differs")
+            target = np.frombuffer(view, dtype=np.uint8).reshape(
+                self.total_slots, self.rows, span.nbytes)
+            if any(np.shares_memory(target, old[2]) for old in fields):
+                raise ValueError("IQ_K copy plan stream destinations overlap")
+            fields.append((offset, offset + span.nbytes, target))
+            offset += span.nbytes
+        if offset != self.row_bytes:
+            raise ValueError("IQ_K copy plan spans do not cover the stored row")
+        self.fields = tuple(fields)
+
+    def copy(self, source, *, slot):
+        if type(slot) is not int or not 0 <= slot < self.total_slots:
+            raise ValueError("IQ_K copy plan slot is out of bounds")
+        source = memoryview(source)
+        if not source.c_contiguous or source.nbytes != self.rows * self.row_bytes:
+            raise ValueError("IQ_K copy plan source geometry differs")
+        rows = np.frombuffer(source, dtype=np.uint8).reshape(self.rows, self.row_bytes)
+        for start, end, target in self.fields:
+            np.copyto(target[slot], rows[:, start:end], casting="no")
 
 
 @dataclass
@@ -49,11 +104,10 @@ class _PoolGrowthCandidate:
     iqk_views: dict[str, memoryview]
     iqk_slot_nbytes: dict[str, int]
     packed: object | None
-    norms: object | None
     scales: object | None
     packed_view: memoryview | None
-    norms_view: memoryview | None
     scales_view: memoryview | None
+    iqk_copy_plan: _IqkSlotCopyPlan | None = None
     expert_at: list[int | None] | None = None
     slot_of: dict[int, int] | None = None
 
@@ -66,14 +120,6 @@ class _PoolGrowthCandidate:
 # with the kill switch.
 _DECAY_EVERY_TOUCHES = int(
     os.environ.get("MOESPRESSO_SSD_HOTNESS_DECAY_TOUCHES", "128") or "0")
-
-# Page-cache hygiene: after a demand eviction, advise the
-# kernel to drop the evicted row's file pages. Advisory-only on a read-only
-# mapping - cannot corrupt; worst cases are an ignored hint or a slower
-# re-read. Default ON; MOESPRESSO_SSD_EVICT_DONTNEED=0 is the kill switch.
-_EVICT_DONTNEED = os.environ.get(
-    "MOESPRESSO_SSD_EVICT_DONTNEED", "1") == "1"
-
 
 class BundleRowCache:
     """One layer's bundle-row reader, shared by its three projection pools.
@@ -182,12 +228,8 @@ class ExpertSlotPool:
         self.projection = projection
         self.combined_kquant_projection = combined_kquant_projection
         self.capacity = int(capacity)
-        # Spare slots live above the demand capacity, written only
-        # by speculative prefetch (place_spare), never chosen by the demand
-        # allocator, never evicted by LFU. A correct prediction becomes a
-        # plain hit (the expert is published at its spare slot); a wrong one
-        # is overwritten by a later prefetch round-robin. This keeps the
-        # live pool's residency untouched by speculation.
+        # Spare slots sit beyond demand capacity and are never allocated or
+        # evicted by demand. Callers manage their contents and lifetime.
         self.spare_slots = int(spare_slots)
         self.eviction_policy = eviction_policy
         self.geometry = index.geometry(layer=layer, projection=projection)
@@ -221,25 +263,28 @@ class ExpertSlotPool:
                 projection=projection,
                 combined_projection=combined_kquant_projection,
             )
-        self._comp_norms = comps.get((projection, "norms"))
         self._comp_scales = comps.get((projection, "scales"))
 
         total_slots = capacity + self.spare_slots
         self.iqk = None
         self._iqk_views: dict[str, memoryview] = {}
         self._iqk_slot_nbytes: dict[str, int] = {}
+        self._iqk_copy_plan: _IqkSlotCopyPlan | None = None
+        self.total_iqk_direct_copies = 0
         self.packed = None
         self.weight = None
-        self.norms = None
         self.scales = None
         if self.codec == IQK_CODEC:
-            if (
-                normalize_iqk_layout(self.geometry.layout)
-                != IQK_LAYOUT_IQK_RELAYOUT
-            ):
+            layout = normalize_iqk_layout(self.geometry.layout)
+            if layout not in {
+                IQK_LAYOUT_IQK_RELAYOUT,
+                IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1,
+            }:
                 raise ValueError(
-                    f"{projection}: IQ_K pool requires "
-                    f"{IQK_LAYOUT_IQK_RELAYOUT!r}, got {self.geometry.layout!r}"
+                    f"{projection}: IQ_K pool requires one of "
+                    f"{IQK_LAYOUT_IQK_RELAYOUT!r}, "
+                    f"{IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1!r}; got "
+                    f"{self.geometry.layout!r}"
                 )
             if self.geometry.iqk_codec is None or self.geometry.in_features is None:
                 raise ValueError(
@@ -252,11 +297,7 @@ class ExpertSlotPool:
                 dtype=packed_dtype,
             )
             self.weight = self.packed if self.codec == KQUANT_CODEC else None
-        if self.codec == TQ_CODEC:
-            self.norms = mx.zeros((total_slots, self.geometry.out_features),
-                                  dtype=mx.float16)
-            mx.eval(self.packed, self.norms)
-        elif self.codec == MXFP4_CODEC:
+        if self.codec == MXFP4_CODEC:
             if self._comp_scales is None:
                 raise ValueError(f"{projection}: mxfp4 pool has no scales component")
             scale_shape = tuple(self._comp_scales["shape"])
@@ -271,7 +312,6 @@ class ExpertSlotPool:
             raise ValueError(f"{projection}: unsupported expert codec {self.codec!r}")
         self._packed_view = (
             memoryview(self.packed).cast("B") if self.packed is not None else None)
-        self._norms_view = memoryview(self.norms).cast("B") if self.norms is not None else None
         self._scales_view = memoryview(self.scales).cast("B") if self.scales is not None else None
 
         self._slot_of: dict[int, int] = {}
@@ -289,6 +329,7 @@ class ExpertSlotPool:
         # all replacement storage and slot maps publish together.
         self._loads_inflight = 0
         self._growth_pending = False
+        self._staging_owner = None
         self._prefetch_inflight = 0
         # expert ids currently reserved by an in-flight prefetch (bytes
         # landing). A demand ensure for such an expert waits for the publish
@@ -303,9 +344,6 @@ class ExpertSlotPool:
         # must never evict an expert the current step just published (surfaces
         # as a KeyError in the worker's slot read).
         self._demand_protect: set[int] = set()
-        self._pending_advise: list[int] = []
-        self.total_dontneed = 0
-        self.total_dontneed_errors = 0
         self.total_prefetch_loads = 0
         self.total_prefetch_skips = 0
         # Recency stamps replace the old _lru python list: the list cost O(n)
@@ -364,9 +402,15 @@ class ExpertSlotPool:
 
     def _allocate_iqk_storage(self, total_slots: int) -> None:
         """Allocate and install the initial kernel-native IQ_K streams."""
-        self.iqk, self._iqk_views, self._iqk_slot_nbytes = (
-            self._new_iqk_storage(total_slots)
-        )
+        iqk, views, slot_nbytes = self._new_iqk_storage(total_slots)
+        plan = self._new_iqk_copy_plan(total_slots, views, slot_nbytes)
+        self.iqk, self._iqk_views, self._iqk_slot_nbytes = iqk, views, slot_nbytes
+        self._iqk_copy_plan = plan
+
+    def _new_iqk_copy_plan(self, total_slots, views, slot_nbytes):
+        if normalize_iqk_layout(self.geometry.layout) != IQK_LAYOUT_IQK_RELAYOUT:
+            return None
+        return _IqkSlotCopyPlan(self.geometry, total_slots, views, slot_nbytes)
 
     def _init_combined_kquant_geometry(
         self,
@@ -441,11 +485,6 @@ class ExpertSlotPool:
         with self._bk_lock:
             return set(self._slot_of)
 
-    def hotness_snapshot(self) -> dict[int, int]:
-        """Return a stable copy of the LFU counters."""
-        with self._bk_lock:
-            return dict(self._freq)
-
     def slot_of(self, expert: int) -> int:
         return self._slot_of[int(expert)]
 
@@ -465,6 +504,7 @@ class ExpertSlotPool:
         grow_expert_slot_pools((self,), capacity)
 
     def _validate_growth_locked(self, capacity: int) -> None:
+        self._require_unstaged_locked()
         capacity = int(capacity)
         if capacity < self.capacity:
             raise ValueError("ExpertSlotPool.grow cannot shrink capacity")
@@ -484,6 +524,7 @@ class ExpertSlotPool:
         total = capacity + self.spare_slots
         if self.codec == IQK_CODEC:
             iqk, views, slot_nbytes = self._new_iqk_storage(total)
+            plan = self._new_iqk_copy_plan(total, views, slot_nbytes)
             return _PoolGrowthCandidate(
                 old_capacity=old_capacity,
                 capacity=capacity,
@@ -491,11 +532,10 @@ class ExpertSlotPool:
                 iqk_views=views,
                 iqk_slot_nbytes=slot_nbytes,
                 packed=None,
-                norms=None,
                 scales=None,
                 packed_view=None,
-                norms_view=None,
                 scales_view=None,
+                iqk_copy_plan=plan,
             )
 
         packed_dtype = mx.uint8 if self.codec == KQUANT_CODEC else mx.uint32
@@ -503,13 +543,8 @@ class ExpertSlotPool:
             (total, self.geometry.out_features, self.geometry.packed_cols),
             dtype=packed_dtype,
         )
-        norms = None
         scales = None
-        if self.codec == TQ_CODEC:
-            norms = mx.zeros(
-                (total, self.geometry.out_features), dtype=mx.float16)
-            mx.eval(packed, norms)
-        elif self.codec == MXFP4_CODEC:
+        if self.codec == MXFP4_CODEC:
             assert self._comp_scales is not None
             scales = mx.zeros(
                 (total, *self._comp_scales["shape"]), dtype=mx.uint8)
@@ -527,10 +562,8 @@ class ExpertSlotPool:
             iqk_views={},
             iqk_slot_nbytes={},
             packed=packed,
-            norms=norms,
             scales=scales,
             packed_view=memoryview(packed).cast("B"),
-            norms_view=(memoryview(norms).cast("B") if norms is not None else None),
             scales_view=(
                 memoryview(scales).cast("B")
                 if scales is not None and self.codec != KQUANT_CODEC
@@ -570,7 +603,6 @@ class ExpertSlotPool:
             assert candidate.packed_view is not None
             assert self._packed_view is not None
             prow = self._packed_row_nbytes()
-            nrow = self.geometry.out_features * 2 if candidate.norms is not None else 0
             srow = (
                 self._comp_scales["nbytes"]
                 if self.codec == MXFP4_CODEC and candidate.scales is not None
@@ -578,9 +610,6 @@ class ExpertSlotPool:
             )
             candidate.packed_view[:old_capacity * prow] = self._packed_view[
                 :old_capacity * prow]
-            if candidate.norms_view is not None and self._norms_view is not None:
-                candidate.norms_view[:old_capacity * nrow] = self._norms_view[
-                    :old_capacity * nrow]
             if (
                 self.codec == MXFP4_CODEC
                 and candidate.scales_view is not None
@@ -591,12 +620,6 @@ class ExpertSlotPool:
             if self.spare_slots:
                 candidate.packed_view[capacity * prow:total * prow] = self._packed_view[
                     old_capacity * prow:(old_capacity + self.spare_slots) * prow]
-                if candidate.norms_view is not None and self._norms_view is not None:
-                    candidate.norms_view[capacity * nrow:total * nrow] = (
-                        self._norms_view[
-                            old_capacity * nrow:
-                            (old_capacity + self.spare_slots) * nrow]
-                    )
                 if (
                     self.codec == MXFP4_CODEC
                     and candidate.scales_view is not None
@@ -625,12 +648,11 @@ class ExpertSlotPool:
         self.iqk = candidate.iqk
         self._iqk_views = candidate.iqk_views
         self._iqk_slot_nbytes = candidate.iqk_slot_nbytes
+        self._iqk_copy_plan = candidate.iqk_copy_plan
         self.packed = candidate.packed
         self.weight = candidate.packed if self.codec == KQUANT_CODEC else None
-        self.norms = candidate.norms
         self.scales = candidate.scales
         self._packed_view = candidate.packed_view
-        self._norms_view = candidate.norms_view
         self._scales_view = candidate.scales_view
         self._expert_at = candidate.expert_at
         self._slot_of = candidate.slot_of
@@ -638,8 +660,14 @@ class ExpertSlotPool:
         self.capacity = candidate.capacity
 
     def _wait_for_growth_locked(self) -> None:
+        self._require_unstaged_locked()
         while self._growth_pending:
             self._growth_cv.wait()
+            self._require_unstaged_locked()
+
+    def _require_unstaged_locked(self) -> None:
+        if getattr(self, "_staging_owner", None) is not None:
+            raise RuntimeError("expert pool is owned by staged verification")
 
     def _finish_load_locked(self) -> None:
         self._loads_inflight -= 1
@@ -680,7 +708,7 @@ class ExpertSlotPool:
             # halve everything: the effective window is the recent few
             # hundred touches, so a topic shift overturns the pool in
             # ~100-200 tokens instead of never. Recency tie-break is
-            # unchanged; persisted hotlists now reflect recent demand.
+            # unchanged.
             self._freq = {e: c >> 1 for e, c in self._freq.items()}
 
     def _choose_slot(self, protected: set[int]) -> tuple[int, bool]:
@@ -709,8 +737,6 @@ class ExpertSlotPool:
             self._recency.pop(expert, None)
             self.total_evictions += 1
             self._slot_table_dirty = True
-            if _EVICT_DONTNEED and self.projection == "gate_proj":
-                self._pending_advise.append(expert)
             return slot, True
         # Diagnostic state in the message: this raise is fail-closed and
         # rare, and the slot ledger is exactly what an investigation needs
@@ -752,8 +778,6 @@ class ExpertSlotPool:
         )
         if component in {"packed", "weight"}:
             dst = self._packed_view
-        elif component == "norms" and self._norms_view is not None:
-            dst = self._norms_view
         elif component == "scales" and self._scales_view is not None:
             dst = self._scales_view
         else:
@@ -767,11 +791,23 @@ class ExpertSlotPool:
         )
 
     def _load_iqk_blocks(self, source: memoryview, *, slot: int) -> None:
-        """Deinterleave one on-disk IQ_K expert into its kernel streams."""
+        """Load one on-disk IQ_K expert into its kernel-native streams."""
         if self.iqk is None:
             raise ValueError(f"{self.projection}: IQ_K storage is not allocated")
         assert self.geometry.iqk_codec is not None
         assert self.geometry.in_features is not None
+        layout = normalize_iqk_layout(self.geometry.layout)
+        if layout == IQK_LAYOUT_QWEN4_STREAM_MAJOR_V1:
+            self._load_iqk_stream_major(source, slot=slot)
+            return
+        if layout != IQK_LAYOUT_IQK_RELAYOUT:
+            raise ValueError(
+                f"{self.projection}: unsupported IQ_K layout {self.geometry.layout!r}")
+        plan = getattr(self, "_iqk_copy_plan", None)
+        if plan is not None:
+            plan.copy(source, slot=slot)
+            self.total_iqk_direct_copies += 1
+            return
         blocks = np.frombuffer(source, dtype=np.uint8).reshape(
             self.geometry.out_features,
             self.geometry.packed_cols,
@@ -791,10 +827,67 @@ class ExpertSlotPool:
                     f"expected {row}")
             dst[slot * row:(slot + 1) * row] = src
 
+    def _load_iqk_stream_major(self, source: memoryview, *, slot: int) -> None:
+        """Copy a Qwen stream-major IQ_K component directly into one slot."""
+        assert self.iqk is not None
+        assert self.geometry.iqk_codec is not None
+        assert self.geometry.in_features is not None
+        expected_source_nbytes = (
+            self.geometry.out_features * self.geometry.packed_cols)
+        source = source.cast("B")
+        if len(source) != expected_source_nbytes:
+            raise ValueError(
+                f"{self.projection}: stream-major IQ_K component is "
+                f"{len(source)} bytes, expected {expected_source_nbytes}")
+        spans = stream_major_spans(
+            self.geometry.iqk_codec,
+            self.geometry.out_features,
+            self.geometry.in_features,
+        )
+        declared_spans = self.geometry.streams
+        if declared_spans is None:
+            raise ValueError(
+                f"{self.projection}: stream-major IQ_K metadata has no streams")
+        expected_fields = tuple(
+            (span.name, span.dtype.name, span.shape, span.offset, span.nbytes)
+            for span in spans)
+        declared_fields = tuple(
+            (span.name, span.dtype, span.shape, span.offset, span.nbytes)
+            for span in declared_spans)
+        if declared_fields != expected_fields:
+            raise ValueError(
+                f"{self.projection}: stream-major IQ_K metadata does not match "
+                "the native stream descriptor")
+        native_names = tuple(self.iqk.stream_names())
+        declared_names = tuple(span.name for span in declared_spans)
+        if declared_names != native_names:
+            raise ValueError(
+                f"{self.projection}: stream-major IQ_K names {declared_names} do not "
+                f"match native streams {native_names}")
+        if tuple(self._iqk_views) != native_names:
+            raise ValueError(
+                f"{self.projection}: persistent IQ_K stream names "
+                f"{tuple(self._iqk_views)} do not match native streams {native_names}")
+        if sum(span.nbytes for span in declared_spans) != len(source):
+            raise ValueError(
+                f"{self.projection}: stream-major IQ_K spans do not cover "
+                f"{len(source)} component bytes")
+        for span in declared_spans:
+            row = self._iqk_slot_nbytes.get(span.name)
+            if row != span.nbytes:
+                raise ValueError(
+                    f"{self.projection}: stream-major IQ_K stream {span.name} is "
+                    f"{span.nbytes} bytes, native slot expects {row}")
+            dst = self._iqk_views[span.name]
+            part = source[span.offset:span.offset + span.nbytes]
+            if len(part) != row:
+                raise ValueError(
+                    f"{self.projection}: stream-major IQ_K stream {span.name} is "
+                    f"{len(part)} bytes, expected {row}")
+            dst[slot * row:(slot + 1) * row] = part
+
     def slot_nbytes(self) -> int:
         total = self._packed_row_nbytes()
-        if self._comp_norms is not None:
-            total += int(self._comp_norms["nbytes"])
         if self.codec == MXFP4_CODEC and self._comp_scales is not None:
             total += int(self._comp_scales["nbytes"])
         return total
@@ -875,11 +968,6 @@ class ExpertSlotPool:
             self._packed_view[base + pn:base + pn + un] = (
                 row[uc["offset"]:uc["offset"] + un])
             return
-        if self._comp_norms is not None and self._norms_view is not None:
-            nc = self._comp_norms
-            nn = nc["nbytes"]
-            self._norms_view[slot * nn:(slot + 1) * nn] = (
-                row[nc["offset"]:nc["offset"] + nn])
         if (
             self.codec == MXFP4_CODEC
             and self._comp_scales is not None
@@ -996,11 +1084,6 @@ class ExpertSlotPool:
                 break
             time.sleep(0.0005)
 
-        if _EVICT_DONTNEED and self._pending_advise:
-            with self._bk_lock:
-                advise, self._pending_advise = self._pending_advise, []
-            for evicted in advise:  # advisory syscalls OUTSIDE the lock
-                self._advise_dontneed(evicted)
         if not placements:
             return
         loaded = 0
@@ -1106,31 +1189,6 @@ class ExpertSlotPool:
                     self._finish_load_locked()
         return loaded
 
-    def _advise_dontneed(self, expert: int) -> None:
-        """Best-effort: drop the evicted expert's file pages from the page
-        cache (mmap read-only + MADV_DONTNEED + munmap; macOS treats it as
-        a hint). Never raises; counts errors. ~5-10us per call, demand
-        evictions only, gate pool only (one row covers all projections)."""
-        import mmap as _mmaplib
-        try:
-            br = self.index.locate_row(layer=self.layer, expert=expert)
-            gran = _mmaplib.ALLOCATIONGRANULARITY
-            start = (br.offset // gran) * gran
-            length = (br.offset + br.nbytes) - start
-            fd = os.open(self.package_dir / br.shard, os.O_RDONLY)
-            try:
-                m = _mmaplib.mmap(fd, length, prot=_mmaplib.PROT_READ,
-                                  offset=start)
-                try:
-                    m.madvise(_mmaplib.MADV_DONTNEED)
-                finally:
-                    m.close()
-            finally:
-                os.close(fd)
-            self.total_dontneed += 1
-        except Exception:
-            self.total_dontneed_errors += 1
-
     def remap_loaded(self, indices_host, shape: tuple[int, ...]) -> mx.array:
         host = np.asarray(indices_host).reshape(-1)
         remapped = np.array([self._slot_of[int(e)] for e in host], dtype=np.uint32)
@@ -1214,6 +1272,13 @@ def _acquire_growth_ready_pool_locks(
     """Acquire every pool lock after any active growth transaction finishes."""
     while True:
         _acquire_pool_locks(pools)
+        try:
+            for pool in pools:
+                if getattr(pool, "_staging_owner", None) is not None:
+                    raise RuntimeError("expert pool is owned by staged verification")
+        except BaseException:
+            _release_pool_locks(pools)
+            raise
         pending = next((pool for pool in pools if pool._growth_pending), None)
         if pending is None:
             return
@@ -1454,96 +1519,5 @@ def seed_hot_expert_slot_pools(pools) -> int:
                 for pool in pools:
                     pool._growth_pending = False
                     pool._growth_cv.notify_all()
-            finally:
-                _release_pool_locks(pools)
-
-
-def place_spare_trio(pools, expert: int, spare_index: int) -> bool:
-    """Atomically place `expert` into the same spare slot of all three
-    projection pools. All-or-nothing under all three bookkeeping
-    locks (fixed order; demand only ever takes single locks, so no cycle):
-    the fused islands index the up pool with the gate pool's slot ids, so a
-    partial trio placement physically desynchronizes gate/up bytes, the
-    exact corruption this guards against. Publication happens only after
-    all three loads landed; a demand ensure arriving mid-flight waits on the
-    reservation registry. Returns True when loaded."""
-    expert = int(expert)
-    pools = _unique_pool_sequence(pools)
-    _acquire_growth_ready_pool_locks(pools)
-    slots = []
-    registered = False
-    try:
-        for pool in pools:
-            if not (0 <= spare_index < pool.spare_slots):
-                return False
-            slot = pool.capacity + spare_index
-            if (expert in pool._slot_of or expert in pool._prefetch_reserved
-                    or expert < 0 or expert >= pool.num_experts):
-                return False
-            # A demand ensure's phase-1 placement reserves occupancy only
-            # (`_expert_at`), publishing `_slot_of` after the bytes land.
-            # Those in-flight placements are invisible to the two checks
-            # above, and placing the same expert into a spare here would
-            # split it across two slots; whichever publishes last strands
-            # the other slot as an occupied-but-unpublished leak (neither
-            # free nor evictable, a permanent capacity loss that ends in
-            # spurious ExpertCapacityExceeded). Refuse on any occupancy.
-            if expert in pool._expert_at:
-                return False
-            occupant = pool._expert_at[slot]
-            if occupant is not None and (
-                    occupant in pool._demand_protect
-                    or occupant in pool._prefetch_reserved):
-                return False
-        for pool in pools:
-            slot = pool.capacity + spare_index
-            slots.append(slot)
-            occupant = pool._expert_at[slot]
-            if occupant is not None:
-                # Sever only the spare mapping this eviction owns: if the
-                # occupant's published residency points elsewhere (stale
-                # occupancy metadata), popping it would strand that other
-                # slot as an occupied-but-unpublished leak.
-                if pool._slot_of.get(occupant) == slot:
-                    pool._slot_of.pop(occupant, None)
-                    pool._recency.pop(occupant, None)
-                pool._slot_table_dirty = True
-            pool._expert_at[slot] = expert
-            pool._prefetch_reserved.add(expert)
-            pool._prefetch_inflight += 1
-            pool._touch(expert)
-            pool._loads_inflight += 1
-        registered = True
-    finally:
-        _release_pool_locks(pools)
-    try:
-        for pool, slot in zip(pools, slots, strict=True):
-            pool._load_expert(expert=expert, slot=slot)
-        _acquire_pool_locks(pools)
-        try:
-            for pool, slot in zip(pools, slots, strict=True):
-                pool._slot_of[expert] = slot
-                pool._slot_table_dirty = True
-                pool.total_prefetch_loads += 1
-        finally:
-            _release_pool_locks(pools)
-        return True
-    except BaseException:
-        _acquire_pool_locks(pools)
-        try:
-            for pool, slot in zip(pools, slots, strict=True):
-                if pool._expert_at[slot] == expert and expert not in pool._slot_of:
-                    pool._expert_at[slot] = None
-        finally:
-            _release_pool_locks(pools)
-        raise
-    finally:
-        if registered:
-            _acquire_pool_locks(pools)
-            try:
-                for pool in pools:
-                    pool._prefetch_reserved.discard(expert)
-                    pool._prefetch_inflight -= 1
-                    pool._finish_load_locked()
             finally:
                 _release_pool_locks(pools)

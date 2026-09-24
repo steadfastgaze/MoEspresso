@@ -624,7 +624,7 @@ def test_deepseek_v4_banded_prefill_small_geometry_keeps_sdpa_form(monkeypatch):
     assert wrapped.banded_prefill_calls == 1
 
 
-def test_deepseek_v4_banded_prefill_mma_dispatch_and_kill_switch(monkeypatch):
+def test_deepseek_v4_banded_prefill_mma_dispatch(monkeypatch):
     import moespresso.runtime.deepseek_v4.model as dsv4_patch
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
     from mlx_lm.models.cache import KVCache
@@ -664,18 +664,6 @@ def test_deepseek_v4_banded_prefill_mma_dispatch_and_kill_switch(monkeypatch):
     assert int(calls[0]["window"]) == 8
     assert float(calls[0]["scale"]) == float(attn.softmax_scale)
 
-    # The kill switch restores the batched banded SDPA form without
-    # touching the engine.
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_MMA", "0")
-    out_off = wrapped(x, mask=mask, cache=KVCache())
-    mx.eval(out_off)
-    final = banded_prefill_call_counts()
-    assert len(calls) == 1
-    assert final["sdpa"] == after["sdpa"] + 1
-    assert final["mma"] == after["mma"]
-    assert np.allclose(np.asarray(reference), np.asarray(out_off), atol=2e-3)
-
-
 def _seed_composed_first_chunk(attn, cache, tokens, window, seed=311):
     x = mx.array(
         np.random.default_rng(seed).standard_normal(
@@ -685,55 +673,6 @@ def _seed_composed_first_chunk(attn, cache, tokens, window, seed=311):
     return out
 
 
-def test_deepseek_v4_banded_prefill_offset_kill_switch_restores_composed(
-    monkeypatch,
-):
-    import moespresso.runtime.deepseek_v4.model as dsv4_patch
-    from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
-    from mlx_lm.models.cache import KVCache
-
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "0")
-    monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
-    model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
-    attn = model.layers[0].self_attn
-    assert _patch_deepseek_v4_banded_prefill_attention(model) == 1
-    wrapped = model.layers[0].self_attn
-
-    tokens, window = 13, 8
-    cache_reference = KVCache()
-    cache_wrapped = KVCache()
-    _seed_composed_first_chunk(attn, cache_reference, tokens, window)
-    _seed_composed_first_chunk(attn, cache_wrapped, tokens, window)
-
-    x_second = mx.random.normal((1, tokens, 64)).astype(mx.float32) * 0.1
-    mask_second = _shared_window_mask(tokens, tokens, window)
-    reference = attn(x_second, mask=mask_second, cache=cache_reference)
-    before = banded_prefill_call_counts()
-    got = wrapped(x_second, mask=mask_second, cache=cache_wrapped)
-    mx.eval(reference, got)
-
-    # The kill-switch arm never engages, never spies on the mask, and
-    # never moves any counter, including the offset-keyed ones.
-    assert banded_prefill_call_counts() == before
-    assert wrapped.banded_prefill_calls == 0
-    np.testing.assert_array_equal(np.asarray(reference), np.asarray(got))
-
-    # Default on: with the variable unset the wrapper attempts the offset
-    # route. The tiny graph fails the hoisted mma eligibility (head dim
-    # 32), so the call falls closed to the composed original and keys the
-    # offset counter, which proves the gate itself was open.
-    monkeypatch.delenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", raising=False)
-    got_default = wrapped(
-        mx.random.normal((1, tokens, 64)).astype(mx.float32) * 0.1,
-        mask=_shared_window_mask(tokens, 2 * tokens, window),
-        cache=cache_wrapped,
-    )
-    mx.eval(got_default)
-    after = banded_prefill_call_counts()
-    assert after["composed_offset"] == before["composed_offset"] + 1
-    assert wrapped.banded_prefill_calls == 0
-
-
 def test_deepseek_v4_banded_prefill_offset_engages_mma_with_counters(
     monkeypatch,
 ):
@@ -741,9 +680,6 @@ def test_deepseek_v4_banded_prefill_offset_engages_mma_with_counters(
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
     from mlx_lm.models.cache import KVCache
 
-    # The route is default-on; the unset environment pins the shipped
-    # default rather than an explicit opt-in.
-    monkeypatch.delenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", raising=False)
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
     attn = model.layers[0].self_attn
@@ -812,7 +748,6 @@ def test_deepseek_v4_banded_prefill_offset_fails_closed_before_mutation(
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
     from mlx_lm.models.cache import KVCache
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
     attn = model.layers[0].self_attn
@@ -863,7 +798,6 @@ def test_deepseek_v4_banded_prefill_offset_mask_mismatch_fails_closed(
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
     from mlx_lm.models.cache import KVCache
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
     attn = model.layers[0].self_attn
@@ -893,7 +827,6 @@ def test_deepseek_v4_banded_prefill_offset_indexer_mirror_is_cumulative(
     import moespresso.runtime.deepseek_v4.model as dsv4_patch
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     manifest = _tiny_manifest()
     cfg = manifest["architecture"]["config"]
@@ -935,7 +868,6 @@ def test_deepseek_v4_banded_prefill_offset_skips_band_economics_gate(
     from moespresso.runtime.deepseek_v4.model import banded_prefill_call_counts
     from mlx_lm.models.cache import KVCache
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
     attn = model.layers[0].self_attn
@@ -992,7 +924,6 @@ def test_deepseek_v4_banded_prefill_offset_plumbing_matches_composed(
     import moespresso.runtime.deepseek_v4.model as dsv4_patch
     from mlx_lm.models.cache import KVCache
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_BANDED_PREFILL_OFFSET", "1")
     monkeypatch.setattr(dsv4_patch, "_DEEPSEEK_V4_BANDED_PREFILL_BLOCK", 4)
     model = build_deepseek_v4_graph_from_manifest(_tiny_manifest())
     attn = model.layers[0].self_attn
@@ -1073,15 +1004,8 @@ def test_deepseek_v4_banded_mma_engine_fails_closed_without_kernel_contract(
         mx, q=q16, kv=kv512, pooled=None, sinks=sinks,
         window=8, ratio=0, scale=0.5,
     ) is None
-    # The consumer kernel kill switch closes the route.
-    monkeypatch.setenv("MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_MMA", "0")
-    assert _deepseek_v4_banded_mma_attention(
-        mx, q=q16, kv=kv512, pooled=None, sinks=sinks,
-        window=8, ratio=0, scale=512 ** -0.5,
-    ) is None
     # Integer routed ids are not a float pool; a pooled tensor outside the
     # float dtypes fails closed.
-    monkeypatch.delenv("MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_MMA", raising=False)
     assert _deepseek_v4_banded_mma_attention(
         mx, q=q16, kv=kv512,
         pooled=mx.zeros((1, 3, 512), dtype=mx.int32),
@@ -1097,7 +1021,6 @@ def test_deepseek_v4_banded_mma_engine_matches_banded_sdpa_math(monkeypatch):
         _deepseek_v4_banded_prefill_plan,
     )
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_R4_PREFILL_CONSUMER_MMA", "1")
     tokens, heads, dim = 200, 16, 512
     window, ratio, block = 64, 16, 64
     pooled_rows = tokens // ratio
@@ -1177,7 +1100,6 @@ def test_deepseek_v4_served_indexer_applies_hadamard_fp4_qat_before_scores(
     from moespresso.runtime.deepseek_v4 import indexer_score_kernel
 
     monkeypatch.setattr(indexer_score_kernel, "_ENABLED", False)
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", "0")
     manifest = _tiny_manifest()
     cfg = manifest["architecture"]["config"]
     cfg["compress_ratios"] = [4]
@@ -1266,7 +1188,7 @@ def test_deepseek_v4_served_indexer_applies_hadamard_fp4_qat_before_scores(
         "indexer_score_contract_cached_pooled_rows": 0,
         "indexer_score_contract_new_qat_pooled_rows": 1,
         "indexer_score_contract_fused_score_calls": 0,
-        "indexer_score_contract_decode_qat_kernel_calls": 0,
+        "indexer_score_contract_decode_qat_kernel_calls": 1,
         "indexer_score_contract_fixed_state_calls": 0,
         "indexer_score_contract_score_tail_kernel_calls": 0,
     }]
@@ -1279,7 +1201,6 @@ def test_deepseek_v4_served_indexer_reuses_cached_qat_pool(monkeypatch):
     from moespresso.runtime.deepseek_v4 import indexer_score_kernel
 
     monkeypatch.setattr(indexer_score_kernel, "_ENABLED", False)
-    monkeypatch.setenv("MOESPRESSO_DSV4_INDEXER_DECODE_QAT_KERNEL", "0")
     manifest = _tiny_manifest()
     cfg = manifest["architecture"]["config"]
     cfg["compress_ratios"] = [4]
@@ -1342,13 +1263,11 @@ def test_deepseek_v4_served_indexer_reuses_cached_qat_pool(monkeypatch):
     compressor.rows = 4
     mx.eval(indexer(x, q_residual, IdentityRope(), IdentityRope(), cache, 2052))
 
-    # Per step: the pool QAT runs first (full pool, then only the one new
-    # tail row on the cached second step), then the query QAT.
+    # The composed pool QAT sees the full pool, then only the new tail row;
+    # the promoted decode kernel owns the query roundtrip.
     assert qat_shapes == [
         (1, 3, 128),
-        (1, 1, 1, 128),
         (1, 1, 128),
-        (1, 1, 1, 128),
     ]
     stats = deepseek_v4_indexer_layer_stats(model)[0]
     assert stats["indexer_score_contract_cached_pooled_rows"] == 3
@@ -1402,8 +1321,6 @@ def test_deepseek_v4_attention_shape_stats_counts_served_sdpa(monkeypatch):
             "attention_sdpa_score_elements": 30,
             "attention_sdpa_value_elements": 60,
             "attention_sdpa_max_key_rows": 5,
-            "fused_decode_attention_calls": 0,
-            "fused_decode_composed_tail_calls": 0,
             "fixed_state_decode_layers": 0,
         }]
     finally:
@@ -1621,59 +1538,6 @@ def _seed_pool_and_aux(cache, rng, *, rows: int = 5):
     cache.indexer_state["pooled_qat_rows"] = rows
 
 
-def test_cache_wrapper_fork_isolation_after_deepcopy(monkeypatch):
-    """A deepcopied wrapped cache must never mutate its source.
-
-    The shipped wrappers replace `update_and_fetch` and `trim` with bound
-    methods reading originals from an instance dict, so the deepcopy memo
-    rebinds them to the copy. Storing the originals in closures instead
-    left the copy driving the source cache's offset, pools, and aux state.
-    """
-    monkeypatch.setenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", "0")
-    cache = _wrapped_cache_model().make_cache()[0]
-    assert cache._moespresso_dsv4_fp8_kv_cache
-    assert cache._moespresso_dsv4_compressed_pool_aux_trim_clear
-
-    rng = np.random.default_rng(61)
-    prefill = mx.array(rng.standard_normal((1, 1, 6, 512), dtype=np.float32))
-    cache.update_and_fetch(prefill, prefill)
-    _seed_pool_and_aux(cache, rng)
-
-    fork = copy.deepcopy(cache)
-    src_offset = int(cache.offset)
-    src_keys = np.asarray(cache.local.keys)
-    src_pool = np.asarray(cache.compressor_state["pooled"])
-
-    step = mx.array(rng.standard_normal((1, 1, 1, 512), dtype=np.float32))
-    fork.update_and_fetch(step, step)
-    assert int(fork.offset) == src_offset + 1
-    assert int(cache.offset) == src_offset
-    assert np.array_equal(np.asarray(cache.local.keys), src_keys)
-
-    fork.trim(4)
-    assert "pooled_fp8" not in fork.compressor_state
-    assert "pooled_qat" not in fork.indexer_state
-    assert int(fork.compressor_state["pooled"].shape[1]) == 4
-    assert int(cache.offset) == src_offset
-    assert np.array_equal(np.asarray(cache.compressor_state["pooled"]), src_pool)
-    assert cache.compressor_state.get("pooled_fp8_rows") == 5
-    assert cache.indexer_state.get("pooled_qat_rows") == 5
-
-    # Driving the source must not perturb the fork either.
-    fork_offset = int(fork.offset)
-    fork_keys = np.asarray(fork.local.keys)
-    fork_pool = np.asarray(fork.compressor_state["pooled"])
-    cache.update_and_fetch(step, step)
-    cache.trim(4)
-    assert int(fork.offset) == fork_offset
-    assert np.array_equal(np.asarray(fork.local.keys), fork_keys)
-    assert np.array_equal(np.asarray(fork.compressor_state["pooled"]), fork_pool)
-    # Identical drive sequences leave source and fork in identical state.
-    assert int(cache.offset) == fork_offset
-    assert np.array_equal(np.asarray(cache.compressor_state["pooled"]), fork_pool)
-    assert "pooled_fp8" not in cache.compressor_state
-
-
 def test_cache_wrapper_fork_isolation_with_fixed_decode_state(monkeypatch):
     """Post-fork trim isolation through the full shipped wrapper stack.
 
@@ -1681,7 +1545,6 @@ def test_cache_wrapper_fork_isolation_with_fixed_decode_state(monkeypatch):
     back through the fixed-state originals dict to the aux-clear wrapper
     and then to the stock trim. Every hop must land on the copy.
     """
-    monkeypatch.delenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", raising=False)
     cache = _wrapped_cache_model().make_cache()[0]
     assert cache._moespresso_dsv4_fixed_decode_state
 
@@ -1721,7 +1584,6 @@ def test_cache_store_fork_leaves_stored_ds4_entry_untouched(monkeypatch):
     """
     from moespresso.runtime.prefix_cache import make_prompt_cache_store
 
-    monkeypatch.delenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", raising=False)
     cache_list = _wrapped_cache_model(sliding_window=32).make_cache()
     cache = cache_list[0]
 
@@ -1765,8 +1627,7 @@ def test_cache_store_fork_leaves_stored_ds4_entry_untouched(monkeypatch):
     assert cache.indexer_state.get("pooled_qat_rows") == 2
 
 
-@pytest.mark.parametrize("fixed_state", ["0", "1"])
-def test_cache_store_insert_accepts_post_decode_aux_state(monkeypatch, fixed_state):
+def test_cache_store_insert_accepts_post_decode_aux_state():
     """`insert_cache` must size a post-decode DS4 cache without raising.
 
     Post-decode, the compressor and indexer state dicts hold the aux row
@@ -1779,7 +1640,6 @@ def test_cache_store_insert_accepts_post_decode_aux_state(monkeypatch, fixed_sta
     """
     from moespresso.runtime.prefix_cache import make_prompt_cache_store
 
-    monkeypatch.setenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", fixed_state)
     cache_list = _wrapped_cache_model(sliding_window=32).make_cache()
     cache = cache_list[0]
 

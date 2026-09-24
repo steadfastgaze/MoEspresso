@@ -11,12 +11,6 @@ from pathlib import Path
 import numpy as np
 
 from moespresso.core.artifact import Validation, artifact_producer, make_artifact
-from moespresso.correctness.tq_reference import (
-    generate_random_signs,
-    hadamard_inverse,
-    hadamard_rotate,
-    unpack_tq_indices,
-)
 from moespresso.probe.weight_io import split_fused_gate_up
 from moespresso.runtime.deepseek_v4.renderer import (
     ASSISTANT_SP_TOKEN,
@@ -49,46 +43,9 @@ def _case(name: str, passed: bool, details: dict | None = None) -> dict:
     return {"case": name, "passed": bool(passed), **(details or {})}
 
 
-def _packed_word(values: list[int], bits: int) -> int:
-    word = 0
-    for i, value in enumerate(values):
-        word |= int(value) << (i * bits)
-    return word
-
-
 def _validation(name: str, message: str) -> Validation:
     return Validation("error", "correctness.golden_failed", message,
                       path=f"/{name}", phase="L2", blocking=True)
-
-
-def _check_tq_unpack() -> tuple[list[dict], list[Validation]]:
-    metrics, out = [], []
-    cases = {
-        1: [0, 1, 1, 0],
-        2: [0, 1, 2, 3],
-        4: [0, 5, 10, 15],
-    }
-    for bits, values in cases.items():
-        packed = np.array([[_packed_word(values, bits)]], dtype=np.uint32)
-        got = unpack_tq_indices(packed, bits=bits, in_features=len(values))[0].tolist()
-        ok = got == values
-        metrics.append(_case(f"tq_unpack_{bits}bit", ok, {"actual": got, "expected": values}))
-        if not ok:
-            out.append(_validation(f"tq_unpack_{bits}bit",
-                                   f"TQ {bits}-bit unpack returned {got}, expected {values}"))
-    return metrics, out
-
-
-def _check_hadamard_inverse() -> tuple[list[dict], list[Validation]]:
-    x = np.array([[1.0, -2.0, 3.0, -4.0]], dtype=np.float32)
-    signs = generate_random_signs(4, seed=17)
-    back = hadamard_inverse(hadamard_rotate(x, signs), signs)
-    err = float(np.max(np.abs(back - x)))
-    ok = err < 1e-6
-    metrics = [_case("tq_hadamard_inverse", ok, {"max_abs": err})]
-    out = [] if ok else [_validation("tq_hadamard_inverse",
-                                     f"Hadamard inverse error {err} >= 1e-6")]
-    return metrics, out
 
 
 def _check_gate_up_split() -> tuple[list[dict], list[Validation]]:
@@ -138,8 +95,7 @@ def l2_micro_goldens(subject: dict | None = None) -> dict:
     """Run the tiny L2 micro-golden suite and return correctness_evidence."""
     metrics: list[dict] = []
     validation: list[Validation] = []
-    for fn in (_check_tq_unpack, _check_hadamard_inverse,
-               _check_gate_up_split, _check_conv1d_trigger, _check_affine_sidecar_shapes):
+    for fn in (_check_gate_up_split, _check_conv1d_trigger, _check_affine_sidecar_shapes):
         m, v = fn()
         metrics.extend(m)
         validation.extend(v)
@@ -152,8 +108,6 @@ def l2_micro_goldens(subject: dict | None = None) -> dict:
         validation=validation,
         rung="L2",
         reference_provenance=[
-            {"component": "tq_reference", "kind": "independent",
-             "identity": "moespresso.correctness.tq_reference", "shared_with": []},
             {"component": "fused_gate_up", "kind": "independent",
              "identity": "fixed tiny source arrays", "shared_with": []},
             {"component": "conv1d_norm", "kind": "independent",

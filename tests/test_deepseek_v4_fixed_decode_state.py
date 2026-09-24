@@ -27,7 +27,6 @@ def _jm():
 
 def _make_caches(jm, monkeypatch, *, ratio, window=8, max_context=256):
     monkeypatch.setenv("MOESPRESSO_DSV4_DECODE_MAX_CONTEXT", str(max_context))
-    monkeypatch.delenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", raising=False)
     legacy = jm.DeepseekV4Cache(window, compress_ratio=ratio)
     fixed = fds.install_fixed_decode_state(
         jm.DeepseekV4Cache(window, compress_ratio=ratio))
@@ -287,18 +286,6 @@ def test_adoption_refuses_oversized_pool(monkeypatch):
         assert fds.engaged_branch(fixed, "compressor_state", pos) is None
 
 
-def test_kill_switch_leaves_stock_contract(monkeypatch):
-    jm = _jm()
-    monkeypatch.setenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", "0")
-    cache = jm.DeepseekV4Cache(8, compress_ratio=4)
-    out = fds.install_fixed_decode_state(cache)
-    assert out is cache
-    assert not getattr(cache, "_moespresso_dsv4_fixed_decode_state", False)
-    for name in ("accumulate_windows", "accumulate_overlap_windows",
-                 "update_pool", "trim"):
-        assert name not in cache.__dict__
-
-
 def test_external_state_replacement_readopts(monkeypatch):
     mx = _mx()
     jm = _jm()
@@ -514,8 +501,6 @@ def test_make_cache_installs_fixed_state(monkeypatch):
         _patch_deepseek_v4_required_attention_cache,
     )
 
-    monkeypatch.delenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", raising=False)
-
     class _Attn:
         def __init__(self, ratio):
             self.compress_ratio = ratio
@@ -547,9 +532,3 @@ def test_make_cache_installs_fixed_state(monkeypatch):
     assert not getattr(caches[0], "_moespresso_dsv4_fixed_decode_state", False)
     assert getattr(caches[1], "_moespresso_dsv4_fixed_decode_state", False)
     assert getattr(caches[2], "_moespresso_dsv4_fixed_decode_state", False)
-
-    monkeypatch.setenv("MOESPRESSO_DSV4_DECODE_FIXED_STATE", "0")
-    caches_off = model.make_cache()
-    assert not getattr(caches_off[1], "_moespresso_dsv4_fixed_decode_state", False)
-    assert "trim" in caches_off[1].__dict__  # stock wrapper chain intact
-    assert "accumulate_windows" not in caches_off[1].__dict__

@@ -59,15 +59,17 @@ artifact never changes its id.
 `required_features` declares capabilities a reader must understand before it may trust the
 artifact. Every entry must be in `KNOWN_FEATURES` for this build, or `validate_base`
 emits a blocking `artifact.unknown_required_feature` error. Currently
-`KNOWN_FEATURES = {"calibration"}` (probe evidence carrying calibration-dataset identity).
-The set grows as real features land; a format declares its requirements here.
+`KNOWN_FEATURES` includes `calibration`, `deepseek_v4_per_layer_experts`,
+`qwen4_per_layer_experts`, and `qwen4_ple_provider_inventory`. The registry
+grows as features are supported; formats declare their requirements here.
 
 ---
 
 ## 2. The artifact kinds
 
-`ARTIFACT_KINDS` registers seven kinds. Five belong to the build pipeline; two are
-standalone correctness-ladder evidence. Each has a short id tag used as the
+`ARTIFACT_KINDS` registers nine kinds: five build-pipeline artifacts, two
+converted expert selections, and two standalone correctness-ladder evidence
+kinds. Each has a short id tag used as the
 `artifact_id` prefix:
 
 | Kind | Tag | Role |
@@ -77,6 +79,8 @@ standalone correctness-ladder evidence. Each has a short id tag used as the
 | `optimizer_decision` | `dec` | What the optimizer chose and why: the decision record for a quantization/optimization pass. |
 | `package_plan` | `plan` | The writer-facing allocation IR. Probe/optimizer output and GGUF recipe import both converge here; the writer consumes only the plan, plus its provenance (`producer_kind`, `producer_reference`, `source_decision_id`, `source_probe_id`, force overrides). |
 | `package_manifest` | `pkg` | The shippable package's contents: every file's identity, so a tampered/partial package fails verification. |
+| `deepseek_v4_expert_selection` | `select` | A validated DeepSeek-V4 routed-expert selection. |
+| `qwen4_expert_selection` | `select` | A validated Qwen4 routed-expert selection. |
 | `architecture_profile` | `arch` | The model-family correctness contract the ladder checks a package against. |
 | `correctness_evidence` | `correct` | What a correctness-ladder rung actually found. |
 

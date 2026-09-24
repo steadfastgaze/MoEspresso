@@ -1,0 +1,24 @@
+[project]
+name = "livebench-short-reproducer"
+version = "1.0.0"
+description = "One-endpoint reproduction of a frozen 48-question LiveBench short form"
+requires-python = ">=3.11,<3.13"
+dependencies = ["httpx>=0.28", "huggingface-hub==1.17.0", "pyarrow>=18"]
+
+[project.optional-dependencies]
+grading = [
+    "livebench @ git+https://github.com/LiveBench/LiveBench.git@1263ee472f4b9ac3833c0d2f6ad50dd3747fd1df",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

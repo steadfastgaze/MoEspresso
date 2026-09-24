@@ -468,10 +468,10 @@ class TestFailClosed:
                                  routed_artifacts=staging_dir)
 
     def test_member_without_a_relayout_is_refused(self, source, tmp_path):
-        staging_dir = tmp_path / "staging_iq3k"
+        staging_dir = tmp_path / "staging_iq4k"
         staging_dir.mkdir()
         (staging_dir / "inventory.json").write_text(
-            json.dumps({"member": "iq3_k", "files": {"x": {}}}))
+            json.dumps({"member": "iq4_k", "files": {"x": {}}}))
         with pytest.raises(DSparkSidecarError, match="no relayout"):
             build_dspark_sidecar(source, tmp_path / "sidecar",
                                  experts_format="iqk",

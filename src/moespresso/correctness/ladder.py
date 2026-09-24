@@ -30,10 +30,9 @@ _FORMAT_TO_OWNER = {
     "affine": "affine",
     "mxfp4": "affine",
     "mxfp8": "affine",
-    "tq": "tq",
     "fp16": "fp16",
 }
-_ROUTED_EXPERT_FORMATS = {"tq", "mxfp4"}
+_ROUTED_EXPERT_FORMATS = {"kquant", "iqk", "mxfp4"}
 
 
 def _role_owner(profile: dict, role: str) -> str | None:
@@ -52,7 +51,7 @@ def _role_owner(profile: dict, role: str) -> str | None:
 
 
 def _owner_class(profile: dict, tensor: dict):
-    """Declared owner class for an inventory tensor: an affine/tq/fp16 quant owner,
+    """Declared owner class for an inventory tensor: an affine/routed_expert/fp16 quant owner,
     'passthrough' for a declared structural tensor, or None if unowned.
 
     Structural passthrough (norms, SSM state, conv1d) is its own owner class: the
@@ -79,7 +78,7 @@ def l0_static_contract(profile: dict, inventory: dict, manifest: dict) -> list[V
     """L0: every non-excluded source tensor is owned by the profile, carried in the
     package, and stored as its owner declares. Pure: inventory + manifest + profile only.
 
-    Owner classes: a quant owner from `role_quant` (affine/tq/fp16), or 'passthrough' for a
+    Owner classes: a quant owner from `role_quant` (affine/routed_expert/fp16), or 'passthrough' for a
     declared structural tensor (stored fp16). Excluded-namespace tensors are skipped.
     """
     out: list[Validation] = []

@@ -58,7 +58,6 @@ def _model(*, n_layers=rg._LAYERS):
 
 
 def _enable(monkeypatch):
-    monkeypatch.setattr(rg, "_QWEN_ROUTER_BF16_F32_GEMV", True)
     monkeypatch.setattr(rg, "_versions_compatible", lambda: True)
     monkeypatch.setattr(rg, "_kernel_available", lambda: True)
 
@@ -143,9 +142,6 @@ def test_capacity_reservation_requires_exact_ornith_geometry(monkeypatch):
     assert rg.router_bf16_f32_resident_bytes(config) == rg._SHADOW_BYTES
     config["text_config"]["num_hidden_layers"] -= 1
     assert rg.router_bf16_f32_resident_bytes(config) == 0
-    config["text_config"]["num_hidden_layers"] += 1
-    monkeypatch.setattr(rg, "_QWEN_ROUTER_BF16_F32_GEMV", False)
-    assert rg.router_bf16_f32_resident_bytes(config) == 0
 
 
 def test_one_non_lattice_weight_prevents_every_install(monkeypatch):
@@ -161,7 +157,7 @@ def test_one_non_lattice_weight_prevents_every_install(monkeypatch):
     assert router_bf16_f32_stats(model)["wrapped_layers"] == 0
 
 
-def test_installer_fails_closed_on_shape_bias_layer_count_and_switches(monkeypatch):
+def test_installer_fails_closed_on_shape_bias_layer_count_and_family(monkeypatch):
     _enable(monkeypatch)
 
     short = _model(n_layers=rg._LAYERS - 1)
@@ -178,11 +174,6 @@ def test_installer_fails_closed_on_shape_bias_layer_count_and_switches(monkeypat
     wrong_family = _model()
     wrong_family.model_type = "other"
     assert install_router_bf16_f32_gemv(wrong_family) == 0
-
-    monkeypatch.setattr(rg, "_QWEN_ROUTER_BF16_F32_GEMV", False)
-    disabled = _model()
-    assert install_router_bf16_f32_gemv(disabled) == 0
-
 
 def test_partial_installation_raises(monkeypatch):
     _enable(monkeypatch)

@@ -3,8 +3,8 @@
 The streamed build wires the same `install_flash_prefill_attention` route the
 resident build uses, on the identical full-attention `self_attn` modules (the
 pooled MoE swap leaves them alone). These tests prove the installer wraps the
-streamed model's full-attention layers, is idempotent, installs nothing under
-the family kill switch, falls back bit-identically on a single-row decode call
+streamed model's full-attention layers, is idempotent, installs nothing without
+an attention kernel, falls back bit-identically on a single-row decode call
 (the flash wrapper counts only `fallback_decode`, zero `flash_calls`), and that
 the streamed stats surface the flash engagement counters. They stay synthetic:
 no real model is loaded. The engaged-kernel numeric bound and every eligibility
@@ -104,7 +104,6 @@ def _streamed_model(*, n_full=2, n_linear=1):
 
 
 def test_installer_wraps_streamed_full_attention_idempotently(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
     model = _streamed_model(n_full=2, n_linear=1)
     assert install_flash_prefill_attention(model) == 2
     layers = model.language_model.model.layers
@@ -119,9 +118,9 @@ def test_installer_wraps_streamed_full_attention_idempotently(monkeypatch):
     assert isinstance(layers[0].self_attn, FlashPrefillD256Attention)
 
 
-def test_kill_switch_installs_nothing_on_streamed(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", False)
-    monkeypatch.setattr(fa, "_QWEN_DECODE_Q8_TILE16", False)
+def test_installer_requires_a_kernel_on_streamed(monkeypatch):
+    monkeypatch.setattr(fa, "_kernel_available", lambda: False)
+    monkeypatch.setattr(fa, "_decode_kernel_available", lambda: False)
     model = _streamed_model(n_full=2, n_linear=1)
     assert install_flash_prefill_attention(model) == 0
     layers = model.language_model.model.layers
@@ -129,8 +128,7 @@ def test_kill_switch_installs_nothing_on_streamed(monkeypatch):
     assert isinstance(layers[1].self_attn, Qwen3NextAttention)
 
 
-def test_decode_falls_back_bit_identically_on_streamed(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
+def test_decode_falls_back_bit_identically_on_streamed():
     model = _streamed_model(n_full=1, n_linear=0)
     stock = _attention(seed=200)
     model.language_model.model.layers[0].self_attn = stock
@@ -158,7 +156,6 @@ def test_decode_falls_back_bit_identically_on_streamed(monkeypatch):
 
 
 def test_streamed_stats_surface_flash_counters(monkeypatch):
-    monkeypatch.setattr(fa, "_QWEN_PREFILL_FLASH_D256", True)
     model = _streamed_model(n_full=2, n_linear=1)
     install_flash_prefill_attention(model)
     # Drive one prefill chunk (empty cache, fail-closed to stock) plus a decode

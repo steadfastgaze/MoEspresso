@@ -185,9 +185,6 @@ Source and artifact pins:
 - llama.cpp revision `936918514ce522b553c0fd80b169a6440e6096c6`,
   Unsloth snapshot `fbbb5b93fb787c21338159b0af3318bb3f4d9768`.
 
-The complete artifact sizes and shard hashes are in
-[`benchmark_reproduction.md`](benchmark_reproduction.md#deepseek-v4-flash-quality-comparison).
-
 ### Full-resident pooled cross-check
 
 A separate five-pair A/B compared the capacity-256 pooled target with the
@@ -259,12 +256,12 @@ Two rules hold for any bounded measurement:
 
 Cold-start seeding belongs in the record. A package-vendored expert hotlist
 lowers first-request misses and raises the request hit rate, so a bounded arm
-has to say which hotlist tier seeded the pools.
+must identify the startup source that seeded the pools.
 
 The shipping package was also served with every routed layer capped at 64
 experts and seeded from its package hotlist. A capacity-256 pooled arm and the
 capacity-64 arm emitted the same 38 token ids and decoded-text digest.
-Both were fresh processes with the disk KV tier, drafting, lookahead, and
+Both were fresh processes with the disk KV tier, drafting, and
 adaptive growth off, an 8-token warmup, and nominal thermal readings before and
 after the measured request.
 

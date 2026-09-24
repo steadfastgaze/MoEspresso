@@ -1,22 +1,8 @@
-"""Build a `package_manifest` artifact: the package's self-description.
+"""Build a package_manifest from a package plan and written-file identities.
 
-This is the phase that pays off the artifact-centered design: the runtime reads
-the manifest and never guesses. The manifest declares, explicitly, the
-architecture facts, every packed tensor's on-disk location + weight format +
-transform, the expert layout, the ops the engine must support, and the file
-identities (path/size/sha256) of every shard so a tampered/partial package fails
-closed.
-
-Pure: a function of the package_plan + the source architecture config + the
-list of written-file identities. No mlx, no jang, no weight bytes, fully
-testable anywhere (no model load). The actual TQ packing + safetensors writing
-lives in package/write.py (the imperative shell with the MLX/JANG runtime).
-
-`tq` transform is declared by versioned reference (`format: "tq", format_params:
-{tq_version, bits, seed}`): the engine knows what tq_version 1 means (Hadamard
-rotation with seed, per-row norms, bit-packing), but versioned so it cannot
-silently drift. The `format_params` sub-object leaves room to declare the
-transform structurally later without a major bump.
+The manifest declares architecture, tensor formats, layouts, required operations,
+and file hashes. This module handles metadata only; package.write owns encoding
+and safetensors output.
 """
 
 from __future__ import annotations
@@ -36,25 +22,9 @@ from moespresso.package.kquant_format import KQUANT_GEOMETRY
 
 PRODUCER = artifact_producer("moespresso.package")
 
-# The package format. MJTQ = "MoEspresso Jang TurboQuant": it reuses jang's TurboQuant codec
-# + tensor conventions (.tq_packed/.tq_norms/.tq_bits) for compression, but adds
-# the strict, fully-explicit manifest layer on top: the runtime reads the
-# manifest and never guesses. The upstream "jangtq" format is a different,
-# third-party package format. Jang supplies the compression backend for mjtq;
-# this manifest defines the package format.
 PACKAGE_FORMAT = "mjtq"
 PACKAGE_FORMAT_VERSION = 1
 
-# What this format requires of the pipeline: its own strictness, declared here,
-# not baked into the generic convert orchestrator. mjtq requires calibration: a
-# mjtq package's probe evidence must be activation-weighted by a real imatrix
-# (the spec's "calibration dataset identity" requirement; an uncalibrated mjtq is
-# the red flag the spec names). Other package formats declare their own feature
-# sets, and the convert pipeline consults those declarations instead of hardcoding
-# requirements. Each entry must be in core.artifact.KNOWN_FEATURES.
-PACKAGE_FORMAT_FEATURES = frozenset({"calibration"})
-
-TQ_VERSION = 1
 _PASSTHROUGH_FORMATS = frozenset({"fp16", "f32_passthrough", "raw_dtype_passthrough"})
 _RAW_DTYPE_PASSTHROUGH_ROLES = frozenset({
     "attn.attn_sink",
@@ -151,6 +121,14 @@ def _architecture(arch_config: dict, max_experts: int | None = None) -> dict:
     else:
         family = raw_family
     config = dict(text)
+    if (
+        raw_family == "qwen4_exp"
+        and config.get("model_type") == "qwen4_exp_text"
+        and config.get("ple_layer_ids")
+    ):
+        # The released Qwen4 config omits this Transformers default. Persist it
+        # so package semantics do not depend on an external library default.
+        config.setdefault("seed", 1234)
     smoke = max_experts is not None and max_experts < _declared_expert_count(config)
     if smoke:
         _clamp_expert_count(config, max_experts)
@@ -197,7 +175,7 @@ def located_key(alloc: dict) -> str:
     return alloc["source_name"]
 
 
-def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
+def _tensor_entry(alloc: dict, located: dict) -> dict:
     """One allocation entry + its on-disk location -> a manifest tensor entry."""
     kind = alloc["kind"]
     entry = {
@@ -207,20 +185,16 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
         "shard": located["shard"],
         "key_prefix": located["key_prefix"],
     }
+    for field in ("module_path", "module_weight_key"):
+        if alloc.get(field) is not None:
+            entry[field] = alloc[field]
     if alloc.get("forced_format") is not None:
         entry["format_decision"] = {"forced": dict(alloc["forced_format"])}
     if kind == "expert":
-        fmt = alloc.get("format") or alloc.get("codec") or "tq"
+        fmt = alloc.get("format") or alloc.get("codec")
         entry["layer_index"] = alloc["layer_index"]
         entry["projection"] = alloc["projection"]
-        if fmt == "tq":
-            entry["format"] = "tq"
-            entry["format_params"] = {
-                "tq_version": TQ_VERSION,
-                "bits": alloc["bits"],
-                "seed": seed,
-            }
-        elif fmt == "mxfp4":
+        if fmt == "mxfp4":
             entry["format"] = "mxfp4"
             entry["format_params"] = {
                 "bits": 4,
@@ -236,10 +210,6 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
             entry["format_params"] = {
                 "kquant_codec": kcodec,
             }
-            if alloc.get("module_weight_key") is not None:
-                entry["module_weight_key"] = alloc["module_weight_key"]
-            if alloc.get("module_path") is not None:
-                entry["module_path"] = alloc["module_path"]
             if geometry is not None:
                 entry["format_params"].update({
                     "bits": geometry.bits,
@@ -272,13 +242,27 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
                 })
             if alloc.get("imatrix_key") is not None:
                 entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
-            if alloc.get("module_weight_key") is not None:
-                entry["module_weight_key"] = alloc["module_weight_key"]
-            if alloc.get("module_path") is not None:
-                entry["module_path"] = alloc["module_path"]
         else:
             entry["format"] = fmt
             entry["format_params"] = {}
+        if alloc.get("logical_shape") is not None:
+            entry["format_params"]["logical_shape"] = list(alloc["logical_shape"])
+        if alloc.get("stored_shape") is not None:
+            entry["format_params"]["stored_shape"] = list(alloc["stored_shape"])
+        if alloc.get("zero_padding") is not None:
+            entry["format_params"]["zero_padding"] = int(alloc["zero_padding"])
+        if alloc.get("calibration_policy") is not None:
+            entry["format_params"]["calibration_policy"] = str(
+                alloc["calibration_policy"]
+            )
+        if alloc.get("zero_count_experts") is not None:
+            entry["format_params"]["zero_count_experts"] = list(
+                alloc["zero_count_experts"]
+            )
+        if alloc.get("zero_count_fallback_policy") is not None:
+            entry["format_params"]["zero_count_fallback_policy"] = str(
+                alloc["zero_count_fallback_policy"]
+            )
     elif kind == "affine":
         fmt = alloc.get("format", "affine")
         entry["format"] = fmt
@@ -299,10 +283,6 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
             kcodec = alloc.get("kquant_codec") or alloc.get("codec")
             geometry = KQUANT_GEOMETRY.get(kcodec)
             entry["format_params"] = {"kquant_codec": kcodec}
-            if alloc.get("module_weight_key") is not None:
-                entry["module_weight_key"] = alloc["module_weight_key"]
-            if alloc.get("module_path") is not None:
-                entry["module_path"] = alloc["module_path"]
             if geometry is not None:
                 entry["format_params"].update({
                     "bits": geometry.bits,
@@ -333,10 +313,6 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
                 })
             if alloc.get("imatrix_key") is not None:
                 entry["format_params"]["imatrix_key"] = alloc["imatrix_key"]
-            if alloc.get("module_weight_key") is not None:
-                entry["module_weight_key"] = alloc["module_weight_key"]
-            if alloc.get("module_path") is not None:
-                entry["module_path"] = alloc["module_path"]
         else:
             entry["format_params"] = {}
     elif kind == "fp16_passthrough":
@@ -354,7 +330,7 @@ def _tensor_entry(alloc: dict, located: dict, seed: int) -> dict:
 def _passthrough_entry(pt: dict, loc: dict) -> dict:
     """A structural passthrough tensor's manifest entry."""
     fmt = pt.get("format", "fp16")
-    return {
+    entry = {
         "source_name": pt["source_name"],
         "role": pt["role"],
         "kind": "passthrough",
@@ -364,6 +340,10 @@ def _passthrough_entry(pt: dict, loc: dict) -> dict:
         "format": fmt,
         "format_params": {},
     }
+    for field in ("module_path", "module_weight_key"):
+        if pt.get(field) is not None:
+            entry[field] = pt[field]
+    return entry
 
 
 def build_package_manifest(
@@ -372,13 +352,13 @@ def build_package_manifest(
     located: dict[str, dict],
     files: list[dict],
     *,
-    seed: int = 42,
     expert_layout: dict | None = None,
     passthrough: list[dict] | None = None,
     passthrough_located: dict[str, dict] | None = None,
     tokenizer: dict | None = None,
     agentic_profile: dict | None = None,
     drafter: dict | None = None,
+    ple_provider: dict | None = None,
     max_experts: int | None = None,
 ) -> dict:
     """Assemble a package_manifest artifact (pure).
@@ -389,6 +369,10 @@ def build_package_manifest(
     `passthrough` is the inventory's structural tensors (norms, SSM state) copied
     verbatim; `passthrough_located` maps each to where it was written. They flow
     directly from the inventory, preserving optimizer purity.
+    Tensor rows preserve an explicit `module_path` and optional
+    `module_weight_key` when their plan or passthrough entry declares them. The
+    runtime can therefore hydrate its graph without deriving module ownership
+    from source checkpoint names.
     `agentic_profile` is the identity block of the agentic profile sidecar
     (package/agentic_profile.py); families without one omit the key.
     `drafter` is the declared draft-model component for packages that bundle a
@@ -396,6 +380,8 @@ def build_package_manifest(
     `files` list carries the identity of every sidecar file so verification
     covers them, and its provenance names the sidecar artifact. Packages
     without a bundled drafter omit the key.
+    `ple_provider` declares package-owned physical rows for a sparse embedding
+    provider. Every payload path must also have a top-level file identity.
     """
     if package_plan.get("artifact_kind") != "package_plan":
         raise ValueError("build_package_manifest requires a package_plan artifact")
@@ -418,16 +404,16 @@ def build_package_manifest(
                 f"{name} -> shard {loc['shard']} not in written files",
                 path=f"/{name}", phase="package", blocking=True))
             continue
-        entry = _tensor_entry(alloc, loc, seed)
+        entry = _tensor_entry(alloc, loc)
         if entry["kind"] == "expert" and entry["format"] not in {
-            "tq", "mxfp4", "kquant", "iqk",
+            "mxfp4", "kquant", "iqk",
         }:
             validation.append(Validation(
                 "error", "package.unsupported_expert_format",
                 f"{name} declares expert format {entry['format']!r}; routed experts "
-                "support only TQ, source-mxfp4, K-quant, or IQ_K",
+                "support only source-mxfp4, K-quant, or IQ_K",
                 path=f"/{name}", phase="package", blocking=True,
-                expected=["tq", "mxfp4", "kquant", "iqk"],
+                expected=["mxfp4", "kquant", "iqk"],
                 actual=entry["format"]))
         if entry["format"] == "iqk":
             icodec = entry["format_params"].get("iqk_codec")
@@ -517,7 +503,6 @@ def build_package_manifest(
             phase="package", blocking=True))
 
     format_ops = {
-        "tq": "tq_dequant",
         "mxfp4": "mxfp4_dequant",
         "kquant": "kquant_dequant",
         "iqk": "iqk_dequant",
@@ -539,7 +524,6 @@ def build_package_manifest(
         required_ops_set.add(op)
     required_ops = sorted(required_ops_set)
 
-    status = "valid" if not any(v.blocking for v in validation) else "invalid"
     manifest_fields = {
         "architecture": arch,
         "tensors": sorted(tensors, key=lambda t: (
@@ -567,12 +551,54 @@ def build_package_manifest(
         manifest_fields["agentic_profile"] = agentic_profile
     if drafter is not None:
         manifest_fields["drafter"] = drafter
+    if ple_provider is not None:
+        if not isinstance(ple_provider, dict):
+            validation.append(Validation(
+                "error", "package.invalid_ple_provider",
+                "PLE provider must be an object",
+                path="/ple_provider", phase="package", blocking=True))
+        else:
+            shards = ple_provider.get("shards")
+            paths = []
+            if ple_provider.get("schema") != "qwen4_ple_provider_v1":
+                validation.append(Validation(
+                    "error", "package.invalid_ple_provider",
+                    "PLE provider must declare schema qwen4_ple_provider_v1",
+                    path="/ple_provider", phase="package", blocking=True))
+            if not isinstance(shards, list) or not shards:
+                validation.append(Validation(
+                    "error", "package.invalid_ple_provider",
+                    "PLE provider must declare a non-empty shards array",
+                    path="/ple_provider/shards", phase="package", blocking=True))
+            else:
+                for index, shard in enumerate(shards):
+                    path = shard.get("path") if isinstance(shard, dict) else None
+                    if not isinstance(path, str) or not path:
+                        validation.append(Validation(
+                            "error", "package.invalid_ple_provider",
+                            "PLE provider shard must declare a non-empty path",
+                            path=f"/ple_provider/shards/{index}",
+                            phase="package", blocking=True))
+                        continue
+                    paths.append(path)
+                    if path not in file_names:
+                        validation.append(Validation(
+                            "error", "package.missing_ple_provider_file",
+                            f"PLE provider shard {path} has no top-level file identity",
+                            path=f"/ple_provider/shards/{index}/path",
+                            phase="package", blocking=True))
+                if len(paths) != len(set(paths)):
+                    validation.append(Validation(
+                        "error", "package.duplicate_ple_provider_file",
+                        "PLE provider shard paths must be unique",
+                        path="/ple_provider/shards", phase="package", blocking=True))
+        manifest_fields["ple_provider"] = ple_provider
     diagnostic = (package_plan.get("source_constraints") or {}).get("diagnostic")
     if diagnostic is not None:
         manifest_fields["provenance"]["diagnostic"] = diagnostic
     if (
         any(
-            t["format"] in {"tq", "mxfp4", "kquant", "iqk"}
+            t["format"] in {"mxfp4", "kquant", "iqk"}
             and t.get("kind") == "expert"
             for t in tensors
         )
@@ -580,8 +606,26 @@ def build_package_manifest(
     ):
         manifest_fields["expert_layout"] = expert_layout or _DEFAULT_EXPERT_LAYOUT
 
+    manifest_inputs = []
+    if expert_layout is not None:
+        per_layer = expert_layout.get("per_layer_experts")
+        if isinstance(per_layer, dict):
+            selection_id = per_layer.get("source_selection_artifact_id")
+            plan_inputs = package_plan.get("inputs")
+            if (
+                not isinstance(selection_id, str)
+                or not isinstance(plan_inputs, list)
+                or plan_inputs.count(selection_id) != 1
+            ):
+                raise ValueError(
+                    "compact expert layout selection must appear once in package-plan inputs"
+                )
+            manifest_inputs.append(selection_id)
+
+    status = "valid" if not any(v.blocking for v in validation) else "invalid"
     return make_artifact(
         "package_manifest", package_plan["subject"], PRODUCER,
+        inputs=manifest_inputs,
         required_features=list(package_plan.get("required_features", [])),
         status=status, validation=validation,
         package_format=PACKAGE_FORMAT,
@@ -595,8 +639,7 @@ def build_package_manifest(
 # [n_experts, row_bytes]) whose row e concatenates expert e's full payload in
 # row_order; the exact per-component geometry travels in each shard's
 # safetensors __metadata__ (package/bundle.py is the schema's source of truth).
-# Older stacked packages (tq_packed/tq_norms/tq_bits) are not readable: the
-# runtime fails loud with a re-convert message (no compatibility path).
+# Component geometry in shard metadata is authoritative for each codec.
 _DEFAULT_EXPERT_LAYOUT = {
     "stacked": False,
     "bundled": True,

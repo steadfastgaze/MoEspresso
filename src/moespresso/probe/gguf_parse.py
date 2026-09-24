@@ -29,12 +29,6 @@ VALUE_TYPE_FORMATS: dict[int, tuple[str, int]] = {
     12: ("<d", 8),  # FLOAT64
 }
 
-VALUE_TYPE_NAMES: dict[int, str] = {
-    0: "UINT8", 1: "INT8", 2: "UINT16", 3: "INT16",
-    4: "UINT32", 5: "INT32", 6: "FLOAT32", 7: "BOOL",
-    8: "STRING", 9: "ARRAY", 10: "UINT64", 11: "INT64", 12: "FLOAT64",
-}
-
 TENSOR_TYPE_NAMES: dict[int, str] = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1",
     6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
@@ -110,11 +104,6 @@ class GGUFBufferParser:
     def _available(self) -> int:
         return len(self._buf) - self._pos
 
-    def _peek(self, n: int) -> bytes | None:
-        if self._available() < n:
-            return None
-        return bytes(self._buf[self._pos : self._pos + n])
-
     def is_complete(self) -> bool:
         if self._header is None:
             return False
@@ -123,9 +112,6 @@ class GGUFBufferParser:
         if len(self._tensor_infos) < self._header.tensor_count:
             return False
         return True
-
-    def needs_more_data(self) -> bool:
-        return not self.is_complete() and self._pos >= len(self._buf)
 
     def try_parse(self) -> None:
         """Parse as many complete records as the buffer allows."""

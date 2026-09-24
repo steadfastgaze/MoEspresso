@@ -10,11 +10,9 @@ on|off` resolves to the family's own mechanism, in order:
    pass the bool through: zero per-model code, the model authors own the
    semantics. This convention is the closest thing to a standard (vLLM/SGLang
    expose generic chat_template_kwargs for the same reason).
-2. Family adapter table keyed on the manifest architecture family: one tiny
-   entry per ported family that needs something else. Grown only when a port
-   lands and is measured; entries return template kwargs today (a family
-   needing prompt surgery instead (the Gemma 4 shape) extends the seam to a
-   message-mutating adapter at that point, with its own tests).
+2. A family adapter may augment that template kwarg with additional package
+   contract fields, or provide the mechanism when the template has no generic
+   switch. Grown only when a port lands and is measured.
 3. Refuse loudly. A user who asked for --thinking off must never silently get
    thinking-on.
 
@@ -28,11 +26,24 @@ class ThinkingToggleUnsupported(RuntimeError):
     """The loaded model has no known thinking on/off mechanism."""
 
 
-# family -> adapter(thinking: bool) -> template kwargs dict.
+QWEN4_DEFAULT_REASONING_EFFORT = "medium"
+_QWEN4_FAMILIES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+
+
+def _qwen4_kwargs(thinking: bool) -> dict:
+    return (
+        {"reasoning_effort": QWEN4_DEFAULT_REASONING_EFFORT}
+        if thinking
+        else {}
+    )
+
+
+# Family augmenters apply only after the generic template switch is proven.
 #
 # DeepSeek-V4 is intentionally absent here. MoEspresso owns its renderer, and the
 # serve layer maps `--thinking` onto the DS4 contract shapes directly
 # (`http.deepseek_v4_contract_template_kwargs`), never through this generic seam.
+_TEMPLATE_AUGMENTERS = {family: _qwen4_kwargs for family in _QWEN4_FAMILIES}
 _FAMILY_ADAPTERS: dict = {}
 
 
@@ -50,9 +61,14 @@ def resolve_thinking_kwargs(
     Raises ThinkingToggleUnsupported when neither the template nor the adapter
     table knows a mechanism: callers surface this at startup, before serving.
     """
+    family_key = family or ""
     if template_supports_enable_thinking(tokenizer):
-        return {"enable_thinking": bool(thinking)}
-    adapter = _FAMILY_ADAPTERS.get(family or "")
+        kwargs = {"enable_thinking": bool(thinking)}
+        augmenter = _TEMPLATE_AUGMENTERS.get(family_key)
+        if augmenter is not None:
+            kwargs.update(augmenter(bool(thinking)))
+        return kwargs
+    adapter = _FAMILY_ADAPTERS.get(family_key)
     if adapter is not None:
         return adapter(bool(thinking))
     raise ThinkingToggleUnsupported(

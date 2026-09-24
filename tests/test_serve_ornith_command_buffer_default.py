@@ -141,13 +141,13 @@ def test_ornith_command_buffer_default_rejects_smoke_and_other_runtimes(
     monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
     smoke = _ornith_manifest()
     smoke["architecture"]["smoke_max_experts"] = 8
-    streaming_tq = _ornith_manifest(
-        artifact_id="pkg:tq",
-        required_ops=("affine_dequant", "fp16_passthrough", "tq_dequant"),
+    unsupported_codec = _ornith_manifest(
+        artifact_id="pkg:unsupported-codec",
+        required_ops=("affine_dequant", "fp16_passthrough", "unknown_dequant"),
     )
     unsupported = _ornith_manifest(artifact_id="pkg:unsupported", required_ops=())
 
-    for manifest in (smoke, streaming_tq, unsupported):
+    for manifest in (smoke, unsupported_codec, unsupported):
         assert (
             default_ornith_mlx_command_buffer_limit(
                 manifest,
