@@ -1,277 +1,57 @@
-# Third-party notices
-
-MoEspresso incorporates or adapts the third-party material listed below. Each
-entry identifies its source and the affected MoEspresso files or code regions.
-MIT and Apache License 2.0 terms are shipped in `LICENSE-MIT` and
-`LICENSE-APACHE-2.0`. The nanobind BSD-3-Clause terms are reproduced here.
-
-## JANG
-
-Source: [jjang-ai/jangq at
-`e0c5a81fb34a63f1547030902044a4b99d3f2345`](https://github.com/jjang-ai/jangq/tree/e0c5a81fb34a63f1547030902044a4b99d3f2345)
-(tag `v2.5.29`).
-
-The pinned `jang-tools/pyproject.toml` declares `Apache-2.0` and identifies
-Jinho Jang as the author. The pinned revision contains no `LICENSE` or `NOTICE`
-file. The applicable Apache License 2.0 terms are in
-`LICENSE-APACHE-2.0`.
-
-The upstream kernel sources contain this attribution:
-
-> Created by Jinho Jang (eric@jangq.ai)
-
-Mapped material:
-
-- `src/moespresso/runtime/deepseek_v4/hc_kernel.py` adapts the embedded Metal
-  source produced by
-  `jang-tools/jang_tools/dsv4/mlx_model.py::_make_hc_split_sinkhorn_kernel`,
-  exposed upstream through `hc_split_sinkhorn`.
-- `src/moespresso/runtime/routed_decode_kernel.py` adapts the packed-matmul
-  structure of `gather_tq_kernel.py::_GATHER_TQ_SOURCE` and
-  `fused_gate_up_kernel.py::_FUSED_SWIGLU_SOURCE` for fused source-MXFP4
-  routed decoding.
-
-Each modified Apache-derived file carries a local modification notice that
-describes the MoEspresso changes.
-
-## ds4
-
-Source: [antirez/ds4 at
-`80ebbc396aee40eedc1d829222f3362d10fa4c6c`](https://github.com/antirez/ds4/tree/80ebbc396aee40eedc1d829222f3362d10fa4c6c).
-
-The Qwen packed-prefill matrix schedule uses
-[`9139e2ae58a41503968a500f36f75895c1ba63fc`](https://github.com/antirez/ds4/tree/9139e2ae58a41503968a500f36f75895c1ba63fc).
-
-License: MIT. The complete terms are in `LICENSE-MIT`. The upstream copyright
-notice is:
-
-> Copyright (c) 2026 The ds4.c authors  
-> Copyright (c) 2023-2026 The ggml authors
->
-> Copyright (c) 2023 DeepSeek
-
-Mapped material:
-
-- `src/moespresso/runtime/qwen4/prefill_packed.py` and
-  `src/moespresso/runtime/qwen4/prefill_packed_down.py` adapt the routed
-  matrix-tile schedule from `metal/qwen4.metal` to the IQ_K stream layout.
-- `src/moespresso/correctness/deepseek_v4/q3.py` and
-  `src/moespresso/correctness/fixtures/deepseek_v4/q3_long_context/answers.json`
-  adapt the DS4 long-context story fixture and
-  `tests/generate_long_context_story_prompt.py`.
-- `src/moespresso/correctness/fixtures/deepseek_v4/test_vectors/` contains the
-  published DS4 test-vector prompts, manifests, selected-token vectors, and
-  official records from `tests/test-vectors/`.
-- `src/moespresso/correctness/fixtures/deepseek_v4/q2_official_continuations/prompts.jsonl`
-  copies the public prompt data from
-  `gguf-tools/quality-testing/prompts.jsonl`.
-- `src/moespresso/runtime/deepseek_v4/indexed_attention_kernel.py` adapts
-  attention, indexer-score, and QAT kernel material from
-  `metal/dsv4_misc.metal` and `metal/dsv4_kv.metal`.
-- The QAT helper in
-  `src/moespresso/runtime/deepseek_v4/indexer_score_kernel.py` adapts
-  `metal/dsv4_kv.metal::kernel_dsv4_indexer_hadamard_fp4_f32`.
-- The FP8 helpers in
-  `src/moespresso/runtime/deepseek_v4/fp8_kv_kernel.py` adapt
-  `metal/dsv4_kv.metal::dsv4_e4m3fn_dequant`,
-  `kernel_dsv4_fp8_kv_quantize_f32`, and
-  `kernel_dsv4_kv_fp8_store_f32`.
-
-The mappings for `indexer_score_kernel.py` and `fp8_kv_kernel.py`
-apply only to the named helpers.
-
-## DeepSeek-V4-Flash
-
-Sources:
-
-- [deepseek-ai/DeepSeek-V4-Flash at
-  `a7aaed80dd2df27620eb534454253ea25eb11c7a`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/a7aaed80dd2df27620eb534454253ea25eb11c7a)
-- [deepseek-ai/DeepSeek-V4-Flash-DSpark at
-  `62af8fffb2f7030cac4de2f0169f5b8d1101b646`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/tree/62af8fffb2f7030cac4de2f0169f5b8d1101b646)
-  (the DSpark drafter reference implementation)
-
-License: MIT. The complete terms are in `LICENSE-MIT`. The upstream copyright
-notice is:
-
-> Copyright (c) 2023 DeepSeek
-
-Mapped material:
-
-- `src/moespresso/runtime/deepseek_v4/renderer.py` adapts the prompt
-  construction implemented by `encoding/encoding_dsv4.py`.
-- `src/moespresso/runtime/deepseek_v4/mtp_model.py` adapts the
-  multi-token-prediction block implemented by `inference/model.py`
-  (class `MTPBlock`).
-- `src/moespresso/runtime/deepseek_v4/dspark_model.py` adapts the
-  semi-autoregressive drafter implemented by the DSpark checkpoint's
-  `inference/model.py` (classes `DSparkAttention`, `DSparkBlock`,
-  `DSparkMarkovHead`, `DSparkConfidenceHead`, and
-  `Transformer.forward_spec`).
-
-The two draft models are MLX implementations written against those reference
-modules, and their comments quote short reference expressions.
-
-## Speculators and the DFlash checkpoint
-
-Sources:
-
-- [vllm-project/speculators at
-  `60cd9833fdd1af767001f87423ca49cc41552931`](https://github.com/vllm-project/speculators/tree/60cd9833fdd1af767001f87423ca49cc41552931)
-- [RedHatAI/DeepSeek-V4-Flash-speculator.dflash at
-  `e44fc94ceb1e7ed45550d15e782aeadd08050483`](https://huggingface.co/RedHatAI/DeepSeek-V4-Flash-speculator.dflash/tree/e44fc94ceb1e7ed45550d15e782aeadd08050483)
-
-The pinned Speculators `pyproject.toml` declares `Apache-2.0` and identifies
-Red Hat as the author. That revision carries the Apache License 2.0 and no
-`NOTICE` file. The complete terms are in `LICENSE-APACHE-2.0`.
-
-The pinned checkpoint revision identifies a DFlash model trained with
-Speculators. It carries no license or notice file. MoEspresso does not
-redistribute the checkpoint weights.
-
-Mapped material:
-
-- `src/moespresso/runtime/deepseek_v4/dflash_model.py` is an MLX
-  reimplementation of the model, attention, and configuration contracts in
-  `src/speculators/models/dflash/`, specialized for the pinned checkpoint and
-  MoEspresso's served cache interface.
-- `src/moespresso/package/deepseek_v4/dflash_sidecar.py` and
-  `src/moespresso/runtime/deepseek_v4/dflash_load.py` implement the pinned
-  checkpoint's configuration, tensor-name, and vocabulary-table contracts.
-
-The MoEspresso implementation replaces the PyTorch training graph with an MLX
-inference graph, adds persistent windowed context caches, and packages the
-checkpoint tensors in a content-hashed sidecar.
-
-## KVarN
-
-Source: [huawei-csl/KVarN at
-`7586257f1c632e63187bfacbbe21ccb51540f7b3`](https://github.com/huawei-csl/KVarN/tree/7586257f1c632e63187bfacbbe21ccb51540f7b3).
-
-The pinned repository carries the Apache License 2.0 and no `NOTICE` file. The
-complete terms are in `LICENSE-APACHE-2.0`.
-
-Mapped material:
-
-- `src/moespresso/correctness/qwen4/kvarn_reference.py` adapts the normalized
-  Hadamard rotation, alternating variance normalization, asymmetric rounding,
-  scale absorption, and selected-row reconstruction used by the KVarN K/V
-  cache codec.
-- `src/moespresso/runtime/qwen4/kvarn_layout.py` records the corresponding
-  packed K4/V4 field sizes and metadata classes for released Qwen sparse
-  attention.
-- `src/moespresso/runtime/qwen4/kvarn_encode.py` encodes a completed released-
-  shape K/V tile into that record with MLX operations.
-- `src/moespresso/runtime/qwen4/kvarn_selected_rows.py` implements selected-row
-  reconstruction from that packed record for Apple Metal.
-
-MoEspresso fixes the codec to the released two-head, 256-wide QSA geometry,
-stores K and V codes token-major for sparse selected-row reads, removes vLLM
-allocator padding, and keeps the QSA index cache outside the quantized record.
-The modified correctness, MLX encoder, and Metal decoder files carry local
-modification notices.
-
-## Apple MLX and MLX LM
-
-Sources:
-
-- [ml-explore/mlx at
-  `39886de461d4f014cd60a3a68ad42fd8d776754a`](https://github.com/ml-explore/mlx/tree/39886de461d4f014cd60a3a68ad42fd8d776754a)
-- [ml-explore/mlx at
-  `68cf2fddd8de5edd8ab3d926391772b2e2cedad8`](https://github.com/ml-explore/mlx/tree/68cf2fddd8de5edd8ab3d926391772b2e2cedad8)
-  (tag `v0.31.2`; router GEMV source)
-- [ml-explore/mlx-lm at
-  `2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5`](https://github.com/ml-explore/mlx-lm/tree/2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5)
-- [ml-explore/mlx-lm at
-  `ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd`](https://github.com/ml-explore/mlx-lm/tree/ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd)
-  (tag `v0.31.3`; raw-greedy generation source)
-
-License: MIT. The complete terms are in `LICENSE-MIT`. The mapped sources carry
-these copyright notices:
-
-> Copyright © 2023 Apple Inc.
-
-> Copyright © 2023-2024 Apple Inc.
-
-> Copyright © 2026 Apple Inc.
-
-Mapped material:
-
-- `src/moespresso/runtime/deepseek_v4/router_kernel.py::_LOG1P_HEADER` adapts
-  the float `log1p` helper from `mlx/backend/metal/kernels/utils.h`. This
-  mapping applies only to `_LOG1P_HEADER` and its
-  `moespresso_dsv4_log1p` function.
-- `src/moespresso/runtime/owned_switchglu.py::OwnedSwitchGLU.__call__` adapts
-  `mlx_lm/models/switch_layers.py::SwitchGLU.__call__`.
-- `src/moespresso/runtime/qwen/gdn_decode.py::_FUSED_SOURCE` adapts
-  `mlx/backend/metal/kernels/conv.metal::depthwise_conv_1d`.
-- `src/moespresso/runtime/qwen/gdn_decode.py::FusedDecodeGatedDeltaNet.__call__`
-  adapts `mlx_lm/models/qwen3_5.py::GatedDeltaNet.__call__`.
-- `src/moespresso/runtime/qwen/router_gemv.py::_SOURCE` adapts
-  `mlx/backend/metal/kernels/gemv.metal::GEMVKernel::run` and its
-  `gemv_float32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` specialization. The fixed
-  launch geometry derives from
-  `mlx/backend/metal/matmul.cpp::gemv_axbpy`.
-- `src/moespresso/runtime/raw_greedy.py::raw_greedy_generate_step` and
-  `src/moespresso/runtime/raw_greedy.py::stream_raw_greedy` adapt
-  `mlx_lm/generate.py::generate_step` and `mlx_lm/generate.py::stream_generate`.
-
-## Apple metal-cpp
-
-Source: the `metal_cpp` headers distributed with MLX `v0.31.2`, from
-[Apple metal-cpp](https://developer.apple.com/metal/cpp/).
-
-License: Apache-2.0. The complete terms are in `LICENSE-APACHE-2.0`.
-
-> Copyright 2020-2025 Apple Inc.
-
-The native gate extension compiles inline Metal and Foundation C++ bindings
-from these headers.
-
-## nanobind
-
-Source: [nanobind `v2.12.0`](https://github.com/wjakob/nanobind/tree/v2.12.0).
-
-The native gate extension statically links the nanobind support library. Its
-BSD-3-Clause license follows.
-
-Copyright (c) 2022 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its contributors
-   may be used to endorse or promote products derived from this software
-   without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-## froggeric Qwen-Fixed-Chat-Templates
-
-Source: [froggeric/Qwen-Fixed-Chat-Templates at
-`c31fd393e531dbacd92b6deb99a2037cc949f950`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/tree/c31fd393e531dbacd92b6deb99a2037cc949f950)
-(version `v19`).
-
-The pinned repository metadata declares `Apache-2.0`. No copyright or
-`NOTICE` text was present in the audited material. The applicable Apache
-License 2.0 terms are in `LICENSE-APACHE-2.0`.
-
-`src/moespresso/package/templates/qwen3_5_moe.chat_template.jinja` adapts the
-root `chat_template.jinja`. MoEspresso changes the thinking-disabled replay and
-generation prefixes so they emit an empty thinking scaffold and preserve token
-prefix identity.
+MoEspresso includes modified code from the following MIT-licensed projects.
+
+MoEspressoV3 M1 fork
+https://github.com/ashe-wb/moespressoV3-m1-fork
+
+mlx-serve
+https://github.com/ddalcu/mlx-serve
+Copyright (c) 2026 David Dalcu
+
+mlx-kquant
+https://github.com/asher/mlx-kquant
+Copyright © 2026 Asher Feldman
+
+MLX and MLX LM
+https://github.com/ml-explore/mlx
+https://github.com/ml-explore/mlx-lm
+Copyright © 2023 Apple Inc.
+Copyright © 2024 Apple Inc.
+Copyright © 2025 Apple Inc.
+
+ggml
+https://github.com/ggml-org/ggml
+Copyright (c) 2023-2024 The ggml authors
+
+ds4.c
+https://github.com/antirez/ds4
+Copyright (c) 2026 The ds4.c authors
+Copyright (c) 2023-2026 The ggml authors
+Copyright (c) 2023 DeepSeek
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+KVarN
+https://github.com/huawei-csl/KVarN
+Copyright [2026] [Huawei]
+
+The KVarN cache codec is modified for MoEspresso's native Rust and Metal
+implementation. It is licensed under Apache License 2.0, included in
+LICENSE-APACHE-2.0.

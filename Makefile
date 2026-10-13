@@ -1,52 +1,113 @@
-.PHONY: help install test lint fmt lock lock-check dist-check clean roadtest
+.DEFAULT_GOAL := help
+.PHONY: help build check lint dead-code test test-model test-adaptive test-conversation test-oracles test-quality test-quality-long quality-record quality-record-long require-quality roadtest test-opencode dist-check require-metal
+.NOTPARALLEL:
 
 help:
-	@echo "make install        - sync the uv environment (incl. dev group)"
-	@echo "make test           - run the full test suite (lock-strict)"
-	@echo "make lint           - ruff check (lock-strict)"
-	@echo "make fmt            - ruff format"
-	@echo "make lock           - re-resolve uv.lock after a deliberate dep change"
-	@echo "make lock-check     - fail if uv.lock is stale vs pyproject.toml"
-	@echo "make dist-check     - build and audit the public wheel and sdist"
-	@echo "make roadtest       - multi-hour 110k-token cumulative certification"
-	@echo "                      soak against a served package (opt-in, GPU-bound; set"
-	@echo "                      MOESPRESSO_ROADTEST_PACKAGE or ROADTEST_ARGS)"
-	@echo "make clean          - remove caches"
+	@printf '%s\n' \
+	  'make build          Build the release executable with locked dependencies' \
+	  'make check          Run formatting, strict Clippy and regular tests' \
+	  'make lint           Check formatting and Clippy on every Cargo target' \
+	  'make dead-code      Check compiler warnings on the library and executable' \
+	  'make test           Run the regular suite, including synthetic Metal tests' \
+	  'make test-model     Run selected real-package storage and recovery checks' \
+	  'make test-adaptive  Check capacity changes, logits and cache ownership' \
+	  'make test-conversation Check conversation reuse through resizing and interleaving' \
+	  'make test-oracles   Compare sigmoid tables with supplied external oracles' \
+	  'make test-quality   Compare short whole-model logits and check answers/tools locally' \
+	  'make test-quality-long Compare optional 10K-token attention/cache boundary logits' \
+	  'make quality-record Record a short baseline from an explicitly selected good build' \
+	  'make quality-record-long Record the optional long-context baseline' \
+	  'make roadtest       Exercise served memory cache, disk restore and disconnect recovery' \
+	  'make test-opencode  Exercise OpenCode read, edit and read-back through the server' \
+	  'make dist-check     Audit a source archive and rebuild all targets independently' \
+	  'See docs/testing.md for prerequisites and GPU ownership.'
 
-install:
-	uv sync
+build:
+	cargo build --locked --release
 
-test:
-	uv run --locked python -m pytest
+check: lint test
 
 lint:
-	uv run --locked ruff check src tests
-	uv run --locked vulture src tests vulture_whitelist.py --min-confidence 100
+	cargo fmt --all -- --check
+	cargo clippy --locked --all-targets -- -D warnings
 
-fmt:
-	uv run ruff format src tests
+dead-code:
+	RUSTFLAGS="-D warnings" cargo check --locked --lib --bin moespresso
 
-# Engine road-test: a multi-hour scripted cumulative agentic session against a
-# served model, asserting cache events, disk checkpoints, and restart resume
-# turn over turn. Its default growth target is 110k tokens. `--target-tokens`
-# controls only the optional extension phase and does not skip the fixed
-# protocol. Opt-in and GPU-bound; never part of `make test`. The runner itself
-# is a pure HTTP client that launches the served process.
-roadtest:
-	uv run --locked python -m moespresso.agentlib.roadtest $(ROADTEST_ARGS)
+require-metal:
+	@test "$$(uname -s)" = Darwin || { printf '%s\n' 'This gate requires a supported macOS Metal host.' >&2; exit 1; }
 
-# Deliberate "I changed deps, re-resolve" step.
-lock:
-	uv lock
+test: require-metal
+	cargo test --locked --all-targets -- --test-threads=1
 
-# Standalone gate (read-only, no env build): is the lockfile current?
-lock-check:
-	uv lock --check
+test-model: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	sh scripts/test-ignored.sh lib package::reader_tests::package_iq3_and_iq2_rows_match_allocating_reader
+	sh scripts/test-ignored.sh lib experts::gpu::overlap_device_tests::prefetch_eof_preserves_publication_prefix_and_retries
+	sh scripts/test-ignored.sh lib experts::gpu::overlap_device_tests::decode_prefetch_failure_preserves_sorted_publication_and_retry
+	sh scripts/test-ignored.sh lib experts::gpu::overlap_device_tests::narrow_prefetch_failure_preserves_sorted_publication_and_retry
+	sh scripts/test-ignored.sh lib experts::gpu::overlap_device_tests::retained_read_failure_and_workspace_conflict_preserve_pool
+	sh scripts/test-ignored.sh lib experts::gpu::overlap_device_tests::package_overlap_preserves_policy_and_scope_cleanup
+	sh scripts/test-ignored.sh lib engine::failure_recovery_tests::bounded_handoff_encoding_failure_allows_new_session_on_same_engine
+	sh scripts/test-ignored.sh lib-release engine::failure_recovery_tests::windowed_handoff_failure_after_service_allows_same_engine_retry
+	sh scripts/test-ignored.sh lib-release engine::failure_recovery_tests::bounded_backing_growth_uses_serial_decode
+	sh scripts/test-ignored.sh lib engine::failure_recovery_tests::injected_metal_errors_allow_next_request_on_same_engine
+	sh scripts/test-ignored.sh lib-release engine::failure_recovery_tests::explicit_4096_command_failure_preserves_prior_conversation
+	sh scripts/test-ignored.sh lib engine::snapshot::disk::tests::wide_prefill_memory_disk_roundtrip_and_cross_width_reuse
+	sh scripts/test-ignored.sh lib-release engine::snapshot::disk::tests::explicit_4096_prefill_memory_disk_roundtrip_and_cross_width_reuse
 
-# Build both public artifacts in a temporary directory, then reject private
-# material, machine-local paths, missing licenses, and missing product surfaces.
+test-adaptive: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	sh scripts/test-ignored.sh lib engine::expert_capacity::tests::whole_engine_resizing_preserves_sessions_and_cache_handles
+	sh scripts/test-ignored.sh lib generation::tests::controlled_growth_exceeds_startup_and_preserves_prefill_and_decode_logits
+	sh scripts/test-ignored.sh lib generation::tests::controlled_shrink_preserves_snapshots_and_unbiased_generation
+	sh scripts/test-ignored.sh lib generation::tests::controlled_boundary_failure_releases_session_before_next_generation
+	sh scripts/test-ignored.sh lib generation::tests::complete_cache_hit_checks_boundary_before_single_token_publication
+
+test-conversation: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	sh scripts/test-ignored.sh lib-release generation::tests::default_gdn_inputs_preserve_resized_generated_conversation
+	sh scripts/test-ignored.sh acceptance default_phased_prefill_preserves_interleaved_generated_conversation
+	sh scripts/test-ignored.sh lib-release server::conversation_tests::conversation_state_survives_resizing_and_interleaving
+	sh scripts/test-ignored.sh lib-release server::conversation_tests::short_generated_conversation_survives_restart_at_another_capacity
+	sh scripts/test-ignored.sh lib-release server::conversation_tests::disk_retention_keeps_interleaved_conversations_while_one_chain_advances
+	sh scripts/test-ignored.sh lib-release server::conversation_tests::followup_uses_generated_disk_state_when_ram_can_retain_only_the_prompt
+	sh scripts/test-ignored.sh lib-release server::conversation_tests::prefix_disk_cache_keeps_shared_anchors_without_turn_writes
+	sh scripts/test-ignored.sh lib-release generation::tests::wide_prefill_cancellation_preserves_prior_conversation
+	sh scripts/test-ignored.sh lib-release generation::tests::wide_prefill_pressure_release_completes_and_reuses_conversation
+	sh scripts/test-ignored.sh lib-release mlp_batch::gpu::device_mapping_tests::wider_grouped_packed_preserves_completed_real_weight_mlp
+	sh scripts/test-ignored.sh lib-release generation::phase_tests::planned_phase_return_preserves_generated_cache_and_repairs_missing_scratch
+	sh scripts/test-ignored.sh lib-release generation::phase_tests::interrupted_wide_phase_keeps_live_disk_anchor_for_narrow_restart
+
+test-oracles: require-metal
+	@test -n "$$MLP_SIGMOID_BF16_ORACLE" || { printf '%s\n' 'MLP_SIGMOID_BF16_ORACLE is required.' >&2; exit 1; }
+	@test -n "$$IQK_SIGMOID_ORACLE" || { printf '%s\n' 'IQK_SIGMOID_ORACLE is required.' >&2; exit 1; }
+	sh scripts/test-ignored.sh lib mlp::tests::stable_sigmoid_matches_external_bf16_table
+	sh scripts/test-ignored.sh lib experts::tests::sigmoid_matches_external_fp16_oracle
+
+require-quality: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	@test -n "$$MOESPRESSO_QUALITY_BASELINE" || { printf '%s\n' 'MOESPRESSO_QUALITY_BASELINE is required; keep generated baselines outside the source tree.' >&2; exit 1; }
+
+test-quality: require-quality
+	MOESPRESSO_QUALITY_RECORD=0 sh scripts/test-ignored.sh lib-release-live server::quality::short
+
+test-quality-long: require-quality
+	MOESPRESSO_QUALITY_RECORD=0 sh scripts/test-ignored.sh lib-release-live server::quality::long
+
+quality-record: require-quality
+	MOESPRESSO_QUALITY_RECORD=1 sh scripts/test-ignored.sh lib-release-live server::quality::short
+
+quality-record-long: require-quality
+	MOESPRESSO_QUALITY_RECORD=1 sh scripts/test-ignored.sh lib-release-live server::quality::long
+
+roadtest: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	sh scripts/test-ignored.sh acceptance cache_roadtest
+
+test-opencode: require-metal
+	@test -n "$$MOESPRESSO_TEST_PACKAGE" || { printf '%s\n' 'MOESPRESSO_TEST_PACKAGE is required; reserve exclusive GPU ownership.' >&2; exit 1; }
+	sh scripts/test-ignored.sh acceptance opencode_read_edit_readback
+
 dist-check:
-	uv run --locked python tests/test_distribution_audit.py --build
-
-clean:
-	rm -rf .pytest_cache .ruff_cache **/__pycache__
+	sh scripts/dist-check.sh

@@ -1,0 +1,175 @@
+# Adaptive bounded expert memory
+
+Serving uses automatic memory admission and adapts expert capacity when the
+initial pool contains 64 through 511 slots. A fully resident 512-slot pool and
+automatically admitted pools of 10 through 63 slots remain static.
+`--no-adaptive-memory` disables capacity changes for a static comparison or
+power-sensitive run. Generate is a one-shot path and does not adapt capacity.
+
+`--max-memory-gb GIB` caps the automatic accounted component budget. It keeps
+the same host and Metal safety reserves as uncapped automatic admission, and it
+bounds both the admitted startup plan and the adaptive operating ceiling. It is
+not a process RSS limit or a reservation from the operating system. The
+advanced `--expert-capacity` diagnostic path bypasses automatic admission,
+disables serving caches, and does not adapt.
+
+## Policy
+
+The inference owner samples Darwin pressure and VM counters at most once per
+second, after completed tokens or prefill chunks and while idle. No background
+worker changes engine allocations.
+
+- Warning pressure releases the next smaller 16-slot-aligned prefix, at most
+  once every five seconds, retaining at least 64 slots.
+- Critical pressure releases directly to 64 slots. If the next sampled
+  observation remains critical at that floor, generation stops or a new
+  request is rejected with HTTP 503. Already selected but unreported work is
+  not published after a generation callback fails.
+- Startup capacity remains provisional until successful serving supplies
+  15 seconds of healthy sampled active intervals. Successful requests can
+  accumulate this credit. The highest capacity accepted through this work
+  becomes the earned target.
+- Restoration advances toward the retained earned target at request start or
+  after a completed generation operation. It requires fresh healthy
+  observations, five seconds of recent quiet and five seconds since the last
+  capacity change. Each increase is at most 16 slots. A final gap within that
+  allowance returns directly to the earned target, bounded by the operating
+  ceiling; larger gaps advance to the next 16-slot boundary. Physical suffix
+  ranges are prepared together before publication.
+- Growth beyond the earned target opens one trial of at most 16 slots after the
+  same work boundaries and five-second quiet and capacity-settling intervals.
+  The candidate must earn successful active-work
+  validation before another trial. Idle observations do not earn active
+  credit or allocate growth. Exploration stops at the fixed operating ceiling.
+- An unaccepted trial has a 15-second adverse active-observation budget.
+  Swap-out activity or compression above the threshold accumulates across
+  requests. Exhausting the budget releases the trial increment at the next
+  completed observation. Accepted capacity is not evicted by this trial rule.
+- A pressure episode preserves the earned target and rejects an unaccepted
+  trial. Further exploration requires new healthy completed work. Pressure
+  interrupting a pending trial or recent increase delays the next attempt by
+  10 seconds; repeated failed attempts increase the delay through 20, 40 and
+  80 seconds to a maximum of 120 seconds. Accepting a candidate resets it.
+- Swap-out activity or compression at 16 MiB/s or more pauses allocation and
+  active credit for the affected interval. Missing observations, counter reset
+  or a sampling gap over five seconds breaks recent eligibility. Earlier
+  healthy credit and the earned target survive these observations.
+- Active time counts sampled intervals between completed operations within a
+  request. It includes intervening output and checkpoint work. Idle time, first
+  active samples and gaps between requests contribute no credit. Cancellation
+  or failure discards that request's credit while preserving earlier
+  successful work. A capacity change starts validation for its new extent.
+
+An unaccepted trial rolls back to its previous aligned capacity after the
+adverse active-observation budget is exhausted. The earned target remains
+available for later restoration. Missing counters, resets and long sample gaps
+add neither healthy nor adverse time.
+
+## Operating budget and capacity
+
+Startup admission uses the smallest of installed RAM minus 5 GiB, observed
+free plus inactive memory minus 3 GiB, Metal's recommended working set minus
+1 GiB, and a positive reported GPU wired limit minus 1 GiB when available.
+An explicit `--max-memory-gb` can lower that budget. The component planner
+includes a 2 GiB process allowance and selects the largest complete estimate
+across loading, engine construction and serving. Insufficient or unavailable
+required observations fail before weight loading. These reserves do not
+guarantee safety against later external allocations or memory pressure.
+
+Ordinary prefill admission prefers 2048 rows. Full expert residency takes
+priority; if its wider workspace does not fit, it uses 512 rows. Bounded engines
+allocate the remaining admitted budget to expert slots, using 512 rows if the
+wider plan cannot retain at least 64 slots. Fixed-capacity diagnostics keep
+their requested slot count and use 2048 rows only when the complete estimate
+fits. Startup reports both capacities. Checkpoints remain reusable across
+prefill widths.
+
+Starting capacity uses automatic admission, including its live-memory
+observation. The adaptive operating ceiling is a separate fixed budget. It
+retains the physical RAM, Metal working-set and optional wired-limit ceilings
+and their reserves, but does not freeze the initial free-plus-inactive
+observation into the operating ceiling. An explicit `--max-memory-gb` also
+bounds that ceiling. These are application policies, not OS memory reservations
+or guarantees of available physical RAM.
+
+Growth reserves the admitted maximum context, workspaces, retained prompt
+cache, snapshot overlap and process allowance. It checks the complete
+preparation peak, including the replacement address table alongside its
+previous owner. Adaptive growth never enters the separate 512-slot fully
+resident path. Healthy observations permit attempts within this budget.
+
+Each bounded pool retains an address table sized for 511 slots. Expert weight
+storage is allocated only for current capacity, in physical ranges ending at or
+before the next 16-slot boundary. Growth appends missing slots and retains
+existing allocations, including a partial final range. For example, capacity
+145 ends with ranges 128..144 and 144..145. Growth to 160 appends 145..160
+without copying or evicting the retained tail. Packed prefill uses these
+physical ranges; decode uses the per-slot address table.
+
+All layers prepare successfully before any layer publishes new storage.
+Preparation failure releases only candidates. New slots are empty until demand
+loads experts. Each layer permits at most 64 physical ranges, with descriptor
+capacity reserved before serving. Repeated smaller requests are refused before
+allocation if they would exceed this bound.
+
+## Request workspace phases
+
+Adaptive serving admitted with 2048 rows and at least 4096 context tokens uses
+request workspace phases by default. The phase owner quotes a complete
+4096-row plan from the serving context, cache allowances and package footprint.
+It widens after prefix
+restoration only when more than 2048 new tokens remain, then returns ordinary
+scratch before the first token is delivered.
+
+If the wider plan cannot retain the adaptive expert floor within the complete
+operating budget, startup keeps ordinary execution. Allocation failure also
+falls back after ordinary scratch is repaired. Static serving, full residency,
+narrower admitted workspaces and smaller contexts do not select this policy.
+
+The controller's ordinary budget, startup capacity and operating ceiling do
+not change. While wider scratch is present, adaptive allocation is frozen;
+pressure release, trial rollback and critical-floor stopping continue. A
+pending trial may use wider scratch when its expert extent fits. Work at a
+temporarily smaller extent cannot validate restored slots. Previously earned
+capacity and fitting-trial credit survive an unchanged extent.
+
+Planned resizing does not count as pressure. Returning experts requires fresh
+quiet observations and ordinary settling, and never reinstates a
+pressure-released or rejected trial increment. Failed expert restoration can
+retain a smaller valid pool. Failed scratch restoration prevents further
+generation until the request owner repairs it. Cleanup failures are attached
+to the original request error rather than replacing it.
+
+## Cache behavior
+
+Conversation state is independent of physical expert storage. Growth, pressure
+release and trial rollback preserve committed sessions and cache entries.
+Warm requests can grow within the operating budget, and cache writes continue
+after resizing at completed operations. Idle polling does not grow capacity.
+A capacity change can alter later residency-biased expert selection and the
+resulting answer; that does not make the conversation's committed state unusable.
+
+Cache-Prior keeps factor 2 and two protected routes by default on the bounded
+path. `--cache-routing off` selects unbiased decode routing for quality checks
+or comparisons. Prefill uses original routing in both modes.
+
+## Logs
+
+Normal logs retain request token counts and timings, cache lookup events,
+checkpoint progress, capacity changes and failures. Startup reports the
+initial capacity, operating ceiling and settling and validation intervals.
+
+## Limits
+
+Response latency includes the current GPU or I/O operation and any blocking
+output callback. Polling can miss short-lived pressure events. The controller
+cannot guarantee survival against fast external allocations, GPU execution
+failure or OS termination, and it does not reduce the maximum-context contract
+or change quantized arithmetic.
+
+Unit tests inject pressure levels, counter deltas and monotonic times. Real
+package tests exercise the controller with synthetic observations at completed
+generation boundaries. Those tests do not create system-wide pressure. Normal
+host serving checks establish integration; desktop coexistence and useful
+recovery require constrained-host evidence. Successful serving at an earned
+capacity does not establish suitability under every workload.

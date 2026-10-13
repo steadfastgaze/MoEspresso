@@ -1,19 +1,4 @@
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-.pytest_cache/
-.ruff_cache/
-dist/
-*.egg-info/
+/target/
+/local/
+/moespresso-results/
 .DS_Store
-.claude/
-.env
-
-# Local/private oracle captures (API continuations, top-logprobs, verified keys).
-# Public prompt/vector fixtures stay tracked; any model's private/ subdir does not.
-src/moespresso/correctness/fixtures/*/private/
-
-# Local research.
-specs_archive/
-/.research/
