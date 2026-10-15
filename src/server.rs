@@ -390,9 +390,9 @@ impl State {
         self.handle_chat(request)
     }
 
-    fn adapt_at_request_boundary(&mut self, allow_recovery: bool) -> Result<()> {
+    fn adapt_at_request_boundary(&mut self, starting_request: bool) -> Result<()> {
         let result = self.adaptive.as_mut().map_or(Ok(false), |controller| {
-            let boundary = if allow_recovery {
+            let boundary = if starting_request {
                 crate::adaptive_memory::Boundary::RequestStart
             } else {
                 crate::adaptive_memory::Boundary::Observe

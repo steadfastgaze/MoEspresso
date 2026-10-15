@@ -16,8 +16,8 @@ disables serving caches, and does not adapt.
 ## Policy
 
 The inference owner samples Darwin pressure and VM counters at most once per
-second, after completed tokens or prefill chunks and while idle. No background
-worker changes engine allocations.
+second, at completed inference boundaries and while idle. No background worker
+changes engine allocations.
 
 - Warning pressure releases the next smaller 16-slot-aligned prefix, at most
   once every five seconds, retaining at least 64 slots.
@@ -29,27 +29,35 @@ worker changes engine allocations.
   15 seconds of healthy sampled active intervals. Successful requests can
   accumulate this credit. The highest capacity accepted through this work
   becomes the earned target.
-- Restoration advances toward the retained earned target at request start or
-  after a completed generation operation. It requires fresh healthy
-  observations, five seconds of recent quiet and five seconds since the last
-  capacity change. Each increase is at most 16 slots. A final gap within that
-  allowance returns directly to the earned target, bounded by the operating
-  ceiling; larger gaps advance to the next 16-slot boundary. Physical suffix
+- Restoration advances toward the retained earned target, including while idle.
+  It requires fresh healthy observations, five seconds of recent quiet and
+  five seconds since the last capacity change. Each increase is at most
+  16 slots. A final gap within that allowance returns directly to the earned
+  target, bounded by the operating ceiling. Larger gaps advance to the next
+  16-slot boundary. Physical suffix
   ranges are prepared together before publication.
-- Growth beyond the earned target opens one trial of at most 16 slots after the
-  same work boundaries and five-second quiet and capacity-settling intervals.
-  The candidate must earn successful active-work
-  validation before another trial. Idle observations do not earn active
-  credit or allocate growth. Exploration stops at the fixed operating ceiling.
-- An unaccepted trial has a 15-second adverse active-observation budget.
-  Swap-out activity or compression above the threshold accumulates across
-  requests. Exhausting the budget releases the trial increment at the next
-  completed observation. Accepted capacity is not evicted by this trial rule.
+- Growth beyond the earned target starts after five-second quiet and
+  capacity-settling intervals. Each preparation adds at most 16 slots. An
+  unaccepted extent can grow again after 15 seconds of healthy observations.
+  During inference it must also accumulate 15 seconds of healthy active work;
+  partial credit from completed requests pauses further preparation until that
+  extent qualifies. Idle preparation does not populate experts or earn an
+  accepted target. The entire unvalidated extent keeps its rollback base.
+  Growth stops at the fixed operating ceiling.
+- An unaccepted extent has a 15-second adverse-observation budget. Swap-out
+  activity or compression above the threshold accumulates during serving and
+  idle observations. Exhausting the budget rolls back to the previous aligned
+  base. Further preparation does not erase earlier adverse intervals.
+- Accepted storage can also be released after sustained active VM churn:
+  swap-outs, or compression and decompression both at 16 MiB/s or more. Busy
+  intervals accumulate toward 15 seconds; quiet intervals subtract time.
+  One-way compression alone pauses growth without evicting accepted storage.
+  Idle observations do not charge this active-churn budget.
 - A pressure episode preserves the earned target and rejects an unaccepted
-  trial. Further exploration requires new healthy completed work. Pressure
-  interrupting a pending trial or recent increase delays the next attempt by
-  10 seconds; repeated failed attempts increase the delay through 20, 40 and
-  80 seconds to a maximum of 120 seconds. Accepting a candidate resets it.
+  trial. Pressure interrupting a pending trial or recent increase delays the
+  next attempt by 10 seconds; repeated failed attempts increase the delay
+  through 20, 40 and 80 seconds to a maximum of 120 seconds. Sustained
+  active-churn releases also delay recovery. Accepting a candidate resets it.
 - Swap-out activity or compression at 16 MiB/s or more pauses allocation and
   active credit for the affected interval. Missing observations, counter reset
   or a sampling gap over five seconds breaks recent eligibility. Earlier
@@ -58,12 +66,16 @@ worker changes engine allocations.
   request. It includes intervening output and checkpoint work. Idle time, first
   active samples and gaps between requests contribute no credit. Cancellation
   or failure discards that request's credit while preserving earlier
-  successful work. A capacity change starts validation for its new extent.
+  successful work. Growth can retain a smaller extent's completed validation
+  within the request, but accepts it only when the request succeeds. The new
+  extent starts its own validation. Pressure or a planned reduction discards
+  incompatible in-request credit.
 
-An unaccepted trial rolls back to its previous aligned capacity after the
-adverse active-observation budget is exhausted. The earned target remains
-available for later restoration. Missing counters, resets and long sample gaps
-add neither healthy nor adverse time.
+Missing counters and resets add neither healthy nor adverse time. Long sample
+gaps cannot earn validation or charge provisional adversity. Valid active-churn
+rates across a long operation contribute at most five seconds, so a slow
+operation cannot hide sustained churn. Quiet recovery can resume without a new
+request after pressure subsides and the backoff expires.
 
 ## Operating budget and capacity
 
@@ -129,9 +141,11 @@ narrower admitted workspaces and smaller contexts do not select this policy.
 The controller's ordinary budget, startup capacity and operating ceiling do
 not change. While wider scratch is present, adaptive allocation is frozen;
 pressure release, trial rollback and critical-floor stopping continue. A
-pending trial may use wider scratch when its expert extent fits. Work at a
-temporarily smaller extent cannot validate restored slots. Previously earned
-capacity and fitting-trial credit survive an unchanged extent.
+pending trial can yield expert storage to wider scratch while retaining its
+adverse-observation budget and a rollback base no higher than the reduced
+extent. Its discarded tail is not automatically restored. Work at a temporarily
+smaller extent cannot validate restored slots. Previously earned capacity and
+fitting-trial credit survive an unchanged extent.
 
 Planned resizing does not count as pressure. Returning experts requires fresh
 quiet observations and ordinary settling, and never reinstates a
@@ -145,7 +159,8 @@ to the original request error rather than replacing it.
 Conversation state is independent of physical expert storage. Growth, pressure
 release and trial rollback preserve committed sessions and cache entries.
 Warm requests can grow within the operating budget, and cache writes continue
-after resizing at completed operations. Idle polling does not grow capacity.
+after resizing at completed operations. Idle growth prepares empty storage;
+expert rows are loaded only when inference needs them.
 A capacity change can alter later residency-biased expert selection and the
 resulting answer; that does not make the conversation's committed state unusable.
 

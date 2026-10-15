@@ -76,7 +76,16 @@ fn request(server: &Server, state: &mut State, messages: Value, stream: bool) ->
 fn qualify_growth(state: &mut State, first: u64) -> Result<()> {
     let controller = state.adaptive.as_mut().unwrap();
     controller.begin_request_at(Duration::from_secs(first));
-    for second in first..=first + 20 {
+    assert!(!controller.check_with_observation(
+        &mut state.engine,
+        false,
+        Duration::from_secs(first),
+        Some(1),
+        Some((0, 0)),
+    )?);
+    // Defer the growth transaction until the real HTTP follow-up below.
+    assert!(controller.try_begin_workspace_phase(&state.engine, state.engine.expert_capacity())?);
+    for second in first + 1..=first + 20 {
         assert!(!controller.check_with_observation(
             &mut state.engine,
             false,
@@ -85,6 +94,7 @@ fn qualify_growth(state: &mut State, first: u64) -> Result<()> {
             Some((0, 0)),
         )?);
     }
+    assert!(!controller.finish_workspace_phase(&mut state.engine)?);
     controller.end_request_at(Duration::from_secs(first + 20), true);
     controller.fix_observation(Duration::from_millis((first + 20) * 1000 + 100), 1);
     Ok(())
@@ -290,7 +300,7 @@ fn conversation_state_survives_resizing_and_interleaving() -> Result<()> {
         shrunk["usage"]["prompt_cache"]["event"], "memory_hit",
         "pressure release discarded conversation: {shrunk}"
     );
-    // Observation-only idle checks cannot grow the engine.
+    // Recovery cannot skip settling after pressure.
     state
         .adaptive
         .as_mut()

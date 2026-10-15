@@ -77,6 +77,7 @@ test-conversation: require-metal
 	sh scripts/test-ignored.sh lib-release generation::tests::wide_prefill_pressure_release_completes_and_reuses_conversation
 	sh scripts/test-ignored.sh lib-release mlp_batch::gpu::device_mapping_tests::wider_grouped_packed_preserves_completed_real_weight_mlp
 	sh scripts/test-ignored.sh lib-release generation::phase_tests::planned_phase_return_preserves_generated_cache_and_repairs_missing_scratch
+	sh scripts/test-ignored.sh lib-release generation::phase_tests::provisional_growth_yields_workspace_and_preserves_generated_cache
 	sh scripts/test-ignored.sh lib-release generation::phase_tests::interrupted_wide_phase_keeps_live_disk_anchor_for_narrow_restart
 
 test-oracles: require-metal

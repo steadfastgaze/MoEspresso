@@ -1067,10 +1067,19 @@ mod tests {
     ) -> Result<()> {
         use std::time::Duration;
 
-        // Replay clean completed-operation samples inside a successful request.
-        // Synthetic time checks policy mechanics, not real host pressure.
+        // Hold the current workspace extent while validating it, then let the
+        // caller exercise the next growth transaction. These injected samples
+        // check lifecycle mechanics, not real host pressure or inference speed.
         controller.begin_request_at(Duration::from_secs(first_second));
-        for second in first_second..=first_second + 121 {
+        assert!(!controller.check_with_observation(
+            engine,
+            false,
+            Duration::from_secs(first_second),
+            Some(1),
+            Some((0, 0)),
+        )?);
+        assert!(controller.try_begin_workspace_phase(engine, engine.expert_capacity())?);
+        for second in first_second + 1..=first_second + 121 {
             assert!(!controller.check_with_observation(
                 engine,
                 false,
@@ -1079,6 +1088,7 @@ mod tests {
                 Some((0, 0)),
             )?);
         }
+        assert!(!controller.finish_workspace_phase(engine)?);
         controller.end_request_at(Duration::from_secs(first_second + 121), true);
         Ok(())
     }
@@ -1383,11 +1393,13 @@ mod tests {
             || false,
             |engine| {
                 boundaries += 1;
+                // Continued warning pressure holds the released floor for the
+                // fixed-capacity reference comparison below.
                 let changed = controller.check_with_observation(
                     engine,
                     false,
                     Duration::from_secs(boundaries - 1),
-                    Some(if boundaries == 1 { 4 } else { 1 }),
+                    Some(if boundaries == 1 { 4 } else { 2 }),
                     Some((0, 0)),
                 )?;
                 assert_eq!(engine.expert_capacity(), 64);

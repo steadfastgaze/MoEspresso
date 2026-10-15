@@ -92,6 +92,11 @@ workspace, then a new preparation boundary repairs scratch, restores ordinary
 capacity and reuses the actual assistant/user follow-up. A cleanup allocation
 failure preserves the primary request error and allows repair on the same
 engine. A pressure release remains in effect after scratch narrows.
+A provisional-growth case prepares storage during healthy idle, yields it for
+wider scratch, repairs an injected scratch-allocation failure and resumes the
+actual generated conversation. Successful requests must accept the validated
+extent across further growth. Injected sustained swap-outs must release
+accepted storage without invalidating the cached continuation.
 A separate interruption case saves a proven live wide frontier, drops the
 engine, restarts at a different narrow expert capacity and resumes from the
 exact disk anchor.

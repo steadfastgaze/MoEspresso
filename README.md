@@ -207,8 +207,10 @@ loaded from SSD into per-layer pools as routing selects them.
 The startup planner reserves memory for the context, resident tensors,
 workspaces, conversation caches and safety headroom, then assigns the remaining
 budget to expert slots. During serving, adaptive memory can grow the pools
-beyond their starting size after healthy inference, or release slots under
-memory pressure. Resizing does not invalidate conversation caches.
+beyond their starting size during healthy serving or idle periods, or release
+slots under memory pressure and sustained active VM churn. Prepared slots are
+populated on demand and validated through successful inference. Resizing does
+not invalidate conversation caches.
 See [adaptive memory](docs/adaptive_memory.md) for the policy and its limits.
 
 ### Cache-Prior routing

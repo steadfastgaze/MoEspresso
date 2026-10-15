@@ -70,6 +70,173 @@ fn options(cap: usize) -> GenerationOptions {
 
 #[test]
 #[ignore = "requires MOESPRESSO_TEST_PACKAGE and exclusive GPU ownership"]
+fn provisional_growth_yields_workspace_and_preserves_generated_cache() -> Result<()> {
+    use crate::adaptive_memory::Boundary;
+    let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+    let footprint = PackageFootprint::from_package(&package)?;
+    let tokenizer = TextTokenizer::load(&package)?;
+    let budget =
+        narrow_budget(&package, 128)?.with_prefill_width(&footprint, CONTEXT, NARROW, NARROW)?;
+    let mut engine = Engine::load_with_prefill_capacity(&package, 128, CONTEXT, NARROW)?;
+    let mut cache = PromptPrefixCache::new(&engine, CACHE_BYTES);
+    let chat = ChatOptions {
+        thinking: false,
+        ..ChatOptions::default()
+    };
+    let mut turns = vec![json!({"role":"user","content":"Explain bridge inspection briefly."})];
+    let prompt = tokenizer.render(&turns, None, &chat)?.tokens;
+    let mut reply = String::new();
+    generate_with_cache(
+        &mut engine,
+        &tokenizer,
+        &prompt,
+        options(8),
+        GenerationCaches {
+            memory: Some(&mut cache),
+            disk: None,
+        },
+        |text| {
+            reply.push_str(text);
+            Ok(())
+        },
+        || false,
+    )?;
+    turns.push(json!({"role":"assistant","content":reply}));
+    turns.push(json!({"role":"user","content":"Why?"}));
+    let followup = tokenizer.render(&turns, None, &chat)?.tokens;
+    let retained = cache
+        .best_match(&engine, &followup)
+        .unwrap()
+        .matched_tokens();
+    ensure!(retained > prompt.len());
+
+    let mut controller = Controller::new(budget)?;
+    controller.fix_observation(Duration::ZERO, 4);
+    controller.check_boundary(&mut engine, Boundary::Observe)?;
+    ensure!(engine.expert_capacity() == 64);
+    for second in 1..=100 {
+        controller.fix_observation(Duration::from_secs(second), 1);
+        controller.check_boundary(&mut engine, Boundary::Observe)?;
+    }
+    ensure!(engine.expert_capacity() == 128);
+    ensure!(controller.test_pending_trial() == Some((64, 128)));
+    ensure!(controller.test_capacity_validation() == (None, true));
+    let mut phase = PhasedPrefill::new(budget, &footprint, CONTEXT, CACHE_BYTES, 0)?;
+    controller.begin_request();
+    phase.transition(
+        &mut engine,
+        RequestPhase::Prefill {
+            new_tokens: WIDE + 1,
+        },
+        &mut controller,
+    )?;
+    let wide_slots = engine.expert_capacity();
+    ensure!(
+        engine.prefill_chunk_size() == WIDE
+            && wide_slots == phase.wide_slot_ceiling()
+            && wide_slots < 128
+    );
+    ensure!(controller.test_pending_trial() == Some((64, wide_slots)));
+    for second in 101..=120 {
+        controller.fix_observation(Duration::from_secs(second), 1);
+        controller.check_boundary(&mut engine, Boundary::CompletedOperation)?;
+    }
+    {
+        let fault = engine.test_metal().test_fail_allocation_after(0)?;
+        ensure!(
+            phase
+                .transition(&mut engine, RequestPhase::Decode, &mut controller)
+                .is_err()
+        );
+        ensure!(fault.fired() && phase.is_active() && !engine.prefill_workspace_ready());
+    }
+    controller.fix_observation(Duration::from_secs(121), 1);
+    phase.transition(&mut engine, RequestPhase::Prepare, &mut controller)?;
+    controller.end_request(true);
+    ensure!(!phase.is_active() && engine.prefill_chunk_size() == NARROW);
+    ensure!(
+        engine.expert_capacity() == wide_slots,
+        "repair restored unaccepted slots"
+    );
+    ensure!(controller.test_capacity_validation() == (None, true));
+    ensure!(
+        cache
+            .best_match(&engine, &followup)
+            .unwrap()
+            .matched_tokens()
+            == retained
+    );
+
+    let mut second = 122;
+    for (cap, accepted, pending) in [(20, wide_slots, true), (32, 128, false)] {
+        controller.fix_observation(Duration::from_secs(second), 1);
+        controller.begin_request();
+        let resumed = generate_with_cache_owned(
+            &mut engine,
+            &tokenizer,
+            &followup,
+            options(cap),
+            GenerationCaches {
+                memory: Some(&mut cache),
+                disk: None,
+            },
+            |_| Ok(()),
+            || false,
+            |engine, event| {
+                second += 1;
+                controller.fix_observation(Duration::from_secs(second), 1);
+                phase.transition(engine, event, &mut controller)?;
+                controller.check_boundary(engine, Boundary::CompletedOperation)?;
+                Ok(false)
+            },
+        )?;
+        controller.end_request(true);
+        if pending {
+            ensure!(resumed.prompt_cache.cached_tokens == retained);
+        }
+        ensure!(resumed.prompt_cache.cached_tokens >= retained && resumed.prefill_tokens <= 20);
+        ensure!(engine.expert_capacity() == 128);
+        ensure!(controller.test_capacity_validation() == (Some(accepted), pending));
+    }
+
+    controller.begin_request_at(Duration::from_secs(second + 1));
+    for offset in 1..=17 {
+        controller.check_with_observation(
+            &mut engine,
+            false,
+            Duration::from_secs(second + offset),
+            Some(1),
+            Some((0, offset)),
+        )?;
+    }
+    ensure!(
+        engine.expert_capacity() == 112,
+        "accepted extent ignored sustained active swap-outs"
+    );
+    controller.end_request_at(Duration::from_secs(second + 17), false);
+    ensure!(controller.test_capacity_validation() == (Some(128), false));
+    let cached = cache
+        .best_match(&engine, &followup)
+        .unwrap()
+        .matched_tokens();
+    let resumed = generate_with_cache(
+        &mut engine,
+        &tokenizer,
+        &followup,
+        options(2),
+        GenerationCaches {
+            memory: Some(&mut cache),
+            disk: None,
+        },
+        |_| Ok(()),
+        || false,
+    )?;
+    ensure!(resumed.prompt_cache.cached_tokens == cached && resumed.generated_tokens == 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOESPRESSO_TEST_PACKAGE and exclusive GPU ownership"]
 fn planned_phase_return_preserves_generated_cache_and_repairs_missing_scratch() -> Result<()> {
     let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
     let footprint = PackageFootprint::from_package(&package)?;

@@ -21,7 +21,7 @@ const COMPRESSION_VETO_BYTES_PER_SECOND: f64 = (16 * (1 << 20)) as f64;
 const MIN_CAPACITY: usize = 64;
 const GROWTH_STEP_SLOTS: usize = 16;
 
-/// Capacity increases require a caller-declared boundary in real serving work.
+/// Owner boundaries distinguish idle observations from completed serving work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Boundary {
     Observe,
@@ -74,6 +74,18 @@ impl VmCounters {
         let swap_out = rate(self.swapouts, before.swapouts)?;
         Some(swap_out == 0.0 && compression < COMPRESSION_VETO_BYTES_PER_SECOND)
     }
+
+    fn churning_since(self, before: Self, elapsed: Duration) -> Option<bool> {
+        if self.quiet_since(before, elapsed)? {
+            return Some(false);
+        }
+        let decompression = self
+            .decompressions
+            .checked_sub(before.decompressions)?
+            .checked_mul(self.page_bytes)? as f64
+            / elapsed.as_secs_f64();
+        Some(self.swapouts > before.swapouts || decompression >= COMPRESSION_VETO_BYTES_PER_SECOND)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +108,7 @@ enum Action {
     Hold,
     Release(usize),
     Rollback(usize),
+    ChurnRelease(usize),
     Recover(usize),
     Stop,
 }
@@ -113,6 +126,10 @@ struct WorkspacePhase {
 }
 
 struct Policy {
+    preparation_healthy: Duration,
+    active_churn: Duration,
+    last_churn_sample_active: bool,
+    validated_in_request: Option<usize>,
     initial_capacity: usize,
     maximum_capacity: usize,
     capacity: usize,
@@ -128,7 +145,6 @@ struct Policy {
     trial_adverse_active: Duration,
     request_clean_active: Duration,
     completed_clean_active: Duration,
-    exploration_paused: bool,
     last_release: Option<Duration>,
     last_capacity_change: Option<Duration>,
     last_increase: Option<Duration>,
@@ -148,6 +164,10 @@ impl Policy {
             "adaptive memory requires a bounded expert ceiling of at least 64 slots"
         );
         Ok(Self {
+            preparation_healthy: Duration::ZERO,
+            active_churn: Duration::ZERO,
+            last_churn_sample_active: false,
+            validated_in_request: None,
             initial_capacity,
             maximum_capacity,
             capacity: initial_capacity,
@@ -163,7 +183,6 @@ impl Policy {
             trial_adverse_active: Duration::ZERO,
             request_clean_active: Duration::ZERO,
             completed_clean_active: Duration::ZERO,
-            exploration_paused: false,
             last_release: None,
             last_capacity_change: None,
             last_increase: None,
@@ -196,9 +215,6 @@ impl Policy {
                 && (MIN_CAPACITY..=capacity).contains(&target_capacity),
             "workspace phase capacity is outside its ordinary operating extent"
         );
-        if self.trial_capacity.is_some() && target_capacity < capacity {
-            return Ok(false);
-        }
         if self.stop_latched || matches!(self.state, Some(State::Warning | State::Critical)) {
             return Ok(false);
         }
@@ -218,11 +234,15 @@ impl Policy {
             .workspace_phase
             .context("workspace phase is not active")?;
         ensure!(
-            (MIN_CAPACITY..=phase.ordinary_capacity).contains(&capacity)
-                && self.trial_capacity.is_none_or(|trial| trial == capacity),
+            (MIN_CAPACITY..=phase.ordinary_capacity).contains(&capacity),
             "planned workspace change differs from the active expert extent"
         );
         if self.capacity != capacity {
+            if self.trial_capacity.is_some() {
+                self.trial_base = self.trial_base.map(|base| base.min(capacity));
+                self.trial_capacity = Some(capacity);
+                self.clear_workspace_validation();
+            }
             self.capacity = capacity;
             self.quiet_since = None;
             self.last_capacity_change = Some(now);
@@ -259,11 +279,23 @@ impl Policy {
         if let Some(phase) = self.workspace_phase.take()
             && self.capacity != phase.ordinary_capacity
         {
-            self.clear_capacity_validation();
+            self.clear_workspace_validation();
+        }
+    }
+
+    fn clear_workspace_validation(&mut self) {
+        let adverse = self.trial_adverse_active;
+        self.clear_capacity_validation();
+        if self.trial_capacity.is_some() {
+            self.trial_adverse_active = adverse;
         }
     }
 
     fn clear_capacity_validation(&mut self) {
+        self.preparation_healthy = Duration::ZERO;
+        self.active_churn = Duration::ZERO;
+        self.last_churn_sample_active = false;
+        self.validated_in_request = None;
         self.request_clean_active = Duration::ZERO;
         self.completed_clean_active = Duration::ZERO;
         self.last_sample_active = false;
@@ -272,6 +304,8 @@ impl Policy {
     }
 
     fn begin_request(&mut self, now: Duration) {
+        self.last_churn_sample_active = false;
+        self.validated_in_request = None;
         self.request_started = Some(now);
         self.request_clean_active = Duration::ZERO;
         self.last_sample_active = false;
@@ -279,6 +313,8 @@ impl Policy {
     }
 
     fn end_request(&mut self, now: Duration, completed: bool) {
+        let validated = self.validated_in_request.take();
+        self.last_churn_sample_active = false;
         let was_active = self.request_started.take().is_some();
         self.last_sample_active = false;
         self.last_sample_trial_active = false;
@@ -292,6 +328,12 @@ impl Policy {
             && self.validation_extent_matches(self.capacity)
             && matches!(self.state, Some(State::NormalQuiet | State::NormalBusy))
         {
+            if let Some(target) = validated.filter(|target| *target < self.capacity) {
+                self.earned_target = Some(self.earned_target.unwrap_or(0).max(target));
+                if self.trial_capacity == Some(self.capacity) {
+                    self.trial_base = Some(self.trial_base.unwrap_or(target).max(target));
+                }
+            }
             self.completed_clean_active = self
                 .completed_clean_active
                 .saturating_add(self.request_clean_active)
@@ -304,7 +346,6 @@ impl Policy {
                     self.trial_capacity = None;
                     self.trial_adverse_active = Duration::ZERO;
                 }
-                self.exploration_paused = false;
                 if accepted_trial {
                     self.retry_delay = RECOVERY_COOLDOWN;
                     self.retry_not_before = None;
@@ -370,35 +411,34 @@ impl Policy {
             && self.retry_not_before.is_none_or(|until| now >= until)
     }
 
-    fn growth_eligibility(
-        &self,
-        now: Duration,
-        capacity: usize,
-        boundary: Boundary,
-    ) -> GrowthEligibility {
+    fn growth_eligibility(&self, now: Duration, capacity: usize) -> GrowthEligibility {
         if self.workspace_phase.is_some()
             || capacity >= self.maximum_capacity
-            || capacity >= self.target(capacity)
+            || self.stop_latched
             || self.state != Some(State::NormalQuiet)
-            || self.retry_not_before.is_some_and(|until| now < until)
             || !self.settled(now)
-            || boundary == Boundary::Observe
         {
             GrowthEligibility::Hold
         } else if self.is_restoring(capacity) {
             GrowthEligibility::Restore
         } else if self.trial_capacity.is_some()
-            || self.exploration_paused
-            || self.completed_clean_active < ACTIVE_VALIDATION
+            && (if self.request_started.is_some() {
+                self.completed_clean_active + self.request_clean_active < ACTIVE_VALIDATION
+            } else {
+                !self.completed_clean_active.is_zero()
+            })
         {
+            // Preserve partial serving credit until it can qualify this extent.
+            GrowthEligibility::Hold
+        } else if self.trial_capacity.is_some() && self.preparation_healthy < ACTIVE_VALIDATION {
             GrowthEligibility::Hold
         } else {
             GrowthEligibility::Trial
         }
     }
 
-    fn recovery_action(&self, now: Duration, capacity: usize, boundary: Boundary) -> Action {
-        match self.growth_eligibility(now, capacity, boundary) {
+    fn recovery_action(&self, now: Duration, capacity: usize) -> Action {
+        match self.growth_eligibility(now, capacity) {
             GrowthEligibility::Restore | GrowthEligibility::Trial => {
                 Action::Recover(self.next_capacity(capacity))
             }
@@ -406,7 +446,7 @@ impl Policy {
         }
     }
 
-    fn cached_action(&self, now: Duration, capacity: usize, boundary: Boundary) -> Action {
+    fn cached_action(&self, now: Duration, capacity: usize) -> Action {
         let fresh = self.last_sample.is_some_and(|last| {
             now.checked_sub(last)
                 .is_some_and(|dt| dt <= SAMPLE_INTERVAL)
@@ -417,21 +457,24 @@ impl Policy {
         if self.stop_latched && capacity == MIN_CAPACITY {
             return Action::Stop;
         }
-        self.recovery_action(now, capacity, boundary)
+        self.recovery_action(now, capacity)
     }
 
     fn pressure_interrupted_work(&mut self, now: Duration) {
+        self.interrupted_work(now, false);
+    }
+
+    fn interrupted_work(&mut self, now: Duration, always_backoff: bool) {
         let pending_trial = self.trial_capacity.take().is_some();
         self.trial_base = None;
         let recent_increase = self.last_increase.take().is_some_and(|increased| {
             now.checked_sub(increased)
                 .is_some_and(|dt| dt <= ACTIVE_VALIDATION)
         });
-        if pending_trial || recent_increase {
+        if pending_trial || recent_increase || always_backoff {
             self.retry_delay = (self.retry_delay * 2).min(Duration::from_secs(120));
             self.retry_not_before = Some(now.saturating_add(self.retry_delay));
         }
-        self.exploration_paused = true;
         self.clear_capacity_validation();
     }
 
@@ -448,6 +491,7 @@ impl Policy {
         self.capacity = capacity;
         let elapsed = self.last_sample.and_then(|last| now.checked_sub(last));
         let gap = elapsed.is_none_or(|dt| dt > SAMPLE_GAP_LIMIT);
+        let active_churn = self.observe_churn(boundary, observation, elapsed);
         let quiet = observation
             .counters
             .zip(self.previous_counters)
@@ -466,7 +510,8 @@ impl Policy {
         };
         let request_active =
             self.request_started.is_some() && self.validation_extent_matches(capacity);
-        let trial_active = boundary == Boundary::CompletedOperation && request_active;
+        let trial_active = self.workspace_phase.is_none()
+            || (self.request_started.is_some() && boundary == Boundary::CompletedOperation);
         // Adverse intervals belong only to the unaccepted trial. Request failure
         // discards healthy credit but cannot erase observed activity at that extent.
         if self.trial_capacity == Some(capacity)
@@ -474,9 +519,7 @@ impl Policy {
             && !gap
             && trial_active
             && self.last_sample_trial_active
-            && self
-                .request_started
-                .is_some_and(|started| self.last_sample.is_some_and(|last| started <= last))
+            && self.trial_interval_started()
         {
             self.trial_adverse_active = self
                 .trial_adverse_active
@@ -503,6 +546,7 @@ impl Policy {
             }
         }
         self.last_sample_active = state == State::NormalQuiet && request_active;
+        self.observe_preparation_span(state, elapsed, gap);
         self.last_sample = Some(now);
         self.previous_counters = observation.counters;
         if matches!(state, State::Warning | State::Critical)
@@ -515,6 +559,9 @@ impl Policy {
             self.stop_latched = false;
         }
         self.state = Some(state);
+        let trial_rollback = self
+            .trial_base
+            .filter(|base| self.trial_capacity == Some(capacity) && *base < capacity);
         let action = match state {
             State::Critical if capacity > MIN_CAPACITY => {
                 self.critical_at_floor = true;
@@ -543,24 +590,41 @@ impl Policy {
                     Action::Hold
                 }
             }
-            State::NormalQuiet => self.recovery_action(now, capacity, boundary),
-            State::NormalBusy if self.trial_adverse_active >= ACTIVE_VALIDATION => self
-                .trial_base
-                .filter(|_| self.trial_capacity == Some(capacity))
-                .map_or(Action::Hold, |base| {
-                    Action::Rollback(
-                        (base / GROWTH_STEP_SLOTS * GROWTH_STEP_SLOTS).max(MIN_CAPACITY),
+            State::NormalQuiet => self.recovery_action(now, capacity),
+            State::NormalBusy
+                if self.trial_adverse_active >= ACTIVE_VALIDATION && trial_rollback.is_some() =>
+            {
+                Action::Rollback(
+                    (trial_rollback.unwrap() / GROWTH_STEP_SLOTS * GROWTH_STEP_SLOTS)
+                        .max(MIN_CAPACITY),
+                )
+            }
+            _ if active_churn && capacity > MIN_CAPACITY => Action::ChurnRelease(
+                self.trial_base
+                    .filter(|base| *base < capacity)
+                    .map_or(
+                        (capacity - 1) / GROWTH_STEP_SLOTS * GROWTH_STEP_SLOTS,
+                        |base| base / GROWTH_STEP_SLOTS * GROWTH_STEP_SLOTS,
                     )
-                }),
+                    .max(MIN_CAPACITY),
+            ),
             _ => Action::Hold,
         };
         Some(action)
     }
 
     fn capacity_changed(&mut self, now: Duration, old_capacity: usize, new_capacity: usize) {
+        let validated = self.validation_before_growth(new_capacity);
+        let pending_adversity = (new_capacity > old_capacity
+            && self.trial_capacity == Some(old_capacity))
+        .then_some(self.trial_adverse_active);
         self.capacity = new_capacity;
         self.quiet_since = None;
         self.clear_capacity_validation();
+        self.validated_in_request = validated;
+        if let Some(adverse) = pending_adversity {
+            self.trial_adverse_active = adverse;
+        }
         self.last_capacity_change = Some(now);
         if new_capacity > old_capacity {
             self.last_increase = Some(now);
@@ -568,7 +632,8 @@ impl Policy {
                 .earned_target
                 .is_some_and(|target| new_capacity <= target)
             {
-                self.trial_base = Some(old_capacity);
+                let base = self.trial_base.unwrap_or(old_capacity);
+                self.trial_base = Some(base);
                 self.trial_capacity = Some(new_capacity);
             }
         } else if new_capacity < old_capacity {
@@ -578,10 +643,86 @@ impl Policy {
         }
     }
 
+    fn trial_interval_started(&self) -> bool {
+        if self.workspace_phase.is_none() {
+            return true;
+        }
+        self.request_started
+            .is_some_and(|started| self.last_sample.is_some_and(|last| started <= last))
+    }
+
     fn recovery_failed(&mut self, now: Duration) {
         self.quiet_since = None;
         self.retry_delay = (self.retry_delay * 2).min(Duration::from_secs(120));
         self.retry_not_before = Some(now.saturating_add(self.retry_delay));
+    }
+
+    fn observe_churn(
+        &mut self,
+        boundary: Boundary,
+        observation: Observation,
+        elapsed: Option<Duration>,
+    ) -> bool {
+        let active = boundary == Boundary::CompletedOperation && self.request_started.is_some();
+        let interval_active = active
+            && self.last_churn_sample_active
+            && self
+                .request_started
+                .is_some_and(|started| self.last_sample.is_some_and(|last| last >= started));
+        let churn = observation
+            .counters
+            .zip(self.previous_counters)
+            .zip(elapsed)
+            .and_then(|((after, before), dt)| after.churning_since(before, dt));
+        if interval_active && observation.pressure == Some(Pressure::Normal) {
+            // Long completed-operation intervals may themselves be stalls.
+            // Valid rate observations contribute at most one sample-gap limit;
+            // they never earn healthy active-work validation.
+            let credit = elapsed.unwrap_or_default().min(SAMPLE_GAP_LIMIT);
+            self.active_churn = match churn {
+                Some(true) => self
+                    .active_churn
+                    .saturating_add(credit)
+                    .min(ACTIVE_VALIDATION),
+                Some(false) => self.active_churn.saturating_sub(credit),
+                None => Duration::ZERO,
+            };
+        } else if !active || observation.pressure != Some(Pressure::Normal) || churn.is_none() {
+            self.active_churn = Duration::ZERO;
+        }
+        self.last_churn_sample_active = active;
+        self.active_churn >= ACTIVE_VALIDATION
+    }
+
+    fn validation_before_growth(&self, new_capacity: usize) -> Option<usize> {
+        if new_capacity <= self.capacity {
+            return None;
+        }
+        let qualified = (self.request_started.is_some()
+            && self.validation_extent_matches(self.capacity)
+            && self.completed_clean_active + self.request_clean_active >= ACTIVE_VALIDATION)
+            .then_some(self.capacity);
+        self.validated_in_request.max(qualified)
+    }
+
+    fn observe_preparation_span(&mut self, state: State, elapsed: Option<Duration>, gap: bool) {
+        if self.workspace_phase.is_some()
+            || state != State::NormalQuiet
+            || self.state != Some(State::NormalQuiet)
+            || gap
+            || !self.last_sample.is_some_and(|last| {
+                self.last_capacity_change
+                    .is_none_or(|changed| last >= changed)
+            })
+        {
+            return;
+        }
+        self.preparation_healthy = self
+            .preparation_healthy
+            .saturating_add(elapsed.unwrap())
+            .min(ACTIVE_VALIDATION);
+        // Quiet storage permits another bounded preparation, not active-work
+        // acceptance. The entire unvalidated extent retains its rollback base.
     }
 }
 
@@ -597,8 +738,7 @@ pub struct Controller {
 
 impl Controller {
     /// Freeze adaptive allocation during a caller-budgeted workspace phase.
-    /// A fitting trial keeps its extent and validation; a trial that would be
-    /// temporarily reduced retains ordinary execution.
+    /// Provisional storage can yield space without losing its rollback base.
     pub(crate) fn try_begin_workspace_phase(
         &mut self,
         engine: &Engine,
@@ -702,6 +842,11 @@ impl Controller {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pending_trial(&self) -> Option<(usize, usize)> {
+        self.policy.trial_base.zip(self.policy.trial_capacity)
+    }
+
     fn now(&self) -> Duration {
         #[cfg(test)]
         if let Some((now, _)) = self.fixed_observation {
@@ -739,7 +884,7 @@ impl Controller {
         self.policy.end_request(now, completed);
     }
 
-    /// Poll after completed engine work. Growth remains inside the admitted
+    /// Poll at a serialized owner boundary. Growth remains inside the admitted
     /// operating envelope; persistent critical pressure at the floor refuses work.
     pub fn check_boundary(&mut self, engine: &mut Engine, boundary: Boundary) -> Result<bool> {
         #[cfg(test)]
@@ -762,14 +907,14 @@ impl Controller {
     pub(crate) fn check_with_observation(
         &mut self,
         engine: &mut Engine,
-        allow_recovery: bool,
+        starting_request: bool,
         now: Duration,
         pressure_level: Option<i32>,
         counters: Option<(u64, u64)>,
     ) -> Result<bool> {
         self.apply_observation(
             engine,
-            if allow_recovery {
+            if starting_request {
                 Boundary::RequestStart
             } else if self.policy.request_started.is_some() {
                 Boundary::CompletedOperation
@@ -806,29 +951,15 @@ impl Controller {
         {
             action
         } else {
-            self.policy.cached_action(now, capacity, boundary)
+            self.policy.cached_action(now, capacity)
         };
         match action {
             Action::Hold => Ok(false),
             Action::Stop => {
                 bail!("adaptive memory: critical pressure persists at the 64-slot expert floor")
             }
-            Action::Release(target) | Action::Rollback(target) => {
-                let report = engine.shrink_expert_capacity(target)?;
-                self.pressure_release_epoch += 1;
-                let reason = if matches!(action, Action::Rollback(_)) {
-                    self.policy.pressure_interrupted_work(now);
-                    "trial-active-vm-churn"
-                } else {
-                    "system-pressure"
-                };
-                self.policy
-                    .capacity_changed(now, report.old_capacity, report.new_capacity);
-                eprintln!(
-                    "adaptive memory: released capacity={} -> {} requested_bytes={} reason={reason}",
-                    report.old_capacity, report.new_capacity, report.released_requested_bytes
-                );
-                Ok(true)
+            Action::Release(target) | Action::Rollback(target) | Action::ChurnRelease(target) => {
+                self.release_capacity(engine, target, action, now)
             }
             Action::Recover(target) => {
                 let mode = self.policy.mode(capacity);
@@ -861,9 +992,42 @@ impl Controller {
             }
         }
     }
+
+    fn release_capacity(
+        &mut self,
+        engine: &mut Engine,
+        target: usize,
+        action: Action,
+        now: Duration,
+    ) -> Result<bool> {
+        let report = engine.shrink_expert_capacity(target)?;
+        self.pressure_release_epoch += 1;
+        let reason = match action {
+            Action::Rollback(_) => {
+                self.policy.pressure_interrupted_work(now);
+                "trial-active-vm-churn"
+            }
+            Action::ChurnRelease(_) => {
+                self.policy.interrupted_work(now, true);
+                "sustained-active-vm-churn"
+            }
+            _ => "system-pressure",
+        };
+        self.policy
+            .capacity_changed(now, report.old_capacity, report.new_capacity);
+        eprintln!(
+            "adaptive memory: released capacity={} -> {} requested_bytes={} reason={reason}",
+            report.old_capacity, report.new_capacity, report.released_requested_bytes
+        );
+        Ok(true)
+    }
 }
 
 fn pressure() -> Option<Pressure> {
+    raw_pressure().and_then(Pressure::from_raw)
+}
+
+fn raw_pressure() -> Option<i32> {
     let mut raw = 0i32;
     let mut length = size_of::<i32>();
     // SAFETY: The NUL-terminated name and scalar output are valid for this
@@ -877,9 +1041,7 @@ fn pressure() -> Option<Pressure> {
             0,
         )
     };
-    (status == 0 && length == size_of::<i32>())
-        .then(|| Pressure::from_raw(raw))
-        .flatten()
+    (status == 0 && length == size_of::<i32>()).then_some(raw)
 }
 
 unsafe extern "C" {
@@ -937,6 +1099,9 @@ fn observe() -> Observation {
 }
 
 #[cfg(test)]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -970,7 +1135,7 @@ mod tests {
         complete_work(&mut policy, 0, 16, 187, 0);
         assert_eq!(policy.earned_target, Some(187));
         assert_eq!(
-            policy.cached_action(Duration::from_secs(16), 187, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(16), 187),
             Action::Recover(192)
         );
         policy.capacity_changed(Duration::from_secs(16), 187, 192);
@@ -979,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn earned_tail_keeps_observation_work_boundary_and_backoff_gates() {
+    fn earned_tail_keeps_fresh_observation_and_backoff_gates() {
         let ready = || {
             let mut policy = Policy::new(201, 201).unwrap();
             complete_work(&mut policy, 0, 16, 201, 0);
@@ -993,29 +1158,16 @@ mod tests {
         };
         let now = Duration::from_secs(23);
         let mut policy = ready();
+        assert_eq!(policy.cached_action(now, 187), Action::Recover(201));
         assert_eq!(
-            policy.cached_action(now, 187, Boundary::CompletedOperation),
-            Action::Recover(201)
-        );
-        assert_eq!(
-            policy.cached_action(now, 187, Boundary::Observe),
-            Action::Hold
-        );
-        assert_eq!(
-            policy.cached_action(now + Duration::from_secs(2), 187, Boundary::RequestStart),
+            policy.cached_action(now + Duration::from_secs(2), 187),
             Action::Hold
         );
         policy.recovery_failed(now);
-        assert_eq!(
-            policy.cached_action(now, 187, Boundary::RequestStart),
-            Action::Hold
-        );
+        assert_eq!(policy.cached_action(now, 187), Action::Hold);
         let mut policy = ready();
         assert!(policy.try_begin_workspace_phase(187, 187, 0).unwrap());
-        assert_eq!(
-            policy.cached_action(now, 187, Boundary::RequestStart),
-            Action::Hold
-        );
+        assert_eq!(policy.cached_action(now, 187), Action::Hold);
         for (observation, expected) in [
             (normal(1024, 0), Action::Hold),
             (normal(0, 1), Action::Hold),
@@ -1084,10 +1236,10 @@ mod tests {
 
     fn quiet_for(policy: &mut Policy, first: u64, last: u64, capacity: usize) {
         for seconds in first..=last {
-            assert_eq!(
+            assert!(matches!(
                 step(policy, seconds, capacity, Boundary::Observe, normal(0, 0)),
-                Action::Hold
-            );
+                Action::Hold | Action::Recover(_)
+            ));
         }
     }
 
@@ -1100,7 +1252,8 @@ mod tests {
     ) {
         policy.begin_request(Duration::from_secs(first));
         for seconds in first..=last {
-            assert_eq!(
+            // Isolate validation at this extent without applying growth offers.
+            assert!(matches!(
                 step(
                     policy,
                     seconds,
@@ -1108,8 +1261,8 @@ mod tests {
                     Boundary::Observe,
                     normal(compressions, 0)
                 ),
-                Action::Hold
-            );
+                Action::Hold | Action::Recover(_)
+            ));
         }
         policy.end_request(Duration::from_secs(last), true);
     }
@@ -1131,9 +1284,6 @@ mod tests {
             );
         }
         let credit = policy.request_clean_active;
-        assert!(!policy.try_begin_workspace_phase(112, 96, 0).unwrap());
-        assert!(policy.workspace_phase.is_none());
-        assert_eq!(policy.request_clean_active, credit);
         assert!(policy.try_begin_workspace_phase(112, 112, 0).unwrap());
         policy
             .sync_planned_workspace_capacity(Duration::from_secs(26), 112)
@@ -1176,14 +1326,14 @@ mod tests {
             Action::Hold
         );
         assert_eq!(
-            policy.cached_action(Duration::from_millis(17_500), 96, Boundary::RequestStart),
+            policy.cached_action(Duration::from_millis(17_500), 96),
             Action::Hold
         );
         assert_eq!(policy.trial_capacity, None);
         assert_eq!(policy.completed_clean_active, ACTIVE_VALIDATION);
         policy.finish_workspace_phase();
         assert_eq!(
-            policy.cached_action(Duration::from_millis(17_500), 96, Boundary::RequestStart),
+            policy.cached_action(Duration::from_millis(17_500), 96),
             Action::Recover(112)
         );
     }
@@ -1203,7 +1353,7 @@ mod tests {
                     Boundary::CompletedOperation,
                     normal(0, 0)
                 ),
-                Action::Hold
+                Action::Recover(112)
             );
         }
         assert_eq!(policy.request_clean_active, Duration::from_secs(1));
@@ -1404,7 +1554,7 @@ mod tests {
             Action::Stop
         );
         assert_eq!(
-            policy.cached_action(Duration::from_millis(2500), 64, Boundary::RequestStart),
+            policy.cached_action(Duration::from_millis(2500), 64),
             Action::Stop
         );
         assert!(Policy::new(64, 511).is_ok());
@@ -1416,65 +1566,14 @@ mod tests {
         complete_work(&mut policy, 0, 16, 64, 0);
         assert_eq!(policy.earned_target, Some(64));
         assert_eq!(
-            policy.cached_action(Duration::from_secs(17), 64, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(17), 64),
             Action::Recover(80)
         );
         let mut fixed_floor = Policy::new(64, 64).unwrap();
         complete_work(&mut fixed_floor, 0, 16, 64, 0);
         assert_eq!(
-            fixed_floor.cached_action(Duration::from_secs(17), 64, Boundary::RequestStart),
+            fixed_floor.cached_action(Duration::from_secs(17), 64),
             Action::Hold
-        );
-    }
-
-    #[test]
-    fn idle_time_does_not_earn_or_allocate_capacity() {
-        let mut policy = Policy::new(147, 204).unwrap();
-        quiet_for(&mut policy, 0, 500, 147);
-        assert_eq!(policy.earned_target, None);
-        assert_eq!(policy.completed_clean_active, Duration::ZERO);
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(500), 147, Boundary::RequestStart),
-            Action::Hold
-        );
-        complete_work(&mut policy, 501, 516, 147, 0);
-        assert_eq!(policy.earned_target, Some(147));
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(516), 147, Boundary::Observe),
-            Action::Hold
-        );
-    }
-
-    #[test]
-    fn startup_admission_is_unproven_and_each_new_trial_needs_completed_work() {
-        let mut policy = Policy::new(147, 204).unwrap();
-        assert_eq!(policy.earned_target, None);
-        complete_work(&mut policy, 0, 16, 147, 0);
-        assert_eq!(policy.earned_target, Some(147));
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(16), 147, Boundary::CompletedOperation),
-            Action::Recover(160)
-        );
-        policy.capacity_changed(Duration::from_secs(16), 147, 160);
-        assert_eq!(policy.trial_base, Some(147));
-        assert_eq!(policy.trial_capacity, Some(160));
-        quiet_for(&mut policy, 17, 100, 160);
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(100), 160, Boundary::RequestStart),
-            Action::Hold
-        );
-        policy.begin_request(Duration::from_secs(101));
-        quiet_for(&mut policy, 101, 116, 160);
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(116), 160, Boundary::CompletedOperation),
-            Action::Hold
-        );
-        policy.end_request(Duration::from_secs(116), true);
-        assert_eq!(policy.earned_target, Some(160));
-        assert_eq!(policy.trial_capacity, None);
-        assert_eq!(
-            policy.cached_action(Duration::from_secs(116), 160, Boundary::CompletedOperation),
-            Action::Recover(176)
         );
     }
 
@@ -1500,7 +1599,7 @@ mod tests {
         policy.end_request(Duration::from_secs(18), true);
         assert_eq!(policy.earned_target, Some(147));
         assert_eq!(
-            policy.cached_action(Duration::from_secs(18), 147, Boundary::CompletedOperation),
+            policy.cached_action(Duration::from_secs(18), 147),
             Action::Recover(160)
         );
     }
@@ -1525,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_preserves_earned_target_and_restores_at_active_operation_boundaries() {
+    fn pressure_preserves_earned_target_and_permits_settled_recovery() {
         let mut policy = Policy::new(147, 204).unwrap();
         complete_work(&mut policy, 0, 16, 147, 0);
         assert_eq!(
@@ -1540,19 +1639,18 @@ mod tests {
         );
         policy.capacity_changed(Duration::from_secs(17), 147, 144);
         assert_eq!(policy.earned_target, Some(147));
-        assert!(policy.exploration_paused);
         policy.begin_request(Duration::from_secs(18));
         quiet_for(&mut policy, 18, 24, 144);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(24), 144, Boundary::CompletedOperation),
+            policy.cached_action(Duration::from_secs(24), 144),
             Action::Recover(147)
         );
         assert_eq!(policy.completed_clean_active, Duration::ZERO);
         policy.capacity_changed(Duration::from_secs(24), 144, 147);
         quiet_for(&mut policy, 25, 30, 147);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(30), 147, Boundary::CompletedOperation),
-            Action::Hold
+            policy.cached_action(Duration::from_secs(30), 147),
+            Action::Recover(160)
         );
         assert_eq!(policy.earned_target, Some(147));
     }
@@ -1575,12 +1673,12 @@ mod tests {
         assert_eq!(policy.completed_clean_active, ACTIVE_VALIDATION);
         assert_eq!(policy.quiet_since, None);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(17), 147, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(17), 147),
             Action::Hold
         );
         quiet_for(&mut policy, 18, 24, 147);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(24), 147, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(24), 147),
             Action::Recover(160)
         );
         assert_eq!(
@@ -1617,17 +1715,16 @@ mod tests {
         policy.capacity_changed(Duration::from_secs(17), 160, 144);
         quiet_for(&mut policy, 18, 26, 144);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(26), 144, Boundary::CompletedOperation),
+            policy.cached_action(Duration::from_secs(26), 144),
             Action::Hold
         );
         step(&mut policy, 27, 144, Boundary::Observe, normal(0, 0));
         assert_eq!(
-            policy.cached_action(Duration::from_secs(27), 144, Boundary::CompletedOperation),
+            policy.cached_action(Duration::from_secs(27), 144),
             Action::Recover(147)
         );
         policy.capacity_changed(Duration::from_secs(27), 144, 147);
         complete_work(&mut policy, 28, 44, 147, 0);
-        assert!(!policy.exploration_paused);
         assert_eq!(policy.retry_delay, Duration::from_secs(10));
         assert_eq!(policy.retry_not_before, Some(Duration::from_secs(27)));
     }
@@ -1678,11 +1775,11 @@ mod tests {
             Action::Stop
         );
         assert_eq!(
-            policy.cached_action(Duration::from_millis(7500), 64, Boundary::RequestStart),
+            policy.cached_action(Duration::from_millis(7500), 64),
             Action::Stop
         );
         assert_eq!(
-            policy.cached_action(Duration::from_secs(9), 64, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(9), 64),
             Action::Hold
         );
     }
@@ -1695,12 +1792,12 @@ mod tests {
         assert_eq!(policy.earned_target, Some(147));
         assert_eq!(policy.completed_clean_active, ACTIVE_VALIDATION);
         assert_eq!(
-            policy.cached_action(Duration::from_millis(16500), 147, Boundary::RequestStart),
+            policy.cached_action(Duration::from_millis(16500), 147),
             Action::Hold
         );
         quiet_for(&mut policy, 17, 26, 147);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(26), 147, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(26), 147),
             Action::Recover(160)
         );
     }
@@ -1743,7 +1840,11 @@ mod tests {
                     Boundary::CompletedOperation,
                     normal(1024, 0)
                 ),
-                Action::Hold
+                if second >= 35 {
+                    Action::Recover(176)
+                } else {
+                    Action::Hold
+                }
             );
         }
         policy.end_request(Duration::from_secs(36), true);
@@ -1796,11 +1897,7 @@ mod tests {
         // An action recommendation leaves the pending trial intact until release succeeds.
         assert_eq!(policy.retry_not_before, None);
         assert_eq!(
-            policy.cached_action(
-                Duration::from_millis(37_500),
-                160,
-                Boundary::CompletedOperation
-            ),
+            policy.cached_action(Duration::from_millis(37_500), 160),
             Action::Hold
         );
         assert!(
@@ -1817,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_boundaries_gaps_and_invalid_counters_do_not_charge_the_trial() {
+    fn idle_trial_adversity_counts_but_gaps_and_invalid_counters_do_not() {
         let mut policy = open_trial(145, 160);
         policy.begin_request(Duration::from_secs(18));
         step(
@@ -1836,15 +1933,16 @@ mod tests {
         );
         policy.end_request(Duration::from_secs(19), true);
         step(&mut policy, 20, 160, Boundary::Observe, normal(2048, 0));
-        policy.begin_request(Duration::from_secs(21));
+        step(&mut policy, 21, 160, Boundary::Observe, normal(3072, 0));
+        policy.begin_request(Duration::from_secs(22));
         step(
             &mut policy,
-            21,
+            22,
             160,
             Boundary::CompletedOperation,
-            normal(3072, 0),
+            normal(4096, 0),
         );
-        assert_eq!(policy.trial_adverse_active, Duration::from_secs(1));
+        assert_eq!(policy.trial_adverse_active, Duration::from_secs(2));
         step(
             &mut policy,
             30,
@@ -1878,7 +1976,7 @@ mod tests {
             Boundary::CompletedOperation,
             normal(1024, 0),
         );
-        assert_eq!(policy.trial_adverse_active, Duration::from_secs(1));
+        assert_eq!(policy.trial_adverse_active, Duration::from_secs(2));
         step(
             &mut policy,
             34,
@@ -1886,11 +1984,11 @@ mod tests {
             Boundary::CompletedOperation,
             normal(2048, 0),
         );
-        assert_eq!(policy.trial_adverse_active, Duration::from_secs(2));
+        assert_eq!(policy.trial_adverse_active, Duration::from_secs(3));
     }
 
     #[test]
-    fn accepted_capacity_is_not_released_for_normal_vm_activity() {
+    fn accepted_capacity_is_not_released_for_one_way_compression() {
         let mut policy = Policy::new(145, 204).unwrap();
         complete_work(&mut policy, 0, 16, 145, 0);
         policy.begin_request(Duration::from_secs(17));
@@ -1929,27 +2027,26 @@ mod tests {
         assert_eq!(policy.earned_target, Some(145));
         assert_eq!(policy.trial_capacity, None);
         assert_eq!(policy.trial_adverse_active, Duration::ZERO);
-        assert!(policy.exploration_paused);
         assert_eq!(policy.retry_not_before, Some(Duration::from_secs(28)));
         quiet_for(&mut policy, 19, 27, 144);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(27), 144, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(27), 144),
             Action::Hold
         );
         step(&mut policy, 28, 144, Boundary::Observe, normal(0, 0));
         assert_eq!(
-            policy.cached_action(Duration::from_secs(28), 144, Boundary::RequestStart),
+            policy.cached_action(Duration::from_secs(28), 144),
             Action::Recover(145)
         );
         policy.capacity_changed(Duration::from_secs(28), 144, 145);
         quiet_for(&mut policy, 29, 34, 145);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(34), 145, Boundary::RequestStart),
-            Action::Hold
+            policy.cached_action(Duration::from_secs(34), 145),
+            Action::Recover(160)
         );
         complete_work(&mut policy, 35, 51, 145, 0);
         assert_eq!(
-            policy.cached_action(Duration::from_secs(51), 145, Boundary::CompletedOperation),
+            policy.cached_action(Duration::from_secs(51), 145),
             Action::Recover(160)
         );
         assert_eq!(policy.retry_delay, Duration::from_secs(10));
