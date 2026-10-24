@@ -4,6 +4,9 @@
 pub(crate) mod adaptive_memory;
 
 #[cfg(target_os = "macos")]
+pub mod ane;
+
+#[cfg(target_os = "macos")]
 mod decode_handoff;
 pub mod decoder;
 pub mod dense_batch;

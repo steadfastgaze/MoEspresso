@@ -292,7 +292,7 @@ mod gpu {
         ) -> Result<()> {
             ensure!(
                 (1..=crate::prefill_capacity::MAX_ROWS).contains(&tokens),
-                "pending KVarN chunk must contain 1 through 4096 tokens"
+                "pending KVarN chunk exceeds supported prefill capacity"
             );
             ensure!(
                 frontier.checked_add(tokens).is_some_and(|n| n <= context),

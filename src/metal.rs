@@ -23,6 +23,7 @@ use objc2_metal::{
 };
 
 mod residency;
+pub(crate) use residency::FixedResidency;
 pub(crate) use residency::PrefillResidencyGuard;
 
 static NEXT_OWNER_ID: AtomicUsize = AtomicUsize::new(1);

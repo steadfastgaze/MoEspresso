@@ -14,11 +14,27 @@ pub const METAL_SOURCE: &str = include_str!("../kernels/metal/gdn_batch.metal");
 pub fn next_frontier(frontier: u64, rows: usize) -> Result<u64> {
     ensure!(
         (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-        "GDN batch supports 2 through 4096 rows"
+        "GDN batch supports 2 through {} rows",
+        crate::prefill_capacity::MAX_ROWS
     );
     frontier
         .checked_add(rows as u64)
         .ok_or_else(|| anyhow::anyhow!("GDN batch frontier overflow"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_chunk_extent(
+    frontier: u64,
+    rows: usize,
+    capacity: usize,
+    hidden_bytes: usize,
+) -> Result<()> {
+    next_frontier(frontier, rows)?;
+    ensure!(
+        rows <= capacity && hidden_bytes >= rows * HIDDEN * 2,
+        "GDN chunk exceeds workspace"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -148,6 +164,12 @@ mod gpu {
             })
         }
 
+        /// Active BF16 `[rows, VALUE]` gate rows for the serialized owner.
+        /// The external-gate prefix does not bind or reserve this allocation.
+        pub(crate) fn external_gate_buffer(&self) -> &Buffer {
+            &self.scratch.gate
+        }
+
         pub fn byte_len(&self) -> usize {
             let s = &self.scratch;
             [
@@ -252,6 +274,18 @@ mod gpu {
     }
 
     impl GdnBatch {
+        /// Borrow the validated gate matrix without another allocation or copy.
+        pub(crate) fn gate_weight_binding(&self) -> Result<Binding<'_>> {
+            let geometry = self.gate.geometry();
+            ensure!(
+                geometry.format() == WeightFormat::Q6K
+                    && geometry.input() == HIDDEN
+                    && geometry.output() == VALUE,
+                "ANE GDN gate requires a Q6_K [6144,2560] matrix"
+            );
+            Ok(self.gate.packed_weight_binding())
+        }
+
         pub fn dense_scratch_bytes(&self, capacity: usize) -> Result<usize> {
             [&self.qkv, &self.gate, &self.beta, &self.decay, &self.output]
                 .iter()
@@ -271,12 +305,62 @@ mod gpu {
             dense: &DenseBatchScratch,
             status: &DeviceStatus,
         ) -> Result<Buffer> {
+            self.encode_chunk_prefix(batch, hidden, rows, state, workspace, dense, true)?;
+            self.encode_chunk_suffix(batch, rows, state, workspace, dense, status)
+        }
+
+        /// Encode through recurrence without touching the gate allocation.
+        /// The owner must order the matching suffix after gate publication and
+        /// drain and invalidate the request if any operation fails after flush.
+        pub(crate) fn encode_external_gate_prefix(
+            &self,
+            batch: &mut Batch,
+            hidden: &Buffer,
+            rows: usize,
+            state: &GdnState,
+            workspace: &mut GdnBatchScratch,
+            dense: &DenseBatchScratch,
+        ) -> Result<()> {
+            self.encode_chunk_prefix(batch, hidden, rows, state, workspace, dense, false)
+        }
+
+        /// Complete the matching prefix on its ordered stream after the active
+        /// gate rows are written. State publication still follows final wait.
+        pub(crate) fn encode_external_gate_suffix(
+            &self,
+            batch: &mut Batch,
+            rows: usize,
+            state: &mut GdnState,
+            workspace: &mut GdnBatchScratch,
+            dense: &DenseBatchScratch,
+            status: &DeviceStatus,
+        ) -> Result<Buffer> {
             next_frontier(state.frontier()?, rows)?;
             ensure!(
-                rows <= workspace.capacity && hidden.byte_len() >= rows * HIDDEN * 2,
-                "GDN chunk exceeds workspace"
+                rows <= workspace.capacity,
+                "GDN external gate suffix exceeds workspace"
             );
-            let scratch = &mut workspace.scratch;
+            self.encode_chunk_suffix(batch, rows, state, workspace, dense, status)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_chunk_prefix(
+            &self,
+            batch: &mut Batch,
+            hidden: &Buffer,
+            rows: usize,
+            state: &GdnState,
+            workspace: &GdnBatchScratch,
+            dense: &DenseBatchScratch,
+            include_gate: bool,
+        ) -> Result<()> {
+            validate_chunk_extent(
+                state.frontier()?,
+                rows,
+                workspace.capacity,
+                hidden.byte_len(),
+            )?;
+            let scratch = &workspace.scratch;
             let (old_conv, recurrent) = state.buffers()?;
             let count = (rows as u32).to_le_bytes();
             // SAFETY: Scratch is shared only between ordered layers. Each SIMD
@@ -285,8 +369,10 @@ mod gpu {
             unsafe {
                 self.qkv
                     .encode_rows_into(batch, hidden, &scratch.qkv, rows, dense)?;
-                self.gate
-                    .encode_rows_into(batch, hidden, &scratch.gate, rows, dense)?;
+                if include_gate {
+                    self.gate
+                        .encode_rows_into(batch, hidden, &scratch.gate, rows, dense)?;
+                }
                 self.beta
                     .encode_rows_into(batch, hidden, &scratch.beta_logits, rows, dense)?;
                 self.decay
@@ -344,6 +430,24 @@ mod gpu {
                     48 * 32 * threads,
                     threads,
                 )?;
+            }
+            Ok(())
+        }
+
+        fn encode_chunk_suffix(
+            &self,
+            batch: &mut Batch,
+            rows: usize,
+            state: &mut GdnState,
+            workspace: &mut GdnBatchScratch,
+            dense: &DenseBatchScratch,
+            status: &DeviceStatus,
+        ) -> Result<Buffer> {
+            let scratch = &mut workspace.scratch;
+            let (_, recurrent) = state.buffers()?;
+            // SAFETY: The prefix and gate producer precede these consumers on
+            // one ordered stream, retaining their allocations until completion.
+            unsafe {
                 let norm = [
                     &scratch.recurrence,
                     &scratch.gate,
@@ -563,6 +667,137 @@ mod gpu {
             })
         }
     }
+    #[cfg(test)]
+    mod external_gate_tests {
+        use super::*;
+        use half::f16;
+
+        fn matrix(input: usize, output: usize) -> DirectWeight {
+            let mut bytes = vec![0; input * output / 256 * 210];
+            for block in bytes.as_chunks_mut::<210>().0 {
+                block[192..208].fill(1);
+                block[208..210].copy_from_slice(&f16::from_f32(-0.0001).to_bits().to_le_bytes());
+            }
+            DirectWeight {
+                role: "synthetic GDN matrix".into(),
+                format: WeightFormat::Q6K,
+                shape: vec![output, input],
+                bytes,
+            }
+        }
+
+        fn raw(shape: &[usize], value: u16) -> DirectWeight {
+            DirectWeight {
+                role: "synthetic GDN parameter".into(),
+                format: WeightFormat::Bf16,
+                shape: shape.to_vec(),
+                bytes: (0..shape.iter().product())
+                    .flat_map(|_| value.to_le_bytes())
+                    .collect(),
+            }
+        }
+
+        #[test]
+        fn external_gate_prefix_keeps_gate_writable_and_matches_default_chunk() -> Result<()> {
+            let metal = Metal::new()?;
+            let qkv = matrix(HIDDEN, CONV);
+            let gate = matrix(HIDDEN, VALUE);
+            let beta = matrix(HIDDEN, HEADS);
+            let decay = matrix(HIDDEN, HEADS);
+            let output = matrix(VALUE, HIDDEN);
+            let mut conv = raw(&[CONV, 1, 4], 0);
+            for channel in 0..CONV {
+                conv.bytes[channel * 8 + 6..channel * 8 + 8]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+            }
+            let a_log = raw(&[HEADS], 0);
+            let dt_bias = raw(&[HEADS], 0);
+            let norm = raw(&[128], 0x3f80);
+            let operator = GdnBatch::new(
+                &metal,
+                GdnWeights {
+                    qkv: &qkv,
+                    gate: &gate,
+                    beta: &beta,
+                    decay: &decay,
+                    output: &output,
+                    conv: &conv,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm: &norm,
+                    eps: 1e-6,
+                },
+            )?;
+            let rows = 16;
+            let input: Vec<u8> = (0..rows * HIDDEN)
+                .flat_map(|i| {
+                    bf16::from_f32(0.125 + (i % 17) as f32 / 128.0)
+                        .to_bits()
+                        .to_le_bytes()
+                })
+                .collect();
+            let hidden = upload(&metal, &input)?;
+            let dense = DenseBatchScratch::new(&metal, operator.dense_scratch_bytes(rows)?)?;
+            let status = DeviceStatus::new(&metal)?;
+            let mut stream = metal.stream()?;
+            let mut baseline_state = GdnState::zero(&metal)?;
+            let mut baseline_scratch = GdnBatchScratch::new(&metal, rows)?;
+            let baseline_output = operator.encode_chunk(
+                stream.batch()?,
+                &hidden,
+                rows,
+                &mut baseline_state,
+                &mut baseline_scratch,
+                &dense,
+                &status,
+            )?;
+            stream.wait()?;
+            status.check()?;
+            baseline_state.publish_rows_after_wait(rows)?;
+            let expected_output = read(&baseline_output)?;
+            let expected_state = baseline_state.snapshot()?;
+            let expected_gate = read(baseline_scratch.external_gate_buffer())?;
+            finite_bf16(&expected_output, rows * HIDDEN, "synthetic GDN output")?;
+            finite_bf16(&expected_gate, rows * VALUE, "synthetic GDN gate")?;
+            assert!(
+                expected_output
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|word| u16::from_le_bytes(*word) & 0x7fff != 0)
+            );
+
+            status.reset()?;
+            let mut split_state = GdnState::zero(&metal)?;
+            let mut split_scratch = GdnBatchScratch::new(&metal, rows)?;
+            operator.encode_external_gate_prefix(
+                stream.batch()?,
+                &hidden,
+                rows,
+                &split_state,
+                &mut split_scratch,
+                &dense,
+            )?;
+            stream.flush()?;
+            split_scratch
+                .external_gate_buffer()
+                .write_bytes(0, &expected_gate)?;
+            let split_output = operator.encode_external_gate_suffix(
+                stream.batch()?,
+                rows,
+                &mut split_state,
+                &mut split_scratch,
+                &dense,
+                &status,
+            )?;
+            stream.wait()?;
+            status.check()?;
+            split_state.publish_rows_after_wait(rows)?;
+            assert_eq!(read(&split_output)?, expected_output);
+            assert_eq!(split_state.snapshot()?, expected_state);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -578,9 +813,26 @@ mod tests {
         assert_eq!(next_frontier(17, 4096).unwrap(), 4113);
         assert_eq!(next_frontier(7, 2).unwrap(), 9);
         assert_eq!(next_frontier(7, 3).unwrap(), 10);
-        for rows in [0, 1, 4097, usize::MAX] {
+        for rows in [0, 1, crate::prefill_capacity::MAX_ROWS + 1, usize::MAX] {
             assert!(next_frontier(0, rows).is_err());
         }
         assert!(next_frontier(u64::MAX - 63, 64).is_err());
+    }
+
+    #[test]
+    fn chunk_extent_checks_frontier_capacity_and_active_hidden_rows() {
+        assert!(validate_chunk_extent(7, 64, 64, 64 * HIDDEN * 2).is_ok());
+        assert!(validate_chunk_extent(7, 64, 2048, 2048 * HIDDEN * 2).is_ok());
+        assert!(validate_chunk_extent(0, 4096, 4096, 4096 * HIDDEN * 2).is_ok());
+        assert!(validate_chunk_extent(0, 64, 63, 64 * HIDDEN * 2).is_err());
+        assert!(validate_chunk_extent(0, 64, 64, 64 * HIDDEN * 2 - 1).is_err());
+        let unsupported = crate::prefill_capacity::MAX_ROWS + 1;
+        assert!(validate_chunk_extent(0, unsupported, unsupported, usize::MAX).is_err());
+        assert!(validate_chunk_extent(u64::MAX - 63, 64, 64, 64 * HIDDEN * 2).is_err());
+        {
+            assert!(validate_chunk_extent(0, 8192, 8192, 8192 * HIDDEN * 2).is_ok());
+            assert!(validate_chunk_extent(0, 8192, 4096, 8192 * HIDDEN * 2).is_err());
+            assert!(validate_chunk_extent(0, 8192, 8192, 8192 * HIDDEN * 2 - 1).is_err());
+        }
     }
 }

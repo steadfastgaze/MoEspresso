@@ -564,7 +564,7 @@ mod gpu {
             let rows = tokens.len();
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "PLE batch supports 2 through 4096 rows"
+                "PLE batch row count exceeds supported prefill capacity"
             );
             ensure!(
                 hidden_bf16.len() == rows * EXPANDED,
@@ -599,7 +599,7 @@ mod gpu {
             let rows = tokens.len();
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "PLE batch supports 2 through 4096 rows"
+                "PLE batch row count exceeds supported prefill capacity"
             );
             ensure!(
                 hidden.byte_len() >= rows * EXPANDED * 2,

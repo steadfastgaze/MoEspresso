@@ -101,7 +101,7 @@ set `enable_thinking` to `true` to override a server started with
 ## Status, queueing and cache evidence
 
 Read `/health` for the loaded package artifact ID, capacity, context limit,
-prefill width, routing and cache tiers:
+prefill width, `prefill_backend` (`gpu+ane` or `gpu`), routing and cache tiers:
 
 ```sh
 curl -sS http://127.0.0.1:8080/health

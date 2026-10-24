@@ -42,7 +42,7 @@ inline ushort db_weight(device const uchar* weights, uint row, uint k, uint K) {
 
 // BM=BN=64, BK=32, WM=WN=2. Each SIMD group owns 4x4 8x8 fragments.
 // The fragment coordinates, K traversal and serpentine MMA order match Steel.
-template<uint Codec>
+template<uint Codec, uint QsaHalf = 0>
 inline void db_gemm(
     device const uchar* weights, device const ushort* input,
     device ushort* output, device float* partials, constant uint* dims,
@@ -76,7 +76,9 @@ inline void db_gemm(
             xs[r * 40 + k] = row_base + r < M && kb + k < k_end
                 ? input[ulong(row_base + r) * K + kb + k] : ushort(0);
             ws[r * 40 + k] = col_base + r < N && kb + k < k_end
-                ? db_weight<Codec>(weights, col_base + r, kb + k, K) : ushort(0);
+                ? db_weight<Codec>(weights, QsaHalf == 0 ? col_base + r
+                    : ((col_base + r) / 256u) * 512u + (col_base + r) % 256u
+                        + (QsaHalf == 2 ? 256u : 0u), kb + k, K) : ushort(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll_count(4)
@@ -136,6 +138,17 @@ kernel void NAME(device const uchar* w [[buffer(0)]], \
 DB_KERNEL(dense_batch_bf16, 0)
 DB_KERNEL(dense_batch_q6_k, 1)
 DB_KERNEL(dense_batch_q8_0, 2)
+
+#define QSA_HALF_KERNEL(NAME, HALF) \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const ushort* x [[buffer(1)]], \
+    device ushort* y [[buffer(2)]], device float* partials [[buffer(3)]], \
+    constant uint* dims [[buffer(4)]], uint group [[threadgroup_position_in_grid]], \
+    uint tid [[thread_position_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup ushort xs[64 * 40], ws[64 * 40]; \
+    db_gemm<1, HALF>(w, x, y, partials, dims, group, tid, simd, lane, xs, ws); \
+}
+QSA_HALF_KERNEL(qsa_query_half, 1)
 
 kernel void dense_batch_split_sum(
     device const float* partials [[buffer(0)]], device ushort* output [[buffer(1)]],

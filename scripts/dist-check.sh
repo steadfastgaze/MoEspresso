@@ -8,7 +8,7 @@ distribution_work=$(mktemp -d "${TMPDIR:-/tmp}/moespresso-dist-check.XXXXXXXX")
 trap 'rm -rf "$distribution_work"' EXIT HUP INT TERM
 
 rg --files --hidden --no-ignore \
-    Cargo.toml Cargo.lock Makefile AGENTS.md README.md .gitignore \
+    Cargo.toml Cargo.lock build.rs Makefile AGENTS.md README.md .gitignore \
     LICENSE-MIT LICENSE-APACHE-2.0 THIRD-PARTY-NOTICES about.toml about.hbs \
     src kernels tests docs scripts > "$distribution_work/candidates"
 LC_ALL=C sort -u "$distribution_work/candidates" > "$distribution_work/files"
@@ -22,7 +22,7 @@ while IFS= read -r path; do
             ;;
     esac
     case "$path" in
-        Cargo.toml|Cargo.lock|Makefile|AGENTS.md|README.md|.gitignore|LICENSE-MIT|LICENSE-APACHE-2.0|THIRD-PARTY-NOTICES|about.toml|about.hbs|src/*.rs|kernels/metal/*.metal|tests/*.rs|docs/*.md|docs/assets/hero.webp|scripts/*.sh) ;;
+        Cargo.toml|Cargo.lock|build.rs|Makefile|AGENTS.md|README.md|.gitignore|LICENSE-MIT|LICENSE-APACHE-2.0|THIRD-PARTY-NOTICES|about.toml|about.hbs|src/*.rs|src/ane/native.m|src/engine/ane_prefill/pack_q6.metal|src/engine/ane_prefill/padded_unpack.metal|kernels/metal/*.metal|tests/*.rs|docs/*.md|docs/assets/hero.webp|scripts/*.sh) ;;
         *) printf 'Path is outside the source distribution allowlist: %s\n' "$path" >&2; exit 1 ;;
     esac
     if [ ! -f "$path" ] || [ -L "$path" ]; then
@@ -32,7 +32,7 @@ while IFS= read -r path; do
     printf '%s\n' "$path" >> "$distribution_work/members"
 done < "$distribution_work/files"
 
-for required in Cargo.toml Cargo.lock Makefile AGENTS.md README.md LICENSE-MIT LICENSE-APACHE-2.0 THIRD-PARTY-NOTICES about.toml about.hbs scripts/dist-check.sh; do
+for required in Cargo.toml Cargo.lock build.rs src/ane.rs src/ane/native.m src/ane/mil.rs src/engine/ane_prefill/pack_q6.metal src/engine/ane_prefill/padded_unpack.metal Makefile AGENTS.md README.md LICENSE-MIT LICENSE-APACHE-2.0 THIRD-PARTY-NOTICES about.toml about.hbs scripts/dist-check.sh; do
     rg -F -x -- "$required" "$distribution_work/members" > /dev/null || {
         printf 'Required distribution member is missing: %s\n' "$required" >&2
         exit 1
@@ -40,7 +40,10 @@ for required in Cargo.toml Cargo.lock Makefile AGENTS.md README.md LICENSE-MIT L
 done
 
 mkdir "$distribution_work/source"
-tar -cf "$distribution_work/source.tar" -T "$distribution_work/members"
+COPYFILE_DISABLE=1 tar -cf "$distribution_work/source.tar" -T "$distribution_work/members"
+tar -tf "$distribution_work/source.tar" > "$distribution_work/archive-members"
+LC_ALL=C sort "$distribution_work/archive-members" > "$distribution_work/archive-members-sorted"
+cmp "$distribution_work/members" "$distribution_work/archive-members-sorted"
 tar -xf "$distribution_work/source.tar" -C "$distribution_work/source"
 for required in Cargo.lock LICENSE-MIT LICENSE-APACHE-2.0 THIRD-PARTY-NOTICES; do
     cmp "$repository_root/$required" "$distribution_work/source/$required"

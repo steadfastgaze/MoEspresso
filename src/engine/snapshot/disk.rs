@@ -121,6 +121,14 @@ fn hash_part(hash: &mut Sha256, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn hash_numerical_producer(hash: &mut Sha256, producer: Option<&str>) -> Result<()> {
+    if let Some(producer) = producer {
+        hash_part(hash, b"moespresso-ane-prefill-numerical-producer-v1")?;
+        hash_part(hash, producer.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn scope(engine: &Engine, tokenizer: &TextTokenizer) -> Result<[u8; 32]> {
     let (manifest, assets) = tokenizer.checkpoint_identity();
     ensure!(
@@ -148,6 +156,7 @@ fn scope(engine: &Engine, tokenizer: &TextTokenizer) -> Result<[u8; 32]> {
             }],
         )?;
     }
+    hash_numerical_producer(&mut hash, engine.ane_prefill_cache_scope().as_deref())?;
     Ok(hash.finalize().into())
 }
 
@@ -676,56 +685,57 @@ mod tests {
         wide_prefill_roundtrip(4096, 10240)
     }
 
+    fn fingerprint(snapshot: &SessionSnapshot) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(snapshot.frontier.to_le_bytes());
+        for value in &snapshot.consumed_tokens {
+            hash.update(value.to_le_bytes());
+        }
+        for value in &snapshot.last_logits_bf16 {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update(snapshot.ple.offset.to_le_bytes());
+        for value in snapshot.ple.context {
+            hash.update(value.to_le_bytes());
+        }
+        for value in &snapshot.ple.conv {
+            hash.update(value.to_le_bytes());
+        }
+        for state in &snapshot.layers {
+            match state {
+                SavedLayer::Gdn(state) => {
+                    hash.update(state.frontier.to_le_bytes());
+                    hash.update(&state.conv_bf16);
+                    hash.update(&state.recurrent_f32);
+                }
+                SavedLayer::Qsa(state) => {
+                    hash.update(state.index_frontier.to_le_bytes());
+                    for value in &state.compressed_index_bf16 {
+                        hash.update(value.to_le_bytes());
+                    }
+                    for value in &state.pending_index_bf16 {
+                        hash.update(value.to_le_bytes());
+                    }
+                    hash.update(state.kv.frontier.to_le_bytes());
+                    for bytes in [
+                        &state.kv.records,
+                        &state.kv.sink_keys,
+                        &state.kv.sink_values,
+                        &state.kv.tail_keys,
+                        &state.kv.tail_values,
+                    ] {
+                        hash.update(bytes);
+                    }
+                }
+            }
+        }
+        hash.finalize().into()
+    }
+
     fn wide_prefill_roundtrip(rows: usize, prefix: usize) -> Result<()> {
         use crate::engine::PromptPrefixCache;
         use crate::package::Package;
         use crate::routing::RoutingMode;
-        fn fingerprint(snapshot: &SessionSnapshot) -> [u8; 32] {
-            let mut hash = Sha256::new();
-            hash.update(snapshot.frontier.to_le_bytes());
-            for value in &snapshot.consumed_tokens {
-                hash.update(value.to_le_bytes());
-            }
-            for value in &snapshot.last_logits_bf16 {
-                hash.update(value.to_le_bytes());
-            }
-            hash.update(snapshot.ple.offset.to_le_bytes());
-            for value in snapshot.ple.context {
-                hash.update(value.to_le_bytes());
-            }
-            for value in &snapshot.ple.conv {
-                hash.update(value.to_le_bytes());
-            }
-            for state in &snapshot.layers {
-                match state {
-                    SavedLayer::Gdn(state) => {
-                        hash.update(state.frontier.to_le_bytes());
-                        hash.update(&state.conv_bf16);
-                        hash.update(&state.recurrent_f32);
-                    }
-                    SavedLayer::Qsa(state) => {
-                        hash.update(state.index_frontier.to_le_bytes());
-                        for value in &state.compressed_index_bf16 {
-                            hash.update(value.to_le_bytes());
-                        }
-                        for value in &state.pending_index_bf16 {
-                            hash.update(value.to_le_bytes());
-                        }
-                        hash.update(state.kv.frontier.to_le_bytes());
-                        for bytes in [
-                            &state.kv.records,
-                            &state.kv.sink_keys,
-                            &state.kv.sink_values,
-                            &state.kv.tail_keys,
-                            &state.kv.tail_values,
-                        ] {
-                            hash.update(bytes);
-                        }
-                    }
-                }
-            }
-            hash.finalize().into()
-        }
         let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
         let tokenizer = TextTokenizer::load(&package)?;
         let slots = std::env::var("MOESPRESSO_TEST_EXPERT_CAPACITY")
@@ -837,6 +847,104 @@ mod tests {
             store.load_match(&engine, &tokens)?.unwrap().frontier()?,
             prefix + 1
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE, ANE support and exclusive GPU ownership"]
+    fn bounded_ane_disk_restart_preserves_state_and_rejects_gpu() -> Result<()> {
+        use crate::package::Package;
+        use crate::routing::RoutingMode;
+
+        let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+        let tokenizer = TextTokenizer::load(&package)?;
+        let root = TempRoot::new();
+        let limits = StoreLimits {
+            mode: DiskCacheMode::Full,
+            max_entries: 2,
+            max_payload_bytes: 1 << 30,
+            checkpoint: DiskLimits {
+                max_file_bytes: 1 << 30,
+                max_io_buffer_bytes: IO_BUFFER_BYTES,
+            },
+        };
+        let tokens: Vec<u32> = (0..4098).map(|i| 7 + i % 32).collect();
+        let (producer, saved, continued) = {
+            let mut engine = Engine::load_with_prefill_capacity(&package, 128, 8192, 4096)?;
+            engine.enable_ane(&package)?;
+            assert!(engine.ane_active());
+            let producer = scope(&engine, &tokenizer)?;
+            let mut session = engine.start_session()?;
+            engine.prefill_chunk(&tokens[..4096], &mut session)?;
+            assert_eq!(engine.prefill.test_projection_trace().len(), 96);
+            engine.prefill_chunk(&tokens[4096..4097], &mut session)?;
+            let saved = fingerprint(&engine.snapshot(&session)?);
+            {
+                let mut store = DiskCheckpointStore::open(&root.0, &engine, &tokenizer, limits)?;
+                assert!(store.save(&engine, &session)?);
+            }
+            engine.step(tokens[4097], RoutingMode::Unbiased, &mut session)?;
+            let continued = fingerprint(&engine.snapshot(&session)?);
+            drop(session);
+            engine.close_ane()?;
+            (producer, saved, continued)
+        };
+        let index = fs::read(root.0.join("index.json"))?;
+        {
+            let engine = Engine::load_with_prefill_capacity(&package, 96, 8192, 2048)?;
+            assert!(!engine.ane_active());
+            assert_ne!(scope(&engine, &tokenizer)?, producer);
+            let mut store = DiskCheckpointStore::open(&root.0, &engine, &tokenizer, limits)?;
+            assert!(store.load_match(&engine, &tokens)?.is_none());
+            assert_eq!(fs::read(root.0.join("index.json"))?, index);
+            drop(store);
+            engine.close_ane()?;
+        }
+        {
+            let mut engine = Engine::load_with_prefill_capacity(&package, 96, 8192, 2048)?;
+            engine.enable_ane(&package)?;
+            assert!(engine.ane_active());
+            assert_eq!(scope(&engine, &tokenizer)?, producer);
+            let mut store = DiskCheckpointStore::open(&root.0, &engine, &tokenizer, limits)?;
+            let mut session = store
+                .load_match(&engine, &tokens)?
+                .context("missing checkpoint from the matching ANE producer")?;
+            assert_eq!(session.frontier()?, 4097);
+            assert_eq!(session.consumed_tokens()?, &tokens[..4097]);
+            assert_eq!(fingerprint(&engine.snapshot(&session)?), saved);
+            engine.step(tokens[4097], RoutingMode::Unbiased, &mut session)?;
+            assert_eq!(fingerprint(&engine.snapshot(&session)?), continued);
+            drop((session, store));
+            engine.close_ane()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn numerical_scope_preserves_gpu_and_separates_producers() -> Result<()> {
+        let base = || {
+            let mut hash = Sha256::new();
+            hash.update(b"checkpoint scope fixture");
+            hash
+        };
+        let unchanged: [u8; 32] = base().finalize().into();
+        let tagged = |producer: Option<&str>| -> Result<[u8; 32]> {
+            let mut hash = base();
+            hash_numerical_producer(&mut hash, producer)?;
+            Ok(hash.finalize().into())
+        };
+        assert_eq!(tagged(None)?, unchanged);
+        let ane = tagged(Some("gdn-z-v1:layer=0:rows=2048:mode=ane"))?;
+        assert_ne!(ane, unchanged);
+        assert_eq!(ane, tagged(Some("gdn-z-v1:layer=0:rows=2048:mode=ane"))?);
+        for other in [
+            "gdn-z-v2:layer=0:rows=2048:mode=ane",
+            "gdn-z-v1:layer=1:rows=2048:mode=ane",
+            "gdn-z-v1:layer=0:rows=4096:mode=ane",
+            "gdn-z-v1:layer=0:rows=2048:mode=gpu-control",
+        ] {
+            assert_ne!(ane, tagged(Some(other))?);
+        }
         Ok(())
     }
 

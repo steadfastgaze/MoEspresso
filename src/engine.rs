@@ -22,10 +22,12 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+mod ane_prefill;
 mod device_greedy;
 mod expert_capacity;
 mod prefill;
 mod prefix_cache;
+mod qsa_gate;
 mod snapshot;
 
 pub use expert_capacity::{ExpertCapacityRecovery, ExpertCapacityRelease};
@@ -375,6 +377,9 @@ pub struct Engine {
     _expert_row_workspace: crate::package::ExpertRowWorkspace,
     identity: Rc<()>,
     cache_identity: Rc<()>,
+    session_started: std::cell::Cell<bool>,
+    ane_residency: Option<crate::metal::FixedResidency>,
+    ane_residency_failed: bool,
     package_manifest_digest: [u8; 32],
     metal: Metal,
     config: QwenConfig,
@@ -510,6 +515,127 @@ fn prefill_is_unbiased_and_decode_keeps_first_two_layers_original() {
 }
 
 impl Engine {
+    fn new_session_owner(&self) -> Rc<()> {
+        self.session_started.set(true);
+        self.identity.clone()
+    }
+
+    /// Configure combined GDN, QSA gate and shared gate/up offload before any
+    /// session or cache attachment. Admission must reserve the ANE allowance.
+    /// Initial GPU workspace width selects one retained physical program;
+    /// later workspace replacement does not change its geometry or producer.
+    /// Setup errors are returned without selecting a different producer.
+    pub fn enable_ane(&mut self, package: &Package) -> Result<()> {
+        self.validate_ane_startup(package)?;
+        if let Err(error) = crate::ane::check(|_| Ok(())) {
+            self.ane_residency_failed = !crate::ane::startup_fallback_allowed(&error);
+            return Err(error).context("ANE startup runtime check failed");
+        }
+        let mut pins = Vec::new();
+        if self.expert_capacity == 512 {
+            for layer in &mut self.layers {
+                let experts = match layer {
+                    Layer::Gdn(block) => block.experts_mut(),
+                    Layer::Qsa(block) => block.mlp.experts_mut(),
+                };
+                pins.extend(experts.full_resident_weight_buffers()?);
+            }
+        }
+        if let Err(error) = self.prefill.enable_ane(package) {
+            self.ane_residency_failed = !crate::ane::startup_fallback_allowed(&error);
+            return Err(error);
+        }
+        if self.expert_capacity == 512 {
+            match crate::metal::FixedResidency::new(&self.metal, pins) {
+                Ok(owner) => self.ane_residency = Some(owner),
+                Err(error) => {
+                    return match self.prefill.close_ane() {
+                        Ok(()) => Err(error).context("ANE expert residency setup failed"),
+                        Err(cleanup) => {
+                            self.ane_residency_failed = true;
+                            Err(cleanup).with_context(|| {
+                                format!("ANE expert residency setup failed: {error:#}; ANE cleanup failed")
+                            })
+                        }
+                    };
+                }
+            }
+        }
+        self.identity = Rc::new(());
+        self.cache_identity = Rc::new(());
+        Ok(())
+    }
+
+    /// Prefer ANE during startup, warning and retaining GPU execution only
+    /// after a setup failure with completed native cleanup. This does not
+    /// recover an engine after session creation or an inference failure.
+    pub fn prefer_ane(&mut self, package: &Package) -> Result<bool> {
+        self.validate_ane_startup(package)?;
+        match self.enable_ane(package) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if !self.ane_residency_failed && crate::ane::startup_fallback_allowed(&error) =>
+            {
+                eprintln!("⚠ ANE prefill unavailable; using GPU prefill: {error:#}");
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn validate_ane_startup(&self, package: &Package) -> Result<()> {
+        ensure!(
+            !self.session_started.get(),
+            "ANE configuration requires an engine with no previous sessions"
+        );
+        ensure!(
+            !self.ane_residency_failed,
+            "ANE residency requires a fresh engine after failure"
+        );
+        ensure!(!self.prefill.ane_active(), "ANE is already configured");
+        ensure!(
+            Rc::strong_count(&self.cache_identity) == 1,
+            "ANE configuration must precede cache attachment"
+        );
+        ensure!(
+            package.manifest_digest() == self.package_manifest_digest,
+            "ANE package differs from engine package"
+        );
+        ensure!(
+            !self.prefill.workspace_in_progress(),
+            "prefill workspace is in progress"
+        );
+        Ok(())
+    }
+
+    fn ane_prefill_cache_scope(&self) -> Option<String> {
+        self.prefill.ane_cache_scope()
+    }
+
+    /// Whether a healthy combined ANE owner is configured.
+    pub fn ane_active(&self) -> bool {
+        !self.ane_residency_failed && self.prefill.ane_active()
+    }
+
+    /// Consume the engine and report synchronous ANE unload failures.
+    pub fn close_ane(mut self) -> Result<()> {
+        ensure!(
+            !self.prefill.workspace_in_progress(),
+            "prefill workspace is in progress"
+        );
+        drop(self.ane_residency.take());
+        self.prefill.close_ane()
+    }
+
+    fn finish_ane_call<T>(&mut self, result: Result<T>) -> Result<T> {
+        // Inner streams and progress guards have retired before this boundary.
+        if result.is_err() && self.prefill.ane_active() {
+            drop(self.ane_residency.take());
+            self.ane_residency_failed = true;
+        }
+        result
+    }
+
     fn decode_backing_growth(&self, session: &Session) -> Result<bool> {
         for state in &session.layers {
             if let LayerState::Qsa(state) = state
@@ -722,6 +848,9 @@ impl Engine {
         Ok(Self {
             identity: Rc::new(()),
             cache_identity: Rc::new(()),
+            session_started: std::cell::Cell::new(false),
+            ane_residency: None,
+            ane_residency_failed: false,
             _expert_row_workspace: expert_row_workspace,
             package_manifest_digest: package.manifest_digest(),
             metal,
@@ -741,6 +870,10 @@ impl Engine {
     }
 
     pub fn start_session(&self) -> Result<Session> {
+        ensure!(
+            !self.ane_residency_failed,
+            "ANE residency requires a fresh engine after failure"
+        );
         autoreleasepool(|_| self.start_session_inner())
     }
 
@@ -760,7 +893,7 @@ impl Engine {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Session {
-            owner: self.identity.clone(),
+            owner: self.new_session_owner(),
             cache_origin: self.cache_identity.clone(),
             frontier: 0,
             valid: true,
@@ -779,13 +912,16 @@ impl Engine {
     pub fn prefill_chunk(&mut self, tokens: &[u32], session: &mut Session) -> Result<TokenOutput> {
         // Model/state resources retain their own owners. Temporary Objective-C
         // objects can drain after this chunk's GPU work has completed.
-        let output = autoreleasepool(|_| self.prefill_chunk_inner(tokens, session, None, None))?
-            .context("uncancellable prefill did not complete")?;
-        Ok(TokenOutput {
-            logits_bf16: session.last_logits_bf16()?.to_vec(),
-            changed_routes: output.changed_routes,
-            frontier: output.frontier,
-        })
+        let result = autoreleasepool(|_| self.prefill_chunk_inner(tokens, session, None, None))
+            .and_then(|output| {
+                let output = output.context("uncancellable prefill did not complete")?;
+                Ok(TokenOutput {
+                    logits_bf16: session.last_logits_bf16()?.to_vec(),
+                    changed_routes: output.changed_routes,
+                    frontier: output.frontier,
+                })
+            });
+        self.finish_ane_call(result)
     }
 
     fn prefill_chunk_inner(
@@ -795,6 +931,10 @@ impl Engine {
         greedy: Option<(&[u32], SamplingOptions)>,
         mut control: Option<&mut GenerationControl<'_>>,
     ) -> Result<Option<GenerationStep>> {
+        ensure!(
+            !self.ane_residency_failed,
+            "ANE residency requires a fresh engine after failure"
+        );
         ensure!(
             !tokens.is_empty() && tokens.len() <= self.prefill_chunk_size(),
             "prefill chunk exceeds the Engine workspace"
@@ -910,12 +1050,15 @@ impl Engine {
         mode: RoutingMode,
         session: &mut Session,
     ) -> Result<TokenOutput> {
-        let output = autoreleasepool(|_| self.step_inner(token, mode, session, None))?;
-        Ok(TokenOutput {
-            logits_bf16: session.last_logits_bf16()?.to_vec(),
-            changed_routes: output.changed_routes,
-            frontier: output.frontier,
-        })
+        let result =
+            autoreleasepool(|_| self.step_inner(token, mode, session, None)).and_then(|output| {
+                Ok(TokenOutput {
+                    logits_bf16: session.last_logits_bf16()?.to_vec(),
+                    changed_routes: output.changed_routes,
+                    frontier: output.frontier,
+                })
+            });
+        self.finish_ane_call(result)
     }
 
     fn step_inner(
@@ -925,6 +1068,10 @@ impl Engine {
         session: &mut Session,
         greedy: Option<(&[u32], SamplingOptions)>,
     ) -> Result<GenerationStep> {
+        ensure!(
+            !self.ane_residency_failed,
+            "ANE residency requires a fresh engine after failure"
+        );
         ensure!(
             Rc::ptr_eq(&self.identity, &session.owner),
             "session belongs to another engine"
@@ -1198,23 +1345,26 @@ impl Engine {
             .map(|sampler| sampler.options())
             .filter(|options| options.temperature == 0.0)
             .map(|options| (history, options));
-        let mut output = autoreleasepool(|_| {
+        let result = autoreleasepool(|_| {
             if tokens.len() == 1 {
                 self.step_inner(tokens[0], mode, session, greedy).map(Some)
             } else {
                 ensure!(mode == RoutingMode::Unbiased, "decode requires one token");
                 self.prefill_chunk_inner(tokens, session, greedy, control)
             }
-        })?;
-        let Some(mut output) = output.take() else {
-            return Ok(None);
-        };
-        if let Some(sampler) = sampler
-            && output.selected_id.is_none()
-        {
-            output.selected_id = Some(self.sample_committed(session, history, sampler)?);
-        }
-        Ok(Some(output))
+        })
+        .and_then(|mut output| {
+            let Some(mut output) = output.take() else {
+                return Ok(None);
+            };
+            if let Some(sampler) = sampler
+                && output.selected_id.is_none()
+            {
+                output.selected_id = Some(self.sample_committed(session, history, sampler)?);
+            }
+            Ok(Some(output))
+        });
+        self.finish_ane_call(result)
     }
 
     /// Select from a restored or just-committed row without consuming a token.
@@ -1225,6 +1375,10 @@ impl Engine {
         sampler: &mut Sampler,
     ) -> Result<u32> {
         ensure!(
+            !self.ane_residency_failed,
+            "ANE residency requires a fresh engine after failure"
+        );
+        ensure!(
             Rc::ptr_eq(&self.identity, &session.owner),
             "session belongs to another engine"
         );
@@ -1232,7 +1386,7 @@ impl Engine {
             session.frontier()? > 0,
             "empty session has no logits to sample"
         );
-        autoreleasepool(|_| {
+        let result = autoreleasepool(|_| {
             if sampler.options().temperature == 0.0 {
                 self.graph.status.reset()?;
                 let mut stream = self.metal.stream()?;
@@ -1260,7 +1414,8 @@ impl Engine {
                     history,
                 )
             }
-        })
+        });
+        self.finish_ane_call(result)
     }
 }
 
@@ -1274,6 +1429,224 @@ mod failure_recovery_tests {
     use crate::sampling::SamplingOptions;
     use crate::sampling::{MetalSamplingPreparation, Sampler};
     use crate::tokenizer::TextTokenizer;
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE, private ANE support and exclusive GPU ownership"]
+    fn combined_expert_residency_rejects_expert_changes_and_releases_after_command_failure()
+    -> Result<()> {
+        expert_residency_failure_case()
+    }
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE, private ANE support and exclusive GPU ownership"]
+    fn combined_qsa_evaluation_precedes_command_failure_and_residency_release() -> Result<()> {
+        post_qsa_command_failure_case(4096)
+    }
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE, private ANE support and exclusive GPU ownership"]
+    fn padded_qsa_evaluation_precedes_command_failure_and_residency_release() -> Result<()> {
+        post_qsa_command_failure_case(4097)
+    }
+
+    fn post_qsa_command_failure_case(useful: usize) -> Result<()> {
+        use objc2_metal::MTLResidencySet;
+
+        let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+        let mut engine = Engine::load_with_prefill_capacity(&package, 512, 8192, 8192)?;
+        engine.enable_ane(&package)?;
+        let metal = engine.metal.clone();
+        let native = engine.ane_residency.as_ref().unwrap().test_set();
+        assert_eq!(native.allocationCount(), 588);
+        assert_eq!(engine.prefill.test_ane_state(), Some((&[][..], false)));
+        let mut session = engine.start_session()?;
+        let tokens: Vec<u32> = (0..useful).map(|i| 61 + (i % 32) as u32).collect();
+
+        // Each mixer and shared front submits pack/prefix. The layer1 flush
+        // adds one command. Completion17 is shared3's prefix, retired by the
+        // next layer's pack wait after QSA3 and shared3 native evaluations.
+        let fault = metal.test_fail_completed_command_after(16)?;
+        let error = engine
+            .prefill_chunk(&tokens, &mut session)
+            .err()
+            .context("post-QSA command injection unexpectedly succeeded")?;
+        assert!(fault.fired());
+        assert!(format!("{error:#}").contains("injected completed Metal command error"));
+        drop(fault);
+        assert_eq!(
+            engine.prefill.test_ane_state(),
+            Some((&[0, 1, 2, 3][..], true))
+        );
+        use ane_prefill::ProjectionKind::{Gdn, QsaGate, SharedFront};
+        assert_eq!(
+            engine.prefill.test_projection_trace(),
+            &[
+                (Gdn, 0),
+                (SharedFront, 0),
+                (Gdn, 1),
+                (SharedFront, 1),
+                (Gdn, 2),
+                (SharedFront, 2),
+                (QsaGate, 3),
+                (SharedFront, 3),
+            ]
+        );
+        assert!(!session.valid);
+        assert!(session.frontier().is_err());
+        assert_eq!(session.frontier, 0);
+        assert!(session.consumed_tokens.is_empty());
+        assert!(engine.ane_residency.is_none());
+        assert!(engine.ane_residency_failed);
+        assert_eq!(native.allocationCount(), 0);
+        assert!(!engine.prefill.workspace_in_progress());
+        engine._expert_row_workspace.check_idle()?;
+        // Host writes fail while any submitted reader still owns this status.
+        engine.graph.status.reset()?;
+        let failed_bytes = engine.memory_stats()?.live_requested_buffer_bytes;
+        assert!(engine.start_session().is_err());
+        assert!(engine.prefill_chunk(&[7, 8], &mut session).is_err());
+        assert!(engine.step(7, RoutingMode::Unbiased, &mut session).is_err());
+        assert_eq!(
+            engine.memory_stats()?.live_requested_buffer_bytes,
+            failed_bytes
+        );
+        assert_eq!(
+            engine.prefill.test_ane_state(),
+            Some((&[0, 1, 2, 3][..], true))
+        );
+        drop(session);
+        engine.close_ane()?;
+        assert_eq!(native.allocationCount(), 0);
+        assert_eq!(metal.memory_stats()?.live_requested_buffer_bytes, 0);
+        Ok(())
+    }
+
+    fn expert_residency_failure_case() -> Result<()> {
+        use objc2_metal::MTLResidencySet;
+
+        fn state(session: &Session) -> Result<Vec<Vec<u8>>> {
+            let ple = session.ple_state()?;
+            let mut values = vec![
+                session.frontier()?.to_le_bytes().to_vec(),
+                ple.offset.to_le_bytes().to_vec(),
+                ple.context.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ple.conv.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ];
+            session.visit_state(|_, layer| {
+                match layer {
+                    LayerStateView::Gdn {
+                        conv_bf16,
+                        recurrent_f32,
+                    } => values.extend([conv_bf16.to_vec(), recurrent_f32.to_vec()]),
+                    LayerStateView::Qsa { index, kv } => values.extend([
+                        index.frontier().to_le_bytes().to_vec(),
+                        index
+                            .compressed_bf16()
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                        index
+                            .pending_bf16()
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                        kv.frontier().to_le_bytes().to_vec(),
+                        kv.records().to_vec(),
+                        kv.sink_keys().to_vec(),
+                        kv.sink_values().to_vec(),
+                        kv.tail_keys().to_vec(),
+                        kv.tail_values().to_vec(),
+                    ]),
+                }
+                Ok(())
+            })?;
+            Ok(values)
+        }
+
+        let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+        let mut engine = Engine::load_with_prefill_capacity(&package, 512, 8192, 4096)?;
+        engine.enable_ane(&package)?;
+        let scope = engine
+            .ane_prefill_cache_scope()
+            .context("active ANE producer scope absent")?;
+        assert!(scope.ends_with(";rows=4096"));
+        let metal = engine.metal.clone();
+        assert!(engine.ane_residency.is_some());
+        let native = engine.ane_residency.as_ref().unwrap().test_set();
+        assert_eq!(native.allocationCount(), 588);
+        let mut session = engine.start_session()?;
+        let before_state = state(&session)?;
+        let before_routes = engine.resident_experts()?;
+        let before_bytes = engine.memory_stats()?.live_requested_buffer_bytes;
+        for error in [
+            engine.shrink_expert_capacity(496).unwrap_err(),
+            engine.recover_expert_capacity(513, u64::MAX).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("fixed ANE residency forbids"));
+        }
+        assert_eq!(engine.recover_expert_capacity(512, 0)?.new_capacity, 512);
+        assert_eq!(engine.shrink_expert_capacity(512)?.new_capacity, 512);
+        // Scratch is not part of the expert set and can be replaced at an
+        // ordinary retired boundary without retaining its previous allocation.
+        engine.replace_prefill_without_overlap(2048, u64::MAX)?;
+        assert_eq!(engine.prefill_chunk_size(), 2048);
+        assert_eq!(
+            engine.ane_prefill_cache_scope().as_deref(),
+            Some(scope.as_str())
+        );
+        assert_eq!(native.allocationCount(), 588);
+        engine.replace_prefill_without_overlap(4096, u64::MAX)?;
+        assert_eq!(
+            engine.ane_prefill_cache_scope().as_deref(),
+            Some(scope.as_str())
+        );
+        assert_eq!(
+            (engine.expert_capacity(), engine.prefill_chunk_size()),
+            (512, 4096)
+        );
+        assert_eq!(engine.resident_experts()?, before_routes);
+        assert_eq!(state(&session)?, before_state);
+        assert_eq!(
+            engine.memory_stats()?.live_requested_buffer_bytes,
+            before_bytes
+        );
+        let mut sampler = Sampler::new(SamplingOptions::default(), 0)?;
+        assert!(
+            engine
+                .sample_committed(&session, &[], &mut sampler)
+                .is_err()
+        );
+        assert!(engine.ane_residency.is_some());
+
+        // A seven-row GPU tail fails before any fixed-shape ANE evaluation.
+        let fault = metal.test_fail_completed_command_after(0)?;
+        let error = engine
+            .prefill_chunk(&[7, 8, 9, 10, 11, 12, 13], &mut session)
+            .err()
+            .context("fixed-residency command injection unexpectedly succeeded")?;
+        assert!(fault.fired());
+        assert!(format!("{error:#}").contains("injected completed Metal command error"));
+        drop(fault);
+        assert!(engine.ane_residency.is_none());
+        assert!(engine.ane_residency_failed);
+        assert_eq!(native.allocationCount(), 0);
+        assert!(!engine.prefill.workspace_in_progress());
+        engine._expert_row_workspace.check_idle()?;
+        engine.graph.status.reset()?;
+        assert!(engine.prefill_chunk(&[7, 8], &mut session).is_err());
+        assert!(engine.step(7, RoutingMode::Unbiased, &mut session).is_err());
+        let failed_bytes = engine.memory_stats()?.live_requested_buffer_bytes;
+        assert!(engine.start_session().is_err());
+        assert_eq!(
+            engine.memory_stats()?.live_requested_buffer_bytes,
+            failed_bytes
+        );
+        drop(session);
+        engine.close_ane()?;
+        assert_eq!(native.allocationCount(), 0);
+        assert_eq!(metal.memory_stats()?.live_requested_buffer_bytes, 0);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires MOESPRESSO_TEST_PACKAGE and exclusive GPU ownership"]

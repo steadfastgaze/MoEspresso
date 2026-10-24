@@ -146,6 +146,7 @@ fn fixture(write_depth: usize, mode: DiskCacheMode) -> Result<(CacheRoot, State,
         }),
         expert_capacity_control: Some(budget),
         adaptive_memory: true,
+        ane_reserved_bytes: 0,
     };
     std::fs::DirBuilder::new().mode(0o700).create(&root.0)?;
     let tokenizer = TextTokenizer::load(&package)?;

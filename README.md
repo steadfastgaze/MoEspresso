@@ -1,15 +1,28 @@
+> **ANE research branch**
+>
+> This branch shares prefill work between Metal and the Apple Neural Engine
+> through private Apple APIs. Matched 8K- and 15K-token measurements on an M3
+> Max with full expert residency showed about 12–13% lower prefill time, while
+> decode continues to run on Metal.
+>
+> Further quality evaluation is pending because the ANE's different arithmetic
+> can change both the answers and when generation stops. The quality table
+> below covers the earlier GPU configurations.
+>
+> Build this branch with `cargo build --locked --release` and run
+> `target/release/moespresso`. Homebrew installs the released version.
+
 <img src="docs/assets/hero.webp" alt="MoEspresso" width="100%">
 
 # MoEspresso
 
-MoEspresso runs large Mixture-of-Experts language models at practical speed on
-Apple Silicon, including Macs whose memory is much smaller than the model
-package.
+MoEspresso runs large Mixture-of-Experts language models on Apple Silicon,
+including Macs with much less memory than the model package. Frequently used
+experts stay in unified memory, and the rest load from SSD as needed, keeping
+the full set of experts available.
 
-It keeps frequently used experts in unified memory and loads the others from
-SSD as needed. All experts remain available. The runtime is written in Rust
-with native Metal kernels and provides local generation and an OpenAI-compatible
-server for chat, reasoning and coding agents.
+Written in Rust with native Metal kernels, the runtime provides local generation
+and an OpenAI-compatible server for chat, reasoning and coding agents.
 
 With Qwen3.8-Flash-Next, a 145.75 GB package runs on a 2021 M1 Max with 32 GB
 of unified memory, retaining all 512 routed experts and the original PLE
@@ -19,7 +32,7 @@ memory while serving with a 128K context limit.
 
 The supported package is
 [Qwen3.8-Flash-Next-MoEspressoV3](https://huggingface.co/steadfastgaze/Qwen3.8-Flash-Next-MoEspressoV3).
-An existing download works with MoEspresso 4.0; it does not need conversion.
+Existing downloads work with MoEspresso 4.0 without conversion.
 
 | Package | Value |
 | --- | --- |
@@ -88,12 +101,11 @@ With the server running, use the built-in speed check:
 moespresso speed
 ```
 
-Each topic result prints as its request finishes, with prefill and decode
-rates, first-token latency and cache reuse. A separate approximately 4K-token
-prefill follows, then an interactive prompt offers a longer 32K test.
-The report includes the server's capacity, context, routing and cache settings.
-See [speed measurement](docs/speed_comparison.md) for timing definitions and
-repeatable comparisons.
+Results appear as each topic finishes, showing prefill and decode rates,
+first-token latency and cache reuse alongside the server's capacity, context,
+routing and cache settings. The check then runs a roughly 4K-token prefill
+and offers an interactive 32K test. Timing definitions and repeatable comparisons
+are described in [speed measurement](docs/speed_comparison.md).
 
 ### Use it with OpenCode
 
@@ -171,11 +183,10 @@ Run `moespresso serve --help`, `moespresso generate --help` or
 
 ## Quality
 
-The generated-answer comparison uses a frozen set of 48 questions: four from
-each of two tasks in each of six public LiveBench categories. The categories
-are coding, data analysis, instruction following, language, math and reasoning.
-Answers are scored with the official task scorers. This is a custom comparison,
-not the official LiveBench leaderboard.
+The generated-answer comparison uses a custom frozen panel of 48 questions,
+scored with the official LiveBench task scorers. It takes four questions from
+each of two tasks in six categories: coding, data analysis, instruction
+following, language, math and reasoning.
 
 | Model and effort | Macro score |
 | --- | ---: |
@@ -187,11 +198,11 @@ not the official LiveBench leaderboard.
 | MoEspresso, Cache-Prior 2/2, 223 resident slots, medium | 80.2% |
 | MoEspresso, fully resident, unbiased routing, medium | 79.4% |
 
-Both native configurations use the same IQ_K package, greedy generation and
-medium thinking. All 48 answers in each configuration stopped naturally,
-without reaching the output cap. Hosted scores are retained from the earlier
-same-question comparison through OpenRouter; hosted Qwen used fixed sampling
-controls, while GPT and Claude used their provider defaults.
+Both native configurations use the same IQ_K package with greedy generation
+and medium thinking, and all 48 answers in each stopped naturally before the
+output cap. Hosted scores come from an earlier comparison of the same questions
+through OpenRouter, with fixed sampling controls for hosted Qwen and provider
+defaults for GPT and Claude.
 
 The 2/2 score is lower than the earlier release's 84.3%. On this small panel,
 the change is not considered a material quality regression: 2/2 remains above
@@ -204,14 +215,14 @@ MoEspresso keeps dense weights, routers, norms, shared experts, attention state
 and a bounded set of routed experts in unified memory. Missing expert rows are
 loaded from SSD into per-layer pools as routing selects them.
 
-The startup planner reserves memory for the context, resident tensors,
+At startup, the planner reserves memory for the context, resident tensors,
 workspaces, conversation caches and safety headroom, then assigns the remaining
-budget to expert slots. During serving, adaptive memory can grow the pools
-beyond their starting size during healthy serving or idle periods, or release
-slots under memory pressure and sustained active VM churn. Prepared slots are
-populated on demand and validated through successful inference. Resizing does
-not invalidate conversation caches.
-See [adaptive memory](docs/adaptive_memory.md) for the policy and its limits.
+budget to expert slots. Once the engine is running, adaptive memory can prepare
+more slots during healthy serving or idle periods. Those slots fill on demand
+and are validated through successful inference; memory pressure or sustained
+active VM churn can cause the pools to shrink. Conversation caches survive
+resizing. The policy and its limits are described in
+[adaptive memory](docs/adaptive_memory.md).
 
 ### Cache-Prior routing
 
@@ -243,18 +254,18 @@ together for prefix reuse.
 
 ## Prefix reuse and disk cache
 
-The memory cache reuses the longest compatible exact token prefix, including
-consumed generated tokens and short conversations. Both cache tiers are enabled
-by default. Disk caching saves shallow prefill prefixes within the first 16K
-tokens, allowing common harness instructions and tools to be reused after a
-restart without saving a growing snapshot at every turn.
+Both cache tiers are enabled by default. In memory, the engine reuses the
+longest compatible exact token prefix, including consumed generated tokens
+and short conversations. The disk cache saves prefill prefixes within the
+first 16K tokens so common harness instructions and tools can be reused after
+a restart without writing a growing snapshot at every turn.
 
-Use `--disk-cache-mode full` for deeper conversation persistence, including
-short prompts and generated state. It adds blocking writes before the first
-token and after generation. In default `prefix` mode, a restart or RAM-cache
-eviction requires reprocessing the conversation after its saved prefix. This
-also applies when a conversation snapshot exceeds `--prompt-cache-gb`.
-Neither disk mode limits conversation length.
+For deeper conversation persistence, including short prompts and generated
+state, use `--disk-cache-mode full`. This adds blocking writes before the first
+token and after generation. With the default `prefix` mode, the engine
+reprocesses everything after the saved prefix following a restart or RAM-cache
+eviction, including when a snapshot exceeds `--prompt-cache-gb`. Conversation
+length is unaffected by the disk-cache mode.
 
 The default disk store is below `~/.cache/moespresso/v4/disk_kv`, or under
 `XDG_CACHE_HOME` when set. Its 8 GiB retention budget is shared across managed
@@ -278,10 +289,10 @@ tokenizer assets and chat template required by the runtime. Routed layers
 store expert bundles in safetensors shards; each expert row contains its gate,
 up and down projection payloads in the layout consumed by the Metal kernels.
 
-Loading validates declared structure and file sizes without re-reading source
-checkpoints or guessing tensor conventions. It does not hash weight payloads;
-download packages from a trusted source. This repository runs prepared packages
-and does not include package construction tools.
+The loader checks the package's declared structure and file sizes, using its
+tensor layouts directly. Download packages from a trusted source, since loading
+does not verify weight-payload hashes. This repository contains the runtime
+for prepared packages.
 
 ## Build from source
 
@@ -294,13 +305,31 @@ cargo build --locked --release
 The executable is `target/release/moespresso`. It can run outside the source
 checkout with an explicit package path.
 
+### Check ANE access
+
+```sh
+target/release/moespresso check-ane
+```
+
+The check compiles a small projection with known inputs, runs it on the ANE
+through the same private APIs used for prefill, verifies the outputs and unloads
+it. No model package is needed. A 30-second watchdog terminates the check if a
+call hangs.
+
+Generation and serving use combined GPU and ANE prefill when the memory budget
+allows it. If ANE setup fails at startup and its resources can be released
+cleanly, MoEspresso prints a warning and continues on the GPU. An ANE failure
+during inference requires a fresh engine. See
+[native validation](docs/testing.md#ane-runtime-check) for the diagnostic and
+prefill checks.
+
 ## Correctness and documentation
 
-Changes to quantized math, attention, routing, package loading and cache state
-are checked against reference logits and generated-answer tests. Cache tests
-exercise conversation continuation through resizing, interleaving, disk restore
-and interrupted requests. Performance changes use matched artifacts and explicit
-A/B conditions.
+Validation combines reference logits and generated-answer tests for changes to
+quantized math, attention, routing and package loading. Cache tests exercise
+conversation continuation through resizing, interleaving, disk restore and
+interrupted requests. Performance comparisons use the same artifacts, routing
+settings and cache state between runs.
 
 - [Validation](docs/testing.md): regular tests, real-package checks, quality
   gates and OpenCode acceptance.

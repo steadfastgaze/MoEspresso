@@ -1,5 +1,6 @@
 //! Capacity-bounded layer-major prefill on the decode engine's ordered stream.
 
+use super::ane_prefill::ProjectionKind;
 use super::{Layer, LayerState, Residual, Session, device_greedy::DeviceGreedy};
 use crate::decoder::FinalProjection;
 use crate::dense_batch::DenseBatchScratch;
@@ -108,6 +109,8 @@ pub(super) struct Prefill {
     write: Pipeline,
     ple_index: usize,
     workspace_lifetime: std::rc::Rc<()>,
+    ane: Option<super::ane_prefill::AnePrefill>,
+    qsa_gate: Option<super::qsa_gate::QsaGate>,
 }
 
 /// One in-progress chunk. Stream retirement precedes the residency guard's
@@ -123,6 +126,56 @@ pub(super) struct PrefillProgress {
 }
 
 impl Prefill {
+    pub(super) fn enable_ane(&mut self, package: &Package) -> Result<()> {
+        ensure!(self.ane.is_none(), "ANE producer is already configured");
+        ensure!(
+            !self.workspace_in_progress(),
+            "prefill workspace is in progress"
+        );
+        // Startup selects the retained projection once. Later ordinary
+        // workspace replacement leaves its geometry and producer unchanged.
+        let rows = crate::prefill_capacity::ane_physical_rows(self.capacity)?;
+        let qsa_gate = super::qsa_gate::QsaGate::new(&self.metal, rows)?;
+        let candidate = super::ane_prefill::AnePrefill::load(&self.metal, package, rows)?;
+        self.ane = Some(candidate);
+        self.qsa_gate = Some(qsa_gate);
+        Ok(())
+    }
+
+    pub(super) fn ane_active(&self) -> bool {
+        self.ane.is_some()
+    }
+
+    pub(super) fn ane_cache_scope(&self) -> Option<String> {
+        self.ane
+            .as_ref()
+            .map(|ane| format!("{};rows={}", ane.cache_identity(), ane.rows()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_ane_state(&self) -> Option<(&[usize], bool)> {
+        self.ane.as_ref().map(|ane| ane.test_state())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_projection_trace(&self) -> &[(ProjectionKind, usize)] {
+        self.ane
+            .as_ref()
+            .map_or(&[], |ane| ane.test_projection_trace())
+    }
+
+    pub(super) fn close_ane(&mut self) -> Result<()> {
+        ensure!(
+            !self.workspace_in_progress(),
+            "prefill workspace is in progress"
+        );
+        drop(self.qsa_gate.take());
+        if let Some(ane) = self.ane.take() {
+            ane.close()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn workspace_in_progress(&self) -> bool {
         std::rc::Rc::strong_count(&self.workspace_lifetime) > 1
     }
@@ -232,6 +285,8 @@ impl Prefill {
             )?,
             ple_index: config.ple_layer_index,
             workspace_lifetime: std::rc::Rc::new(()),
+            ane: None,
+            qsa_gate: None,
         })
     }
 
@@ -350,27 +405,106 @@ impl Prefill {
             .as_ref()
             .context("attention injection missing")?;
         let mixed = match (&layer.mixer, &mut *state, &mut *decode) {
-            (Mixer::Gdn(mixer), LayerState::Gdn(state), Layer::Gdn(_)) => mixer.encode_chunk(
-                stream.batch()?,
-                &attention.mixed,
-                rows,
-                state.begin_prefill()?,
-                &mut workspace.gdn,
-                &workspace.dense,
-                status,
-            )?,
-            (Mixer::Qsa(mixer), LayerState::Qsa(state), Layer::Qsa(decode)) => {
-                let scratch = &mut workspace.qsa;
-                let batch = stream.batch()?;
-                unsafe {
-                    mixer.0.encode_into(
-                        batch,
+            (Mixer::Gdn(mixer), LayerState::Gdn(state), Layer::Gdn(_)) => {
+                let state = state.begin_prefill()?;
+                let external_gate =
+                    if let Some(ane) = self.ane.as_mut().filter(|ane| ane.accepts_gdn_rows(rows)) {
+                        let weight = mixer.gate_weight_binding()?;
+                        let input_ready =
+                            ane.encode_input(index, rows, stream, &attention.mixed, weight)?;
+                        mixer.encode_external_gate_prefix(
+                            stream.batch()?,
+                            &attention.mixed,
+                            rows,
+                            state,
+                            &mut workspace.gdn,
+                            &workspace.dense,
+                        )?;
+                        stream.flush()?;
+                        ane.stage_input(ProjectionKind::Gdn, index, stream, input_ready)?;
+                        ane.evaluate_and_stage(ProjectionKind::Gdn, index)?;
+                        ane.encode_gate(
+                            ProjectionKind::Gdn,
+                            index,
+                            stream.batch()?,
+                            &[workspace.gdn.external_gate_buffer()],
+                        )?;
+                        true
+                    } else {
+                        false
+                    };
+                if external_gate {
+                    mixer.encode_external_gate_suffix(
+                        stream.batch()?,
+                        rows,
+                        state,
+                        &mut workspace.gdn,
+                        &workspace.dense,
+                        status,
+                    )?
+                } else {
+                    mixer.encode_chunk(
+                        stream.batch()?,
                         &attention.mixed,
                         rows,
-                        frontier,
-                        &scratch.projected,
+                        state,
+                        &mut workspace.gdn,
                         &workspace.dense,
-                    )?;
+                        status,
+                    )?
+                }
+            }
+            (Mixer::Qsa(mixer), LayerState::Qsa(state), Layer::Qsa(decode)) => {
+                let scratch = &mut workspace.qsa;
+                let qsa_gate = if let Some(qsa) = &self.qsa_gate {
+                    let ane_rows = self
+                        .ane
+                        .as_ref()
+                        .context("combined ANE owner absent")?
+                        .rows();
+                    qsa.eligible(rows, ane_rows)?.then_some(qsa)
+                } else {
+                    None
+                };
+                let input_ready = if qsa_gate.is_some() {
+                    Some(
+                        self.ane
+                            .as_mut()
+                            .context("combined ANE owner absent")?
+                            .encode_qsa_input(
+                                index,
+                                rows,
+                                stream,
+                                &attention.mixed,
+                                mixer.0.gate_weight_binding()?,
+                            )?,
+                    )
+                } else {
+                    None
+                };
+                let deferred_gate = qsa_gate.is_some();
+                let batch = stream.batch()?;
+                unsafe {
+                    if let Some(qsa) = qsa_gate {
+                        mixer.0.encode_external_gate(
+                            batch,
+                            &attention.mixed,
+                            rows,
+                            frontier,
+                            &scratch.projected,
+                            &workspace.dense,
+                            [&qsa.query, &qsa.prepare],
+                        )?;
+                    } else {
+                        mixer.0.encode_into(
+                            batch,
+                            &attention.mixed,
+                            rows,
+                            frontier,
+                            &scratch.projected,
+                            &workspace.dense,
+                        )?;
+                    }
                 }
                 // Dense index prefixes bypass scoring, and short attention
                 // tails share the decode consumer. Validate their logical
@@ -379,9 +513,11 @@ impl Prefill {
                     (&scratch.projected.index_queries, 512),
                     (&scratch.projected.raw_index_key, 128),
                     (&scratch.projected.queries, 6144),
-                    (&scratch.projected.query_gate, 6144),
                 ] {
                     status.encode_bf16_count(batch, buffer, rows * width)?;
+                }
+                if !deferred_gate {
+                    status.encode_bf16_count(batch, &scratch.projected.query_gate, rows * 6144)?;
                 }
                 let selection = decode.index.encode_chunk_device(
                     batch,
@@ -404,6 +540,39 @@ impl Prefill {
                     )?
                 };
                 let mut reconstructed = pending.encode_reconstruct(batch, &scratch.selected)?;
+                ensure!(
+                    !deferred_gate || reconstructed.is_some(),
+                    "QSA external gate requires reconstructed full tiles"
+                );
+                let encode_online =
+                    |batch: &mut crate::metal::Batch, offset, tile_rows| -> Result<()> {
+                        pending.encode_tile_device_into(
+                            batch,
+                            &selection,
+                            offset,
+                            tile_rows,
+                            &scratch.selected,
+                            &scratch.effective_valid,
+                            &scratch.safe_counts,
+                        )?;
+                        // SAFETY: The existing gather precedes its consumer;
+                        // earlier indexed readers precede this scratch reuse.
+                        unsafe {
+                            mixer.1.encode_tile_online(
+                                batch,
+                                &scratch.projected.queries,
+                                &scratch.projected.query_gate,
+                                &scratch.selected,
+                                &scratch.effective_valid,
+                                &scratch.safe_counts,
+                                offset,
+                                tile_rows,
+                                &scratch.output,
+                                &selection.status,
+                                &scratch.online_partials,
+                            )
+                        }
+                    };
                 for offset in (0..rows).step_by(64) {
                     let tile_rows = (rows - offset).min(64);
                     if tile_rows <= 8 && reconstructed.is_some() {
@@ -412,6 +581,9 @@ impl Prefill {
                         // old gather may overwrite this scratch only after
                         // the final indexed reader on this ordered stream.
                         reconstructed = None;
+                    }
+                    if deferred_gate && tile_rows <= 8 {
+                        continue;
                     }
                     if let Some(raw) = &reconstructed {
                         pending.encode_selection_guard(
@@ -439,37 +611,42 @@ impl Prefill {
                                 tile_rows,
                                 &scratch.output,
                                 &selection.status,
+                                qsa_gate.map(|qsa| (&qsa.deferred, &qsa.attended)),
                             )?;
                         }
                     } else {
-                        pending.encode_tile_device_into(
-                            batch,
-                            &selection,
-                            offset,
-                            tile_rows,
-                            &scratch.selected,
-                            &scratch.effective_valid,
-                            &scratch.safe_counts,
-                        )?;
-                        // SAFETY: The existing gather precedes its consumer;
-                        // earlier indexed readers precede this scratch reuse.
-                        unsafe {
-                            mixer.1.encode_tile_online(
-                                batch,
-                                &scratch.projected.queries,
-                                &scratch.projected.query_gate,
-                                &scratch.selected,
-                                &scratch.effective_valid,
-                                &scratch.safe_counts,
-                                offset,
-                                tile_rows,
-                                &scratch.output,
-                                &selection.status,
-                                &scratch.online_partials,
-                            )?;
-                        }
+                        encode_online(batch, offset, tile_rows)?;
                     }
                 }
+                if let (Some(qsa), Some(input_ready)) = (qsa_gate, input_ready) {
+                    stream.flush()?;
+                    let ane = self.ane.as_mut().context("combined ANE owner absent")?;
+                    ane.stage_input(ProjectionKind::QsaGate, index, stream, input_ready)?;
+                    ane.evaluate_and_stage(ProjectionKind::QsaGate, index)?;
+                    ane.encode_gate(
+                        ProjectionKind::QsaGate,
+                        index,
+                        stream.batch()?,
+                        &[&scratch.projected.query_gate],
+                    )?;
+                    qsa.encode_late(
+                        stream.batch()?,
+                        &scratch.projected.query_gate,
+                        &scratch.output.gated,
+                        &selection.status,
+                        rows,
+                    )?;
+                    let tail = rows % 64;
+                    if (1..=8).contains(&tail) {
+                        encode_online(stream.batch()?, rows - tail, tail)?;
+                    }
+                    status.encode_bf16_count(
+                        stream.batch()?,
+                        &scratch.projected.query_gate,
+                        rows * 6144,
+                    )?;
+                }
+                let batch = stream.batch()?;
                 unsafe {
                     mixer.1.encode_projection_into(
                         batch,
@@ -509,15 +686,59 @@ impl Prefill {
             Layer::Qsa(block) => block.mlp.experts_mut(),
         };
         let full_resident = experts.capacity() == 512;
-        let output = layer.mlp.run_device(
-            stream,
-            &mlp_read.mixed,
-            rows,
-            &workspace.mlp,
-            &workspace.dense,
-            experts,
-            status,
-        )?;
+        let split_output = if let Some(ane) = self
+            .ane
+            .as_mut()
+            .filter(|ane| ane.accepts_shared_rows(rows))
+        {
+            let ready = ane.encode_shared_input(
+                index,
+                rows,
+                stream,
+                &mlp_read.mixed,
+                layer.mlp.shared_weight_bindings(),
+            )?;
+            layer.mlp.encode_external_shared_prefix(
+                stream,
+                &mlp_read.mixed,
+                rows,
+                &workspace.mlp,
+                &workspace.dense,
+                experts,
+                status,
+            )?;
+            stream.flush()?;
+            ane.stage_input(ProjectionKind::SharedFront, index, stream, ready)?;
+            ane.evaluate_and_stage(ProjectionKind::SharedFront, index)?;
+            ane.encode_gate(
+                ProjectionKind::SharedFront,
+                index,
+                stream.batch()?,
+                &workspace.mlp.shared_front_buffers(),
+            )?;
+            Some(layer.mlp.encode_external_shared_suffix(
+                stream.batch()?,
+                rows,
+                &workspace.mlp,
+                &workspace.dense,
+                status,
+            )?)
+        } else {
+            None
+        };
+        let output = if let Some(output) = split_output {
+            output
+        } else {
+            layer.mlp.run_device(
+                stream,
+                &mlp_read.mixed,
+                rows,
+                &workspace.mlp,
+                &workspace.dense,
+                experts,
+                status,
+            )?
+        };
         *residual = Residual {
             value: mlp_read.updated,
             pending: Some((output, mlp_read.injection.context("MLP injection missing")?)),
@@ -561,6 +782,9 @@ impl Prefill {
             )?;
         }
         stream.wait().context("prefill graph completion")?;
+        if let Some(ane) = &mut self.ane {
+            ane.check_status_after_completion()?;
+        }
         status.check()?;
         for state in &mut session.layers {
             match state {

@@ -15,7 +15,8 @@ const LOGITS_READBACK_BYTES: usize = 16 * 1024;
 fn validate_rows(rows: usize) -> Result<()> {
     ensure!(
         (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-        "MLP batch requires 2 through 4096 rows"
+        "MLP batch requires 2 through {} rows",
+        crate::prefill_capacity::MAX_ROWS
     );
     Ok(())
 }
@@ -237,6 +238,7 @@ fn partition_packed_group(
 
 #[cfg(target_os = "macos")]
 mod gpu {
+    mod full_schedule;
     use super::*;
     use crate::dense_batch::{DenseBatch, DenseBatchScratch};
     use crate::device_status::DeviceStatus;
@@ -249,6 +251,7 @@ mod gpu {
     use crate::package::{ExpertLayer, Package, Projection, WeightFormat};
     use crate::routing::{CachePriorRouter, RoutingBuffers, RoutingGeometry, RoutingMode};
     use anyhow::Context;
+    use full_schedule::{FullSchedule, ScheduleBuffers};
     use std::cell::OnceCell;
     use std::collections::BTreeMap;
 
@@ -417,9 +420,15 @@ mod gpu {
         schedule: Buffer,
         total: Buffer,
         route_order: Buffer,
+        // Pipeline-only cache; metadata precedes activation in the same storage.
+        full_schedule: OnceCell<FullSchedule>,
     }
 
     impl MlpBatchScratch {
+        pub(crate) fn shared_front_buffers(&self) -> [&Buffer; 2] {
+            [&self.base.gate, &self.base.up]
+        }
+
         pub fn new(metal: &Metal, capacity: usize) -> Result<Self> {
             validate_rows(capacity)?;
             let pairs = capacity * ROUTES;
@@ -434,6 +443,7 @@ mod gpu {
                 schedule: metal.shared_buffer(max_tiles * 3 * 4)?,
                 total: metal.shared_buffer(4)?,
                 route_order: metal.shared_buffer(pairs * 4)?,
+                full_schedule: OnceCell::new(),
             })
         }
 
@@ -616,6 +626,92 @@ mod gpu {
             experts: &mut BoundedExperts,
             status: &DeviceStatus,
         ) -> Result<Buffer> {
+            self.run_device_inner(stream, hidden, rows, scratch, dense, experts, status, false)
+        }
+
+        pub(crate) fn shared_weight_bindings(&self) -> [Binding<'_>; 2] {
+            [
+                self.shared_gate.packed_weight_binding(),
+                self.shared_up.packed_weight_binding(),
+            ]
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn encode_external_shared_prefix(
+            &self,
+            stream: &mut Stream,
+            hidden: &Buffer,
+            rows: usize,
+            scratch: &MlpBatchScratch,
+            dense: &DenseBatchScratch,
+            experts: &mut BoundedExperts,
+            status: &DeviceStatus,
+        ) -> Result<()> {
+            self.run_device_inner(stream, hidden, rows, scratch, dense, experts, status, true)?;
+            Ok(())
+        }
+
+        pub(crate) fn encode_external_shared_suffix(
+            &self,
+            batch: &mut Batch,
+            rows: usize,
+            scratch: &MlpBatchScratch,
+            dense: &DenseBatchScratch,
+            status: &DeviceStatus,
+        ) -> Result<Buffer> {
+            validate_rows(rows)?;
+            ensure!(
+                rows <= scratch.capacity,
+                "external shared suffix exceeds capacity"
+            );
+            let base = &scratch.base;
+            // SAFETY: Ordered unpack initializes gate/up before these ordinary
+            // consumers. The prefix initialized scalar and complete routed rows.
+            unsafe {
+                batch.dispatch_1d(
+                    &self.activate,
+                    &[&base.gate, &base.up, &base.activation]
+                        .map(|buffer| Binding { buffer, offset: 0 }),
+                    rows * SHARED,
+                    256,
+                )?;
+                self.shared_down.encode_rows_into(
+                    batch,
+                    &base.activation,
+                    &base.down,
+                    rows,
+                    dense,
+                )?;
+                batch.dispatch_1d(
+                    &self.finish,
+                    &[
+                        &base.routed,
+                        &base.down,
+                        &base.scalar,
+                        &base.shared,
+                        &base.output,
+                    ]
+                    .map(|buffer| Binding { buffer, offset: 0 }),
+                    rows * HIDDEN,
+                    256,
+                )?;
+            }
+            status.encode_bf16_count(batch, &base.output, rows * HIDDEN)?;
+            Ok(base.output.clone())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_device_inner(
+            &self,
+            stream: &mut Stream,
+            hidden: &Buffer,
+            rows: usize,
+            scratch: &MlpBatchScratch,
+            dense: &DenseBatchScratch,
+            experts: &mut BoundedExperts,
+            status: &DeviceStatus,
+            external_shared: bool,
+        ) -> Result<Buffer> {
             validate_rows(rows)?;
             ensure!(
                 rows <= scratch.capacity && hidden.byte_len() >= rows * HIDDEN * 2,
@@ -679,26 +775,30 @@ mod gpu {
             // SAFETY: These producers read only hidden/direct weights and
             // ordered partition scratch, not route IDs, status or expert pools.
             unsafe {
-                self.shared_gate
-                    .encode_rows_into(batch, hidden, &base.gate, rows, dense)?;
-                self.shared_up
-                    .encode_rows_into(batch, hidden, &base.up, rows, dense)?;
+                if !external_shared {
+                    self.shared_gate
+                        .encode_rows_into(batch, hidden, &base.gate, rows, dense)?;
+                    self.shared_up
+                        .encode_rows_into(batch, hidden, &base.up, rows, dense)?;
+                }
                 self.scalar
                     .encode_rows_into(batch, hidden, &base.scalar, rows, dense)?;
-                batch.dispatch_1d(
-                    &self.activate,
-                    &[&base.gate, &base.up, &base.activation]
-                        .map(|buffer| Binding { buffer, offset: 0 }),
-                    rows * SHARED,
-                    256,
-                )?;
-                self.shared_down.encode_rows_into(
-                    batch,
-                    &base.activation,
-                    &base.down,
-                    rows,
-                    dense,
-                )?;
+                if !external_shared {
+                    batch.dispatch_1d(
+                        &self.activate,
+                        &[&base.gate, &base.up, &base.activation]
+                            .map(|buffer| Binding { buffer, offset: 0 }),
+                        rows * SHARED,
+                        256,
+                    )?;
+                    self.shared_down.encode_rows_into(
+                        batch,
+                        &base.activation,
+                        &base.down,
+                        rows,
+                        dense,
+                    )?;
+                }
                 batch.dispatch_1d(
                     &self.to_half,
                     &[hidden, &scratch.x_half].map(|buffer| Binding { buffer, offset: 0 }),
@@ -856,6 +956,9 @@ mod gpu {
                     rows * HIDDEN,
                     256,
                 )?;
+                if external_shared {
+                    return Ok(base.output.clone());
+                }
                 let finish = [
                     &base.routed,
                     &base.down,
@@ -1541,25 +1644,56 @@ mod gpu {
             // IQ2 never reads the absent qh/sch placeholder bindings. Batch
             // retains every stream, including aliases, until completion.
             unsafe {
-                batch.dispatch_1d(
-                    if source_sorted {
-                        &pipelines.sorted_schedule
-                    } else {
-                        &pipelines.schedule
-                    },
-                    &[
-                        Binding {
-                            buffer: sorted_ids,
-                            offset: start * 4,
+                if experts.capacity() == EXPERTS
+                    && start == 0
+                    && slot_map.is_none()
+                    && original_pairs.is_none()
+                    && !source_sorted
+                    && physical_chunk.is_none()
+                    && !addressed
+                {
+                    ensure!(tile_tokens == 32, "full-resident schedule requires tile32");
+                    if scratch.full_schedule.get().is_none() {
+                        ensure!(
+                            scratch
+                                .full_schedule
+                                .set(FullSchedule::new(&self.metal)?)
+                                .is_ok(),
+                            "full-resident schedule is already initialized"
+                        );
+                    }
+                    scratch.full_schedule.get().unwrap().encode(
+                        batch,
+                        ScheduleBuffers {
+                            ids: sorted_ids,
+                            order: &scratch.order,
+                            schedule: &scratch.schedule,
+                            total: &scratch.total,
+                            activation: &scratch.packed_activation,
                         },
-                        binding(&dims),
-                        binding(&scratch.order),
-                        binding(&scratch.schedule),
-                        binding(&scratch.total),
-                    ],
-                    EXPERTS,
-                    EXPERTS,
-                )?;
+                        pairs,
+                    )?;
+                } else {
+                    batch.dispatch_1d(
+                        if source_sorted {
+                            &pipelines.sorted_schedule
+                        } else {
+                            &pipelines.schedule
+                        },
+                        &[
+                            Binding {
+                                buffer: sorted_ids,
+                                offset: start * 4,
+                            },
+                            binding(&dims),
+                            binding(&scratch.order),
+                            binding(&scratch.schedule),
+                            binding(&scratch.total),
+                        ],
+                        EXPERTS,
+                        EXPERTS,
+                    )?;
+                }
                 if let Some(original) = original_pairs {
                     let pair_count = (pairs as u32).to_le_bytes();
                     batch.dispatch_1d_with_inline(
@@ -1721,12 +1855,16 @@ mod gpu {
                     let codec =
                         |g: crate::iqk::Geometry| if g.codec() == Codec::Iq3K { 3 } else { 2 };
                     let dims = encoded(&[pairs as u32, codec(gg), codec(dg), u32::from(capture)])?;
-                    batch.dispatch_1d(
-                        &pipelines.schedule,
-                        &[&scratch.ids, &dims, &order, &schedule, &total]
-                            .map(|buffer| Binding { buffer, offset: 0 }),
-                        EXPERTS,
-                        EXPERTS,
+                    FullSchedule::new(&self.metal)?.encode(
+                        &mut batch,
+                        ScheduleBuffers {
+                            ids: &scratch.ids,
+                            order: &order,
+                            schedule: &schedule,
+                            total: &total,
+                            activation: &activation,
+                        },
+                        pairs,
                     )?;
                     let mut bindings = vec![Binding {
                         buffer: &x,
@@ -2742,7 +2880,7 @@ mod tests {
 
     #[test]
     fn projected_logits_scan_rejects_invalid_geometry_before_read() {
-        for rows in [0, 1, 4097, usize::MAX] {
+        for rows in [0, 1, crate::prefill_capacity::MAX_ROWS + 1, usize::MAX] {
             let mut called = false;
             assert!(
                 validate_projected_logits(rows, |_, _| {
@@ -2769,16 +2907,17 @@ mod tests {
     }
     #[test]
     fn rows_reject_singleton_and_overflow() {
+        assert!(validate_rows(crate::prefill_capacity::MAX_ROWS).is_ok());
         for rows in [2, 3, 64, 409, 410, 512, 1024, 2048, 2049, 4096] {
             assert!(validate_rows(rows).is_ok());
         }
-        for rows in [0, 1, 4097, usize::MAX] {
+        for rows in [0, 1, crate::prefill_capacity::MAX_ROWS + 1, usize::MAX] {
             assert!(validate_rows(rows).is_err());
         }
     }
     #[test]
     fn wide_source_groups_preserve_every_pair_and_visit_each_source_once() {
-        let rows = 4096;
+        let rows = crate::prefill_capacity::MAX_ROWS;
         let ids: Vec<_> = (0..rows)
             .flat_map(|row| {
                 (0..ROUTES).map(move |route| ((row * 13 + route * 37) % EXPERTS) as u32)

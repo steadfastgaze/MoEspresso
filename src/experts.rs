@@ -453,6 +453,27 @@ mod gpu {
     }
 
     impl BoundedExperts {
+        pub(crate) fn full_resident_weight_buffers(&self) -> Result<Vec<Buffer>> {
+            ensure!(
+                self.capacity == 512,
+                "expert residency requires all experts"
+            );
+            let ExpertStorage::Contiguous { gate, up, down } = &self.storage else {
+                anyhow::bail!("expert residency requires contiguous storage");
+            };
+            // The first six bindings carry payloads and scales. The seventh
+            // small codec table is outside the expert-payload residency set.
+            Ok([gate, up, down]
+                .into_iter()
+                .flat_map(|projection| {
+                    projection.stream_bindings()[..6]
+                        .iter()
+                        .map(|binding| binding.buffer.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect())
+        }
+
         pub fn new(metal: &Metal, layer: ExpertLayer, capacity: usize) -> Result<Self> {
             let workspace = crate::package::ExpertRowWorkspace::new(layer.row_bytes)?;
             Self::with_workspace_contiguous(metal, layer, capacity, workspace)

@@ -399,7 +399,7 @@ pub(super) fn read_session(
     }
     reader.finish()?;
     let session = Session {
-        owner: engine.identity.clone(),
+        owner: engine.new_session_owner(),
         cache_origin: engine.cache_identity.clone(),
         frontier,
         valid: true,

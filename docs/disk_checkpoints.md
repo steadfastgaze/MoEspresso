@@ -18,12 +18,17 @@ are excluded and must be evaluated when they appear in a later request.
 Compatibility binds the actual parsed package manifest and tokenizer,
 generation configuration and chat-template assets, supported state version and
 model geometry. Executable contents, device identifiers, paths, OS version,
-expert capacity and prefill width do not determine compatibility. A checkpoint
+expert capacity and ordinary GPU prefill width do not determine compatibility. A checkpoint
 must fit the receiving engine's context limit. Changed residency or chunk width
 may affect subsequent outputs without making the committed state invalid.
 Package payloads must remain immutable; manifest identity is not
 independent verification of weight bytes. This format does not read MoEspresso
 3 checkpoints.
+
+Combined ANE execution additionally binds its numerical producer and physical
+program width to cache identity. GPU and GPU+ANE execution cannot interchange
+checkpoints. An incompatible producer returns no match; changing its identity
+does not convert saved state.
 
 `save` validates independently committed component frontiers and size admission.
 It streams typed tensor spans and a checksum to a temporary

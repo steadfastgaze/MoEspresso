@@ -76,7 +76,8 @@ fn chunk_rows(frontier: u64, raw_words: usize, query_words: usize, limit: u64) -
     ensure!(
         (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows)
             && query_words == rows * QUERY_WORDS,
-        "QSA index chunk requires 2 through 4096 complete query/key rows"
+        "QSA index chunk requires 2 through {} complete query/key rows",
+        crate::prefill_capacity::MAX_ROWS
     );
     ensure!(
         frontier
@@ -2488,6 +2489,16 @@ mod tests {
 
     #[test]
     fn chunks_check_rows_and_frontier_before_arithmetic_or_allocation() {
+        {
+            assert_eq!(
+                chunk_rows(MAX_POSITIONS - 8192, 8192 * 128, 8192 * 512, MAX_POSITIONS).unwrap(),
+                8192
+            );
+            assert!(
+                chunk_rows(MAX_POSITIONS - 8191, 8192 * 128, 8192 * 512, MAX_POSITIONS).is_err()
+            );
+            assert!(chunk_rows(0, 8192 * 128, 8192 * 512 - 1, MAX_POSITIONS).is_err());
+        }
         for rows in [2, 3, 64, 512, 1024, 2048, 2049, 4096] {
             assert_eq!(
                 chunk_rows(0, rows * 128, rows * 512, MAX_POSITIONS).unwrap(),
@@ -2503,7 +2514,7 @@ mod tests {
             4096
         );
         assert!(chunk_rows(MAX_POSITIONS - 4095, 4096 * 128, 4096 * 512, MAX_POSITIONS).is_err());
-        for rows in [0, 1, 4097] {
+        for rows in [0, 1, crate::prefill_capacity::MAX_ROWS + 1] {
             assert!(chunk_rows(0, rows * 128, rows * 512, MAX_POSITIONS).is_err());
         }
         assert!(chunk_rows(0, 257, 1024, MAX_POSITIONS).is_err());

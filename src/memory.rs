@@ -24,6 +24,49 @@ pub(crate) const DEVICE_GREEDY_HOST_BYTES: u64 = 4 * (GENERATION_VOCABULARY / 32
 const SAMPLING_PREPARATION_DEVICE_BYTES: u64 = 4 * GENERATION_VOCABULARY + 4;
 const SAMPLING_HOST_WORKSPACE_BYTES: u64 = 27 * GENERATION_VOCABULARY + 262_144;
 
+/// Process, compiler, driver and allocator overhead outside labelled payloads.
+/// This policy reserve is not a bound on native allocation or later pressure.
+pub const PROCESS_OVERHEAD_ALLOWANCE_BYTES: u64 = 2 << 30;
+
+/// Retained payloads of one combined ANE owner. The single dynamic
+/// input includes activations and weights; no decoded weight copy is retained.
+/// Native program, pipeline, compiler and allocation overhead remain within
+/// the caller's separate process allowance. These lengths are not an RSS bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnePrefillMemory {
+    pub host_staging_bytes: u64,
+    pub metal_staging_bytes: u64,
+    pub iosurface_payload_bytes: u64,
+    pub qsa_attended_bytes: u64,
+}
+
+/// Logical payload lengths for one supported physical program shape.
+pub fn ane_prefill_memory(physical_rows: usize) -> Result<AnePrefillMemory> {
+    ensure!(
+        matches!(physical_rows, 4096 | 8192),
+        "ANE physical rows must be 4096 or 8192"
+    );
+    let rows = physical_rows as u64;
+    let staging = 2 * 2560 * (rows + 6144) + 2 * 6144 * rows;
+    Ok(AnePrefillMemory {
+        host_staging_bytes: staging,
+        metal_staging_bytes: staging + 4,
+        iosurface_payload_bytes: staging,
+        qsa_attended_bytes: 4 * 6144 * rows,
+    })
+}
+
+/// Charge once, alongside the ordinary process allowance, before selecting
+/// expert capacity or workspace phases. The physical owner does not resize
+/// when ordinary GPU scratch changes between 2048 and 4096 rows.
+pub fn ane_prefill_allowance_bytes(physical_rows: usize) -> Result<u64> {
+    let memory = ane_prefill_memory(physical_rows)?;
+    Ok(memory.host_staging_bytes
+        + memory.metal_staging_bytes
+        + memory.iosurface_payload_bytes
+        + memory.qsa_attended_bytes)
+}
+
 // Persistent operator and session buffers plus one request's reusable
 // sampling scratch, outside packed package tensors. This includes the IQ3
 // lookup-table upper bound and must be revised with those operator buffers.
@@ -69,6 +112,7 @@ pub(crate) fn native_prefill_workspace_bytes_for_capacity(
     let dense = match capacity {
         512 => 2_097_152,
         2048 | 4096 => 4_194_304,
+        8192 => 4_194_304,
         _ => unreachable!("validated prefill capacity"),
     };
     let fixed = capacity * 42_248 + 2 // HC transient
@@ -287,6 +331,25 @@ impl ExpertCapacityControlBudget {
 
     pub fn initial_serving_peak_bytes(&self) -> u64 {
         self.initial_serving_peak_bytes
+    }
+
+    pub(crate) fn process_overhead_allowance_bytes(&self) -> u64 {
+        self.process_overhead_allowance_bytes
+    }
+
+    /// Verify that a wider request workspace can retain at least 64 expert
+    /// slots within the existing operating budget. Context, caches and the
+    /// process allowance, including any reserved ANE payload, remain charged.
+    /// This proof does not change the ordinary budget or allocate storage.
+    pub fn validate_prefill_phase(
+        &self,
+        footprint: &PackageFootprint,
+        context: usize,
+        ordinary_rows: usize,
+        wide_rows: usize,
+    ) -> Result<()> {
+        self.with_prefill_width(footprint, context, ordinary_rows, wide_rows)
+            .map(|_| ())
     }
 
     /// A request phase changes scratch, chunk transients and experts.
@@ -1469,10 +1532,10 @@ impl PackageFootprint {
         if context_limit <= crate::prefill_capacity::DEFAULT_ROWS {
             return Ok((estimate, plan, admitted_rows));
         }
-        for wider_rows in [
-            crate::prefill_capacity::AUTOMATIC_ROWS,
-            crate::prefill_capacity::MAX_ROWS,
-        ] {
+        for wider_rows in [crate::prefill_capacity::AUTOMATIC_ROWS, 4096, 8192]
+            .into_iter()
+            .filter(|&rows| rows <= crate::prefill_capacity::MAX_ROWS)
+        {
             if wider_rows > requested_rows {
                 break;
             }
@@ -1757,6 +1820,125 @@ mod tests {
     }
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn combined_ane_payload_is_reserved_once_outside_workspace_phases() {
+        let mib = 1024 * 1024;
+        for (physical, staging, attended, total) in [(4096, 98, 96, 390), (8192, 166, 192, 690)] {
+            let memory = ane_prefill_memory(physical).unwrap();
+            assert_eq!(memory.host_staging_bytes, staging * mib);
+            assert_eq!(memory.metal_staging_bytes, staging * mib + 4);
+            assert_eq!(memory.iosurface_payload_bytes, staging * mib);
+            assert_eq!(memory.qsa_attended_bytes, attended * mib);
+            assert_eq!(
+                ane_prefill_allowance_bytes(physical).unwrap(),
+                total * mib + 4
+            );
+        }
+        assert_eq!(
+            ane_prefill_allowance_bytes(8192).unwrap() - ane_prefill_allowance_bytes(4096).unwrap(),
+            300 * mib
+        );
+        for rows in [0, 2048, 4097, 8193, usize::MAX] {
+            assert!(ane_prefill_memory(rows).is_err());
+            assert!(ane_prefill_allowance_bytes(rows).is_err());
+        }
+        let report = ordinary_report();
+        for rows in [2048, 4096, 8192] {
+            let allowance = ane_prefill_allowance_bytes(
+                crate::prefill_capacity::ane_physical_rows(rows).unwrap(),
+            )
+            .unwrap();
+            let input = ordinary_input(131072, rows, 511);
+            let ordinary = report
+                .estimate_ordinary_path_with_prefill_capacity(input, rows)
+                .unwrap();
+            let reserved = report
+                .estimate_ordinary_path_with_prefill_capacity(
+                    OrdinaryPathInputs {
+                        driver_allocator_allowance_bytes: input.driver_allocator_allowance_bytes
+                            + allowance,
+                        ..input
+                    },
+                    rows,
+                )
+                .unwrap();
+            for (before, after) in ordinary
+                .phase_component_sums()
+                .unwrap()
+                .into_iter()
+                .zip(reserved.phase_component_sums().unwrap())
+            {
+                assert_eq!(before.0, after.0);
+                assert_eq!(after.1 - before.1, allowance);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_8192_workspace_retains_exact_linear_inventory_and_admission_cost() {
+        for context in [1, 8192, 131072, 262144] {
+            let ordinary = native_prefill_workspace_bytes_for_capacity(context, 4096).unwrap();
+            let wider = native_prefill_workspace_bytes_for_capacity(context, 8192).unwrap();
+            assert_eq!(wider - ordinary, 1_996_144_640);
+            assert!(wider < u32::MAX as usize);
+        }
+        assert_eq!(
+            native_prefill_workspace_bytes_for_capacity(131072, 8192).unwrap(),
+            4_275_747_470
+        );
+        let report = ordinary_report();
+        let estimate = |rows| {
+            report
+                .estimate_ordinary_path_with_prefill_capacity(
+                    OrdinaryPathInputs {
+                        prefix_retained_budget_bytes: 0,
+                        snapshot_capture_restore_overlap_reserve_bytes: Some(0),
+                        ..ordinary_input(131072, rows, 512)
+                    },
+                    rows,
+                )
+                .unwrap()
+        };
+        let base = estimate(4096);
+        let wider = estimate(8192);
+        assert_eq!(
+            wider.prefill_workspace_requested_bytes - base.prefill_workspace_requested_bytes,
+            1_996_144_640
+        );
+        assert_eq!(
+            wider.engine_construction_phase_peak_bytes - base.engine_construction_phase_peak_bytes,
+            1_996_144_640
+        );
+        assert_eq!(
+            wider
+                .runtime_workspace_across_candidates
+                .combined_component_bytes
+                - base
+                    .runtime_workspace_across_candidates
+                    .combined_component_bytes,
+            80_842_752
+        );
+        assert_eq!(
+            wider.serving_phase_peak_bytes - base.serving_phase_peak_bytes,
+            2_076_987_392
+        );
+        let full_stage = |rows| {
+            runtime_workspaces(rows, 512, 0)
+                .unwrap()
+                .into_iter()
+                .find(|stage| stage.stage == OrdinaryWorkspaceStage::PrefillQueuedGraph)
+                .unwrap()
+        };
+        assert_eq!(
+            full_stage(8192).combined_component_bytes - full_stage(4096).combined_component_bytes,
+            65_114_112
+        );
+        assert_eq!(
+            wider.startup_phase_peak_bytes,
+            base.startup_phase_peak_bytes
+        );
+    }
 
     #[test]
     fn generation_sampling_inventory_matches_sampler_workspace() {
@@ -2289,6 +2471,8 @@ mod tests {
         let per_slot = footprint.packed_expert_bytes_per_uniform_slot;
         let overlap = 3_532_032;
         let other = 8u64 << 30;
+        let process_allowance =
+            PROCESS_OVERHEAD_ALLOWANCE_BYTES + ane_prefill_allowance_bytes(4096).unwrap();
         let root = ExpertCapacityControlBudget {
             initial_capacity: 96,
             maximum_capacity: 96,
@@ -2297,12 +2481,16 @@ mod tests {
             initial_serving_peak_bytes: other + old + 96 * per_slot,
             packed_expert_bytes_per_slot: per_slot,
             replacement_address_table_overlap_bytes: overlap,
-            process_overhead_allowance_bytes: 2 << 30,
+            process_overhead_allowance_bytes: process_allowance,
             operating_growth: true,
         };
         let wide = root
             .test_with_prefill_width(&footprint, 131072, 2048, 4096)
             .unwrap();
+        let unchanged = root;
+        root.validate_prefill_phase(&footprint, 131072, 2048, 4096)
+            .unwrap();
+        assert_eq!(root, unchanged);
         assert_eq!(wide.maximum_capacity(), 82);
         assert_eq!(
             wide.initial_serving_peak_bytes(),
@@ -2320,6 +2508,7 @@ mod tests {
             root.process_overhead_allowance_bytes,
             wide.process_overhead_allowance_bytes
         );
+        assert_eq!(wide.process_overhead_allowance_bytes, process_allowance);
         assert!(
             root.test_with_prefill_width(&footprint, 131072, 2048, 513)
                 .is_err()
@@ -2334,6 +2523,11 @@ mod tests {
         assert!(
             tight
                 .test_with_prefill_width(&footprint, 131072, 2048, 4096)
+                .is_err()
+        );
+        assert!(
+            tight
+                .validate_prefill_phase(&footprint, 131072, 2048, 4096)
                 .is_err()
         );
     }

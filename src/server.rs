@@ -56,6 +56,10 @@ pub struct ServeOptions {
     pub expert_capacity_control: Option<crate::memory::ExpertCapacityControlBudget>,
     /// Pressure response within the fixed operating budget.
     pub adaptive_memory: bool,
+    /// ANE payload reserved by admission, separately from process overhead.
+    /// Zero retains GPU execution; otherwise reserve the complete allowance
+    /// for the physical shape selected from the initial prefill workspace.
+    pub ane_reserved_bytes: u64,
 }
 
 /// Explicit host-cache allowances. These do not include the live Session,
@@ -356,6 +360,7 @@ impl State {
             "max_context": self.options.max_context,
             "prefill_capacity": self.engine.prefill_chunk_size(),
             "prefill_workspace_ready": self.engine.prefill_workspace_ready(),
+            "prefill_backend": if self.engine.ane_active() { "gpu+ane" } else { "gpu" },
             "phased_prefill": self.prefill_phase.is_some(),
             "adaptive_memory": self.adaptive.is_some(),
             "cache_routing": match self.options.decode_mode {
@@ -831,6 +836,27 @@ fn prefill_phase_after_quote(
     }
 }
 
+fn validate_ane_reservation(
+    reserved: u64,
+    process_allowance: Option<u64>,
+    workspace_rows: usize,
+) -> Result<()> {
+    let physical = crate::prefill_capacity::ane_physical_rows(workspace_rows)?;
+    let expected = crate::memory::ane_prefill_allowance_bytes(physical)?;
+    ensure!(
+        reserved == 0 || reserved == expected,
+        "ANE admission must reserve its complete retained payload"
+    );
+    if let Some(allowance) = process_allowance {
+        ensure!(
+            reserved == 0
+                || allowance >= crate::memory::PROCESS_OVERHEAD_ALLOWANCE_BYTES + reserved,
+            "capacity control budget omits the ANE reservation"
+        );
+    }
+    Ok(())
+}
+
 /// Serve a single package on loopback. Inference is serialized on the Metal
 /// owner thread; health and transport errors do not wait for generation.
 pub fn serve(package_path: &str, options: ServeOptions) -> Result<()> {
@@ -848,6 +874,13 @@ pub fn serve_with_prefill_capacity(
         "expert capacity must be 10..=512"
     );
     ensure!(options.max_context > 0, "max context must be positive");
+    validate_ane_reservation(
+        options.ane_reserved_bytes,
+        options
+            .expert_capacity_control
+            .map(|budget| budget.process_overhead_allowance_bytes()),
+        prefill_capacity,
+    )?;
     if let Some(budget) = options.expert_capacity_control {
         ensure!(
             budget.initial_capacity() == options.expert_capacity,
@@ -887,68 +920,6 @@ pub fn serve_with_prefill_capacity(
             disk_io,
         )?;
     }
-    let sampling_defaults = SamplingOptions::from_package(&package)?;
-    let tokenizer = TextTokenizer::load(&package)?;
-    let engine = Engine::load_with_prefill_capacity(
-        &package,
-        options.expert_capacity,
-        options.max_context,
-        prefill_capacity,
-    )?;
-    eprintln!("prefill workspace capacity={prefill_capacity}");
-    if let Some(disk) = options.cache.as_ref().and_then(|cache| cache.disk.as_ref()) {
-        let first =
-            crate::prefill_capacity::first_checkpoint_frontier(disk.stride, prefill_capacity)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned());
-        eprintln!(
-            "disk checkpoint cadence: mode={} configured_stride={} first_cold_anchor={first} prefill_capacity={prefill_capacity} anchor_write_depth={} final_frontiers={}",
-            disk.mode.as_str(),
-            disk.stride,
-            disk.write_depth,
-            if disk.mode == DiskCacheMode::Full {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-    }
-    let (memory_cache, disk_cache) = if let Some(cache) = &options.cache {
-        let disk_io = cache
-            .disk
-            .as_ref()
-            .map_or(0, |disk| disk.max_io_buffer_bytes);
-        let memory = (cache.memory_retained_bytes > 0)
-            .then(|| PromptPrefixCache::new(&engine, cache.memory_retained_bytes));
-        let disk = if let Some(disk) = &cache.disk {
-            match disk.open_store(&engine, &tokenizer) {
-                Ok(store) => Some(GenerationDiskCache::new(
-                    store,
-                    disk.stride,
-                    disk.write_depth,
-                )?),
-                Err(error) if disk.required => return Err(error),
-                Err(error) => {
-                    eprintln!("prompt cache disk unavailable; serving without it: {error:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if memory.is_some() || disk.is_some() {
-            eprintln!(
-                "prompt cache enabled: retained={} host_overlap={} disk_io_allowance={} disk_active={}",
-                cache.memory_retained_bytes,
-                cache.host_overlap_bytes,
-                disk_io,
-                disk.is_some()
-            );
-        }
-        (memory, disk)
-    } else {
-        (None, None)
-    };
     let prefill_phase = if phased_prefill_enabled(
         options.adaptive_memory,
         options.expert_capacity_control.is_some(),
@@ -983,10 +954,92 @@ pub fn serve_with_prefill_capacity(
     } else {
         None
     };
+    ensure!(
+        options.ane_reserved_bytes == 0 || prefill_capacity >= 4096 || prefill_phase.is_some(),
+        "ANE admission has no eligible ordinary or phased prefill workspace"
+    );
+    let sampling_defaults = SamplingOptions::from_package(&package)?;
+    let tokenizer = TextTokenizer::load(&package)?;
+    let mut engine = Engine::load_with_prefill_capacity(
+        &package,
+        options.expert_capacity,
+        options.max_context,
+        prefill_capacity,
+    )?;
+    if options.ane_reserved_bytes > 0 {
+        engine.prefer_ane(&package)?;
+    }
+    eprintln!("prefill workspace capacity={prefill_capacity}");
+    let initialized: Result<_> = (|| {
+        if let Some(disk) = options.cache.as_ref().and_then(|cache| cache.disk.as_ref()) {
+            let first =
+                crate::prefill_capacity::first_checkpoint_frontier(disk.stride, prefill_capacity)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned());
+            eprintln!(
+                "disk checkpoint cadence: mode={} configured_stride={} first_cold_anchor={first} prefill_capacity={prefill_capacity} anchor_write_depth={} final_frontiers={}",
+                disk.mode.as_str(),
+                disk.stride,
+                disk.write_depth,
+                if disk.mode == DiskCacheMode::Full {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        let (memory_cache, disk_cache) = if let Some(cache) = &options.cache {
+            let disk_io = cache
+                .disk
+                .as_ref()
+                .map_or(0, |disk| disk.max_io_buffer_bytes);
+            let memory = (cache.memory_retained_bytes > 0)
+                .then(|| PromptPrefixCache::new(&engine, cache.memory_retained_bytes));
+            let disk = if let Some(disk) = &cache.disk {
+                match disk.open_store(&engine, &tokenizer) {
+                    Ok(store) => Some(GenerationDiskCache::new(
+                        store,
+                        disk.stride,
+                        disk.write_depth,
+                    )?),
+                    Err(error) if disk.required => return Err(error),
+                    Err(error) => {
+                        eprintln!("prompt cache disk unavailable; serving without it: {error:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if memory.is_some() || disk.is_some() {
+                eprintln!(
+                    "prompt cache enabled: retained={} host_overlap={} disk_io_allowance={} disk_active={}",
+                    cache.memory_retained_bytes,
+                    cache.host_overlap_bytes,
+                    disk_io,
+                    disk.is_some()
+                );
+            }
+            (memory, disk)
+        } else {
+            (None, None)
+        };
+        let address = format!("127.0.0.1:{}", options.port);
+        let server = Server::http(&address).map_err(|error| anyhow!("bind {address}: {error}"))?;
+        Ok((memory_cache, disk_cache, server))
+    })();
+    let (memory_cache, disk_cache, server) = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            return match engine.close_ane() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup.context(format!("server startup failed: {error:#}"))),
+            };
+        }
+    };
     let address = format!("127.0.0.1:{}", options.port);
-    let server = Server::http(&address).map_err(|error| anyhow!("bind {address}: {error}"))?;
     eprintln!(
-        "serving {} on http://{address}/v1/chat/completions (serial, expert_capacity={}, max_context={})",
+        "☕ serving {} on http://{address}/v1/chat/completions (serial, expert_capacity={}, max_context={})",
         package.artifact_id, options.expert_capacity, options.max_context
     );
     let mut state = State {
@@ -1005,7 +1058,7 @@ pub fn serve_with_prefill_capacity(
     state.publish_health();
     let health = Arc::clone(&state.health);
     let (sender, receiver) = sync_channel(MAX_QUEUED_REQUESTS);
-    std::thread::scope(|scope| -> Result<()> {
+    let served = std::thread::scope(|scope| -> Result<()> {
         let dispatcher = scope.spawn(|| dispatch_requests_with_health(&server, &health, sender));
         // Release a dispatcher waiting in recv if the inference owner unwinds.
         let _unblock = UnblockOnDrop(&server);
@@ -1035,7 +1088,17 @@ pub fn serve_with_prefill_capacity(
             .join()
             .map_err(|_| anyhow!("HTTP dispatcher failed"))?;
         Ok(())
-    })
+    });
+    drop(state.disk_cache.take());
+    drop(state.memory_cache.take());
+    let cleanup = state.engine.close_ane();
+    match (served, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("ANE cleanup also failed: {cleanup:#}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1109,31 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc::{self, TryRecvError};
     use std::thread;
+
+    #[test]
+    fn ane_reservation_is_additional_to_the_complete_process_allowance() {
+        let base = crate::memory::PROCESS_OVERHEAD_ALLOWANCE_BYTES;
+        for workspace in [2048, 4096, 8192] {
+            let physical = crate::prefill_capacity::ane_physical_rows(workspace).unwrap();
+            let ane = crate::memory::ane_prefill_allowance_bytes(physical).unwrap();
+            assert!(base > ane);
+            assert!(validate_ane_reservation(0, None, workspace).is_ok());
+            assert!(validate_ane_reservation(0, Some(base), workspace).is_ok());
+            assert!(validate_ane_reservation(ane, None, workspace).is_ok());
+            assert!(validate_ane_reservation(ane, Some(base), workspace).is_err());
+            assert!(validate_ane_reservation(ane, Some(base + ane - 1), workspace).is_err());
+            assert!(validate_ane_reservation(ane, Some(base + ane), workspace).is_ok());
+            assert!(validate_ane_reservation(ane, Some(base + ane + 1), workspace).is_ok());
+            for invalid in [1, ane - 1, ane + 1, u64::MAX] {
+                assert!(validate_ane_reservation(invalid, None, workspace).is_err());
+                assert!(validate_ane_reservation(invalid, Some(u64::MAX), workspace).is_err());
+            }
+        }
+        let small = crate::memory::ane_prefill_allowance_bytes(4096).unwrap();
+        let large = crate::memory::ane_prefill_allowance_bytes(8192).unwrap();
+        assert!(validate_ane_reservation(small, Some(base + small), 8192).is_err());
+        assert!(validate_ane_reservation(large, Some(base + large), 2048).is_err());
+    }
 
     #[test]
     fn phased_prefill_defaults_only_for_eligible_admitted_serving() {

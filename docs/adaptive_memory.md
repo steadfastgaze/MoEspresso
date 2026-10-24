@@ -88,13 +88,26 @@ across loading, engine construction and serving. Insufficient or unavailable
 required observations fail before weight loading. These reserves do not
 guarantee safety against later external allocations or memory pressure.
 
-Ordinary prefill admission prefers 2048 rows. Full expert residency takes
-priority; if its wider workspace does not fit, it uses 512 rows. Bounded engines
-allocate the remaining admitted budget to expert slots, using 512 rows if the
-wider plan cannot retain at least 64 slots. Fixed-capacity diagnostics keep
-their requested slot count and use 2048 rows only when the complete estimate
-fits. Startup reports both capacities. Checkpoints remain reusable across
-prefill widths.
+ANE admission reserves one physical program selected from the initial GPU
+workspace. An 8192-row workspace selects an 8192-row program; smaller workspaces
+select a 4096-row program. Their retained payloads are 690 MiB plus four bytes
+and 390 MiB plus four bytes respectively, covering host staging, Metal staging,
+IOSurfaces and QSA attended scratch. The selected reservation remains charged
+during expert resizing and workspace changes. Native program and compiler
+overhead use the separate 2 GiB process allowance; the estimate is not an RSS
+guarantee.
+
+Fully resident ANE admission first tries the complete 8192-row plan, then a
+4096-row plan if the wider program and workspace do not fit. The wider plan
+must retain all 512 experts. Bounded adaptive serving uses the 4096-row program
+with 2048-row ordinary scratch
+and admits a 4096-row request phase only when its complete plan can retain at
+least 64 expert slots. Fixed-capacity execution keeps its requested experts and
+requires a fitting 4096-row workspace. If ANE cannot be admitted, startup warns
+and selects GPU execution, whose ordinary preference is 2048 rows with a
+512-row minimum. Full expert residency takes priority over a wider workspace.
+Startup reports both capacities. Cache checkpoints include numerical producer
+identity and remain reusable across workspace widths within that producer.
 
 Starting capacity uses automatic admission, including its live-memory
 observation. The adaptive operating ceiling is a separate fixed budget. It

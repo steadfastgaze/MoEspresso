@@ -314,7 +314,7 @@ mod gpu {
         ) -> Result<HcBatchOutput> {
             ensure!(
                 (2..=scratch.capacity).contains(&rows),
-                "HC batch supports 2 through 4096 rows"
+                "HC batch row count exceeds workspace capacity"
             );
             ensure!(
                 input.byte_len() >= rows * EXPANDED * 2,
@@ -415,7 +415,7 @@ mod gpu {
         ) -> Result<HcBatchStages> {
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "HC batch supports 2 through 4096 rows"
+                "HC batch row count exceeds supported prefill capacity"
             );
             checked_words(residual, rows * EXPANDED)?;
             if let Some((output, injection)) = pending {

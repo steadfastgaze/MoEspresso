@@ -155,7 +155,14 @@ struct QsaPrefillShared {
     int key_positions[16];
 };
 
-template<bool indexed>
+inline ushort qsa_finish_gate(float attended, float logistic, device atomic_uint* status) {
+    const float mixed = attended * logistic;
+    if (!metal::isfinite(attended) || !metal::isfinite(logistic) || !metal::isfinite(mixed))
+        atomic_fetch_or_explicit(status, 1u, memory_order_relaxed);
+    return qa_round(mixed);
+}
+
+template<bool indexed, bool DeferredGate = false>
 inline void qsa_prefill_online_body(
     const device ushort* queries,
     const device ushort* gates,
@@ -173,7 +180,7 @@ inline void qsa_prefill_online_body(
     ushort simd_group,
     ushort lane,
     const device int* logical_ids, const constant uint* geometry,
-    threadgroup QsaPrefillShared& shared) {
+    threadgroup QsaPrefillShared& shared, device float* attended_output = nullptr) {
     const uint query = group_index / 2u, kv_head = group_index % 2u;
     if (query >= rows[0]) return;
     constexpr uint D = 256u, selected = 2051u, key_tile = 16u;
@@ -337,16 +344,18 @@ inline void qsa_prefill_online_body(
         if (head >= 12u) continue;
         const uint output_index = (query * 24u + kv_head * 12u + head) * D + dimension;
         const float attended = ((threadgroup float*)shared.kv)[head * D + dimension];
+        if (DeferredGate) {
+            if (!metal::isfinite(attended)) atomic_fetch_or_explicit(status, 1u, memory_order_relaxed);
+            attended_output[output_index] = attended;
+            continue;
+        }
         const float gate = qa_bf16(gates[output_index]);
         const float logistic = 1.0f / (1.0f + exp(-gate));
-        const float mixed = attended * logistic;
-        if (!metal::isfinite(attended) || !metal::isfinite(logistic) || !metal::isfinite(mixed))
-            atomic_fetch_or_explicit(status, 1u, memory_order_relaxed);
         if (rows[1] != 0u) {
             attention[output_index] = qa_round(attended);
             sigmoid[output_index] = qa_round(logistic);
         }
-        gated[output_index] = qa_round(mixed);
+        gated[output_index] = qsa_finish_gate(attended, logistic, status);
     }
 }
 
@@ -394,4 +403,28 @@ kernel void qsa_prefill_indexed_mm(
     qsa_prefill_online_body<true>(queries, gates, gathered_keys, gathered_values,
         valid, selected_count, attention, sigmoid, gated, status, rows,
         group_index, tid, simd_group, lane, logical_ids, geometry, shared);
+}
+
+kernel void qsa_prefill_indexed_deferred(
+    const device ushort* q [[buffer(0)]], const device ushort* unused_gate [[buffer(1)]],
+    const device ushort* k [[buffer(2)]], const device ushort* v [[buffer(3)]],
+    const device uchar* valid [[buffer(4)]], const device uint* count [[buffer(5)]],
+    device ushort* unused_a [[buffer(6)]], device ushort* unused_s [[buffer(7)]],
+    device float* attended [[buffer(8)]], device atomic_uint* status [[buffer(9)]],
+    const constant uint* rows [[buffer(10)]], const device int* ids [[buffer(11)]],
+    const constant uint* geometry [[buffer(12)]], uint group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]], ushort simd [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup QsaPrefillShared shared;
+    qsa_prefill_online_body<true,true>(q,unused_gate,k,v,valid,count,unused_a,unused_s,
+        nullptr,status,rows,group,tid,simd,lane,ids,geometry,shared,attended);
+}
+
+kernel void qsa_late_gate(const device float* attended [[buffer(0)]],
+    const device ushort* gate [[buffer(1)]], device ushort* gated [[buffer(2)]],
+    device atomic_uint* status [[buffer(3)]], constant uint& count [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    const float logistic = 1.0f / (1.0f + exp(-qa_bf16(gate[index])));
+    gated[index] = qsa_finish_gate(attended[index], logistic, status);
 }

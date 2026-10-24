@@ -296,6 +296,7 @@ mod gpu {
             rows: usize,
             output: &QsaBatchAttentionOutput,
             status: &Buffer,
+            deferred: Option<(&Pipeline, &Buffer)>,
         ) -> Result<()> {
             let frontier = raw.frontier;
             let reconstructed_rows = raw.total_rows;
@@ -351,6 +352,16 @@ mod gpu {
                 .collect::<Vec<_>>(),
             )?;
             let offset = tile_offset * EXPANDED * 2;
+            let (pipeline, destination, destination_offset) =
+                if let Some((pipeline, buffer)) = deferred {
+                    ensure!(
+                        buffer.byte_len() >= end * EXPANDED * 4,
+                        "deferred QSA FP32 extent differs"
+                    );
+                    (pipeline, buffer, tile_offset * EXPANDED * 4)
+                } else {
+                    (&self.indexed_mm, &output.gated, offset)
+                };
             let bindings = [
                 (queries, offset),
                 (gates, offset),
@@ -360,7 +371,7 @@ mod gpu {
                 (counts, 0),
                 (&output.attention, 0),
                 (&output.sigmoid, 0),
-                (&output.gated, offset),
+                (destination, destination_offset),
                 (status, 0),
                 (&count, 0),
                 (ids, tile_offset * 2051 * 4),
@@ -370,7 +381,7 @@ mod gpu {
             // SAFETY: Guarded IDs precede this dispatch and the kernel also
             // rejects negative/future/out-of-reconstruction IDs before access.
             unsafe {
-                batch.dispatch_1d(&self.indexed_mm, &bindings, rows * 2 * 128, 128)?;
+                batch.dispatch_1d(pipeline, &bindings, rows * 2 * 128, 128)?;
             }
             Ok(())
         }
@@ -382,7 +393,7 @@ mod gpu {
         pub fn allocate_output(&self, rows: usize) -> Result<QsaBatchAttentionOutput> {
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "QSA batch requires 2 through 4096 rows"
+                "QSA batch row count exceeds supported prefill capacity"
             );
             QsaBatchAttentionOutput::new(&self.metal, rows)
         }

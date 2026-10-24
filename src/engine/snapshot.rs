@@ -517,7 +517,7 @@ impl Engine {
         let last_logits_bf16 = OnceCell::new();
         let _ = last_logits_bf16.set(snapshot.last_logits_bf16.clone());
         Ok(Session {
-            owner: self.identity.clone(),
+            owner: self.new_session_owner(),
             cache_origin: snapshot.cache_origin.clone(),
             frontier: snapshot.frontier,
             valid: true,

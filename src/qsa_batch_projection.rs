@@ -205,6 +205,75 @@ mod gpu {
     }
 
     impl QsaBatchProjector {
+        pub(crate) fn gate_weight_binding(&self) -> Result<Binding<'_>> {
+            let geometry = self.query.geometry();
+            ensure!(
+                geometry.format() == WeightFormat::Q6K
+                    && geometry.input() == 2560
+                    && geometry.output() == 12288,
+                "ANE QSA gate requires a Q6_K [12288,2560] matrix"
+            );
+            Ok(self.query.packed_weight_binding())
+        }
+
+        /// Mapped query GEMM and unchanged head preparation for an external gate.
+        ///
+        /// # Safety
+        /// Inputs, output and dense scratch satisfy encode_into's ordered ownership.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn encode_external_gate(
+            &self,
+            batch: &mut Batch,
+            hidden: &Buffer,
+            rows: usize,
+            start: usize,
+            out: &QsaBatchProjected,
+            dense: &DenseBatchScratch,
+            pipelines: [&Pipeline; 2],
+        ) -> Result<()> {
+            ensure!(
+                (4096..=8192).contains(&rows),
+                "QSA external gate rows differ"
+            );
+            out.check_rows(rows)?;
+            let end = start.checked_add(rows).context("QSA positions overflow")?;
+            let [query, prepare] = pipelines;
+            unsafe {
+                self.index
+                    .encode_rows_into(batch, hidden, &out.index_projection, rows, dense)?;
+                self.query.encode_qsa_half(
+                    batch,
+                    hidden,
+                    &out.query_projection,
+                    rows,
+                    dense,
+                    query,
+                )?;
+                self.key
+                    .encode_rows_into(batch, hidden, &out.key_projection, rows, dense)?;
+                self.value
+                    .encode_rows_into(batch, hidden, &out.values, rows, dense)?;
+                let positions: Vec<u8> = (start..end)
+                    .flat_map(|p| (0..3).flat_map(move |_| (p as i64).to_le_bytes()))
+                    .collect();
+                let positions = upload(&self.metal, &positions)?;
+                encode_preparation(
+                    batch,
+                    &self.factors,
+                    prepare,
+                    &positions,
+                    [
+                        &self.index_norm,
+                        &self.query_norm,
+                        &self.key_norm,
+                        &self.epsilon,
+                    ],
+                    out,
+                    rows,
+                )
+            }
+        }
+
         pub fn dense_scratch_bytes(&self, capacity: usize) -> Result<usize> {
             [&self.index, &self.query, &self.key, &self.value]
                 .iter()
@@ -309,7 +378,7 @@ mod gpu {
         ) -> Result<QsaBatchProjected> {
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "QSA batch requires 2 through 4096 rows"
+                "QSA batch row count exceeds supported prefill capacity"
             );
             ensure!(
                 start.checked_add(rows).is_some_and(|end| end <= 262144),
@@ -394,7 +463,7 @@ mod gpu {
         ) -> Result<BTreeMap<&'static str, Vec<u8>>> {
             ensure!(
                 (2..=crate::prefill_capacity::MAX_ROWS).contains(&rows),
-                "QSA batch requires 2 through 4096 rows"
+                "QSA batch row count exceeds supported prefill capacity"
             );
             ensure!(
                 hidden.len() == rows * 2560 * 2,

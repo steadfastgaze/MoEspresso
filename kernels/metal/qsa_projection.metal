@@ -44,6 +44,7 @@ kernel void qsa_rope_factors_rows(
                          sine + row * 64u, index % 32u);
 }
 
+template<bool CompactQuery = false>
 inline void qsa_project_rope_head(
     device const ushort* index_projection,
     device const ushort* query_projection,
@@ -75,7 +76,7 @@ inline void qsa_project_rope_head(
     uint per_thread = width / 32;
     device const ushort* source = is_index
         ? index_projection + local_head * index_width
-        : (is_query ? query_projection + local_head * 2 * head_width
+        : (is_query ? query_projection + local_head * (CompactQuery ? 1u : 2u) * head_width
                     : key_projection + local_head * head_width);
     device const ushort* weight = is_index ? index_norm_weight
         : (is_query ? query_norm_weight : key_norm_weight);
@@ -135,7 +136,7 @@ inline void qsa_project_rope_head(
             raw_index_key[dimension] = index_projection[index_heads * index_width + dimension];
         }
     }
-    if (is_query) {
+    if (is_query && !CompactQuery) {
         for (uint i = 0; i < 8; ++i) {
             uint dimension = tid * 8 + i;
             query_gate[local_head * head_width + dimension] = source[head_width + dimension];
@@ -195,4 +196,20 @@ kernel void qsa_project_rope_rows(
         index_queries + row * 512u, raw_index_key + row * 128u,
         queries + row * 6144u, query_gate + row * 6144u, keys + row * 512u,
         epsilon, normalized, group % 30u, tid);
+}
+
+kernel void qsa_project_rope_compact_rows(
+    device const ushort* a [[buffer(0)]], device const ushort* b [[buffer(1)]],
+    device const ushort* c [[buffer(2)]], device const ushort* d [[buffer(3)]],
+    device const ushort* e [[buffer(4)]], device const ushort* f [[buffer(5)]],
+    device const ushort* g [[buffer(6)]], device const ushort* h [[buffer(7)]],
+    device ushort* i [[buffer(8)]], device ushort* j [[buffer(9)]],
+    device ushort* k [[buffer(10)]], device ushort* l [[buffer(11)]],
+    device ushort* m [[buffer(12)]], device const float* n [[buffer(13)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint row = group / 30u;
+    threadgroup ushort normalized[256];
+    qsa_project_rope_head<true>(a + row*640u, b + row*6144u, c + row*512u,
+        d,e,f,g + row*64u,h + row*64u,i + row*512u,j + row*128u,
+        k + row*6144u,l + row*6144u,m + row*512u,n,normalized,group%30u,tid);
 }

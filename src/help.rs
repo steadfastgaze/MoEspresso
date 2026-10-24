@@ -9,11 +9,31 @@ Commands:
   serve       Start a local Chat Completions server
   generate    Generate text from one prompt
   speed       Measure an existing server's prefill and decode speed
+  check-ane   Check private ANE runtime access without loading model weights
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Run 'moespresso <COMMAND> --help' for command options.
+";
+
+pub(crate) const CHECK_ANE: &str = "\
+Check private ANE runtime access on this Mac without loading model weights.
+
+Usage: moespresso check-ane
+
+Compiles and loads a small projection, changes its inputs and weights three
+times, checks every result against known exact values, then unloads it.
+Uses a fixed 30-second deadline. A timeout exits with status 124; other failures
+exit unsuccessfully and identify the failing stage. Temporary compiler files
+are removed on normal completion; a timeout may leave them behind.
+
+A pass checks this runtime path, not model performance or numerical quality.
+The command does not change inference settings or enable ANE in the server.
 
 Options:
   -h, --help  Print help
-
-Run 'moespresso <COMMAND> --help' for command options.
 ";
 
 pub(crate) const SERVE: &str = "\
@@ -82,12 +102,12 @@ Options:
   --max-tokens N            Topic output cap, 2..2048 [default: 256]
   --timeout SECONDS         Request timeout [default: 300; 32K: 1800]
   --stream                 Use SSE streaming instead of buffered JSON
-  --compare-id U64          Repeatable prompts for native/fork comparisons
+  --compare-id U64          Repeatable prompts for cross-server comparisons
   -h, --help                Print help
 
 Uses greedy sampling and does not bypass server caches.
 Comparison pins thinking on and excludes cached/early-stop results from matched rates.
 Non-interactive runs skip 32K. Prefill cases generate at most 8 tokens.
 For uncached prefill, start the server with --no-disk-cache --prompt-cache-gb 0.
-Native/fork setup and timing definitions: docs/speed_comparison.md
+Comparison setup and timing definitions: docs/speed_comparison.md
 ";

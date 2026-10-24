@@ -1,6 +1,8 @@
 //! Native text generation and loopback Chat Completions serving.
 
 #[cfg(target_os = "macos")]
+mod check_ane;
+#[cfg(target_os = "macos")]
 mod disk_config;
 #[cfg(target_os = "macos")]
 mod help;
@@ -17,7 +19,7 @@ mod cli {
     use moespresso::generation::{GenerationOptions, generate};
     use moespresso::host_memory::{HostMemoryObservation, observe_host_memory};
     use moespresso::memory::ExpertCapacityControlBudget;
-    use moespresso::memory::PackageFootprint;
+    use moespresso::memory::{PROCESS_OVERHEAD_ALLOWANCE_BYTES, PackageFootprint};
     use moespresso::metal::Metal;
     use moespresso::model::QwenConfig;
     use moespresso::package::Package;
@@ -34,9 +36,6 @@ mod cli {
     // allowances are policy choices, not guarantees against later pressure.
     const AUTO_LIVE_RESERVE_BYTES: u64 = 3 * GIB_BYTES;
     const AUTO_METAL_RESERVE_BYTES: u64 = GIB_BYTES;
-    // Absolute allowance for process, driver, allocator and serving ownership
-    // outside the labelled package, state and requested workspace components.
-    const PROCESS_OVERHEAD_ALLOWANCE_BYTES: u64 = 2 * GIB_BYTES;
 
     #[derive(Debug, PartialEq)]
     struct ServeArgs {
@@ -60,6 +59,7 @@ mod cli {
         prefill_capacity: usize,
         control_budget: Option<ExpertCapacityControlBudget>,
         adaptive_memory: bool,
+        ane_reserved_bytes: u64,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +119,8 @@ mod cli {
     #[derive(Debug, PartialEq)]
     enum Command {
         Help(&'static str),
+        Version,
+        CheckAne,
         Generate(GenerateArgs),
         Serve(ServeArgs),
         Speed(speed::SpeedOptions),
@@ -341,6 +343,100 @@ mod cli {
         disk_snapshot_overlap_bytes: u64,
         adaptive_memory: bool,
     ) -> Result<ResolvedCapacity> {
+        if max_context >= 4096 {
+            let mut refusals = Vec::new();
+            for physical_rows in [8192, 4096] {
+                if max_context < physical_rows
+                    || (physical_rows == 8192 && explicit_capacity.is_some_and(|slots| slots < 512))
+                {
+                    continue;
+                }
+                match resolve_capacity_with_ane(
+                    package,
+                    max_context,
+                    explicit_capacity,
+                    max_memory_bytes,
+                    prompt_cache_bytes,
+                    disk_snapshot_overlap_bytes,
+                    adaptive_memory,
+                    Some(physical_rows),
+                ) {
+                    Ok(capacity) => return Ok(capacity),
+                    Err(error) => refusals.push(format!("{physical_rows} rows: {error:#}")),
+                }
+            }
+            eprintln!(
+                "⚠ ANE prefill cannot be admitted; using GPU prefill: {}",
+                refusals.join("; ")
+            );
+        } else {
+            eprintln!("⚠ ANE prefill requires at least 4096 context tokens; using GPU prefill");
+        }
+        resolve_capacity_with_ane(
+            package,
+            max_context,
+            explicit_capacity,
+            max_memory_bytes,
+            prompt_cache_bytes,
+            disk_snapshot_overlap_bytes,
+            adaptive_memory,
+            None,
+        )
+    }
+
+    fn validate_ane_candidate(
+        physical_rows: Option<usize>,
+        expert_capacity: usize,
+        workspace_rows: usize,
+        context: usize,
+    ) -> Result<()> {
+        let Some(physical_rows) = physical_rows else {
+            return Ok(());
+        };
+        ensure!(
+            matches!(physical_rows, 4096 | 8192),
+            "ANE physical rows must be 4096 or 8192"
+        );
+        ensure!(
+            context >= physical_rows,
+            "ANE shape exceeds the context limit"
+        );
+        ensure!(
+            moespresso::prefill_capacity::ane_physical_rows(workspace_rows)? == physical_rows,
+            "ANE reservation differs from the initial workspace shape"
+        );
+        if physical_rows == 8192 {
+            ensure!(
+                expert_capacity == 512 && workspace_rows == 8192,
+                "8192-row ANE admission requires full residency and an 8192-row workspace"
+            );
+        } else {
+            ensure!(
+                matches!(workspace_rows, 2048 | 4096),
+                "4096-row ANE admission requires an eligible ordinary or phased workspace"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_capacity_with_ane(
+        package: &Package,
+        max_context: usize,
+        explicit_capacity: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        prompt_cache_bytes: u64,
+        disk_snapshot_overlap_bytes: u64,
+        adaptive_memory: bool,
+        ane: Option<usize>,
+    ) -> Result<ResolvedCapacity> {
+        let ane_reserved_bytes = ane
+            .map(moespresso::memory::ane_prefill_allowance_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let process_allowance = PROCESS_OVERHEAD_ALLOWANCE_BYTES
+            .checked_add(ane_reserved_bytes)
+            .context("ANE admission allowance overflow")?;
         if let Some(capacity) = explicit_capacity {
             ensure!(
                 max_memory_bytes.is_none(),
@@ -350,21 +446,51 @@ mod cli {
                 prompt_cache_bytes == 0 && disk_snapshot_overlap_bytes == 0,
                 "enabled caches conflict with fixed --expert-capacity"
             );
-            let rows = (|| -> Result<usize> {
+            let select_rows = || -> Result<usize> {
                 if max_context <= moespresso::prefill_capacity::DEFAULT_ROWS {
                     return Ok(moespresso::prefill_capacity::DEFAULT_ROWS);
                 }
                 let footprint = PackageFootprint::from_package(package)?;
-                let recommended = Metal::new()?.memory_stats()?.device_recommended_max_working_set_bytes;
+                let recommended = Metal::new()?
+                    .memory_stats()?
+                    .device_recommended_max_working_set_bytes;
                 let budget = automatic_host_budget(observe_host_memory()?, recommended)?;
-                let wide = footprint.estimate_fixed_capacity_prefill(max_context, capacity,
-                    moespresso::prefill_capacity::AUTOMATIC_ROWS, PROCESS_OVERHEAD_ALLOWANCE_BYTES)?;
+                if let Some(rows) = ane {
+                    validate_ane_candidate(ane, capacity, rows, max_context)?;
+                    let wide = footprint.estimate_fixed_capacity_prefill(
+                        max_context,
+                        capacity,
+                        rows,
+                        process_allowance,
+                    )?;
+                    ensure!(
+                        wide.accounted_component_sum_bytes <= budget.process_budget_bytes,
+                        "fixed expert capacity leaves insufficient memory for ANE and {rows}-row prefill"
+                    );
+                    return Ok(rows);
+                }
+                let wide = footprint.estimate_fixed_capacity_prefill(
+                    max_context,
+                    capacity,
+                    moespresso::prefill_capacity::AUTOMATIC_ROWS,
+                    process_allowance,
+                )?;
                 Ok(moespresso::prefill_capacity::admitted_rows(
-                    wide.accounted_component_sum_bytes, budget.process_budget_bytes))
-            })().unwrap_or_else(|error| {
-                eprintln!("prefill admission unavailable; retaining 512 rows for fixed expert capacity: {error:#}");
-                moespresso::prefill_capacity::DEFAULT_ROWS
-            });
+                    wide.accounted_component_sum_bytes,
+                    budget.process_budget_bytes,
+                ))
+            };
+            let rows = if ane.is_some() {
+                select_rows()?
+            } else {
+                select_rows().unwrap_or_else(|error| {
+                    eprintln!(
+                        "prefill admission unavailable; retaining 512 rows for fixed expert capacity: {error:#}"
+                    );
+                    moespresso::prefill_capacity::DEFAULT_ROWS
+                })
+            };
+            validate_ane_candidate(ane, capacity, rows, max_context)?;
             eprintln!(
                 "prefill admission: mode=fixed-expert-capacity selected_slots={capacity} prefill_capacity={rows}"
             );
@@ -373,6 +499,7 @@ mod cli {
                 prefill_capacity: rows,
                 control_budget: None,
                 adaptive_memory: false,
+                ane_reserved_bytes,
             });
         }
         let footprint = PackageFootprint::from_package(package)?;
@@ -389,12 +516,24 @@ mod cli {
             max_context,
             budget.process_budget_bytes,
             user_limit_bytes,
-            PROCESS_OVERHEAD_ALLOWANCE_BYTES,
+            process_allowance,
             prompt_cache_bytes,
             disk_snapshot_overlap_bytes,
         )?;
+        if ane == Some(8192) {
+            ensure!(
+                plan.slots == 512,
+                "8192-row ANE admission requires full expert residency"
+            );
+        }
+        let requested_rows = match ane {
+            Some(8192) => 8192,
+            Some(4096) if plan.slots == 512 || !adaptive_memory || plan.slots < 64 => 4096,
+            _ => moespresso::prefill_capacity::AUTOMATIC_ROWS,
+        };
         let (estimate, plan, prefill_capacity) =
-            footprint.upgrade_prefill_capacity(max_context, estimate, plan)?;
+            footprint.upgrade_prefill_capacity_to(max_context, estimate, plan, requested_rows)?;
+        validate_ane_candidate(ane, plan.slots, prefill_capacity, max_context)?;
         let adaptive_mode = adaptive_mode(plan.slots, adaptive_memory);
         let control_budget = adaptive_mode
             .enabled()
@@ -424,6 +563,15 @@ mod cli {
         } else {
             control_budget
         };
+        if ane.is_some() && prefill_capacity < 4096 {
+            ensure!(
+                prefill_capacity == moespresso::prefill_capacity::AUTOMATIC_ROWS,
+                "ANE admission requires an eligible prefill workspace"
+            );
+            control_budget
+                .context("ANE admission requires a wider adaptive prefill phase")?
+                .validate_prefill_phase(&footprint, max_context, prefill_capacity, 4096)?;
+        }
         let selected_expert_bytes = footprint
             .packed_expert_bytes_per_uniform_slot
             .checked_mul(u64::try_from(plan.slots)?)
@@ -473,11 +621,17 @@ mod cli {
             adaptive_mode.enabled(),
             adaptive_mode.reason()
         );
+        if let Some(physical_rows) = ane {
+            eprintln!(
+                "ANE admission: retained_bytes={ane_reserved_bytes} physical_rows={physical_rows} minimum_actual_rows=4096"
+            );
+        }
         Ok(ResolvedCapacity {
             expert_capacity: plan.slots,
             prefill_capacity,
             control_budget,
             adaptive_memory: adaptive_mode.enabled(),
+            ane_reserved_bytes,
         })
     }
 
@@ -485,6 +639,16 @@ mod cli {
         let mut args = args.into_iter();
         match args.next().as_deref() {
             Some("--help" | "-h") => return Ok(Command::Help(help::OVERVIEW)),
+            Some("--version" | "-V") => return Ok(Command::Version),
+            Some("check-ane") => {
+                return match args.next().as_deref() {
+                    None => Ok(Command::CheckAne),
+                    Some("--help" | "-h") => Ok(Command::Help(help::CHECK_ANE)),
+                    Some(arg) => bail!(
+                        "unexpected check-ane argument: {arg}\nUse moespresso check-ane --help for options."
+                    ),
+                };
+            }
             Some("serve") => return parse_serve_args(args),
             Some("speed") => {
                 let options: Vec<_> = args.collect();
@@ -809,6 +973,11 @@ mod cli {
                 println!("{text}");
                 Ok(())
             }
+            Command::Version => {
+                println!(concat!("moespresso ", env!("CARGO_PKG_VERSION")));
+                Ok(())
+            }
+            Command::CheckAne => crate::check_ane::run(),
             Command::Generate(args) => run_generate(args),
             Command::Serve(args) => run_serve(args),
             Command::Speed(args) => speed::run(args),
@@ -871,6 +1040,7 @@ mod cli {
                 decode_mode: args.cache_routing,
                 expert_capacity_control: control_budget,
                 adaptive_memory: resolved_capacity.adaptive_memory,
+                ane_reserved_bytes: resolved_capacity.ane_reserved_bytes,
                 cache: (retained > 0 || disk.is_some()).then_some(ServeCacheOptions {
                     memory_retained_bytes: retained,
                     host_overlap_bytes: host_overlap,
@@ -938,7 +1108,7 @@ mod cli {
             args.max_context
         );
         eprintln!(
-            "loading {}: prompt={} tokens, expert_capacity={}, max_context={}, decode_routing={:?}, sampling={}, temperature={}, top_p={}, top_k={}, min_p={}, presence_penalty={}, presence_context_size={}, seed={}",
+            "☕ loading {}: prompt={} tokens, expert_capacity={}, max_context={}, decode_routing={:?}, sampling={}, temperature={}, top_p={}, top_k={}, min_p={}, presence_penalty={}, presence_context_size={}, seed={}",
             package.artifact_id,
             prompt.tokens.len(),
             expert_capacity,
@@ -963,9 +1133,12 @@ mod cli {
             args.max_context,
             prefill_capacity,
         )?;
+        if resolved_capacity.ane_reserved_bytes > 0 {
+            engine.prefer_ane(&package)?;
+        }
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        let stats = generate(
+        let generated = generate(
             &mut engine,
             &tokenizer,
             &prompt.tokens,
@@ -982,7 +1155,15 @@ mod cli {
                 Ok(())
             },
             || false,
-        )?;
+        );
+        let cleanup = engine.close_ane();
+        let stats = match (generated, cleanup) {
+            (Ok(stats), Ok(())) => stats,
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+            (Err(error), Err(cleanup)) => {
+                return Err(error.context(format!("ANE cleanup also failed: {cleanup:#}")));
+            }
+        };
         eprintln!(
             "finish={:?} prompt_consumed={} generated={} frontier={} changed_routes={}",
             stats.finish,
@@ -997,6 +1178,26 @@ mod cli {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn ane_candidates_match_initial_workspace_and_full_residency() {
+            assert!(validate_ane_candidate(Some(8192), 512, 8192, 131072).is_ok());
+            assert!(validate_ane_candidate(Some(8192), 128, 8192, 131072).is_err());
+            assert!(validate_ane_candidate(Some(8192), 512, 4096, 131072).is_err());
+            assert!(validate_ane_candidate(Some(8192), 512, 8192, 4096).is_err());
+            for capacity in [64, 128, 512] {
+                for workspace in [2048, 4096] {
+                    assert!(
+                        validate_ane_candidate(Some(4096), capacity, workspace, 131072).is_ok()
+                    );
+                }
+            }
+            assert!(validate_ane_candidate(Some(4096), 128, 8192, 131072).is_err());
+            assert!(validate_ane_candidate(Some(4096), 128, 512, 131072).is_err());
+            assert!(validate_ane_candidate(Some(4096), 128, 2048, 2048).is_err());
+            assert!(validate_ane_candidate(Some(2048), 128, 2048, 131072).is_err());
+            assert!(validate_ane_candidate(None, 128, 512, 2048).is_ok());
+        }
 
         #[test]
         fn speed_command_uses_bounded_client_options() {
@@ -1275,6 +1476,7 @@ mod cli {
                 ("serve", help::SERVE),
                 ("generate", help::GENERATE),
                 ("speed", help::SPEED),
+                ("check-ane", help::CHECK_ANE),
             ] {
                 for flag in ["--help", "-h"] {
                     assert_eq!(
@@ -1287,6 +1489,17 @@ mod cli {
                 parse_args(["--help"].map(str::to_owned)).unwrap(),
                 Command::Help(help::OVERVIEW)
             );
+        }
+
+        #[test]
+        fn ane_check_needs_no_package_and_rejects_configuration_arguments() {
+            assert_eq!(
+                parse_args(["check-ane"].map(str::to_owned)).unwrap(),
+                Command::CheckAne
+            );
+            for argument in ["model", "--timeout", "--expert-capacity", "--unknown"] {
+                assert!(parse_args(["check-ane", argument].map(str::to_owned)).is_err());
+            }
         }
 
         #[test]

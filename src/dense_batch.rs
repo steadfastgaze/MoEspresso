@@ -34,7 +34,7 @@ impl DenseBatchPlan {
     pub fn new(geometry: DenseGeometry, rows: usize) -> Result<Self> {
         ensure!(
             (MIN_ROWS..=MAX_ROWS).contains(&rows),
-            "dense batch supports 1 through 4096 rows"
+            "dense batch supports 1 through {MAX_ROWS} rows"
         );
         let input = geometry.input();
         let output = geometry.output();
@@ -273,6 +273,63 @@ mod gpu {
 
         pub fn geometry(&self) -> DenseGeometry {
             self.geometry
+        }
+
+        /// Borrow immutable packed storage for the external projection.
+        pub(crate) fn packed_weight_binding(&self) -> Binding<'_> {
+            self.weight.binding()
+        }
+
+        /// Row-bounded QSA projection using the ordinary GEMM with mapped weight rows.
+        ///
+        /// # Safety
+        /// The supplied strict pipeline is one of the QSA half wrappers. Operands
+        /// are initialized and retained on the same stream without unordered access.
+        pub(crate) unsafe fn encode_qsa_half(
+            &self,
+            batch: &mut Batch,
+            input: &Buffer,
+            output: &Buffer,
+            rows: usize,
+            scratch: &DenseBatchScratch,
+            pipeline: &Pipeline,
+        ) -> Result<()> {
+            ensure!(
+                self.geometry.format() == WeightFormat::Q6K
+                    && self.geometry.input() == 2560
+                    && self.geometry.output() == 12288
+                    && (4096..=8192).contains(&rows)
+                    && input.byte_len() >= rows * 2560 * 2
+                    && output.byte_len() >= rows * 6144 * 2,
+                "QSA half geometry differs"
+            );
+            let dims = [rows as u32, 6144, 2560, 1, 2560]
+                .map(u32::to_le_bytes)
+                .concat();
+            let bindings = [
+                self.weight.binding(),
+                Binding {
+                    buffer: input,
+                    offset: 0,
+                },
+                Binding {
+                    buffer: output,
+                    offset: 0,
+                },
+                Binding {
+                    buffer: &scratch.partials,
+                    offset: 0,
+                },
+            ];
+            unsafe {
+                batch.dispatch_1d_with_inline(
+                    pipeline,
+                    &bindings,
+                    &[&dims],
+                    rows.div_ceil(64) * 96 * 128,
+                    128,
+                )
+            }
         }
 
         #[cfg(test)]
@@ -616,6 +673,37 @@ mod tests {
     }
 
     #[test]
+    fn wide_dense_plans_keep_uint_extents_and_existing_peak_scratch() {
+        let router = geometry(WeightFormat::Bf16, 512, 2560);
+        let (peak_rows, bytes) = (1..=8192)
+            .map(|rows| {
+                (
+                    rows,
+                    DenseBatchPlan::new(router, rows).unwrap().scratch_bytes(),
+                )
+            })
+            .max_by_key(|&(_, bytes)| bytes)
+            .unwrap();
+        assert_eq!((peak_rows, bytes), (1024, 4_194_304));
+        for (format, output, input) in [
+            (WeightFormat::Q6K, 12288, 2560),
+            (WeightFormat::Q6K, 10240, 2560),
+            (WeightFormat::Q6K, 6144, 2560),
+            (WeightFormat::Q8_0, 2560, 6144),
+            (WeightFormat::Bf16, 512, 2560),
+        ] {
+            let plan = DenseBatchPlan::new(geometry(format, output, input), 8192).unwrap();
+            assert_eq!(plan.method(), DenseBatchMethod::Matmul);
+            assert_eq!(plan.partitions(), 1);
+            assert_eq!(plan.scratch_bytes(), 4);
+            assert!(plan.input_bytes() <= u32::MAX as usize);
+            assert!(plan.output_bytes() <= u32::MAX as usize);
+            assert!(plan.grid_threads().unwrap() <= u32::MAX as usize);
+            assert_eq!(plan.dimensions().unwrap().len(), 20);
+        }
+    }
+
+    #[test]
     #[ignore = "requires MOESPRESSO_TEST_PACKAGE; checks headers and CPU plans without Metal"]
     fn package_prefill_dense_scratch_inventory_is_accounted() -> Result<()> {
         let package = crate::package::Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
@@ -676,7 +764,7 @@ mod tests {
                 assert_eq!(p.scratch_bytes(), 4);
                 assert_eq!(p.output_bytes(), rows * 4 * 2);
             }
-            for rows in [0, 4097, usize::MAX] {
+            for rows in [0, MAX_ROWS + 1, usize::MAX] {
                 assert!(DenseBatchPlan::new(g, rows).is_err());
             }
         }

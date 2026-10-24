@@ -1,4 +1,4 @@
-//! Scoped Metal residency requests without extending Rust buffer ownership.
+//! Scoped prefill and fixed expert residency with explicit buffer ownership.
 
 use super::{BufferInner, Metal};
 use anyhow::{Context, Result, ensure};
@@ -12,6 +12,84 @@ use objc2_metal::{
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+
+/// An external owner of original expert payloads and their native residency set.
+/// The serialized inference owner drains its streams before dropping this value.
+pub(crate) struct FixedResidency {
+    metal: Metal,
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    pins: Vec<super::Buffer>,
+    active: bool,
+}
+
+impl FixedResidency {
+    pub(crate) fn new(metal: &Metal, mut pins: Vec<super::Buffer>) -> Result<Self> {
+        ensure!(
+            Support::for_device(&metal.0.device) == Support::Available,
+            "fixed ANE residency requires supported Metal residency"
+        );
+        ensure!(
+            !pins.is_empty()
+                && pins.iter().all(|buffer| {
+                    Rc::ptr_eq(&buffer.0.device, &metal.0)
+                        && buffer.0.uses.get() == 0
+                        && buffer.0.reserved_by.get() == 0
+                }),
+            "fixed ANE residency requires completed same-device expert buffers"
+        );
+        pins.sort_unstable_by_key(|buffer| Rc::as_ptr(&buffer.0));
+        pins.dedup_by(|a, b| Rc::ptr_eq(&a.0, &b.0));
+        let requested_bytes = pins.iter().try_fold(0usize, |sum, buffer| {
+            sum.checked_add(buffer.byte_len())
+                .context("expert residency byte count overflow")
+        })?;
+        let descriptor = MTLResidencySetDescriptor::new();
+        descriptor.setLabel(Some(&NSString::from_str("MoEspresso ANE expert residency")));
+        let mut owner = Self {
+            metal: metal.clone(),
+            set: metal
+                .0
+                .device
+                .newResidencySetWithDescriptor_error(&descriptor)
+                .context("create ANE expert Metal residency set")?,
+            pins,
+            active: false,
+        };
+        for buffer in &owner.pins {
+            owner.set.addAllocation(allocation(&buffer.0));
+        }
+        owner.set.commit();
+        owner.set.requestResidency();
+        owner.metal.0.queue.addResidencySet(&owner.set);
+        owner.active = true;
+        ensure!(
+            owner.set.allocationCount() == owner.pins.len(),
+            "fixed ANE residency differs from expert allocations"
+        );
+        eprintln!(
+            "ANE expert residency: allocation_count={} requested_bytes={requested_bytes}",
+            owner.pins.len()
+        );
+        Ok(owner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set(&self) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+        self.set.clone()
+    }
+}
+
+impl Drop for FixedResidency {
+    fn drop(&mut self) {
+        if self.active {
+            self.metal.0.queue.removeResidencySet(&self.set);
+            self.set.endResidency();
+        }
+        self.set.removeAllAllocations();
+        self.set.commit();
+        // Native ownership ends before the Buffer fields release their pins.
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Support {
@@ -197,6 +275,71 @@ mod tests {
     use anyhow::Result;
     use objc2_metal::MTLResidencySet;
     use std::rc::Rc;
+
+    #[test]
+    fn standalone_set_deduplicates_original_payloads_and_drops_without_cycle() -> Result<()> {
+        let metal = Metal::for_engine(512)?;
+        assert!(metal.0.prefill_residency.is_none());
+        let first = metal.shared_buffer(64)?;
+        let second = metal.shared_buffer(96)?;
+        let small_table = metal.shared_buffer(16)?;
+        let first_weak = Rc::downgrade(&first.0);
+        assert!(super::FixedResidency::new(&metal, Vec::new()).is_err());
+        let owner = super::FixedResidency::new(
+            &metal,
+            vec![first.clone(), second.clone(), first.clone(), second.clone()],
+        )?;
+        let native = owner.test_set();
+        assert_eq!(owner.pins.len(), 2);
+        assert_eq!(native.allocationCount(), 2);
+        assert!(native.containsAllocation(allocation(&first.0)));
+        assert!(native.containsAllocation(allocation(&second.0)));
+        assert!(!native.containsAllocation(allocation(&small_table.0)));
+        assert!(metal.0.prefill_residency.is_none());
+        drop(first);
+        assert!(first_weak.upgrade().is_some());
+        drop(owner);
+        assert!(first_weak.upgrade().is_none());
+        assert_eq!(native.allocationCount(), 0);
+        drop((second, small_table));
+        assert_eq!(metal.memory_stats()?.live_requested_buffer_bytes, 0);
+        let context = Rc::downgrade(&metal.0);
+        drop(metal);
+        assert!(context.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_set_rejects_foreign_or_unretired_payload_owners() -> Result<()> {
+        let metal = Metal::for_engine(512)?;
+        let foreign = Metal::new()?.shared_buffer(4)?;
+        assert!(super::FixedResidency::new(&metal, vec![foreign]).is_err());
+        let buffer = metal.shared_buffer(4)?;
+        let pipeline = metal.compile_msl_strict(
+            "#include <metal_stdlib>\nusing namespace metal;\nkernel void touch(device uint* out [[buffer(0)]]) { out[0] = 17; }",
+            "touch",
+        )?;
+        let mut batch = metal.batch()?;
+        // SAFETY: One thread writes the complete checked uint allocation.
+        unsafe {
+            batch.dispatch_1d(
+                &pipeline,
+                &[super::super::Binding {
+                    buffer: &buffer,
+                    offset: 0,
+                }],
+                1,
+                1,
+            )?;
+        }
+        assert!(super::FixedResidency::new(&metal, vec![buffer.clone()]).is_err());
+        let flight = batch.submit();
+        assert!(super::FixedResidency::new(&metal, vec![buffer.clone()]).is_err());
+        flight.wait()?;
+        let owner = super::FixedResidency::new(&metal, vec![buffer])?;
+        drop(owner);
+        Ok(())
+    }
 
     #[test]
     fn prefill_residency_defaults_to_supported_bounded_engines_only() {

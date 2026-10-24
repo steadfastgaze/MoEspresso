@@ -126,12 +126,14 @@ pub fn run() -> Result<()> {
             && health["max_context"] == CONTEXT
             && health["prefill_capacity"] == 2048
             && health["prefill_workspace_ready"] == true
+            && matches!(health["prefill_backend"].as_str(), Some("gpu" | "gpu+ane"))
             && health["prompt_cache"]["memory_enabled"] == true
             && health["prompt_cache"]["disk_enabled"] == false,
         "serving did not return ordinary resources and retain its cache policy: {health}"
     );
     println!(
-        "phased serving: prompt={prompt_tokens} cached={cached} suffix={new_tokens} ordinary_rows=2048 cache=memory_hit"
+        "phased serving: prompt={prompt_tokens} cached={cached} suffix={new_tokens} ordinary_rows=2048 cache=memory_hit prefill_backend={}",
+        health["prefill_backend"].as_str().unwrap()
     );
     drop(server);
     scratch.cleanup_all()?;

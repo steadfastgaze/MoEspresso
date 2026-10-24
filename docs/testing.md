@@ -285,6 +285,71 @@ with the reference. Generated answer/tool checks evaluate the project-owned
 tasks independently. Cross-width comparisons retain the same numerical limits;
 the width declaration never adjusts tolerances or refreshes a baseline.
 
+## ANE runtime check
+
+An ordinary release build includes a model-free diagnostic:
+
+```sh
+target/release/moespresso check-ane
+```
+
+The command creates IOSurfaces, compiles and loads the dynamic projection used
+by the ANE path, writes three different input/weight pairs, evaluates them,
+reads and checks all 98,304 outputs against known exact values, and explicitly
+unloads the native owner. Its 64-row, 512-channel fixture requests 589,824 input
+bytes and 65,536 output bytes, excluding compiler and driver memory. No Metal
+device or model package is needed. Temporary compiled files are removed on
+normal completion.
+
+Run it without another ANE workload. Stage progress precedes native calls.
+Errors exit unsuccessfully; a fixed 30-second watchdog terminates the standalone
+process with status 124 if initialization, execution or cleanup hangs. Timeout
+termination skips destructors and may leave temporary compiler files. The
+watchdog is not used by library inference or serving.
+
+A pass establishes only this API and graph lifecycle on the tested Mac. It
+does not qualify model-sized shapes, memory admission, overlap, numerical
+quality or another Mac. The command does not change inference settings.
+
+## ANE prefill checks
+
+Normal generation and serving prefer ANE after memory admission. Setup runs
+the model-free runtime check and prepares the model-sized program before any
+session or cache is attached. A clean setup failure warns and uses GPU. Failed
+native cleanup or an inference failure requires a fresh engine; neither changes
+the numerical producer in flight. No backend-selection option is exposed.
+The standalone diagnostic watchdog does not run inside library or server setup.
+
+The combined path reuses one dynamic program for GDN z, QSA gates and shared
+gate/up projections. An initial 8192-row GPU workspace selects physical 8192,
+accepting 4096 through 8192 actual rows. Smaller initial workspaces select
+physical 4096, accepting exactly 4096 actual rows. Other chunks and decode remain
+on GPU. Session and cache frontiers advance by actual input rows, including
+when native buffers contain padding. GPU workspace replacement does not replace
+the selected ANE owner or its numerical producer scope.
+
+Low-level `Engine::load` retains GPU execution for independent controls.
+Explicit library setup with `enable_ane` is strict and must precede session
+creation. Callers must reserve the complete ANE allowance and retain exclusive
+GPU and ANE ownership. `prefer_ane` additionally permits clean startup fallback.
+
+Real-package tests remain individually selected ignored tests. They check
+packing against independent operands, exact GPU boundary state, typed native
+evaluation, continuation and failure cleanup after completed commands. Native
+owners must close explicitly; a failed operation must drain submitted work
+before invalidating state or releasing residency. Numerical and generated-answer
+qualification require separate unchanged references. Default GPU checks do not
+establish ANE equivalence. Keep one-off timing and task campaigns outside the
+source tree.
+
+The bounded disk checkpoint regression checks exact state and continuation after
+a fresh ANE engine restores the checkpoint. A GPU-only engine must refuse that
+checkpoint without consuming or rewriting it:
+
+```sh
+MOESPRESSO_TEST_PACKAGE=/path/to/package sh scripts/test-ignored.sh lib-release engine::snapshot::disk::tests::bounded_ane_disk_restart_preserves_state_and_rejects_gpu
+```
+
 ## External numerical references
 
 ```sh
@@ -306,7 +371,8 @@ make dist-check
 The source-only gate assembles files from the declared source directories
 through an explicit path and extension allowlist. It rejects private paths,
 links, non-source files and machine-local paths, requires the lockfile and
-license/notice files, checks those files byte for byte after extraction, then
+license/notice files, verifies exact archive membership without platform
+metadata, checks those files byte for byte after extraction, then
 rebuilds all Cargo targets from the extracted archive with `--locked --offline`
 and an independent target directory. Fetch the locked dependencies before this
 offline check. It writes the successful archive to

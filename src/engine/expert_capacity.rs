@@ -64,6 +64,10 @@ impl Engine {
             return Ok(report);
         }
         ensure!(
+            !self.ane_residency_failed && self.ane_residency.is_none(),
+            "fixed ANE residency forbids expert capacity changes"
+        );
+        ensure!(
             target_capacity > self.expert_capacity,
             "expert recovery requires a larger capacity"
         );
@@ -149,6 +153,10 @@ impl Engine {
         if target_capacity == self.expert_capacity {
             return Ok(report);
         }
+        ensure!(
+            !self.ane_residency_failed && self.ane_residency.is_none(),
+            "fixed ANE residency forbids expert capacity changes"
+        );
         ensure!(
             target_capacity >= 64
                 && target_capacity.is_multiple_of(16)
@@ -247,6 +255,111 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE and exclusive GPU ownership"]
+    fn ane_startup_rejects_attached_cache_and_previous_session() -> Result<()> {
+        let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+        let mut engine = Engine::load(&package, 64, 8192)?;
+        let cache = PromptPrefixCache::new(&engine, 0);
+        assert!(
+            engine
+                .enable_ane(&package)
+                .unwrap_err()
+                .to_string()
+                .contains("cache attachment")
+        );
+        assert!(engine.prefer_ane(&package).is_err());
+        assert!(!engine.ane_active());
+        drop(cache);
+        drop(engine.start_session()?);
+        assert!(
+            engine
+                .enable_ane(&package)
+                .unwrap_err()
+                .to_string()
+                .contains("previous sessions")
+        );
+        assert!(engine.prefer_ane(&package).is_err());
+        assert!(!engine.ane_active());
+        engine.close_ane()
+    }
+
+    #[test]
+    #[ignore = "requires MOESPRESSO_TEST_PACKAGE, ANE support and exclusive GPU ownership"]
+    fn bounded_ane_storage_resizes_across_workspace_phases_and_restores_state() -> Result<()> {
+        let package = Package::open(std::env::var("MOESPRESSO_TEST_PACKAGE")?)?;
+        let mut engine = Engine::load_with_prefill_capacity(&package, 128, 8192, 4096)?;
+        engine.enable_ane(&package)?;
+        assert!(engine.ane_active());
+        assert!(engine.ane_residency.is_none());
+        let scope = engine
+            .ane_prefill_cache_scope()
+            .expect("an active bounded ANE engine must have a producer scope");
+        assert!(
+            scope.ends_with(";rows=4096"),
+            "the bounded 4096-row workspace must retain a 4096-row ANE producer: {scope}"
+        );
+        let cache_identity = engine.cache_identity.clone();
+        let mut session = engine.start_session()?;
+        let tokens: Vec<_> = (0..4096).map(|index| 7 + index % 32).collect();
+        engine.prefill_chunk(&tokens, &mut session)?;
+        let snapshot = engine.snapshot(&session)?;
+        let before = engine.memory_stats()?.live_requested_buffer_bytes;
+        let released = engine.shrink_expert_capacity(96)?;
+        assert!(released.released_requested_bytes > 0);
+        assert_eq!(
+            before - engine.memory_stats()?.live_requested_buffer_bytes,
+            released.released_requested_bytes
+        );
+        assert_eq!(
+            engine.ane_prefill_cache_scope().as_deref(),
+            Some(scope.as_str())
+        );
+        let grown = engine.recover_expert_capacity(144, u64::MAX)?;
+        assert!(grown.added_requested_bytes > released.released_requested_bytes);
+        assert!(engine.ane_active());
+        assert!(engine.ane_residency.is_none());
+        assert!(Rc::ptr_eq(&cache_identity, &engine.cache_identity));
+        assert_eq!(
+            engine.ane_prefill_cache_scope().as_deref(),
+            Some(scope.as_str())
+        );
+        engine.replace_prefill_without_overlap(2048, u64::MAX)?;
+        assert_eq!(engine.prefill_chunk_size(), 2048);
+        assert!(engine.ane_active());
+        assert_eq!(
+            engine.ane_prefill_cache_scope().as_deref(),
+            Some(scope.as_str())
+        );
+        let mut restored = engine.restore(&snapshot)?;
+        assert_eq!(restored.frontier()?, tokens.len());
+        assert_eq!(restored.consumed_tokens()?, tokens);
+        let ordinary = engine.step(7, RoutingMode::Unbiased, &mut session)?;
+        let restored_output = engine.step(7, RoutingMode::Unbiased, &mut restored)?;
+        assert_eq!(ordinary.logits_bf16, restored_output.logits_bf16);
+        assert_eq!(ordinary.frontier, restored_output.frontier);
+
+        // A completed GPU error also poisons an active bounded ANE engine,
+        // although it has no persistent expert-residency set to release.
+        let fault = engine.metal.test_fail_completed_command_after(0)?;
+        assert!(engine.prefill_chunk(&[7, 8, 9], &mut session).is_err());
+        assert!(fault.fired());
+        drop(fault);
+        assert!(!engine.ane_active());
+        assert!(engine.ane_residency_failed);
+        assert!(!engine.prefill.workspace_in_progress());
+        engine._expert_row_workspace.check_idle()?;
+        engine.graph.status.reset()?;
+        assert!(engine.start_session().is_err());
+        assert!(engine.shrink_expert_capacity(128).is_err());
+        assert!(engine.recover_expert_capacity(160, u64::MAX).is_err());
+        let metal = engine.metal.clone();
+        drop((session, restored, snapshot));
+        engine.close_ane()?;
+        assert_eq!(metal.memory_stats()?.live_requested_buffer_bytes, 0);
+        Ok(())
     }
 
     #[test]
